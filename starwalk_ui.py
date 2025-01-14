@@ -463,34 +463,6 @@ if uploaded_file:
         # Add the Translate button below the header
         translate_to_english = st.button("Translate All Reviews to English")
 
-        # Add Export to Excel functionality
-        if st.button("Export Filtered Reviews to Excel"):
-            # Create a filtered DataFrame for export
-            export_df = filtered_verbatims.copy()
-            
-            # Optionally translate all reviews if the "Translate All Reviews to English" button is active
-            if translate_to_english:
-                export_df['Translated Verbatim'] = export_df['Verbatim'].apply(
-                    lambda x: translator.translate(x, dest="en").text if isinstance(x, str) else x
-                )
-            else:
-                export_df['Translated Verbatim'] = export_df['Verbatim']  # Add a copy without translating
-
-            # Convert the DataFrame to an Excel file in memory
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                export_df.to_excel(writer, index=False, sheet_name="Filtered Reviews")
-                writer.save()
-            output.seek(0)
-
-            # Offer the Excel file as a download
-            st.download_button(
-                label="Download Excel File",
-                data=output,
-                file_name="filtered_reviews.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
         reviews_per_page = 10
 
         # Initialize pagination state
