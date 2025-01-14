@@ -4,7 +4,11 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
-
+from googletrans import Translator
+import pandas as pd
+import io
+        
+        
 # Set widescreen layout
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
@@ -52,8 +56,6 @@ if uploaded_file:
                 verbatims[col] = pd.to_numeric(verbatims[col], errors='coerce')
 
         # Proceed with further processing (e.g., filtering, aggregations, comparisons)
-
-
         if 'Review Date' in verbatims.columns:
             verbatims['Review Date'] = pd.to_datetime(verbatims['Review Date'], errors='coerce')
 
@@ -129,23 +131,26 @@ if uploaded_file:
 
         # Inventory Delighter and Detractor Symptoms
         delighter_columns = ['Symptom 11', 'Symptom 12', 'Symptom 13', 'Symptom 14', 'Symptom 15',
-                             'Symptom 16', 'Symptom 17', 'Symptom 18', 'Symptom 19', 'Symptom 20']
+                            'Symptom 16', 'Symptom 17', 'Symptom 18', 'Symptom 19', 'Symptom 20']
         detractor_columns = ['Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5',
-                             'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10']
+                            'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10']
 
+        # Extract unique symptoms for each group
         delighter_symptoms = pd.unique(filtered_verbatims[delighter_columns].values.ravel())
         delighter_symptoms = [symptom for symptom in delighter_symptoms if pd.notna(symptom)]
 
         detractor_symptoms = pd.unique(filtered_verbatims[detractor_columns].values.ravel())
         detractor_symptoms = [symptom for symptom in detractor_symptoms if pd.notna(symptom)]
 
-        # Filters for Delighters and Detractors
+        # Filters for Delighters and Detractors (Grouped)
         st.sidebar.header("😊 Delighters and 😠 Detractors Filters")
+
         selected_delighter = st.sidebar.multiselect(
             "Select Delighter Symptoms",
             options=["All"] + sorted(delighter_symptoms),
             default=["All"]
         )
+
         selected_detractor = st.sidebar.multiselect(
             "Select Detractor Symptoms",
             options=["All"] + sorted(detractor_symptoms),
@@ -163,7 +168,19 @@ if uploaded_file:
                 filtered_verbatims[detractor_columns].isin(selected_detractor).any(axis=1)
             ]
 
+        # Dynamic Additional Filters for Columns after Symptom 20
+        additional_columns = verbatims.columns[20:]  # Columns from the 21st onward
+        if len(additional_columns) > 0:
+            st.sidebar.header("📋 Additional Filters")
+            for column in additional_columns:
+                if column not in delighter_columns + detractor_columns:  # Avoid duplicating delighter/detractor filters
+                    filtered_verbatims, _ = apply_filter(filtered_verbatims, column, column)
+        else:
+            st.sidebar.info("No additional filters available.")
+
         st.markdown("---")  # Separator line
+            
+                    
 
        # Metrics Summary Section
         st.markdown("""
@@ -257,16 +274,17 @@ if uploaded_file:
 
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
+
         if 'Review Date' not in filtered_verbatims.columns:
             st.error("The 'Review Date' column is missing from the data. Please upload a valid file.")
             st.stop()
 
         filtered_verbatims['Review Date'] = pd.to_datetime(filtered_verbatims['Review Date'], errors='coerce')
 
-        # Add a dropdown for selecting bar size
-        st.sidebar.markdown("### 📊 Bar Size")
-        bar_size = st.sidebar.selectbox(
-            "Select bar size for review mentions:",
+        # Add a dropdown for selecting bar size below the graph header
+        st.markdown("#### Select Bar Size")
+        bar_size = st.selectbox(
+            "Choose the aggregation level for review mentions:",
             options=["Daily", "Weekly", "Monthly"]
         )
 
@@ -343,21 +361,25 @@ if uploaded_file:
                 title="Cumulative Star Rating (1-5)",
                 overlaying="y",
                 side="right",
-                range=[1, 5],
+                range=[1, 5.2],  # Added extra headroom above 5 stars
                 title_font=dict(size=14),
                 showgrid=False
             ),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=-0.4,  # Adjusted to move the legend away from the graph axes
+                xanchor="center",
+                x=0.5
+            ),
             barmode="stack",
             template="plotly_white",
-            margin=dict(l=50, r=50, t=50, b=50)
+            margin=dict(l=50, r=50, t=70, b=70)  # Adjusted margins for better responsiveness
         )
 
         st.plotly_chart(fig, use_container_width=True)
 
-
         st.markdown("---")  # Separator line
-
 
         # Updated Delighters and Detractors Analysis Section
 
@@ -431,21 +453,78 @@ if uploaded_file:
 
         st.markdown("---")  # Separator line
 
+
+        # Initialize translator
+        translator = Translator()
+
         # Enhanced Reviews Display Section with Pagination
         st.markdown("### 📝 All Reviews")
+
+        # Add the Translate button below the header
+        translate_to_english = st.button("Translate All Reviews to English")
+
+        # Add Export to Excel functionality
+        if st.button("Export Filtered Reviews to Excel"):
+            # Create a filtered DataFrame for export
+            export_df = filtered_verbatims.copy()
+            
+            # Optionally translate all reviews if the "Translate All Reviews to English" button is active
+            if translate_to_english:
+                export_df['Translated Verbatim'] = export_df['Verbatim'].apply(
+                    lambda x: translator.translate(x, dest="en").text if isinstance(x, str) else x
+                )
+            else:
+                export_df['Translated Verbatim'] = export_df['Verbatim']  # Add a copy without translating
+
+            # Convert the DataFrame to an Excel file in memory
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                export_df.to_excel(writer, index=False, sheet_name="Filtered Reviews")
+                writer.save()
+            output.seek(0)
+
+            # Offer the Excel file as a download
+            st.download_button(
+                label="Download Excel File",
+                data=output,
+                file_name="filtered_reviews.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
         reviews_per_page = 10
+
+        # Initialize pagination state
         if "review_page" not in st.session_state:
             st.session_state["review_page"] = 0
 
+        # Function to reset scroll position to the top of the section
+        def scroll_to_top():
+            st.experimental_rerun()
+
+        # Determine start and end indices for the current page
         current_page = st.session_state["review_page"]
         start_index = current_page * reviews_per_page
         end_index = start_index + reviews_per_page
+
+        # Slice the paginated reviews
         paginated_reviews = filtered_verbatims.iloc[start_index:end_index]
 
         if paginated_reviews.empty:
             st.warning("No reviews match the selected criteria.")
         else:
             for _, row in paginated_reviews.iterrows():
+                if translate_to_english:
+                    # Translate review if the button is pressed
+                    try:
+                        translated_review = translator.translate(row['Verbatim'], dest="en").text
+                    except Exception as e:
+                        st.error(f"Error translating review: {e}")
+                        translated_review = row['Verbatim']  # Fallback to original text
+                else:
+                    # Show the original review
+                    translated_review = row['Verbatim']
+
+                # Prepare delighter and detractor badges
                 delighter_badges = [
                     f'<div style="display:inline-block; padding:5px 10px; background-color:lightgreen; color:black; border-radius:5px; margin:5px;">{row[col]}</div>'
                     for col in delighter_columns if col in row and pd.notna(row[col])
@@ -459,14 +538,14 @@ if uploaded_file:
                 delighter_message = "<i>No delighter symptoms reported</i>" if not delighter_badges else " ".join(delighter_badges)
                 detractor_message = "<i>No detractor symptoms reported</i>" if not detractor_badges else " ".join(detractor_badges)
 
+                # Display review
                 st.markdown(
                     f"""
                     <div style="border: 1px solid #ddd; padding: 15px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;">
                         <p><strong>Source:</strong> {row['Source']} | <strong>Model:</strong> {row['Model (SKU)']}</p>
                         <p><strong>Country:</strong> {row['Country']}</p>
                         <p><strong>Rating:</strong> {'⭐' * int(row['Star Rating'])} ({row['Star Rating']}/5)</p>
-                        <p><strong>Date:</strong> {row['Review Date'].date() if pd.notna(row['Review Date']) else 'N/A'}</p>
-                        <p><strong>Verbatim:</strong> {row['Verbatim']}</p>
+                        <p><strong>Review:</strong> {translated_review}</p>
                         <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
                         <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
                     </div>
@@ -474,9 +553,28 @@ if uploaded_file:
                     unsafe_allow_html=True
                 )
 
-        if end_index < len(filtered_verbatims):
-            if st.button("View More Reviews"):
+        # Add navigation buttons for pagination
+        col1, col2, col3 = st.columns([1, 1, 1])
+
+        # "Go Back" button
+        with col1:
+            if current_page > 0 and st.button("⬅ Go Back", key="go_back"):
+                st.session_state["review_page"] -= 1
+                scroll_to_top()
+
+        # Page indicator
+        with col2:
+            total_pages = (len(filtered_verbatims) + reviews_per_page - 1) // reviews_per_page  # Calculate total pages
+            st.markdown(
+                f"<div style='text-align: center; font-weight: bold;'>Page {current_page + 1} of {total_pages}</div>",
+                unsafe_allow_html=True,
+            )
+
+        # "View More" button
+        with col3:
+            if end_index < len(filtered_verbatims) and st.button("➡ View More", key="view_more"):
                 st.session_state["review_page"] += 1
+                scroll_to_top()
 
         st.markdown("---")  # Separator line
  
