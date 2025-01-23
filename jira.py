@@ -93,6 +93,7 @@ if uploaded_file:
             )
             tsf_only_filter = st.sidebar.checkbox("TSF Only", value=True)
             top_10_symptoms_filter = st.sidebar.checkbox("Top 10 Symptoms Only", value=False)
+            top_10_dispositions_filter = st.sidebar.checkbox("Top 10 Dispositions Only", value=False)
             date_filter = st.sidebar.selectbox(
                 "Date Range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3
             )
@@ -135,6 +136,9 @@ if uploaded_file:
             if top_10_symptoms_filter:
                 top_symptoms = filtered_data_table['Symptom'].value_counts().nlargest(10).index
                 filtered_data_table['Symptom'] = filtered_data_table['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
+            if top_10_dispositions_filter:
+                top_dispositions = filtered_data_table['Disposition'].value_counts().nlargest(10).index
+                filtered_data_table['Disposition'] = filtered_data_table['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
             if search_query:
                 filtered_data_table = filtered_data_table[filtered_data_table['Description'].str.contains(search_query, case=False, na=False)]
             filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
@@ -148,6 +152,9 @@ if uploaded_file:
             if top_10_symptoms_filter:
                 top_symptoms = filtered_data_graph['Symptom'].value_counts().nlargest(10).index
                 filtered_data_graph['Symptom'] = filtered_data_graph['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
+            if top_10_dispositions_filter:
+                top_dispositions = filtered_data_graph['Disposition'].value_counts().nlargest(10).index
+                filtered_data_graph['Disposition'] = filtered_data_graph['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
             if search_query:
                 filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
 
@@ -281,4 +288,3 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"An error occurred while processing the file: {str(e)}")
-
