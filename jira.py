@@ -56,9 +56,13 @@ if not uploaded_file:
         - **Symptom**: The reported symptom or issue.
         - **Disposition**: The resolution or status of the issue.
         - **Description**: A detailed description of the issue.
+        - **Serial Number**: The serial number of the affected unit.
+
+        You can download the correct Excel format [here](https://sharkninja.atlassian.net/issues/?filter=19767).
 
         Make sure your file has a tab named **'Your Jira Issues'**.
-        """
+        """,
+        unsafe_allow_html=True
     )
 
 if uploaded_file:
@@ -240,12 +244,12 @@ if uploaded_file:
                 st.markdown(
                     f"""
                     <div class='description-box'>
-                        <strong>{idx + 1}.</strong> {row['Description']}<br>
                         <strong>SKU:</strong> {row['SKU(s)']}<br>
                         <strong>Disposition:</strong> {row['Disposition']}<br>
                         <strong>Symptom:</strong> {row['Symptom']}<br>
                         <strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}<br>
-                        <strong>Serial Number:</strong> {row['Serial Number']}
+                        <strong>Serial Number:</strong> {row['Serial Number']}<br>
+                        <strong>Description:</strong> {row['Description']}
                     </div>
                     """,
                     unsafe_allow_html=True
