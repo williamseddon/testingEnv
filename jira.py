@@ -91,7 +91,8 @@ if uploaded_file:
             disposition_filter = st.sidebar.multiselect(
                 "Filter by Disposition", options=['ALL'] + list(data['Disposition'].dropna().unique()), default=['ALL']
             )
-            tsf_only_filter = st.sidebar.checkbox("TSF Only", value=False)
+            tsf_only_filter = st.sidebar.checkbox("TSF Only", value=True)
+            top_10_symptoms_filter = st.sidebar.checkbox("Top 10 Symptoms Only", value=False)
             date_filter = st.sidebar.selectbox(
                 "Date Range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3
             )
@@ -131,6 +132,9 @@ if uploaded_file:
                 filtered_data_table = filtered_data_table[
                     filtered_data_table['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
                 ]
+            if top_10_symptoms_filter:
+                top_symptoms = filtered_data_table['Symptom'].value_counts().nlargest(10).index
+                filtered_data_table['Symptom'] = filtered_data_table['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
             if search_query:
                 filtered_data_table = filtered_data_table[filtered_data_table['Description'].str.contains(search_query, case=False, na=False)]
             filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
@@ -141,6 +145,9 @@ if uploaded_file:
                 filtered_data_graph = filtered_data_graph[
                     filtered_data_graph['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
                 ]
+            if top_10_symptoms_filter:
+                top_symptoms = filtered_data_graph['Symptom'].value_counts().nlargest(10).index
+                filtered_data_graph['Symptom'] = filtered_data_graph['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
             if search_query:
                 filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
 
@@ -274,3 +281,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"An error occurred while processing the file: {str(e)}")
+
