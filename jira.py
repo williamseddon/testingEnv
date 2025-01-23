@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import plotly.io as pio
 
 # Page Config
-st.set_page_config(page_title="Jira Issues Dashboard", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Jira Issues Dashboard", layout="wide", page_icon="\ud83d\udcca")
 
 # Title with Styling
 st.markdown(
@@ -38,7 +38,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("📊 Jira Issues Dashboard")
+st.title("\ud83d\udcca Jira Issues Dashboard")
 
 # File Upload with Custom Message
 uploaded_file = st.file_uploader(
@@ -53,12 +53,12 @@ if not uploaded_file:
         To use this dashboard, please upload an Excel file containing the following columns:
         - **Date Identified**: The date the issue was identified (e.g., 2024-01-01).
         - **SKU(s)**: The SKU(s) related to the issue.
+        - **Base SKU**: The base SKU category.
+        - **Region**: The region where the issue occurred.
         - **Symptom**: The reported symptom or issue.
         - **Disposition**: The resolution or status of the issue.
         - **Description**: A detailed description of the issue.
         - **Serial Number**: The serial number of the affected unit.
-
-        You can download the correct Excel format [here](https://sharkninja.atlassian.net/issues/?filter=19767).
 
         Make sure your file has a tab named **'Your Jira Issues'**.
         """,
@@ -71,7 +71,7 @@ if uploaded_file:
         data = pd.read_excel(uploaded_file, sheet_name='Your Jira Issues')
 
         # Validate required columns
-        required_columns = ['Date Identified', 'SKU(s)', 'Symptom', 'Disposition', 'Description', 'Serial Number']
+        required_columns = ['Date Identified', 'SKU(s)', 'Base SKU', 'Region', 'Symptom', 'Disposition', 'Description', 'Serial Number']
         missing_columns = [col for col in required_columns if col not in data.columns]
 
         if missing_columns:
@@ -84,6 +84,12 @@ if uploaded_file:
             st.sidebar.header("Filters")
             sku_filter = st.sidebar.multiselect(
                 "Filter by SKU", options=['ALL'] + list(data['SKU(s)'].dropna().unique()), default=['ALL']
+            )
+            base_sku_filter = st.sidebar.multiselect(
+                "Filter by Base SKU", options=['ALL'] + list(data['Base SKU'].dropna().unique()), default=['ALL']
+            )
+            region_filter = st.sidebar.multiselect(
+                "Filter by Region", options=['ALL'] + list(data['Region'].dropna().unique()), default=['ALL']
             )
             symptom_filter = st.sidebar.multiselect(
                 "Filter by Symptom", options=['ALL'] + list(data['Symptom'].dropna().unique()), default=['ALL']
@@ -125,6 +131,10 @@ if uploaded_file:
             filtered_data_table = data.copy()
             if 'ALL' not in sku_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
+            if 'ALL' not in base_sku_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['Base SKU'].isin(base_sku_filter)]
+            if 'ALL' not in region_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
             if 'ALL' not in symptom_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
             if 'ALL' not in disposition_filter:
@@ -159,19 +169,23 @@ if uploaded_file:
                 filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
 
             # Summary Section
-            st.header("🔍 Summary")
+            st.header("\ud83d\udd0d Summary")
             total_issues = len(filtered_data_graph)
             unique_skus = filtered_data_graph['SKU(s)'].nunique()
+            unique_base_skus = filtered_data_graph['Base SKU'].nunique()
+            unique_regions = filtered_data_graph['Region'].nunique()
             unique_symptoms = filtered_data_graph['Symptom'].nunique()
             st.write(f"**Total Issues:** {total_issues}")
             st.write(f"**Unique SKUs:** {unique_skus}")
+            st.write(f"**Unique Base SKUs:** {unique_base_skus}")
+            st.write(f"**Unique Regions:** {unique_regions}")
             st.write(f"**Unique Symptoms:** {unique_symptoms}")
 
             # Toggle for combining lesser symptoms into "Other"
             combine_other = st.checkbox("Combine lesser symptoms into 'Other'")
 
             # Symptom Issues Over Time (Graph)
-            st.header("📅 Symptom Issues Over Time (Graph)")
+            st.header("\ud83d\udcc5 Symptom Issues Over Time (Graph)")
             aggregation = st.selectbox("Aggregate By", ["Day", "Week", "Month"], index=1)
             aggregation_mapping = {"Day": 'D', "Week": 'W', "Month": 'M'}
             agg_freq = aggregation_mapping[aggregation]
@@ -203,7 +217,7 @@ if uploaded_file:
             st.plotly_chart(fig, use_container_width=True)
 
             # Dispositions Over Time (Graph)
-            st.header("📅 Dispositions Over Time (Graph)")
+            st.header("\ud83d\udcc5 Dispositions Over Time (Graph)")
             disposition_time_data_graph = filtered_data_graph.groupby([pd.Grouper(key='Date Identified', freq=agg_freq), 'Disposition']).size().reset_index(name='Count')
 
             if combine_other:
@@ -231,7 +245,7 @@ if uploaded_file:
             st.plotly_chart(fig, use_container_width=True)
 
             # Ranked Symptoms with Metrics (Table)
-            st.header("📊 Ranked Symptoms (Table)")
+            st.header("\ud83d\udcca Ranked Symptoms (Table)")
             symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
             symptom_rank.columns = ['Symptom', 'Count']
 
@@ -257,8 +271,8 @@ if uploaded_file:
             st.dataframe(symptom_rank)
 
             # Paginated Descriptions
-            st.header("🗋 Descriptions")
-            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
+            st.header("\ud83d\udd0b Descriptions")
+            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
             page = st.number_input("Page", min_value=1, max_value=(len(descriptions) // 10) + 1, step=1)
             start_idx = (page - 1) * 10
             end_idx = start_idx + 10
@@ -268,6 +282,8 @@ if uploaded_file:
                     f"""
                     <div class='description-box'>
                         <strong>SKU:</strong> {row['SKU(s)']}<br>
+                        <strong>Base SKU:</strong> {row['Base SKU']}<br>
+                        <strong>Region:</strong> {row['Region']}<br>
                         <strong>Disposition:</strong> {row['Disposition']}<br>
                         <strong>Symptom:</strong> {row['Symptom']}<br>
                         <strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}<br>
