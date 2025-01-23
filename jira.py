@@ -91,6 +91,7 @@ if uploaded_file:
             disposition_filter = st.sidebar.multiselect(
                 "Filter by Disposition", options=['ALL'] + list(data['Disposition'].dropna().unique()), default=['ALL']
             )
+            tsf_only_filter = st.sidebar.checkbox("TSF Only", value=False)
             date_filter = st.sidebar.selectbox(
                 "Date Range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3
             )
@@ -126,12 +127,20 @@ if uploaded_file:
                 filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
             if 'ALL' not in disposition_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
+            if tsf_only_filter:
+                filtered_data_table = filtered_data_table[
+                    filtered_data_table['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
+                ]
             if search_query:
                 filtered_data_table = filtered_data_table[filtered_data_table['Description'].str.contains(search_query, case=False, na=False)]
             filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
 
             filtered_data_graph = data.copy()
             filtered_data_graph = filtered_data_graph[filtered_data_graph['Date Identified'] >= start_date_graph]
+            if tsf_only_filter:
+                filtered_data_graph = filtered_data_graph[
+                    filtered_data_graph['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
+                ]
             if search_query:
                 filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
 
