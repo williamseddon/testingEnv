@@ -40,25 +40,27 @@ st.markdown(
 
 st.title("📊 Jira Issues Dashboard")
 
-# Text for required columns
-st.markdown(
-    """
-    ### Required Column Format:
-    To use this dashboard, please upload an Excel file containing the following columns:
-    - **Date Identified**: The date the issue was identified (e.g., 2024-01-01).
-    - **SKU(s)**: The SKU(s) related to the issue.
-    - **Symptom**: The reported symptom or issue.
-    - **Disposition**: The resolution or status of the issue.
-    - **Description**: A detailed description of the issue.
-
-    Make sure your file has a tab named **'Your Jira Issues'**.
-    """
-)
-
 # File Upload with Custom Message
 uploaded_file = st.file_uploader(
     "Upload your Excel file (must contain 'Your Jira Issues' tab)", type=['xlsx']
 )
+
+# Text for required columns
+if not uploaded_file:
+    st.markdown(
+        """
+        ### Required Column Format:
+        To use this dashboard, please upload an Excel file containing the following columns:
+        - **Date Identified**: The date the issue was identified (e.g., 2024-01-01).
+        - **SKU(s)**: The SKU(s) related to the issue.
+        - **Symptom**: The reported symptom or issue.
+        - **Disposition**: The resolution or status of the issue.
+        - **Description**: A detailed description of the issue.
+
+        Make sure your file has a tab named **'Your Jira Issues'**.
+        """
+    )
+
 if uploaded_file:
     try:
         # Load data
@@ -89,6 +91,8 @@ if uploaded_file:
                 "Date Range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3
             )
 
+            search_query = st.sidebar.text_input("Search Descriptions")
+
             # Input for setting periods for table
             period_days_table = st.sidebar.number_input("Set Table Period Length (days)", min_value=1, value=30, step=1)
 
@@ -118,10 +122,14 @@ if uploaded_file:
                 filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
             if 'ALL' not in disposition_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
+            if search_query:
+                filtered_data_table = filtered_data_table[filtered_data_table['Description'].str.contains(search_query, case=False, na=False)]
             filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
 
             filtered_data_graph = data.copy()
             filtered_data_graph = filtered_data_graph[filtered_data_graph['Date Identified'] >= start_date_graph]
+            if search_query:
+                filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
 
             # Summary Section
             st.header("🔍 Summary")
@@ -223,13 +231,24 @@ if uploaded_file:
 
             # Paginated Descriptions
             st.header("🗋 Descriptions")
-            descriptions = filtered_data_table['Description'].dropna().sort_values(ascending=False).reset_index(drop=True)
+            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Disposition', 'Symptom', 'Date Identified']].dropna().reset_index(drop=True)
             page = st.number_input("Page", min_value=1, max_value=(len(descriptions) // 10) + 1, step=1)
             start_idx = (page - 1) * 10
             end_idx = start_idx + 10
             st.write("### Descriptions (Filtered)")
-            for idx, desc in enumerate(descriptions[start_idx:end_idx], start=start_idx + 1):
-                st.markdown(f"<div class='description-box'><strong>{idx}.</strong> {desc}</div>", unsafe_allow_html=True)
+            for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
+                st.markdown(
+                    f"""
+                    <div class='description-box'>
+                        <strong>{idx + 1}.</strong> {row['Description']}<br>
+                        <strong>SKU:</strong> {row['SKU(s)']}<br>
+                        <strong>Disposition:</strong> {row['Disposition']}<br>
+                        <strong>Symptom:</strong> {row['Symptom']}<br>
+                        <strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
             # Add Download Option
             st.sidebar.download_button(
