@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import plotly.io as pio
 
 # Page Config
-st.set_page_config(page_title="Jira Issues Dashboard", layout="wide", page_icon="\ud83d\udcca")
+st.set_page_config(page_title="Jira Issues Dashboard", layout="wide", page_icon="📊")
 
 # Title with Styling
 st.markdown(
@@ -38,7 +38,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("\ud83d\udcca Jira Issues Dashboard")
+st.title("📊 Jira Issues Dashboard")
 
 # File Upload with Custom Message
 uploaded_file = st.file_uploader(
@@ -169,7 +169,7 @@ if uploaded_file:
                 filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
 
             # Summary Section
-            st.header("\ud83d\udd0d Summary")
+            st.header("🔍 Summary")
             total_issues = len(filtered_data_graph)
             unique_skus = filtered_data_graph['SKU(s)'].nunique()
             unique_base_skus = filtered_data_graph['Base SKU'].nunique()
@@ -185,7 +185,7 @@ if uploaded_file:
             combine_other = st.checkbox("Combine lesser symptoms into 'Other'")
 
             # Symptom Issues Over Time (Graph)
-            st.header("\ud83d\udcc5 Symptom Issues Over Time (Graph)")
+            st.header("📅 Symptom Issues Over Time (Graph)")
             aggregation = st.selectbox("Aggregate By", ["Day", "Week", "Month"], index=1)
             aggregation_mapping = {"Day": 'D', "Week": 'W', "Month": 'M'}
             agg_freq = aggregation_mapping[aggregation]
@@ -217,7 +217,7 @@ if uploaded_file:
             st.plotly_chart(fig, use_container_width=True)
 
             # Dispositions Over Time (Graph)
-            st.header("\ud83d\udcc5 Dispositions Over Time (Graph)")
+            st.header("📅 Dispositions Over Time (Graph)")
             disposition_time_data_graph = filtered_data_graph.groupby([pd.Grouper(key='Date Identified', freq=agg_freq), 'Disposition']).size().reset_index(name='Count')
 
             if combine_other:
@@ -245,7 +245,7 @@ if uploaded_file:
             st.plotly_chart(fig, use_container_width=True)
 
             # Ranked Symptoms with Metrics (Table)
-            st.header("\ud83d\udcca Ranked Symptoms (Table)")
+            st.header("📊 Ranked Symptoms (Table)")
             symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
             symptom_rank.columns = ['Symptom', 'Count']
 
@@ -271,7 +271,7 @@ if uploaded_file:
             st.dataframe(symptom_rank)
 
             # Paginated Descriptions
-            st.header("\ud83d\udd0b Descriptions")
+            st.header("🗒 Descriptions")
             descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
             page = st.number_input("Page", min_value=1, max_value=(len(descriptions) // 10) + 1, step=1)
             start_idx = (page - 1) * 10
