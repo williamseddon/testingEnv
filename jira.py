@@ -67,7 +67,7 @@ if uploaded_file:
         data = pd.read_excel(uploaded_file, sheet_name='Your Jira Issues')
 
         # Validate required columns
-        required_columns = ['Date Identified', 'SKU(s)', 'Symptom', 'Disposition', 'Description']
+        required_columns = ['Date Identified', 'SKU(s)', 'Symptom', 'Disposition', 'Description', 'Serial Number']
         missing_columns = [col for col in required_columns if col not in data.columns]
 
         if missing_columns:
@@ -231,7 +231,7 @@ if uploaded_file:
 
             # Paginated Descriptions
             st.header("🗋 Descriptions")
-            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Disposition', 'Symptom', 'Date Identified']].dropna().reset_index(drop=True)
+            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
             page = st.number_input("Page", min_value=1, max_value=(len(descriptions) // 10) + 1, step=1)
             start_idx = (page - 1) * 10
             end_idx = start_idx + 10
@@ -244,7 +244,8 @@ if uploaded_file:
                         <strong>SKU:</strong> {row['SKU(s)']}<br>
                         <strong>Disposition:</strong> {row['Disposition']}<br>
                         <strong>Symptom:</strong> {row['Symptom']}<br>
-                        <strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}
+                        <strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}<br>
+                        <strong>Serial Number:</strong> {row['Serial Number']}
                     </div>
                     """,
                     unsafe_allow_html=True
