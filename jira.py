@@ -33,6 +33,12 @@ st.markdown(
         font-family: Arial, sans-serif;
         line-height: 1.5;
     }
+    .pagination {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin: 20px 0;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -104,10 +110,10 @@ if uploaded_file:
                 "Date Range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3
             )
 
-            search_query = st.sidebar.text_input("Search Descriptions")
-
             # Input for setting periods for table
             period_days_table = st.sidebar.number_input("Set Table Period Length (days)", min_value=1, value=30, step=1)
+
+            search_query = st.sidebar.text_input("Search Descriptions")
 
             # Adjust start_date for graphs and table
             if date_filter == "Last Week":
@@ -273,9 +279,15 @@ if uploaded_file:
             # Paginated Descriptions
             st.header("🗒 Descriptions")
             descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
-            page = st.number_input("Page", min_value=1, max_value=(len(descriptions) // 10) + 1, step=1)
-            start_idx = (page - 1) * 10
-            end_idx = start_idx + 10
+
+            items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
+            total_items = len(descriptions)
+            total_pages = -(-total_items // items_per_page)  # Ceiling division
+
+            current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
+            start_idx = (current_page - 1) * items_per_page
+            end_idx = start_idx + items_per_page
+
             st.write("### Descriptions (Filtered)")
             for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
                 st.markdown(
@@ -293,6 +305,16 @@ if uploaded_file:
                     """,
                     unsafe_allow_html=True
                 )
+
+            st.markdown(
+                f"""
+                <div class='pagination'>
+                    <span>Total Items: {total_items}</span>
+                    <span>Page {current_page} of {total_pages}</span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
             # Add Download Option
             st.sidebar.download_button(
