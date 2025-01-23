@@ -25,19 +25,48 @@ st.markdown(
         background-color: #f9f9f9;
     }
     .description-box {
-        background-color: #f0f8ff;
-        padding: 15px;
-        margin: 10px 0;
-        border-left: 4px solid #4CAF50;
-        border-radius: 8px;
-        font-family: Arial, sans-serif;
-        line-height: 1.5;
+        background-color: #ffffff;
+        padding: 20px;
+        margin: 15px 0;
+        border-left: 5px solid #4CAF50;
+        border-radius: 10px;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        line-height: 1.6;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .description-box:hover {
+        transform: scale(1.02);
+        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+    }
+    .description-box h4 {
+        color: #4CAF50;
+        margin-bottom: 10px;
+    }
+    .description-field {
+        margin-bottom: 8px;
+    }
+    .description-field strong {
+        color: #333;
     }
     .pagination {
         display: flex;
         justify-content: space-between;
         align-items: center;
         margin: 20px 0;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .pagination span {
+        font-size: 14px;
+        color: #555;
+    }
+    .delta-positive {
+        color: green;
+        font-weight: bold;
+    }
+    .delta-negative {
+        color: red;
+        font-weight: bold;
     }
     </style>
     """,
@@ -272,9 +301,15 @@ if uploaded_file:
                 lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2) if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
             )
 
+            # Add Trend Column
+            symptom_rank['Trend'] = symptom_rank['Delta'].apply(lambda x: "🔺 Up" if x > 0 else ("🔻 Down" if x < 0 else "➖ No Change"))
+            symptom_rank['Trend'] = symptom_rank.apply(
+                lambda row: f"<span class='delta-positive'>{row['Trend']}</span>" if "Down" in row['Trend'] else f"<span class='delta-negative'>{row['Trend']}</span>", axis=1
+            )
+
             # Display Ranked Symptoms Table with Scrollable Option
             st.subheader("Ranked Symptoms Table")
-            st.dataframe(symptom_rank)
+            st.markdown(symptom_rank.to_html(escape=False, index=False), unsafe_allow_html=True)
 
             # Paginated Descriptions
             st.header("🗒 Descriptions")
@@ -293,19 +328,21 @@ if uploaded_file:
                 st.markdown(
                     f"""
                     <div class='description-box'>
-                        <strong>SKU:</strong> {row['SKU(s)']}<br>
-                        <strong>Base SKU:</strong> {row['Base SKU']}<br>
-                        <strong>Region:</strong> {row['Region']}<br>
-                        <strong>Disposition:</strong> {row['Disposition']}<br>
-                        <strong>Symptom:</strong> {row['Symptom']}<br>
-                        <strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}<br>
-                        <strong>Serial Number:</strong> {row['Serial Number']}<br>
-                        <strong>Description:</strong> {row['Description']}
+                        <h4>Issue Details</h4>
+                        <div class='description-field'><strong>SKU:</strong> {row['SKU(s)']}</div>
+                        <div class='description-field'><strong>Base SKU:</strong> {row['Base SKU']}</div>
+                        <div class='description-field'><strong>Region:</strong> {row['Region']}</div>
+                        <div class='description-field'><strong>Disposition:</strong> {row['Disposition']}</div>
+                        <div class='description-field'><strong>Symptom:</strong> {row['Symptom']}</div>
+                        <div class='description-field'><strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}</div>
+                        <div class='description-field'><strong>Serial Number:</strong> {row['Serial Number']}</div>
+                        <div class='description-field'><strong>Description:</strong> {row['Description']}</div>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
 
+            # Pagination Controls
             st.markdown(
                 f"""
                 <div class='pagination'>
@@ -323,6 +360,6 @@ if uploaded_file:
                 file_name="filtered_jira_issues.csv",
                 mime="text/csv"
             )
-
     except Exception as e:
         st.error(f"An error occurred while processing the file: {str(e)}")
+
