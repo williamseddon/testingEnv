@@ -181,7 +181,7 @@ if uploaded_file:
         st.markdown("---")  # Separator linehttps://github.com/williamseddon/testingEnv/blob/main/starwalk_ui_test.py#L13C47
             
                     
-       # Metrics Summary Section
+     # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -281,22 +281,19 @@ if uploaded_file:
                 .reset_index()
             )
         
-            country_source_stats['Avg_Rating_Color'] = country_source_stats['Avg_Rating'].apply(
-                lambda x: 'background-color: #d4edda; color: #155724;' if x >= 4.5 else 'background-color: #f8d7da; color: #721c24;'
+            # Calculate overall average and review count by country
+            country_overall = (
+                filtered_verbatims
+                .groupby('Country')
+                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .reset_index()
             )
+            country_overall['Source'] = 'Overall'
         
-            def style_country_source_table(row):
-                styles = []
-                for col in row.index:
-                    if col == 'Avg_Rating':
-                        styles.append(row['Avg_Rating_Color'])
-                    else:
-                        styles.append('')
-                return styles
+            # Append the overall data to the detailed data
+            combined_stats = pd.concat([country_source_stats, country_overall], ignore_index=True)
         
-            styled_table = country_source_stats.style.apply(
-                style_country_source_table, axis=1
-            ).format({
+            styled_table = combined_stats.style.format({
                 'Avg_Rating': '{:.1f}',
                 'Review_Count': '{:,}'
             })
@@ -312,7 +309,6 @@ if uploaded_file:
             st.dataframe(styled_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-
 
 
         # Graph Over Time
