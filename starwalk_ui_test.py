@@ -179,8 +179,7 @@ if uploaded_file:
             st.sidebar.info("No additional filters available.")
 
         st.markdown("---")  # Separator line
-            
-   # Metrics Summary Section
+         # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -311,7 +310,6 @@ if uploaded_file:
                 .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-            country_overall['Source'] = 'Overall'
         
             for country in country_overall['Country'].unique():
                 st.markdown(f"#### {country}")
@@ -319,6 +317,7 @@ if uploaded_file:
                 # Filter for the specific country
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
+                overall_data['Source'] = 'Overall'
         
                 # Add new review rows
                 new_review_rows = add_new_review_rows(
@@ -328,33 +327,30 @@ if uploaded_file:
                 # Combine specific country data with overall and new review rows
                 combined_country_data = pd.concat([country_data, overall_data, new_review_rows], ignore_index=True)
         
-                # Rename column headers for better readability
-                combined_country_data.rename(
-                    columns={'Avg_Rating': 'Average Rating', 'Review_Count': 'Review Count', 'Source': 'Source'},
-                    inplace=True
-                )
-        
-                # Reset index to ensure unique indices
-                combined_country_data.reset_index(drop=True, inplace=True)
+                # Ensure unique column names for Styler compatibility
+                combined_country_data.columns = combined_country_data.columns.map(str)
         
                 # Format table and bold the overall row
                 def highlight_overall(row):
-                    return ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row]
+                    if row['Source'] == 'Overall':
+                        return ['font-weight: bold;' for _ in row]
+                    return ['' for _ in row]
         
                 formatted_table = combined_country_data.style.format({
-                    'Average Rating': '{:.1f}',
+                    'Avg Rating': '{:.1f}',
                     'Review Count': '{:,}'
                 }).apply(
                     highlight_overall, axis=1
                 ).applymap(
                     lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
-                    subset=['Average Rating']
+                    subset=['Avg Rating']
                 )
         
                 st.dataframe(formatted_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-         
+           
+          
 
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
