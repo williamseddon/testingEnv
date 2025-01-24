@@ -162,7 +162,7 @@ if uploaded_file:
             previous_start_date_table = start_date_table - timedelta(days=period_days_table)
             period_label_table = f"Last {period_days_table} Days"
 
-            # Apply filters for table and graphs
+             # Apply filters for table and graphs
             filtered_data_table = data.copy()
             if 'ALL' not in sku_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
@@ -189,10 +189,10 @@ if uploaded_file:
                 search_query = search_query.strip().lower()
                 filtered_data_table = filtered_data_table[
                     filtered_data_table['Description']
-                    .str.lower()  # Convert descriptions to lowercase
+                    .fillna('')  # Replace NaN with empty strings
+                    .str.lower()  # Convert to lowercase
                     .str.contains(search_query, na=False)  # Perform the search
-    ]
-
+                ]
             filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
 
             filtered_data_graph = data.copy()
@@ -208,7 +208,12 @@ if uploaded_file:
                 top_dispositions = filtered_data_graph['Disposition'].value_counts().nlargest(10).index
                 filtered_data_graph['Disposition'] = filtered_data_graph['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
             if search_query:
-                filtered_data_graph = filtered_data_graph[filtered_data_graph['Description'].str.contains(search_query, case=False, na=False)]
+                filtered_data_graph = filtered_data_graph[
+                    filtered_data_graph['Description']
+                    .fillna('')
+                    .str.lower()
+                    .str.contains(search_query, na=False)
+                ]           
 
             # Summary Section
             st.header("🔍 Summary")
