@@ -179,6 +179,7 @@ if uploaded_file:
             st.sidebar.info("No additional filters available.")
 
         st.markdown("---")  # Separator line
+
         # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
@@ -236,45 +237,40 @@ if uploaded_file:
         
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
         
-        # Add country and source breakdown
-        st.markdown("### 🌍 Country & Source Breakdown")
+        # Add country-specific tables
+        st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
             country_source_stats = (
                 filtered_verbatims
                 .groupby(['Country', 'Source'])
-                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-            
-            country_source_stats['Avg_Rating_Color'] = country_source_stats['Avg_Rating'].apply(
-                lambda x: 'background-color: #d4edda; color: #155724;' if x >= 4.5 else 'background-color: #f8d7da; color: #721c24;'
+        
+            # Calculate overall average and review count by country
+            country_overall = (
+                filtered_verbatims
+                .groupby('Country')
+                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .reset_index()
             )
         
-            def style_country_source_table(row):
-                return [row['Avg_Rating_Color'] if col == 'Avg_Rating' else '' for col in row.index]
+            for country in country_overall['Country'].unique():
+                st.markdown(f"#### {country}")
         
-            styled_table = country_source_stats.style.apply(
-                style_country_source_table, axis=1
-            ).format({
-                'Avg_Rating': '{:.1f}',
-                'Review_Count': '{:,}'
-            })
+                # Filter for the specific country
+                country_data = country_source_stats[country_source_stats['Country'] == country]
+                overall_data = country_overall[country_overall['Country'] == country]
+                overall_data['Source'] = 'Overall'
         
-            st.markdown("""
-                <style>
-                    .dataframe tbody tr:hover {
-                        background-color: #f1f1f1;
-                    }
-                </style>
-            """, unsafe_allow_html=True)
+                # Combine specific country data with overall
+                combined_country_data = pd.concat([overall_data, country_data], ignore_index=True)
         
-            st.dataframe(styled_table, use_container_width=True)
+                # Format table
+                st.table(combined_country_data)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-
-
-           
           
 
         # Graph Over Time
