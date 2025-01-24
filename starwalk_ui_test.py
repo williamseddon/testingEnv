@@ -344,6 +344,30 @@ if uploaded_file:
                     formatted_table.to_html(escape=False, index=False),
                     unsafe_allow_html=True
                 )
+
+            # Replace NaN values with a placeholder
+                combined_country_data.fillna("N/A", inplace=True)
+                
+                # Function to apply custom styles to the table
+                def format_table(row):
+                    if row.name == len(combined_country_data) - 1:  # Bold the "Overall" row
+                        return ['font-weight: bold' for _ in row]
+                    return ['' if cell != "N/A" else 'color: gray; font-style: italic;' for cell in row]
+                
+                # Render the table with the styled NaN placeholders
+                formatted_table = combined_country_data.style.format({
+                    'Avg Rating': '{}',
+                    'Review Count': '{:,}',
+                    'New Review Average': '{}',
+                    'New Review Count': '{:,}'
+                }).apply(format_table, axis=1)
+                
+                # Display the styled table
+                st.markdown(
+                    formatted_table.to_html(escape=False, index=False),
+                    unsafe_allow_html=True
+                )
+
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
 
