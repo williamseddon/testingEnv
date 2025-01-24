@@ -104,16 +104,23 @@ if uploaded_file:
     try:
         # Load data
         data = pd.read_excel(uploaded_file, sheet_name='Your Jira Issues')
-
+        
         # Validate required columns
         required_columns = ['Date Identified', 'SKU(s)', 'Base SKU', 'Region', 'Symptom', 'Disposition', 'Description', 'Serial Number']
         missing_columns = [col for col in required_columns if col not in data.columns]
-
+        
         if missing_columns:
             st.error(f"The following required columns are missing: {', '.join(missing_columns)}")
         else:
             # Preprocess date
             data['Date Identified'] = pd.to_datetime(data['Date Identified'], errors='coerce')
+        
+            # Standardize SKU(s) and Base SKU to uppercase
+            data['SKU(s)'] = data['SKU(s)'].str.upper().str.strip()
+            data['Base SKU'] = data['Base SKU'].str.upper().str.strip()
+        
+            # Proceed with filtering and dashboard logic
+
 
             # Sidebar Filters
             st.sidebar.header("Filters")
@@ -162,12 +169,11 @@ if uploaded_file:
             previous_start_date_table = start_date_table - timedelta(days=period_days_table)
             period_label_table = f"Last {period_days_table} Days"
 
-            # Apply filters for table and graphs
-            filtered_data_table = data.copy()
-            if 'ALL' not in sku_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
-            if 'ALL' not in base_sku_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Base SKU'].isin(base_sku_filter)]
+            # Standardize SKU(s) and Base SKU to uppercase
+            data['SKU(s)'] = data['SKU(s)'].str.upper().str.strip()
+            data['Base SKU'] = data['Base SKU'].str.upper().str.strip()
+
+
             if 'ALL' not in region_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
             if 'ALL' not in symptom_filter:
