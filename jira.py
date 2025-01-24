@@ -180,16 +180,26 @@ if uploaded_file:
                 filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
             if 'ALL' not in disposition_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
+            # Initialize filtered_data_table with the complete dataset
+            filtered_data_table = data.copy()
+            
+            # Apply "TSF Only" filter
             if tsf_only_filter:
                 filtered_data_table = filtered_data_table[
                     filtered_data_table['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
                 ]
+            
+            # Apply "Top 10 Symptoms Only" filter
             if top_10_symptoms_filter:
                 top_symptoms = filtered_data_table['Symptom'].value_counts().nlargest(10).index
                 filtered_data_table['Symptom'] = filtered_data_table['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
+            
+            # Apply "Top 10 Dispositions Only" filter
             if top_10_dispositions_filter:
                 top_dispositions = filtered_data_table['Disposition'].value_counts().nlargest(10).index
                 filtered_data_table['Disposition'] = filtered_data_table['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
+
+            
             # Apply keyword search filter separately from table period logic
             if search_query:
                 search_query = search_query.strip().lower()
