@@ -238,7 +238,7 @@ if uploaded_file:
         
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
         
-        # Add country-specific tables
+    # Add country-specific tables
         st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
@@ -267,8 +267,9 @@ if uploaded_file:
         
                 # Combine specific country data with overall and ensure the "Overall" row is at the bottom
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
-                combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(lambda x: 1 if x == 'Overall' else 0)
-                combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=False).drop(columns=['Sort_Order'])
+                combined_country_data = combined_country_data.sort_values(
+                    by=['Source'], key=lambda col: col == 'Overall', ascending=True
+                )
         
                 # Rename columns for better readability
                 combined_country_data.rename(columns={
@@ -279,13 +280,15 @@ if uploaded_file:
         
                 # Apply color formatting to Avg Rating
                 def color_avg_rating(value):
-                    if value >= 4.5:
-                        return f"<span style='color:green;'>{value:.1f}</span>"
-                    return f"<span style='color:red;'>{value:.1f}</span>"
+                    if isinstance(value, float):
+                        if value >= 4.5:
+                            return f"<span style='color:green;'>{value:.1f}</span>"
+                        return f"<span style='color:red;'>{value:.1f}</span>"
+                    return value
         
                 combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(color_avg_rating)
         
-                # Format the table and bold the overall row
+                # Ensure "Overall" row is bold
                 def format_table(row):
                     if row['Source'] == 'Overall':
                         return ['font-weight: bold' for _ in row]
@@ -298,8 +301,8 @@ if uploaded_file:
                 )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-        
-                
+          
+                        
                        
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
