@@ -180,7 +180,6 @@ if uploaded_file:
 
         st.markdown("---")  # Separator line
 
-     
      # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
@@ -237,13 +236,14 @@ if uploaded_file:
         )
         
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+        
         # Add country-specific tables
         st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
             # Create a filtered dataframe for rows where 'New Review' is "Yes"
             new_review_filtered = filtered_verbatims[filtered_verbatims['New Review'].str.upper() == "YES"]
-            
+        
             # Calculate statistics for all reviews
             country_source_stats = (
                 filtered_verbatims
@@ -251,7 +251,7 @@ if uploaded_file:
                 .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-            
+        
             # Calculate statistics for "New Review" rows
             new_review_stats = (
                 new_review_filtered
@@ -259,14 +259,14 @@ if uploaded_file:
                 .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-            
+        
             # Merge the two datasets to include new review metrics
             country_source_stats = country_source_stats.merge(
-                new_review_stats, 
-                on=['Country', 'Source'], 
+                new_review_stats,
+                on=['Country', 'Source'],
                 how='left'
             )
-            
+        
             # Calculate overall average and review count by country
             country_overall = (
                 filtered_verbatims
@@ -274,7 +274,7 @@ if uploaded_file:
                 .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-            
+        
             # Add "New Review" metrics to overall statistics
             overall_new_review_stats = (
                 new_review_filtered
@@ -283,29 +283,29 @@ if uploaded_file:
                 .reset_index()
             )
             country_overall = country_overall.merge(
-                overall_new_review_stats, 
-                on='Country', 
+                overall_new_review_stats,
+                on='Country',
                 how='left'
             )
             country_overall['Source'] = 'Overall'
-            
+        
             for country in country_overall['Country'].unique():
                 st.markdown(f"#### {country}")
-                
+        
                 # Filter for the specific country
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
-                
+        
                 # Combine specific country data with overall and ensure the "Overall" row is at the bottom
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
                 combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
                     lambda x: 1 if x == 'Overall' else 0
                 )
-                combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
-                
-                # Drop the Country column for the final display
-                combined_country_data = combined_country_data.drop(columns=['Country'])
-                
+                combined_country_data = combined_country_data.sort_values(by=['Sort_Order'], ascending=True).drop(columns=['Sort_Order'])
+        
+                # Replace NaN values with a dash (-)
+                combined_country_data = combined_country_data.fillna("-")
+        
                 # Rename columns for better readability
                 combined_country_data.rename(columns={
                     'Source': 'Source',
@@ -314,7 +314,7 @@ if uploaded_file:
                     'New_Review_Average': 'New Review Average',
                     'New_Review_Count': 'New Review Count'
                 }, inplace=True)
-                
+        
                 # Apply color formatting to Avg Rating
                 def color_avg_rating(value):
                     if isinstance(value, float):
@@ -322,16 +322,16 @@ if uploaded_file:
                             return f"<span style='color:green;'>{value:.1f}</span>"
                         return f"<span style='color:red;'>{value:.1f}</span>"
                     return value
-                
+        
                 combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(color_avg_rating)
                 combined_country_data['New Review Average'] = combined_country_data['New Review Average'].apply(color_avg_rating)
-                
-                # Bold the last row (Overall row)
+        
+                # Bold the "Overall" row
                 def format_table(row):
-                    if row.name == len(combined_country_data) - 1:  # Check if it's the last row
+                    if row['Source'] == 'Overall':  # Check if the Source column has "Overall"
                         return ['font-weight: bold' for _ in row]
                     return ['' for _ in row]
-                
+        
                 # Render the table as HTML
                 formatted_table = combined_country_data.style.format({
                     'Avg Rating': '{}',
@@ -339,13 +339,15 @@ if uploaded_file:
                     'New Review Average': '{}',
                     'New Review Count': '{:,}'
                 }).apply(format_table, axis=1)
-                
+        
                 st.markdown(
                     formatted_table.to_html(escape=False, index=False),
                     unsafe_allow_html=True
                 )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
+
+
 
                        
         # Graph Over Time
