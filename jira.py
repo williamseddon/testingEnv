@@ -377,127 +377,87 @@ if uploaded_file:
                               margin=dict(t=40))
             st.plotly_chart(fig, use_container_width=True)
 
+           # Ranked Symptoms with Metrics (Table)
+            st.header("📊 Ranked Symptoms (Table)")
+            symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
+            symptom_rank.columns = ['Symptom', 'Count']
             
-          
-        # Ensure filtered_data_table is defined
-        filtered_data_table = data.copy()
-        
-        # Apply filters dynamically based on user selection
-        if 'ALL' not in sku_filter:
-            filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
-        if 'ALL' not in base_sku_filter:
-            filtered_data_table = filtered_data_table[filtered_data_table['Base SKU'].isin(base_sku_filter)]
-        if 'ALL' not in region_filter:
-            filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
-        if 'ALL' not in symptom_filter:
-            filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
-        if 'ALL' not in disposition_filter:
-            filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
-        if tsf_only_filter:
-            filtered_data_table = filtered_data_table[
-                filtered_data_table['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
-            ]
-        
-        # Apply the table period length (time-based filter)
-        filtered_data_for_table = filtered_data_table[
-            filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=period_days_table)
-        ]
-        
-        # Ranked Symptoms with Metrics (Table)
-        st.header("📊 Ranked Symptoms (Table)")
-        
-        # Calculate symptom counts dynamically
-        symptom_rank = filtered_data_for_table['Symptom'].value_counts().reset_index()
-        symptom_rank.columns = ['Symptom', 'Count']
-        
-        # Calculate additional metrics
-        current_counts = filtered_data_for_table['Symptom'].value_counts()
-        previous_counts = filtered_data_table[
-            (filtered_data_table['Date Identified'] < datetime.now() - timedelta(days=period_days_table)) &
-            (filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=2 * period_days_table))
-        ]['Symptom'].value_counts()
-        
-        symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
-        symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
-        
-        symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
-        symptom_rank['Delta (%)'] = symptom_rank.apply(
-            lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
-            if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
-        )
-        
-        symptom_rank['Trend'] = symptom_rank['Delta'].apply(
-            lambda x: "🔺 Up" if x > 0
-            else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
-                  else "➖ No Change")
-        )
-        
-        # Limit to Top 10 Symptoms
-        symptom_rank = symptom_rank.head(10)
-        
-        # Display the table in a scrollable container
-        st.subheader("Ranked Symptoms Table")
-        st.markdown(
-            f"""
-            <div class="scrollable-table">
-                {symptom_rank.to_html(escape=False, index=False)}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-        # Descriptions Section
-        st.header("🗒 Descriptions")
-        
-        # Paginated descriptions
-        descriptions = filtered_data_table[
-            ['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']
-        ].dropna().reset_index(drop=True)
-        
-        # Handle empty descriptions
-        total_items = len(descriptions)
-        items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
-        total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
-        current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
+            # Calculate additional metrics
+            current_period = filtered_data_table[filtered_data_table['Date Identified'] >= start_date_table]
+            previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < start_date_table) &
+                                                  (filtered_data_table['Date Identified'] >= previous_start_date_table)]
+            
+            current_counts = current_period['Symptom'].value_counts()
+            previous_counts = previous_period['Symptom'].value_counts()
+            
+            symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
+            symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
+            
+            symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
+            symptom_rank['Delta (%)'] = symptom_rank.apply(
+                lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
+                if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
+            )
+            
+            # Add Trend Column with Green Arrow for Down Only
+            symptom_rank['Trend'] = symptom_rank['Delta'].apply(
+                lambda x: "🔺 Up" if x > 0
+                else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
+                      else "➖ No Change")
+            )
 
-        
-        # Calculate start and end indices for pagination
-        start_idx = (current_page - 1) * items_per_page
-        end_idx = start_idx + items_per_page
-        
-        if total_items == 0:
-            st.warning("No descriptions match your search criteria.")
-        else:
-            st.write("### Descriptions (Filtered)")
-            for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
-                st.markdown(
-                    f"""
-                    <div class='description-box'>
-                        <h4>Issue Details</h4>
-                        <div class='description-field'><strong>SKU:</strong> {row['SKU(s)']}</div>
-                        <div class='description-field'><strong>Base SKU:</strong> {row['Base SKU']}</div>
-                        <div class='description-field'><strong>Region:</strong> {row['Region']}</div>
-                        <div class='description-field'><strong>Disposition:</strong> {row['Disposition']}</div>
-                        <div class='description-field'><strong>Symptom:</strong> {row['Symptom']}</div>
-                        <div class='description-field'><strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}</div>
-                        <div class='description-field'><strong>Serial Number:</strong> {row['Serial Number']}</div>
-                        <div class='description-field'><strong>Description:</strong> {row['Description']}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-        
-            # Pagination Controls
+            
+            # Limit to Top 10 Rows
+            symptom_rank = symptom_rank.head(10)
+            
+            # Display Ranked Symptoms Table in Scrollable Box
+            st.subheader("Ranked Symptoms Table")
             st.markdown(
                 f"""
-                <div class='pagination'>
-                    <span>Total Items: {total_items}</span>
-                    <span>Page {current_page} of {total_pages}</span>
+                <div class="scrollable-table">
+                    {symptom_rank.to_html(escape=False, index=False)}
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-          
+
+            # Paginated Descriptions
+            st.header("🗒 Descriptions")
+            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
+
+            # Handle empty descriptions
+            total_items = len(descriptions)
+            items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
+            total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
+            current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
+
+            # Calculate start and end indices for pagination
+            start_idx = (current_page - 1) * items_per_page
+            end_idx = start_idx + items_per_page
+
+            if total_items == 0:
+                st.warning("No descriptions match your search criteria.")
+            else:
+                st.write("### Descriptions (Filtered)")
+                for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
+                    st.markdown(
+                        f"""
+                        <div class='description-box'>
+                            <h4>Issue Details</h4>
+                            <div class='description-field'><strong>SKU:</strong> {row['SKU(s)']}</div>
+                            <div class='description-field'><strong>Base SKU:</strong> {row['Base SKU']}</div>
+                            <div class='description-field'><strong>Region:</strong> {row['Region']}</div>
+                            <div class='description-field'><strong>Disposition:</strong> {row['Disposition']}</div>
+                            <div class='description-field'><strong>Symptom:</strong> {row['Symptom']}</div>
+                            <div class='description-field'><strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}</div>
+                            <div class='description-field'><strong>Serial Number:</strong> {row['Serial Number']}</div>
+                            <div class='description-field'><strong>Description:</strong> {row['Description']}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
                 # Pagination Controls
                 st.markdown(
                     f"""
@@ -518,4 +478,3 @@ if uploaded_file:
             )
     except Exception as e:
         st.error(f"An error occurred while processing the file: {str(e)}")
-
