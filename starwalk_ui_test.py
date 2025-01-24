@@ -288,7 +288,7 @@ if uploaded_file:
         
             return pd.DataFrame()
         
-          # Add country-specific tables with overall row and new reviews filter
+        # Add country-specific tables with overall row and new reviews filter
         st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
@@ -334,22 +334,27 @@ if uploaded_file:
                     inplace=True
                 )
         
+                # Reset index to ensure unique indices
+                combined_country_data.reset_index(drop=True, inplace=True)
+        
                 # Format table and bold the overall row
+                def highlight_overall(row):
+                    return ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row]
+        
                 formatted_table = combined_country_data.style.format({
                     'Average Rating': '{:.1f}',
                     'Review Count': '{:,}'
-                }).applymap(
+                }).apply(
+                    highlight_overall, axis=1
+                ).applymap(
                     lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
                     subset=['Average Rating']
-                ).apply(
-                    lambda row: ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row.index],
-                    axis=1
                 )
         
                 st.dataframe(formatted_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-            
+         
 
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
