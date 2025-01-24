@@ -80,12 +80,13 @@ uploaded_file = st.file_uploader(
     "Upload your Excel file (must contain 'Your Jira Issues' tab)", type=['xlsx']
 )
 
-# Text for required columns
+# Text for required columns with a download button
 if not uploaded_file:
     st.markdown(
         """
         ### Required Column Format:
         To use this dashboard, please upload an Excel file containing the following columns:
+        
         - **Date Identified**: The date the issue was identified (e.g., 2024-01-01).
         - **SKU(s)**: The SKU(s) related to the issue.
         - **Base SKU**: The base SKU category.
@@ -99,6 +100,18 @@ if not uploaded_file:
         """,
         unsafe_allow_html=True
     )
+
+    # Add a button to download the template
+    st.markdown(
+        """
+        <a href="https://sharkninja.atlassian.net/issues/?filter=19767" target="_blank">
+            <button style="background-color: #4CAF50; color: white; padding: 10px 20px; border: none; 
+            border-radius: 5px; cursor: pointer; text-align: center;">Download Template Here</button>
+        </a>
+        """,
+        unsafe_allow_html=True
+    )
+
 
 if uploaded_file:
     try:
