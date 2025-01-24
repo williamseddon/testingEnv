@@ -332,14 +332,13 @@ if uploaded_file:
                         return ['font-weight: bold' for _ in row]
                     return ['' for _ in row]
         
-                # Render the table as HTML
                 formatted_table = combined_country_data.style.format({
-                    'Avg Rating': '{}',
-                    'Review Count': '{:,}',
-                    'New Review Average': '{}',
-                    'New Review Count': '{:,}'
+                    'Avg Rating': '{}',  # No thousands separator for ratings
+                    'Review Count': '{:,.0f}',  # Proper numeric formatting with thousands separator
+                    'New Review Average': '{}',  # No thousands separator for ratings
+                    'New Review Count': '{:,.0f}'  # Proper numeric formatting with thousands separator
                 }).apply(format_table, axis=1)
-        
+                
                 st.markdown(
                     formatted_table.to_html(escape=False, index=False),
                     unsafe_allow_html=True
