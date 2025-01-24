@@ -296,7 +296,7 @@ if uploaded_file:
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
         
-                # Combine specific country data with overall and ensure the "Overall" row is at the bottom
+              # Combine specific country data with overall and ensure the "Overall" row is at the bottom
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
                 combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
                     lambda x: 1 if x == 'Overall' else 0
@@ -305,6 +305,14 @@ if uploaded_file:
                 
                 # Replace NaN values with a dash (-)
                 combined_country_data = combined_country_data.fillna("-")
+                
+                # Rename columns for better readability
+                combined_country_data.rename(columns={
+                    'Average_Rating': 'Avg Rating',
+                    'Review_Count': 'Review Count',
+                    'New_Review_Average': 'New Review Average',
+                    'New_Review_Count': 'New Review Count'
+                }, inplace=True)
                 
                 # Ensure numeric columns are properly converted
                 numeric_columns = ['Avg Rating', 'Review Count', 'New Review Average', 'New Review Count']
@@ -321,6 +329,12 @@ if uploaded_file:
                     'New Review Average': '{:.1f}',  # One decimal place for ratings
                     'New Review Count': '{:,.0f}'  # Thousands separator for counts
                 }).apply(format_table, axis=1)
+                
+                st.markdown(
+                    formatted_table.to_html(escape=False, index=False),
+                    unsafe_allow_html=True
+                )
+
                 
                 st.markdown(
                     formatted_table.to_html(escape=False, index=False),
