@@ -135,8 +135,8 @@ if not uploaded_file:
     # Add instructions below the button
     st.markdown(
         """
-        **After downloading the template:**
-        1. Open the downloaded file.
+        **After visiting the webpage:**
+        1. Change Base SKU or adjust filters accordingly.
         2. Press **Apps** in the top bar.
         3. Choose **Open in Microsoft Excel** to get your download file.
         """,
