@@ -180,6 +180,114 @@ if uploaded_file:
 
         st.markdown("---")  # Separator line
             
+     # Metrics Summary Section
+        st.markdown("""
+            ### ⭐ Star Rating Metrics
+            <p style="text-align: center; font-size: 14px; color: gray;">
+                A summary of customer feedback and review distribution.
+            </p>
+            """, unsafe_allow_html=True)
+        
+        # Calculate the metrics
+        total_reviews = len(filtered_verbatims)
+        avg_rating = filtered_verbatims['Star Rating'].mean()
+        star_counts = filtered_verbatims['Star Rating'].value_counts().sort_index()
+        percentages = (star_counts / total_reviews * 100).round(1)  # Calculate percentages
+        star_labels = [f"{int(star)} stars" for star in star_counts.index]
+        
+        # Display metrics in a single centered row
+        metrics_container = st.container()
+        with metrics_container:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Reviews", f"{total_reviews:,}")
+            with col2:
+                st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
+        
+        # Add a star rating distribution as an interactive horizontal bar chart
+        fig_bar_horizontal = go.Figure(go.Bar(
+            x=star_counts.values,
+            y=star_labels,
+            orientation='h',
+            text=[f"{value} reviews ({percentage}%)" for value, percentage in zip(star_counts.values, percentages)],
+            textposition='auto',
+            marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
+            hoverinfo="y+x+text"
+        ))
+        
+        fig_bar_horizontal.update_layout(
+            title="<b>Star Rating Distribution</b>",
+            xaxis=dict(
+                title="Number of Reviews",
+                title_font=dict(size=14),
+                tickfont=dict(size=12),
+                showgrid=False,
+            ),
+            yaxis=dict(
+                title="Star Ratings",
+                title_font=dict(size=14),
+                tickfont=dict(size=12),
+                showgrid=False,
+            ),
+            title_font=dict(size=18),
+            plot_bgcolor="white",
+            template="plotly_white",
+            margin=dict(l=50, r=50, t=50, b=50)
+        )
+        
+        st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+        
+        # Calculate percentages for 1-star reviews
+        one_star_count = star_counts.get(1, 0)  # Safely get 1-star count or default to 0 if missing
+        one_star_percentage = (one_star_count / total_reviews * 100) if total_reviews > 0 else 0
+        
+        # Evaluate review quality
+        if one_star_percentage < 10:
+            review_quality = "high"
+            review_insight = "Most customers are satisfied, with less than 10% reporting 1-star reviews."
+        elif one_star_percentage >= 10 and one_star_percentage < 20:
+            review_quality = "moderate"
+            review_insight = "There are moderate concerns, with 10-20% reporting 1-star reviews."
+        else:
+            review_quality = "low"
+            review_insight = "Customer satisfaction is low, with over 20% reporting 1-star reviews."
+        
+        # Find the most common star rating
+        most_common_rating = star_counts.idxmax() if not star_counts.empty else None
+        most_common_count = star_counts[most_common_rating] if most_common_rating else 0
+        most_common_percentage = percentages[most_common_rating] if most_common_rating else 0
+        
+        # Display insights
+        st.markdown(f"""
+            <p style="text-align: center; font-size: 14px; color: gray;">
+                <strong>Review Quality:</strong> {review_quality.title()}<br>
+                {review_insight}
+            </p>
+            <p style="text-align: center; font-size: 14px; color: gray;">
+                The majority of reviews ({most_common_count} reviews, {most_common_percentage}%) are {most_common_rating} stars,
+                indicating strong customer sentiment.
+            </p>
+            """, unsafe_allow_html=True)
+        
+        # Function to handle new review rows
+        def add_new_review_rows(data):
+            """Adds rows for new review averages and counts if 'New Review' column exists."""
+            if 'New Review' in data.columns:
+                data['New Review'] = data['New Review'].str.lower()
+                new_review_data = data[data['New Review'] == 'yes']
+        
+                if not new_review_data.empty:
+                    avg_rating = new_review_data['Star Rating'].mean()
+                    review_count = new_review_data['Star Rating'].count()
+        
+                    return pd.DataFrame({
+                        'Source': ['New Review Avg', 'New Review Count'],
+                        'Avg Rating': [avg_rating, None],
+                        'Review Count': [None, review_count]
+                    })
+        
+            return pd.DataFrame()
+        
         # Add country-specific tables with overall row and new reviews filter
         st.markdown("### 🌍 Country-Specific Breakdown")
         
@@ -212,23 +320,36 @@ if uploaded_file:
                 overall_data = country_overall[country_overall['Country'] == country]
                 overall_data['Source'] = 'Overall'
         
-                # Combine specific country data with overall
-                combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
+                # Add new review rows
+                new_review_rows = add_new_review_rows(
+                    filtered_verbatims[filtered_verbatims['Country'] == country]
+                )
         
-                # Format table
+                # Combine specific country data with overall and new review rows
+                combined_country_data = pd.concat([country_data, overall_data, new_review_rows], ignore_index=True)
+        
+                # Format table and bold the overall row
                 formatted_table = combined_country_data.style.format({
-                    'Avg_Rating': '{:.1f}',
-                    'Review_Count': '{:,}'
+                    'Avg Rating': '{:.1f}',
+                    'Review Count': '{:,}'
                 }).applymap(
                     lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
-                    subset=['Avg_Rating']
+                    subset=['Avg Rating']
+                ).apply(
+                    lambda row: ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row],
+                    axis=1
+                )
+        
+                # Rename column headers for better readability
+                formatted_table = formatted_table.rename(
+                    columns={'Avg_Rating': 'Average Rating', 'Review_Count': 'Review Count', 'Source': 'Source'}
                 )
         
                 st.dataframe(formatted_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-
-                    
+        
+                            
 
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
