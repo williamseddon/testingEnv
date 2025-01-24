@@ -302,18 +302,31 @@ if uploaded_file:
                     lambda x: 1 if x == 'Overall' else 0
                 )
                 combined_country_data = combined_country_data.sort_values(by=['Sort_Order'], ascending=True).drop(columns=['Sort_Order'])
-        
+                
                 # Replace NaN values with a dash (-)
                 combined_country_data = combined_country_data.fillna("-")
-        
-                # Rename columns for better readability
-                combined_country_data.rename(columns={
-                    'Source': 'Source',
-                    'Average_Rating': 'Avg Rating',
-                    'Review_Count': 'Review Count',
-                    'New_Review_Average': 'New Review Average',
-                    'New_Review_Count': 'New Review Count'
-                }, inplace=True)
+                
+                # Ensure numeric columns are properly converted
+                numeric_columns = ['Avg Rating', 'Review Count', 'New Review Average', 'New Review Count']
+                for col in numeric_columns:
+                    combined_country_data[col] = pd.to_numeric(combined_country_data[col], errors='coerce')
+                
+                # Replace NaN values again with a dash (-) after conversion
+                combined_country_data = combined_country_data.fillna("-")
+                
+                # Render the table as HTML with proper formatting
+                formatted_table = combined_country_data.style.format({
+                    'Avg Rating': '{:.1f}',  # One decimal place for ratings
+                    'Review Count': '{:,.0f}',  # Thousands separator for counts
+                    'New Review Average': '{:.1f}',  # One decimal place for ratings
+                    'New Review Count': '{:,.0f}'  # Thousands separator for counts
+                }).apply(format_table, axis=1)
+                
+                st.markdown(
+                    formatted_table.to_html(escape=False, index=False),
+                    unsafe_allow_html=True
+                )
+
         
                 # Apply color formatting to Avg Rating
                 def color_avg_rating(value):
