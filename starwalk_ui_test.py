@@ -265,28 +265,28 @@ if uploaded_file:
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
         
-                # Combine specific country data with overall
+                # Combine specific country data with overall and ensure the "Overall" row is at the bottom
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
-        
-                # Ensure overall row is at the bottom
-                combined_country_data = combined_country_data[combined_country_data['Source'] != 'Overall'].append(
-                    combined_country_data[combined_country_data['Source'] == 'Overall'],
-                    ignore_index=True
-                )
-        
+                
+                # Sort so that "Overall" appears at the bottom
+                combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(lambda x: 1 if x == 'Overall' else 0)
+                combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=False).drop(columns=['Sort_Order'])
+                
                 # Format the table and bold the overall row
                 def format_table(row):
                     if row['Source'] == 'Overall':
                         return ['font-weight: bold' for _ in row]
                     return ['' for _ in row]
-        
+                
                 formatted_table = combined_country_data.style.format({
                     'Average_Rating': '{:.1f}',
                     'Review_Count': '{:,}'
                 }).apply(format_table, axis=1)
-        
+                
                 # Display the table
                 st.table(formatted_table)
+
+            
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
                
