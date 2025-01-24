@@ -178,176 +178,180 @@ if uploaded_file:
         else:
             st.sidebar.info("No additional filters available.")
 
-        st.markdown("---")  # Separator line
+st.markdown("---")  # Separator line
 
-                # Metrics Summary Section
-                st.markdown("""
-                    ### ⭐ Star Rating Metrics
-                    <p style="text-align: center; font-size: 14px; color: gray;">
-                        A summary of customer feedback and review distribution.
-                    </p>
-                    """, unsafe_allow_html=True)
-                
-                # Calculate the metrics
-                total_reviews = len(filtered_verbatims)
-                avg_rating = filtered_verbatims['Star Rating'].mean()
-                star_counts = filtered_verbatims['Star Rating'].value_counts().sort_index()
-                percentages = (star_counts / total_reviews * 100).round(1)  # Calculate percentages
-                star_labels = [f"{int(star)} stars" for star in star_counts.index]
-                
-                # Display metrics in a single centered row
-                metrics_container = st.container()
-                with metrics_container:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Total Reviews", f"{total_reviews:,}")
-                    with col2:
-                        st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
-                
-                # Add a star rating distribution as an interactive horizontal bar chart
-                fig_bar_horizontal = go.Figure(go.Bar(
-                    x=star_counts.values,
-                    y=star_labels,
-                    orientation='h',
-                    text=[f"{value} reviews ({percentage}%)" for value, percentage in zip(star_counts.values, percentages)],
-                    textposition='auto',
-                    marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
-                    hoverinfo="y+x+text"
-                ))
-                
-                fig_bar_horizontal.update_layout(
-                    title="<b>Star Rating Distribution</b>",
-                    xaxis=dict(
-                        title="Number of Reviews",
-                        title_font=dict(size=14),
-                        tickfont=dict(size=12),
-                        showgrid=False,
-                    ),
-                    yaxis=dict(
-                        title="Star Ratings",
-                        title_font=dict(size=14),
-                        tickfont=dict(size=12),
-                        showgrid=False,
-                    ),
-                    title_font=dict(size=18),
-                    plot_bgcolor="white",
-                    template="plotly_white",
-                    margin=dict(l=50, r=50, t=50, b=50)
+        # Metrics Summary Section
+        st.markdown("""
+            ### ⭐ Star Rating Metrics
+            <p style="text-align: center; font-size: 14px; color: gray;">
+                A summary of customer feedback and review distribution.
+            </p>
+            """, unsafe_allow_html=True)
+        # Metrics Summary Section
+        st.markdown("""
+            ### ⭐ Star Rating Metrics
+            <p style="text-align: center; font-size: 14px; color: gray;">
+                A summary of customer feedback and review distribution.
+            </p>
+            """, unsafe_allow_html=True)
+        
+        # Calculate the metrics
+        total_reviews = len(filtered_verbatims)
+        avg_rating = filtered_verbatims['Star Rating'].mean()
+        star_counts = filtered_verbatims['Star Rating'].value_counts().sort_index()
+        percentages = (star_counts / total_reviews * 100).round(1)  # Calculate percentages
+        star_labels = [f"{int(star)} stars" for star in star_counts.index]
+        
+        # Display metrics in a single centered row
+        metrics_container = st.container()
+        with metrics_container:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Reviews", f"{total_reviews:,}")
+            with col2:
+                st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
+        
+        # Add a star rating distribution as an interactive horizontal bar chart
+        fig_bar_horizontal = go.Figure(go.Bar(
+            x=star_counts.values,
+            y=star_labels,
+            orientation='h',
+            text=[f"{value} reviews ({percentage}%)" for value, percentage in zip(star_counts.values, percentages)],
+            textposition='auto',
+            marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
+            hoverinfo="y+x+text"
+        ))
+        
+        fig_bar_horizontal.update_layout(
+            title="<b>Star Rating Distribution</b>",
+            xaxis=dict(
+                title="Number of Reviews",
+                title_font=dict(size=14),
+                tickfont=dict(size=12),
+                showgrid=False,
+            ),
+            yaxis=dict(
+                title="Star Ratings",
+                title_font=dict(size=14),
+                tickfont=dict(size=12),
+                showgrid=False,
+            ),
+            title_font=dict(size=18),
+            plot_bgcolor="white",
+            template="plotly_white",
+            margin=dict(l=50, r=50, t=50, b=50)
+        )
+        
+        st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+        
+        # Add country-specific tables
+        st.markdown("### 🌍 Country-Specific Breakdown")
+        
+        if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
+            # Create a filtered DataFrame for rows where 'New Review' is "Yes"
+            new_review_filtered = filtered_verbatims[filtered_verbatims['New Review'].str.upper() == "YES"]
+        
+            # Calculate statistics for all reviews
+            country_source_stats = (
+                filtered_verbatims
+                .groupby(['Country', 'Source'])
+                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .reset_index()
+            )
+        
+            # Calculate statistics for "New Review" rows
+            new_review_stats = (
+                new_review_filtered
+                .groupby(['Country', 'Source'])
+                .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
+                .reset_index()
+            )
+        
+            # Merge the two datasets to include new review metrics
+            country_source_stats = country_source_stats.merge(
+                new_review_stats,
+                on=['Country', 'Source'],
+                how='left'
+            )
+        
+            # Calculate overall average and review count by country
+            country_overall = (
+                filtered_verbatims
+                .groupby('Country')
+                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .reset_index()
+            )
+        
+            # Add "New Review" metrics to overall statistics
+            overall_new_review_stats = (
+                new_review_filtered
+                .groupby('Country')
+                .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
+                .reset_index()
+            )
+            country_overall = country_overall.merge(
+                overall_new_review_stats,
+                on='Country',
+                how='left'
+            )
+            country_overall['Source'] = 'Overall'
+        
+            # Define the function to bold the "Overall" row
+            def format_table(row):
+                if row['Source'] == 'Overall':  # Check if the Source column has "Overall"
+                    return ['font-weight: bold' for _ in row]
+                return ['' for _ in row]
+        
+            for country in country_overall['Country'].unique():
+                st.markdown(f"#### {country}")
+        
+                # Filter for the specific country
+                country_data = country_source_stats[country_source_stats['Country'] == country]
+                overall_data = country_overall[country_overall['Country'] == country]
+        
+                # Combine specific country data with overall and ensure the "Overall" row is at the bottom
+                combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
+                combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
+                    lambda x: 1 if x == 'Overall' else 0
                 )
-                
-                st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-                
-                # Add country-specific tables
-                st.markdown("### 🌍 Country-Specific Breakdown")
-                
-                if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
-                    # Create a filtered DataFrame for rows where 'New Review' is "Yes"
-                    new_review_filtered = filtered_verbatims[filtered_verbatims['New Review'].str.upper() == "YES"]
-                
-                    # Calculate statistics for all reviews
-                    country_source_stats = (
-                        filtered_verbatims
-                        .groupby(['Country', 'Source'])
-                        .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
-                        .reset_index()
-                    )
-                
-                    # Calculate statistics for "New Review" rows
-                    new_review_stats = (
-                        new_review_filtered
-                        .groupby(['Country', 'Source'])
-                        .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
-                        .reset_index()
-                    )
-                
-                    # Merge the two datasets to include new review metrics
-                    country_source_stats = country_source_stats.merge(
-                        new_review_stats,
-                        on=['Country', 'Source'],
-                        how='left'
-                    )
-                
-                    # Calculate overall average and review count by country
-                    country_overall = (
-                        filtered_verbatims
-                        .groupby('Country')
-                        .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
-                        .reset_index()
-                    )
-                
-                    # Add "New Review" metrics to overall statistics
-                    overall_new_review_stats = (
-                        new_review_filtered
-                        .groupby('Country')
-                        .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
-                        .reset_index()
-                    )
-                    country_overall = country_overall.merge(
-                        overall_new_review_stats,
-                        on='Country',
-                        how='left'
-                    )
-                    country_overall['Source'] = 'Overall'
-                
-                    # Define the function to bold the "Overall" row
-                    def format_table(row):
-                        if row['Source'] == 'Overall':  # Check if the Source column has "Overall"
-                            return ['font-weight: bold' for _ in row]
-                        return ['' for _ in row]
-                
-                    for country in country_overall['Country'].unique():
-                        st.markdown(f"#### {country}")
-                
-                        # Filter for the specific country
-                        country_data = country_source_stats[country_source_stats['Country'] == country]
-                        overall_data = country_overall[country_overall['Country'] == country]
-                
-                        # Combine specific country data with overall and ensure the "Overall" row is at the bottom
-                        combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
-                        combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
-                            lambda x: 1 if x == 'Overall' else 0
-                        )
-                        combined_country_data = combined_country_data.sort_values(by=['Sort_Order'], ascending=True).drop(columns=['Sort_Order'])
-                
-                        # Replace NaN values with a dash (-)
-                        combined_country_data = combined_country_data.fillna("-")
-                
-                        # Rename columns for better readability
-                        combined_country_data.rename(columns={
-                            'Average_Rating': 'Avg Rating',
-                            'Review_Count': 'Review Count',
-                            'New_Review_Average': 'New Review Average',
-                            'New_Review_Count': 'New Review Count'
-                        }, inplace=True)
-                
-                        # Ensure numeric columns are properly converted
-                        numeric_columns = ['Avg Rating', 'Review Count', 'New Review Average', 'New Review Count']
-                        for col in numeric_columns:
-                            combined_country_data[col] = pd.to_numeric(combined_country_data[col], errors='coerce')
-                
-                        # Replace NaN values again with a dash (-) after conversion
-                        combined_country_data = combined_country_data.fillna("-")
-                
-                        # Render the table as HTML with proper formatting
-                        formatted_table = combined_country_data.style.format({
-                            'Avg Rating': '{:.1f}',  # One decimal place for ratings
-                            'Review Count': '{:,.0f}',  # Thousands separator for counts
-                            'New Review Average': '{:.1f}',  # One decimal place for ratings
-                            'New Review Count': '{:,.0f}'  # Thousands separator for counts
-                        }).apply(format_table, axis=1)
-                
-                        st.markdown(
-                            formatted_table.to_html(escape=False, index=False),
-                            unsafe_allow_html=True
-                        )
-                else:
-                    st.warning("Country or Source data is missing in the uploaded file.")
-                
-                
+                combined_country_data = combined_country_data.sort_values(by=['Sort_Order'], ascending=True).drop(columns=['Sort_Order'])
+        
+                # Replace NaN values with a dash (-)
+                combined_country_data = combined_country_data.fillna("-")
+        
+                # Rename columns for better readability
+                combined_country_data.rename(columns={
+                    'Average_Rating': 'Avg Rating',
+                    'Review_Count': 'Review Count',
+                    'New_Review_Average': 'New Review Average',
+                    'New_Review_Count': 'New Review Count'
+                }, inplace=True)
+        
+                # Ensure numeric columns are properly converted
+                numeric_columns = ['Avg Rating', 'Review Count', 'New Review Average', 'New Review Count']
+                for col in numeric_columns:
+                    combined_country_data[col] = pd.to_numeric(combined_country_data[col], errors='coerce')
+        
+                # Replace NaN values again with a dash (-) after conversion
+                combined_country_data = combined_country_data.fillna("-")
+        
+                # Render the table as HTML with proper formatting
+                formatted_table = combined_country_data.style.format({
+                    'Avg Rating': '{:.1f}',  # One decimal place for ratings
+                    'Review Count': '{:,.0f}',  # Thousands separator for counts
+                    'New Review Average': '{:.1f}',  # One decimal place for ratings
+                    'New Review Count': '{:,.0f}'  # Thousands separator for counts
+                }).apply(format_table, axis=1)
+        
+                st.markdown(
+                    formatted_table.to_html(escape=False, index=False),
+                    unsafe_allow_html=True
+                )
+        else:
+            st.warning("Country or Source data is missing in the uploaded file.")
+        
 
-
-
-                       
+                
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
 
