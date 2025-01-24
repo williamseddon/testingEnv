@@ -80,7 +80,7 @@ uploaded_file = st.file_uploader(
     "Upload your Excel file (must contain 'Your Jira Issues' tab)", type=['xlsx']
 )
 
-# Text for required columns with a download button
+# Text for required columns with a modern download button
 if not uploaded_file:
     st.markdown(
         """
@@ -101,12 +101,32 @@ if not uploaded_file:
         unsafe_allow_html=True
     )
 
-    # Add a button to download the template
+    # Add a modern, animated button to download the template
     st.markdown(
         """
-        <a href="https://sharkninja.atlassian.net/issues/?filter=19767" target="_blank">
-            <button style="background-color: #4CAF50; color: white; padding: 10px 20px; border: none; 
-            border-radius: 5px; cursor: pointer; text-align: center;">Download Template Here</button>
+        <style>
+        .modern-button {
+            display: inline-block;
+            background-color: #4CAF50;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            padding: 10px 25px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-align: center;
+            text-decoration: none;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .modern-button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3);
+        }
+        </style>
+        <a href="https://sharkninja.atlassian.net/issues/?filter=19767" target="_blank" class="modern-button">
+            Download Template Here
         </a>
         """,
         unsafe_allow_html=True
