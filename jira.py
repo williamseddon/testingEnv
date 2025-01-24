@@ -162,7 +162,7 @@ if uploaded_file:
             previous_start_date_table = start_date_table - timedelta(days=period_days_table)
             period_label_table = f"Last {period_days_table} Days"
 
-             # Apply filters for table and graphs
+            # Apply filters for table and graphs
             filtered_data_table = data.copy()
             if 'ALL' not in sku_filter:
                 filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
@@ -213,7 +213,7 @@ if uploaded_file:
                     .fillna('')
                     .str.lower()
                     .str.contains(search_query, na=False)
-                ]           
+                ]
 
             # Summary Section
             st.header("🔍 Summary")
