@@ -237,8 +237,8 @@ if uploaded_file:
         )
         
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-        
-    # Add country-specific tables
+        # Add country-specific tables
+
         st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
@@ -267,9 +267,10 @@ if uploaded_file:
         
                 # Combine specific country data with overall and ensure the "Overall" row is at the bottom
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
-                combined_country_data = combined_country_data.sort_values(
-                    by=['Source'], key=lambda col: col == 'Overall', ascending=True
+                combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
+                    lambda x: 1 if x == 'Overall' else 0
                 )
+                combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
         
                 # Rename columns for better readability
                 combined_country_data.rename(columns={
@@ -288,21 +289,26 @@ if uploaded_file:
         
                 combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(color_avg_rating)
         
-                # Ensure "Overall" row is bold
+                # Bold the last row (Overall row)
                 def format_table(row):
-                    if row['Source'] == 'Overall':
+                    if row.name == len(combined_country_data) - 1:  # Check if it's the last row
                         return ['font-weight: bold' for _ in row]
                     return ['' for _ in row]
         
-                # Use HTML for proper rendering
+                # Render the table as HTML
+                formatted_table = combined_country_data.style.format({
+                    'Avg Rating': '{}',
+                    'Review Count': '{:,}'
+                }).apply(format_table, axis=1)
+        
                 st.markdown(
-                    combined_country_data.to_html(escape=False, index=False),
+                    formatted_table.to_html(escape=False, index=False),
                     unsafe_allow_html=True
                 )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-          
-                        
+
+ 
                        
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
