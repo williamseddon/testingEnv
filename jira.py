@@ -126,7 +126,7 @@ if not uploaded_file:
         }
         </style>
         <a href="https://sharkninja.atlassian.net/issues/?filter=19767" target="_blank" class="modern-button">
-            Download Template Here
+            View Template Here
         </a>
         """,
         unsafe_allow_html=True
@@ -138,7 +138,7 @@ if not uploaded_file:
         **After downloading the template:**
         1. Open the downloaded file.
         2. Press **Apps** in the top bar.
-        3. Choose **Open in Microsoft Excel** to begin editing the file.
+        3. Choose **Open in Microsoft Excel** to get your download file.
         """,
         unsafe_allow_html=True
     )
