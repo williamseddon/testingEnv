@@ -80,7 +80,7 @@ uploaded_file = st.file_uploader(
     "Upload your Excel file (must contain 'Your Jira Issues' tab)", type=['xlsx']
 )
 
-# Text for required columns with a modern download button
+# Text for required columns with a modern download button and additional instructions
 if not uploaded_file:
     st.markdown(
         """
@@ -108,7 +108,7 @@ if not uploaded_file:
         .modern-button {
             display: inline-block;
             background-color: #4CAF50;
-            color: white;
+            color: white; /* Font color set to white */
             font-size: 16px;
             font-weight: bold;
             padding: 10px 25px;
@@ -131,6 +131,18 @@ if not uploaded_file:
         """,
         unsafe_allow_html=True
     )
+
+    # Add instructions below the button
+    st.markdown(
+        """
+        **After downloading the template:**
+        1. Open the downloaded file.
+        2. Press **Apps** in the top bar.
+        3. Choose **Open in Microsoft Excel** to begin editing the file.
+        """,
+        unsafe_allow_html=True
+    )
+
 
 
 if uploaded_file:
