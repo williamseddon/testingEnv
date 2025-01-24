@@ -180,7 +180,8 @@ if uploaded_file:
 
         st.markdown("---")  # Separator line
 
-       # Metrics Summary Section
+     
+     # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -244,7 +245,7 @@ if uploaded_file:
             country_source_stats = (
                 filtered_verbatims
                 .groupby(['Country', 'Source'])
-                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
         
@@ -252,9 +253,10 @@ if uploaded_file:
             country_overall = (
                 filtered_verbatims
                 .groupby('Country')
-                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
+            country_overall['Source'] = 'Overall'
         
             for country in country_overall['Country'].unique():
                 st.markdown(f"#### {country}")
@@ -262,44 +264,32 @@ if uploaded_file:
                 # Filter for the specific country
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
-                overall_data['Source'] = 'Overall'
         
                 # Combine specific country data with overall
-                combined_country_data = pd.concat([overall_data, country_data], ignore_index=True)
+                combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
         
-                # Drop the Country column
-                combined_country_data = combined_country_data.drop(columns=['Country'])
-        
-                # Ensure `Avg_Rating` column is rounded and formatted
-                combined_country_data['Avg Rating'] = combined_country_data['Avg_Rating'].round(1)
-                combined_country_data = combined_country_data.drop(columns=['Avg_Rating'])
-        
-                # Apply color formatting to Avg Rating
-                def format_avg_rating(value):
-                    if isinstance(value, float):
-                        if value >= 4.5:
-                            return f"<span style='color:green;'>{value:.1f}</span>"
-                        return f"<span style='color:red;'>{value:.1f}</span>"
-                    return value
-        
-                combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(format_avg_rating)
-        
-                # Rename columns for better readability
-                combined_country_data.rename(
-                    columns={'Source': 'Source', 'Review_Count': 'Review Count'},
-                    inplace=True
+                # Ensure overall row is at the bottom
+                combined_country_data = combined_country_data[combined_country_data['Source'] != 'Overall'].append(
+                    combined_country_data[combined_country_data['Source'] == 'Overall'],
+                    ignore_index=True
                 )
         
-                # Format the table
-                st.markdown(
-                    combined_country_data.to_html(escape=False, index=False),
-                    unsafe_allow_html=True
-                )
+                # Format the table and bold the overall row
+                def format_table(row):
+                    if row['Source'] == 'Overall':
+                        return ['font-weight: bold' for _ in row]
+                    return ['' for _ in row]
+        
+                formatted_table = combined_country_data.style.format({
+                    'Average_Rating': '{:.1f}',
+                    'Review_Count': '{:,}'
+                }).apply(format_table, axis=1)
+        
+                # Display the table
+                st.table(formatted_table)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-
-
-            
+               
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
 
