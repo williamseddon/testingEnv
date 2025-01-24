@@ -445,45 +445,58 @@ if uploaded_file:
             """,
             unsafe_allow_html=True
         )
-           
+           # Descriptions Section
+st.header("🗒 Descriptions")
 
+        # Paginated descriptions
+        descriptions = filtered_data_table[
+            ['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']
+        ].dropna().reset_index(drop=True)
+        
+        # Handle empty descriptions
+        total_items = len(descriptions)
+        items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
+        total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
+        current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
+        
+        # Calculate start and end indices for pagination
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        
+        if total_items == 0:
+            st.warning("No descriptions match your search criteria.")
+        else:
+            st.write("### Descriptions (Filtered)")
+            for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
+                st.markdown(
+                    f"""
+                    <div class='description-box'>
+                        <h4>Issue Details</h4>
+                        <div class='description-field'><strong>SKU:</strong> {row['SKU(s)']}</div>
+                        <div class='description-field'><strong>Base SKU:</strong> {row['Base SKU']}</div>
+                        <div class='description-field'><strong>Region:</strong> {row['Region']}</div>
+                        <div class='description-field'><strong>Disposition:</strong> {row['Disposition']}</div>
+                        <div class='description-field'><strong>Symptom:</strong> {row['Symptom']}</div>
+                        <div class='description-field'><strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}</div>
+                        <div class='description-field'><strong>Serial Number:</strong> {row['Serial Number']}</div>
+                        <div class='description-field'><strong>Description:</strong> {row['Description']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+        
+            # Pagination Controls
+            st.markdown(
+                f"""
+                <div class='pagination'>
+                    <span>Total Items: {total_items}</span>
+                    <span>Page {current_page} of {total_pages}</span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
-            # Paginated Descriptions
-            st.header("🗒 Descriptions")
-            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
-
-            # Handle empty descriptions
-            total_items = len(descriptions)
-            items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
-            total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
-            current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
-
-            # Calculate start and end indices for pagination
-            start_idx = (current_page - 1) * items_per_page
-            end_idx = start_idx + items_per_page
-
-            if total_items == 0:
-                st.warning("No descriptions match your search criteria.")
-            else:
-                st.write("### Descriptions (Filtered)")
-                for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
-                    st.markdown(
-                        f"""
-                        <div class='description-box'>
-                            <h4>Issue Details</h4>
-                            <div class='description-field'><strong>SKU:</strong> {row['SKU(s)']}</div>
-                            <div class='description-field'><strong>Base SKU:</strong> {row['Base SKU']}</div>
-                            <div class='description-field'><strong>Region:</strong> {row['Region']}</div>
-                            <div class='description-field'><strong>Disposition:</strong> {row['Disposition']}</div>
-                            <div class='description-field'><strong>Symptom:</strong> {row['Symptom']}</div>
-                            <div class='description-field'><strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}</div>
-                            <div class='description-field'><strong>Serial Number:</strong> {row['Serial Number']}</div>
-                            <div class='description-field'><strong>Description:</strong> {row['Description']}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
+          
                 # Pagination Controls
                 st.markdown(
                     f"""
