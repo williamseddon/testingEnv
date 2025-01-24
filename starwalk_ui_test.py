@@ -181,7 +181,7 @@ if uploaded_file:
         st.markdown("---")  # Separator linehttps://github.com/williamseddon/testingEnv/blob/main/starwalk_ui_test.py#L13C47
             
                     
-        # Metrics Summary Section
+       # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -280,13 +280,19 @@ if uploaded_file:
                 .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-            
+        
             country_source_stats['Avg_Rating_Color'] = country_source_stats['Avg_Rating'].apply(
                 lambda x: 'background-color: #d4edda; color: #155724;' if x >= 4.5 else 'background-color: #f8d7da; color: #721c24;'
             )
         
             def style_country_source_table(row):
-                return [row['Avg_Rating_Color'] if col == 'Avg_Rating' else '' for col in row.index]
+                styles = []
+                for col in row.index:
+                    if col == 'Avg_Rating':
+                        styles.append(row['Avg_Rating_Color'])
+                    else:
+                        styles.append('')
+                return styles
         
             styled_table = country_source_stats.style.apply(
                 style_country_source_table, axis=1
@@ -301,11 +307,12 @@ if uploaded_file:
                         background-color: #f1f1f1;
                     }
                 </style>
-            ", unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
         
             st.dataframe(styled_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
+
 
 
         # Graph Over Time
