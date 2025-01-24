@@ -314,24 +314,21 @@ if uploaded_file:
             # Paginated Descriptions
             st.header("🗒 Descriptions")
             descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
-            
-            # Handle case where descriptions are empty
+
+            # Handle empty descriptions
             total_items = len(descriptions)
             items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
             total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
-            
-            # Ensure current_page does not exceed total_pages
             current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
-            
-            # Define the range of items to display
+
+            # Calculate start and end indices for pagination
             start_idx = (current_page - 1) * items_per_page
             end_idx = start_idx + items_per_page
-            
-            st.write("### Descriptions (Filtered)")
-            
+
             if total_items == 0:
                 st.warning("No descriptions match your search criteria.")
             else:
+                st.write("### Descriptions (Filtered)")
                 for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
                     st.markdown(
                         f"""
@@ -349,7 +346,7 @@ if uploaded_file:
                         """,
                         unsafe_allow_html=True
                     )
-            
+
                 # Pagination Controls
                 st.markdown(
                     f"""
@@ -360,7 +357,7 @@ if uploaded_file:
                     """,
                     unsafe_allow_html=True
                 )
-            
+
             # Add Download Option
             st.sidebar.download_button(
                 label="Download Filtered Data",
@@ -368,3 +365,6 @@ if uploaded_file:
                 file_name="filtered_jira_issues.csv",
                 mime="text/csv"
             )
+    except Exception as e:
+        st.error(f"An error occurred while processing the file: {str(e)}")
+
