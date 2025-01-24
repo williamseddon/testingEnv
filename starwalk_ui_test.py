@@ -303,49 +303,49 @@ if uploaded_file:
                 )
                 combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
                 
-    # Replace NaN values with a placeholder
-        combined_country_data.fillna("N/A", inplace=True)
-        
-        # Function to apply custom styles to each row
-        def format_table(row):
-            """
-            Styles each row in the table:
-            - Bold the "Overall" row.
-            - Green text for ratings >= 4.5.
-            - Red text for ratings < 4.5.
-            - Gray italic for "N/A" placeholders.
-            """
-            if row.name == len(combined_country_data) - 1:  # Check if it's the "Overall" row
-                return ['font-weight: bold;' for _ in row]
-            return [
-                "color: green; font-weight: bold;" if isinstance(cell, float) and cell >= 4.5 else
-                "color: red;" if isinstance(cell, float) and cell < 4.5 else
-                "color: gray; font-style: italic;" if cell == "N/A" else ""
-                for cell in row
-            ]
-        
-        # Render the table with styles for Avg Rating and placeholders for NaN values
-        formatted_table = (
-            combined_country_data
-            .style
-            .format({
-                'Avg Rating': '{:.1f}',  # Format Avg Rating with 1 decimal place
-                'Review Count': '{:,}',  # Format Review Count with thousands separator
-                'New Review Average': '{:.1f}',  # Format New Review Average with 1 decimal place
-                'New Review Count': '{:,}'  # Format New Review Count with thousands separator
-            })
-            .apply(format_table, axis=1)
-        )
-        
-        # Display the styled table
-        st.markdown(
-            formatted_table.to_html(escape=False, index=False),
-            unsafe_allow_html=True
-        )
-        
-        # Warning for missing data
-        else:
-            st.warning("Country or Source data is missing in the uploaded file.")
+            # Replace NaN values with a placeholder
+                combined_country_data.fillna("N/A", inplace=True)
+                
+                # Function to apply custom styles to each row
+                def format_table(row):
+                    """
+                    Styles each row in the table:
+                    - Bold the "Overall" row.
+                    - Green text for ratings >= 4.5.
+                    - Red text for ratings < 4.5.
+                    - Gray italic for "N/A" placeholders.
+                    """
+                    if row.name == len(combined_country_data) - 1:  # Check if it's the "Overall" row
+                        return ['font-weight: bold;' for _ in row]
+                    return [
+                        "color: green; font-weight: bold;" if isinstance(cell, float) and cell >= 4.5 else
+                        "color: red;" if isinstance(cell, float) and cell < 4.5 else
+                        "color: gray; font-style: italic;" if cell == "N/A" else ""
+                        for cell in row
+                    ]
+                
+                # Render the table with styles for Avg Rating and placeholders for NaN values
+                formatted_table = (
+                    combined_country_data
+                    .style
+                    .format({
+                        'Avg Rating': '{:.1f}',  # Format Avg Rating with 1 decimal place
+                        'Review Count': '{:,}',  # Format Review Count with thousands separator
+                        'New Review Average': '{:.1f}',  # Format New Review Average with 1 decimal place
+                        'New Review Count': '{:,}'  # Format New Review Count with thousands separator
+                    })
+                    .apply(format_table, axis=1)
+                )
+                
+                # Display the styled table
+                st.markdown(
+                    formatted_table.to_html(escape=False, index=False),
+                    unsafe_allow_html=True
+                )
+                
+                # Warning for missing data
+                else:
+                    st.warning("Country or Source data is missing in the uploaded file.")
 
                        
         # Graph Over Time
