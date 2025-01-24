@@ -288,7 +288,7 @@ if uploaded_file:
         
             return pd.DataFrame()
         
-        # Add country-specific tables with overall row and new reviews filter
+          # Add country-specific tables with overall row and new reviews filter
         st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
@@ -311,6 +311,7 @@ if uploaded_file:
                 .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
+            country_overall['Source'] = 'Overall'
         
             for country in country_overall['Country'].unique():
                 st.markdown(f"#### {country}")
@@ -318,7 +319,6 @@ if uploaded_file:
                 # Filter for the specific country
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
-                overall_data['Source'] = 'Overall'
         
                 # Add new review rows
                 new_review_rows = add_new_review_rows(
@@ -328,28 +328,28 @@ if uploaded_file:
                 # Combine specific country data with overall and new review rows
                 combined_country_data = pd.concat([country_data, overall_data, new_review_rows], ignore_index=True)
         
+                # Rename column headers for better readability
+                combined_country_data.rename(
+                    columns={'Avg_Rating': 'Average Rating', 'Review_Count': 'Review Count', 'Source': 'Source'},
+                    inplace=True
+                )
+        
                 # Format table and bold the overall row
                 formatted_table = combined_country_data.style.format({
-                    'Avg Rating': '{:.1f}',
+                    'Average Rating': '{:.1f}',
                     'Review Count': '{:,}'
                 }).applymap(
                     lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
-                    subset=['Avg Rating']
+                    subset=['Average Rating']
                 ).apply(
                     lambda row: ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row.index],
                     axis=1
                 )
         
-                # Rename column headers for better readability
-                formatted_table = formatted_table.rename(
-                    columns={'Avg_Rating': 'Average Rating', 'Review_Count': 'Review Count', 'Source': 'Source'}
-                )
-        
                 st.dataframe(formatted_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-         
-                            
+            
 
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
