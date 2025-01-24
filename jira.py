@@ -332,48 +332,48 @@ if uploaded_file:
                               margin=dict(t=40))
             st.plotly_chart(fig, use_container_width=True)
 
-       # Ranked Symptoms with Metrics (Table)
-        st.header("📊 Ranked Symptoms (Table)")
-        symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
-        symptom_rank.columns = ['Symptom', 'Count']
-        
-        # Calculate additional metrics
-        current_period = filtered_data_table[filtered_data_table['Date Identified'] >= start_date_table]
-        previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < start_date_table) &
-                                              (filtered_data_table['Date Identified'] >= previous_start_date_table)]
-        
-        current_counts = current_period['Symptom'].value_counts()
-        previous_counts = previous_period['Symptom'].value_counts()
-        
-        symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
-        symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
-        
-        symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
-        symptom_rank['Delta (%)'] = symptom_rank.apply(
-            lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
-            if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
-        )
-        
-        # Add Trend Column with Green Arrow for Down
-        symptom_rank['Trend'] = symptom_rank['Delta'].apply(
-            lambda x: "<span class='delta-positive'>🔺 Up</span>" if x > 0
-            else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
-                  else "➖ No Change")
-        )
-        
-        # Limit to Top 10 Rows
-        symptom_rank = symptom_rank.head(10)
-        
-        # Display Ranked Symptoms Table in Scrollable Box
-        st.subheader("Ranked Symptoms Table")
-        st.markdown(
-            f"""
-            <div class="scrollable-table">
-                {symptom_rank.to_html(escape=False, index=False)}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+           # Ranked Symptoms with Metrics (Table)
+            st.header("📊 Ranked Symptoms (Table)")
+            symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
+            symptom_rank.columns = ['Symptom', 'Count']
+            
+            # Calculate additional metrics
+            current_period = filtered_data_table[filtered_data_table['Date Identified'] >= start_date_table]
+            previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < start_date_table) &
+                                                  (filtered_data_table['Date Identified'] >= previous_start_date_table)]
+            
+            current_counts = current_period['Symptom'].value_counts()
+            previous_counts = previous_period['Symptom'].value_counts()
+            
+            symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
+            symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
+            
+            symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
+            symptom_rank['Delta (%)'] = symptom_rank.apply(
+                lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
+                if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
+            )
+            
+            # Add Trend Column with Green Arrow for Down
+            symptom_rank['Trend'] = symptom_rank['Delta'].apply(
+                lambda x: "<span class='delta-positive'>🔺 Up</span>" if x > 0
+                else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
+                      else "➖ No Change")
+            )
+            
+            # Limit to Top 10 Rows
+            symptom_rank = symptom_rank.head(10)
+            
+            # Display Ranked Symptoms Table in Scrollable Box
+            st.subheader("Ranked Symptoms Table")
+            st.markdown(
+                f"""
+                <div class="scrollable-table">
+                    {symptom_rank.to_html(escape=False, index=False)}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
 
             # Paginated Descriptions
