@@ -379,58 +379,73 @@ if uploaded_file:
 
             
           
-            # Ranked Symptoms with Metrics (Table)
-            st.header("📊 Ranked Symptoms (Table)")
-            
-            # Apply the table period length (time-based filter)
-            filtered_data_for_table = filtered_data_table[
-                filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=period_days_table)
+        # Ensure filtered_data_table is defined
+        filtered_data_table = data.copy()
+        
+        # Apply filters dynamically based on user selection
+        if 'ALL' not in sku_filter:
+            filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
+        if 'ALL' not in base_sku_filter:
+            filtered_data_table = filtered_data_table[filtered_data_table['Base SKU'].isin(base_sku_filter)]
+        if 'ALL' not in region_filter:
+            filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
+        if 'ALL' not in symptom_filter:
+            filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
+        if 'ALL' not in disposition_filter:
+            filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
+        if tsf_only_filter:
+            filtered_data_table = filtered_data_table[
+                filtered_data_table['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
             ]
-            
-            # Calculate symptom counts dynamically from the filtered dataset (including time-based filter)
-            symptom_rank = filtered_data_for_table['Symptom'].value_counts().reset_index()
-            symptom_rank.columns = ['Symptom', 'Count']
-            
-            # Calculate additional metrics based on the filtered data
-            current_period = filtered_data_for_table
-            previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < datetime.now() - timedelta(days=period_days_table)) &
-                                                  (filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=2 * period_days_table))]
-            
-            current_counts = current_period['Symptom'].value_counts()
-            previous_counts = previous_period['Symptom'].value_counts()
-            
-            # Add columns for current and previous periods
-            symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
-            symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
-            
-            # Calculate deltas and percentages
-            symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
-            symptom_rank['Delta (%)'] = symptom_rank.apply(
-                lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
-                if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
-            )
-            
-            # Add Trend Column with Green Arrow for Down Only
-            symptom_rank['Trend'] = symptom_rank['Delta'].apply(
-                lambda x: "🔺 Up" if x > 0
-                else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
-                      else "➖ No Change")
-            )
-            
-            # Limit the table to the Top 10 Symptoms
-            symptom_rank = symptom_rank.head(10)
-            
-            # Display the table in a scrollable container
-            st.subheader("Ranked Symptoms Table")
-            st.markdown(
-                f"""
-                <div class="scrollable-table">
-                    {symptom_rank.to_html(escape=False, index=False)}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
+        
+        # Apply the table period length (time-based filter)
+        filtered_data_for_table = filtered_data_table[
+            filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=period_days_table)
+        ]
+        
+        # Ranked Symptoms with Metrics (Table)
+        st.header("📊 Ranked Symptoms (Table)")
+        
+        # Calculate symptom counts dynamically
+        symptom_rank = filtered_data_for_table['Symptom'].value_counts().reset_index()
+        symptom_rank.columns = ['Symptom', 'Count']
+        
+        # Calculate additional metrics
+        current_counts = filtered_data_for_table['Symptom'].value_counts()
+        previous_counts = filtered_data_table[
+            (filtered_data_table['Date Identified'] < datetime.now() - timedelta(days=period_days_table)) &
+            (filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=2 * period_days_table))
+        ]['Symptom'].value_counts()
+        
+        symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
+        symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
+        
+        symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
+        symptom_rank['Delta (%)'] = symptom_rank.apply(
+            lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
+            if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
+        )
+        
+        symptom_rank['Trend'] = symptom_rank['Delta'].apply(
+            lambda x: "🔺 Up" if x > 0
+            else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
+                  else "➖ No Change")
+        )
+        
+        # Limit to Top 10 Symptoms
+        symptom_rank = symptom_rank.head(10)
+        
+        # Display the table in a scrollable container
+        st.subheader("Ranked Symptoms Table")
+        st.markdown(
+            f"""
+            <div class="scrollable-table">
+                {symptom_rank.to_html(escape=False, index=False)}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+           
 
 
             # Paginated Descriptions
