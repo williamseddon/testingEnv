@@ -237,8 +237,8 @@ if uploaded_file:
         )
         
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-        # Add country-specific tables
 
+        # Add country-specific tables
         st.markdown("### 🌍 Country-Specific Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
@@ -271,6 +271,9 @@ if uploaded_file:
                     lambda x: 1 if x == 'Overall' else 0
                 )
                 combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
+        
+                # Drop the Country column for the final display
+                combined_country_data = combined_country_data.drop(columns=['Country'])
         
                 # Rename columns for better readability
                 combined_country_data.rename(columns={
@@ -307,6 +310,8 @@ if uploaded_file:
                 )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
+        
+                
 
  
                        
