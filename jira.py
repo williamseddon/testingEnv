@@ -377,12 +377,14 @@ if uploaded_file:
                               margin=dict(t=40))
             st.plotly_chart(fig, use_container_width=True)
 
-           # Ranked Symptoms with Metrics (Table)
+            # Ranked Symptoms with Metrics (Table)
             st.header("📊 Ranked Symptoms (Table)")
+            
+            # Calculate symptom counts dynamically from the filtered data
             symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
             symptom_rank.columns = ['Symptom', 'Count']
             
-            # Calculate additional metrics
+            # Calculate additional metrics based on filtered data
             current_period = filtered_data_table[filtered_data_table['Date Identified'] >= start_date_table]
             previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < start_date_table) &
                                                   (filtered_data_table['Date Identified'] >= previous_start_date_table)]
@@ -390,9 +392,11 @@ if uploaded_file:
             current_counts = current_period['Symptom'].value_counts()
             previous_counts = previous_period['Symptom'].value_counts()
             
+            # Add columns for current and previous periods
             symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
             symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
             
+            # Calculate delta and percentage changes
             symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
             symptom_rank['Delta (%)'] = symptom_rank.apply(
                 lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
@@ -405,12 +409,11 @@ if uploaded_file:
                 else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
                       else "➖ No Change")
             )
-
             
-            # Limit to Top 10 Rows
+            # Limit the table to the Top 10 Symptoms
             symptom_rank = symptom_rank.head(10)
             
-            # Display Ranked Symptoms Table in Scrollable Box
+            # Display the table in a scrollable container
             st.subheader("Ranked Symptoms Table")
             st.markdown(
                 f"""
@@ -420,6 +423,7 @@ if uploaded_file:
                 """,
                 unsafe_allow_html=True
             )
+
 
 
             # Paginated Descriptions
