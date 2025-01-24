@@ -205,7 +205,78 @@ if uploaded_file:
                 st.metric("Total Reviews", f"{total_reviews:,}")
             with col2:
                 st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
+                    
+        # Function to style average ratings
+        def style_ratings(value):
+            """Apply green for ratings >= 4.5, red for below."""
+            if isinstance(value, (float, int)):
+                if value >= 4.5:
+                    return "color: green; font-weight: bold;"
+                elif value < 4.5:
+                    return "color: red; font-weight: bold;"
+            return ""
+        
+        # Function to create a summary table
+        def create_review_summary(data, new_reviews_filter=False):
+            """Create a summary table for overall and new reviews."""
+            # Group by country and source
+            grouped = data.groupby(['Country', 'Source'], as_index=False).agg(
+                Avg_Rating=('Star Rating', 'mean'),
+                Review_Count=('Star Rating', 'count')
+            )
+            # Apply overall totals by country
+            country_totals = grouped.groupby('Country', as_index=False).agg(
+                Avg_Rating=('Avg_Rating', 'mean'),
+                Review_Count=('Review_Count', 'sum')
+            ).assign(Source='Overall')
+            # Add the country-level totals to the grouped data
+            grouped = pd.concat([country_totals, grouped], axis=0).reset_index(drop=True)
+            
+            # Apply grand totals
+            grand_totals = grouped.agg(
+                Avg_Rating=('Avg_Rating', 'mean'),
+                Review_Count=('Review_Count', 'sum')
+            ).assign(Country='Grand Total', Source='')
+            grouped = pd.concat([grouped, grand_totals], axis=0).reset_index(drop=True)
+            
+            # Rename columns for display
+            grouped = grouped.rename(columns={
+                'Country': 'Country',
+                'Source': 'Source',
+                'Avg_Rating': 'Avg. Rating',
+                'Review_Count': 'Review Count'
+            })
+            
+            return grouped
+        
+        # Display Overall Reviews Table
+        st.markdown("### 🌟 Review Summary Table")
+        if 'New Review' in filtered_verbatims.columns:
+            # Separate overall and new reviews
+            overall_reviews = create_review_summary(filtered_verbatims)
+            new_reviews = create_review_summary(filtered_verbatims[filtered_verbatims['New Review'] == 'Yes'])
+            
+            # Display side-by-side tables
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("#### Overall Reviews")
+                st.dataframe(
+                    overall_reviews.style.applymap(style_ratings, subset=['Avg. Rating'])
+                    .format({'Avg. Rating': '{:.2f}', 'Review Count': '{:,}'})
+                )
+            with col2:
+                st.markdown("#### New Reviews")
+                if new_reviews.empty:
+                    st.write("No new reviews match the selected criteria.")
+                else:
+                    st.dataframe(
+                        new_reviews.style.applymap(style_ratings, subset=['Avg. Rating'])
+                        .format({'Avg. Rating': '{:.2f}', 'Review Count': '{:,}'})
+                    )
+        else:
+            st.error("The 'New Review' column is missing. Please upload a valid dataset.")
 
+            
         # Add a star rating distribution as an interactive horizontal bar chart
         fig_bar_horizontal = go.Figure(go.Bar(
             x=star_counts.values,
