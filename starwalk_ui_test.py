@@ -181,22 +181,21 @@ if uploaded_file:
         st.markdown("---")  # Separator line
             
                     
-
-       # Metrics Summary Section
+        # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
                 A summary of customer feedback and review distribution.
             </p>
             """, unsafe_allow_html=True)
-
+        
         # Calculate the metrics
         total_reviews = len(filtered_verbatims)
         avg_rating = filtered_verbatims['Star Rating'].mean()
         star_counts = filtered_verbatims['Star Rating'].value_counts().sort_index()
         percentages = (star_counts / total_reviews * 100).round(1)  # Calculate percentages
         star_labels = [f"{int(star)} stars" for star in star_counts.index]
-
+        
         # Display metrics in a single centered row
         metrics_container = st.container()
         with metrics_container:
@@ -205,7 +204,7 @@ if uploaded_file:
                 st.metric("Total Reviews", f"{total_reviews:,}")
             with col2:
                 st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
-
+        
         # Add a star rating distribution as an interactive horizontal bar chart
         fig_bar_horizontal = go.Figure(go.Bar(
             x=star_counts.values,
@@ -216,7 +215,7 @@ if uploaded_file:
             marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
             hoverinfo="y+x+text"
         ))
-
+        
         fig_bar_horizontal.update_layout(
             title="<b>Star Rating Distribution</b>",
             xaxis=dict(
@@ -236,13 +235,13 @@ if uploaded_file:
             template="plotly_white",
             margin=dict(l=50, r=50, t=50, b=50)
         )
-
+        
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-
-      # Calculate percentages for 1-star reviews
+        
+        # Calculate percentages for 1-star reviews
         one_star_count = star_counts.get(1, 0)  # Safely get 1-star count or default to 0 if missing
         one_star_percentage = (one_star_count / total_reviews * 100) if total_reviews > 0 else 0
-
+        
         # Evaluate review quality
         if one_star_percentage < 10:
             review_quality = "high"
@@ -253,12 +252,12 @@ if uploaded_file:
         else:
             review_quality = "low"
             review_insight = "Customer satisfaction is low, with over 20% reporting 1-star reviews."
-
+        
         # Find the most common star rating
         most_common_rating = star_counts.idxmax() if not star_counts.empty else None
         most_common_count = star_counts[most_common_rating] if most_common_rating else 0
         most_common_percentage = percentages[most_common_rating] if most_common_rating else 0
-
+        
         # Display insights
         st.markdown(f"""
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -270,6 +269,43 @@ if uploaded_file:
                 indicating strong customer sentiment.
             </p>
             """, unsafe_allow_html=True)
+        
+        # Add country and source breakdown
+        st.markdown("### 🌍 Country & Source Breakdown")
+        
+        if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
+            country_source_stats = (
+                filtered_verbatims
+                .groupby(['Country', 'Source'])
+                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .reset_index()
+            )
+            
+            country_source_stats['Avg_Rating_Color'] = country_source_stats['Avg_Rating'].apply(
+                lambda x: 'background-color: #d4edda; color: #155724;' if x >= 4.5 else 'background-color: #f8d7da; color: #721c24;'
+            )
+        
+            def style_country_source_table(row):
+                return [row['Avg_Rating_Color'] if col == 'Avg_Rating' else '' for col in row.index]
+        
+            styled_table = country_source_stats.style.apply(
+                style_country_source_table, axis=1
+            ).format({
+                'Avg_Rating': '{:.1f}',
+                'Review_Count': '{:,}'
+            })
+        
+            st.markdown("""
+                <style>
+                    .dataframe tbody tr:hover {
+                        background-color: #f1f1f1;
+                    }
+                </style>
+            ", unsafe_allow_html=True)
+        
+            st.dataframe(styled_table, use_container_width=True)
+        else:
+            st.warning("Country or Source data is missing in the uploaded file.")
 
 
         # Graph Over Time
