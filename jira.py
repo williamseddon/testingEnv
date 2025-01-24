@@ -378,24 +378,37 @@ if uploaded_file:
             st.plotly_chart(fig, use_container_width=True)
 
             
+          
             # Ranked Symptoms with Metrics (Table)
             st.header("📊 Ranked Symptoms (Table)")
             
-            # Calculate symptom counts dynamically from the filtered data (excluding time filters)
-            symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
+            # Apply the table period length (time-based filter)
+            filtered_data_for_table = filtered_data_table[
+                filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=period_days_table)
+            ]
+            
+            # Calculate symptom counts dynamically from the filtered dataset (including time-based filter)
+            symptom_rank = filtered_data_for_table['Symptom'].value_counts().reset_index()
             symptom_rank.columns = ['Symptom', 'Count']
             
-            # Calculate additional metrics dynamically, excluding time-based filters
-            current_counts = filtered_data_table['Symptom'].value_counts()
-            previous_counts = pd.Series(dtype='int')  # Empty series as time is excluded
+            # Calculate additional metrics based on the filtered data
+            current_period = filtered_data_for_table
+            previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < datetime.now() - timedelta(days=period_days_table)) &
+                                                  (filtered_data_table['Date Identified'] >= datetime.now() - timedelta(days=2 * period_days_table))]
             
-            # Add columns for the current and (dummy) previous periods
+            current_counts = current_period['Symptom'].value_counts()
+            previous_counts = previous_period['Symptom'].value_counts()
+            
+            # Add columns for current and previous periods
             symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
-            symptom_rank[f"Previous {period_days_table} Days"] = 0  # No time-based filtering, so this is set to 0
+            symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
             
-            # Calculate deltas (no time impact)
+            # Calculate deltas and percentages
             symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
-            symptom_rank['Delta (%)'] = None  # Since no previous time data, percentages won't apply
+            symptom_rank['Delta (%)'] = symptom_rank.apply(
+                lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
+                if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
+            )
             
             # Add Trend Column with Green Arrow for Down Only
             symptom_rank['Trend'] = symptom_rank['Delta'].apply(
@@ -417,7 +430,7 @@ if uploaded_file:
                 """,
                 unsafe_allow_html=True
             )
-            
+
 
 
             # Paginated Descriptions
