@@ -178,7 +178,7 @@ if uploaded_file:
         else:
             st.sidebar.info("No additional filters available.")
 
-        st.markdown("---")  # Separator line
+        st.markdown("---")  # Separator linehttps://github.com/williamseddon/testingEnv/blob/main/starwalk_ui_test.py#L13C47
             
                     
         # Metrics Summary Section
