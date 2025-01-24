@@ -185,7 +185,14 @@ if uploaded_file:
                 top_dispositions = filtered_data_table['Disposition'].value_counts().nlargest(10).index
                 filtered_data_table['Disposition'] = filtered_data_table['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
             if search_query:
-                filtered_data_table = filtered_data_table[filtered_data_table['Description'].str.contains(search_query, case=False, na=False)]
+                # Ensure case-insensitive and whitespace-trimmed search
+                search_query = search_query.strip().lower()
+                filtered_data_table = filtered_data_table[
+                    filtered_data_table['Description']
+                    .str.lower()  # Convert descriptions to lowercase
+                    .str.contains(search_query, na=False)  # Perform the search
+    ]
+
             filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
 
             filtered_data_graph = data.copy()
