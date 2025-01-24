@@ -296,16 +296,19 @@ if uploaded_file:
                 country_data = country_source_stats[country_source_stats['Country'] == country]
                 overall_data = country_overall[country_overall['Country'] == country]
                 
-                # Combine specific country data with overall and ensure the "Overall" row is at the bottom
+                             # Combine specific country data with overall and ensure the "Overall" row is at the bottom
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
                 combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
                     lambda x: 1 if x == 'Overall' else 0
                 )
                 combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
-                
+
                 # Drop the Country column for the final display
                 combined_country_data = combined_country_data.drop(columns=['Country'])
-                
+
+                # Replace NaN values with a dash (-)
+                combined_country_data = combined_country_data.fillna("-")
+
                 # Rename columns for better readability
                 combined_country_data.rename(columns={
                     'Source': 'Source',
@@ -314,7 +317,7 @@ if uploaded_file:
                     'New_Review_Average': 'New Review Average',
                     'New_Review_Count': 'New Review Count'
                 }, inplace=True)
-                
+
                 # Apply color formatting to Avg Rating
                 def color_avg_rating(value):
                     if isinstance(value, float):
@@ -322,16 +325,16 @@ if uploaded_file:
                             return f"<span style='color:green;'>{value:.1f}</span>"
                         return f"<span style='color:red;'>{value:.1f}</span>"
                     return value
-                
+
                 combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(color_avg_rating)
                 combined_country_data['New Review Average'] = combined_country_data['New Review Average'].apply(color_avg_rating)
-                
+
                 # Bold the last row (Overall row)
                 def format_table(row):
                     if row.name == len(combined_country_data) - 1:  # Check if it's the last row
                         return ['font-weight: bold' for _ in row]
                     return ['' for _ in row]
-                
+
                 # Render the table as HTML
                 formatted_table = combined_country_data.style.format({
                     'Avg Rating': '{}',
@@ -339,10 +342,12 @@ if uploaded_file:
                     'New Review Average': '{}',
                     'New Review Count': '{:,}'
                 }).apply(format_table, axis=1)
-                
+
                 st.markdown(
                     formatted_table.to_html(escape=False, index=False),
                     unsafe_allow_html=True
+                )
+
                 )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
