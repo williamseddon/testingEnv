@@ -180,7 +180,7 @@ if uploaded_file:
 
         st.markdown("---")  # Separator line
 
-        # Metrics Summary Section
+       # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -244,7 +244,7 @@ if uploaded_file:
             country_source_stats = (
                 filtered_verbatims
                 .groupby(['Country', 'Source'])
-                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
         
@@ -252,7 +252,7 @@ if uploaded_file:
             country_overall = (
                 filtered_verbatims
                 .groupby('Country')
-                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
         
@@ -270,25 +270,34 @@ if uploaded_file:
                 # Drop the Country column
                 combined_country_data = combined_country_data.drop(columns=['Country'])
         
-                # Round Avg Rating to 1 decimal place
-                combined_country_data['Average Rating'] = combined_country_data['Average Rating'].round(1)
+                # Ensure `Avg_Rating` column is rounded and formatted
+                combined_country_data['Avg Rating'] = combined_country_data['Avg_Rating'].round(1)
+                combined_country_data = combined_country_data.drop(columns=['Avg_Rating'])
         
                 # Apply color formatting to Avg Rating
                 def format_avg_rating(value):
-                    if value >= 4.5:
-                        return f"<span style='color:green;'>{value:.1f}</span>"
-                    return f"<span style='color:red;'>{value:.1f}</span>"
+                    if isinstance(value, float):
+                        if value >= 4.5:
+                            return f"<span style='color:green;'>{value:.1f}</span>"
+                        return f"<span style='color:red;'>{value:.1f}</span>"
+                    return value
         
-                combined_country_data['Average Rating'] = combined_country_data['Average Rating'].apply(format_avg_rating)
+                combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(format_avg_rating)
+        
+                # Rename columns for better readability
+                combined_country_data.rename(
+                    columns={'Source': 'Source', 'Review_Count': 'Review Count'},
+                    inplace=True
+                )
         
                 # Format the table
-                st.markdown("#### Overview Table")
                 st.markdown(
                     combined_country_data.to_html(escape=False, index=False),
                     unsafe_allow_html=True
                 )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
+
 
             
         # Graph Over Time
