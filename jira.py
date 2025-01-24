@@ -445,9 +445,9 @@ if uploaded_file:
             """,
             unsafe_allow_html=True
         )
-           # Descriptions Section
-st.header("🗒 Descriptions")
-
+        # Descriptions Section
+        st.header("🗒 Descriptions")
+        
         # Paginated descriptions
         descriptions = filtered_data_table[
             ['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']
@@ -458,6 +458,7 @@ st.header("🗒 Descriptions")
         items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
         total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
         current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
+
         
         # Calculate start and end indices for pagination
         start_idx = (current_page - 1) * items_per_page
