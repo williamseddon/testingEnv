@@ -178,7 +178,7 @@ if uploaded_file:
         else:
             st.sidebar.info("No additional filters available.")
 
-st.markdown("---")  # Separator line
+        st.markdown("---")  # Separator line
 
         # Metrics Summary Section
         st.markdown("""
