@@ -267,12 +267,30 @@ if uploaded_file:
                 # Combine specific country data with overall
                 combined_country_data = pd.concat([overall_data, country_data], ignore_index=True)
         
-                # Format table
-                st.table(combined_country_data)
+                # Drop the Country column
+                combined_country_data = combined_country_data.drop(columns=['Country'])
+        
+                # Round Avg Rating to 1 decimal place
+                combined_country_data['Average Rating'] = combined_country_data['Average Rating'].round(1)
+        
+                # Apply color formatting to Avg Rating
+                def format_avg_rating(value):
+                    if value >= 4.5:
+                        return f"<span style='color:green;'>{value:.1f}</span>"
+                    return f"<span style='color:red;'>{value:.1f}</span>"
+        
+                combined_country_data['Average Rating'] = combined_country_data['Average Rating'].apply(format_avg_rating)
+        
+                # Format the table
+                st.markdown("#### Overview Table")
+                st.markdown(
+                    combined_country_data.to_html(escape=False, index=False),
+                    unsafe_allow_html=True
+                )
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-          
 
+            
         # Graph Over Time
         st.markdown("### 📈 Graph Over Time")
 
