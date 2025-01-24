@@ -327,15 +327,16 @@ if uploaded_file:
                 # Combine specific country data with overall and new review rows
                 combined_country_data = pd.concat([country_data, overall_data, new_review_rows], ignore_index=True)
         
-                # Ensure unique column names for Styler compatibility
-                combined_country_data.columns = combined_country_data.columns.map(str)
-        
+                # Ensure unique index before styling
+                combined_country_data.reset_index(drop=True, inplace=True)
+                
                 # Format table and bold the overall row
                 def highlight_overall(row):
                     if row['Source'] == 'Overall':
-                        return ['font-weight: bold;' for _ in row]
-                    return ['' for _ in row]
-        
+                        return ['font-weight: bold;' for _ in row.index]
+                    return ['' for _ in row.index]
+                
+                # Apply formatting and styling
                 formatted_table = combined_country_data.style.format({
                     'Avg Rating': '{:.1f}',
                     'Review Count': '{:,}'
@@ -345,10 +346,7 @@ if uploaded_file:
                     lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
                     subset=['Avg Rating']
                 )
-        
-                st.dataframe(formatted_table, use_container_width=True)
-        else:
-            st.warning("Country or Source data is missing in the uploaded file.")
+
            
           
 
