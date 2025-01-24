@@ -354,12 +354,13 @@ if uploaded_file:
                 if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
             )
             
-            # Add Trend Column with Green Arrow for Down
+            # Add Trend Column with Green Arrow for Down Only
             symptom_rank['Trend'] = symptom_rank['Delta'].apply(
-                lambda x: "<span class='delta-positive'>🔺 Up</span>" if x > 0
+                lambda x: "🔺 Up" if x > 0
                 else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
                       else "➖ No Change")
             )
+
             
             # Limit to Top 10 Rows
             symptom_rank = symptom_rank.head(10)
