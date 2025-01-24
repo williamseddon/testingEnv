@@ -179,7 +179,7 @@ if uploaded_file:
             st.sidebar.info("No additional filters available.")
 
         st.markdown("---")  # Separator line
-         # Metrics Summary Section
+        # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -236,116 +236,43 @@ if uploaded_file:
         
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
         
-        # Calculate percentages for 1-star reviews
-        one_star_count = star_counts.get(1, 0)  # Safely get 1-star count or default to 0 if missing
-        one_star_percentage = (one_star_count / total_reviews * 100) if total_reviews > 0 else 0
-        
-        # Evaluate review quality
-        if one_star_percentage < 10:
-            review_quality = "high"
-            review_insight = "Most customers are satisfied, with less than 10% reporting 1-star reviews."
-        elif one_star_percentage >= 10 and one_star_percentage < 20:
-            review_quality = "moderate"
-            review_insight = "There are moderate concerns, with 10-20% reporting 1-star reviews."
-        else:
-            review_quality = "low"
-            review_insight = "Customer satisfaction is low, with over 20% reporting 1-star reviews."
-        
-        # Find the most common star rating
-        most_common_rating = star_counts.idxmax() if not star_counts.empty else None
-        most_common_count = star_counts[most_common_rating] if most_common_rating else 0
-        most_common_percentage = percentages[most_common_rating] if most_common_rating else 0
-        
-        # Display insights
-        st.markdown(f"""
-            <p style="text-align: center; font-size: 14px; color: gray;">
-                <strong>Review Quality:</strong> {review_quality.title()}<br>
-                {review_insight}
-            </p>
-            <p style="text-align: center; font-size: 14px; color: gray;">
-                The majority of reviews ({most_common_count} reviews, {most_common_percentage}%) are {most_common_rating} stars,
-                indicating strong customer sentiment.
-            </p>
-            """, unsafe_allow_html=True)
-        
-        # Function to handle new review rows
-        def add_new_review_rows(data):
-            """Adds rows for new review averages and counts if 'New Review' column exists."""
-            if 'New Review' in data.columns:
-                data['New Review'] = data['New Review'].str.lower()
-                new_review_data = data[data['New Review'] == 'yes']
-        
-                if not new_review_data.empty:
-                    avg_rating = new_review_data['Star Rating'].mean()
-                    review_count = new_review_data['Star Rating'].count()
-        
-                    return pd.DataFrame({
-                        'Source': ['New Review Avg', 'New Review Count'],
-                        'Avg Rating': [avg_rating, None],
-                        'Review Count': [None, review_count]
-                    })
-        
-            return pd.DataFrame()
-        
-        # Add country-specific tables with overall row and new reviews filter
-        st.markdown("### 🌍 Country-Specific Breakdown")
+        # Add country and source breakdown
+        st.markdown("### 🌍 Country & Source Breakdown")
         
         if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
-            # Filter for new reviews if column exists
-            if 'New Review' in filtered_verbatims.columns:
-                filtered_verbatims['New Review'] = filtered_verbatims['New Review'].str.lower()  # Normalize case
-                filtered_verbatims = filtered_verbatims[filtered_verbatims['New Review'] == 'yes']
-        
             country_source_stats = (
                 filtered_verbatims
                 .groupby(['Country', 'Source'])
                 .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
                 .reset_index()
             )
-        
-            # Calculate overall average and review count by country
-            country_overall = (
-                filtered_verbatims
-                .groupby('Country')
-                .agg(Avg_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
-                .reset_index()
+            
+            country_source_stats['Avg_Rating_Color'] = country_source_stats['Avg_Rating'].apply(
+                lambda x: 'background-color: #d4edda; color: #155724;' if x >= 4.5 else 'background-color: #f8d7da; color: #721c24;'
             )
         
-            for country in country_overall['Country'].unique():
-                st.markdown(f"#### {country}")
+            def style_country_source_table(row):
+                return [row['Avg_Rating_Color'] if col == 'Avg_Rating' else '' for col in row.index]
         
-                # Filter for the specific country
-                country_data = country_source_stats[country_source_stats['Country'] == country]
-                overall_data = country_overall[country_overall['Country'] == country]
-                overall_data['Source'] = 'Overall'
+            styled_table = country_source_stats.style.apply(
+                style_country_source_table, axis=1
+            ).format({
+                'Avg_Rating': '{:.1f}',
+                'Review_Count': '{:,}'
+            })
         
-                # Add new review rows
-                new_review_rows = add_new_review_rows(
-                    filtered_verbatims[filtered_verbatims['Country'] == country]
-                )
+            st.markdown("""
+                <style>
+                    .dataframe tbody tr:hover {
+                        background-color: #f1f1f1;
+                    }
+                </style>
+            """, unsafe_allow_html=True)
         
-                # Combine specific country data with overall and new review rows
-                combined_country_data = pd.concat([country_data, overall_data, new_review_rows], ignore_index=True)
-        
-                # Ensure unique index before styling
-                combined_country_data.reset_index(drop=True, inplace=True)
-                
-                # Format table and bold the overall row
-                def highlight_overall(row):
-                    if row['Source'] == 'Overall':
-                        return ['font-weight: bold;' for _ in row.index]
-                    return ['' for _ in row.index]
-                
-                # Apply formatting and styling
-                formatted_table = combined_country_data.style.format({
-                    'Avg Rating': '{:.1f}',
-                    'Review Count': '{:,}'
-                }).apply(
-                    highlight_overall, axis=1
-                ).applymap(
-                    lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
-                    subset=['Avg Rating']
-                )
+            st.dataframe(styled_table, use_container_width=True)
+        else:
+            st.warning("Country or Source data is missing in the uploaded file.")
+
 
            
           
