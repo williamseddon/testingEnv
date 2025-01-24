@@ -180,7 +180,7 @@ if uploaded_file:
 
         st.markdown("---")  # Separator line
             
-     # Metrics Summary Section
+   # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -336,7 +336,7 @@ if uploaded_file:
                     lambda val: 'color: green;' if isinstance(val, float) and val >= 4.5 else 'color: red;',
                     subset=['Avg Rating']
                 ).apply(
-                    lambda row: ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row],
+                    lambda row: ['font-weight: bold;' if row['Source'] == 'Overall' else '' for _ in row.index],
                     axis=1
                 )
         
@@ -348,7 +348,7 @@ if uploaded_file:
                 st.dataframe(formatted_table, use_container_width=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
-        
+         
                             
 
         # Graph Over Time
