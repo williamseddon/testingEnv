@@ -184,17 +184,42 @@ if uploaded_file:
             if top_10_dispositions_filter:
                 top_dispositions = filtered_data_table['Disposition'].value_counts().nlargest(10).index
                 filtered_data_table['Disposition'] = filtered_data_table['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
+            # Apply keyword search filter separately from table period logic
             if search_query:
-                # Ensure case-insensitive and whitespace-trimmed search
                 search_query = search_query.strip().lower()
-                filtered_data_table = filtered_data_table[
-                    filtered_data_table['Description']
-                    .fillna('')  # Replace NaN with empty strings
-                    .str.lower()  # Convert to lowercase
-                    .str.contains(search_query, na=False)  # Perform the search
+                keyword_filtered_data = data[
+                    data['Description']
+                    .fillna('')
+                    .str.lower()
+                    .str.contains(search_query, na=False)
                 ]
-            filtered_data_table = filtered_data_table[filtered_data_table['Date Identified'] >= previous_start_date_table]
-
+            else:
+                keyword_filtered_data = data.copy()
+            
+            # Apply additional filters to the keyword-filtered data
+            filtered_data_table = keyword_filtered_data.copy()
+            if 'ALL' not in sku_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
+            if 'ALL' not in base_sku_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['Base SKU'].isin(base_sku_filter)]
+            if 'ALL' not in region_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
+            if 'ALL' not in symptom_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
+            if 'ALL' not in disposition_filter:
+                filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
+            
+            # Apply the date filter for tables and graphs separately
+            date_filtered_data = filtered_data_table[
+                filtered_data_table['Date Identified'] >= start_date_table
+            ]
+            
+            # Use keyword-filtered data directly for descriptions
+            descriptions = keyword_filtered_data[
+                ['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']
+            ].dropna(subset=['Description']).reset_index(drop=True)
+            
+                        
             filtered_data_graph = data.copy()
             filtered_data_graph = filtered_data_graph[filtered_data_graph['Date Identified'] >= start_date_graph]
             if tsf_only_filter:
