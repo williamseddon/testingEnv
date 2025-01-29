@@ -181,7 +181,7 @@ if uploaded_file:
         st.markdown("---")  # Separator line
 
      
-     # Metrics Summary Section
+        # Metrics Summary Section
         st.markdown("""
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
@@ -192,8 +192,12 @@ if uploaded_file:
         # Calculate the metrics
         total_reviews = len(filtered_verbatims)
         avg_rating = filtered_verbatims['Star Rating'].mean()
+        
+        # Ensure there are no division errors when calculating percentages
         star_counts = filtered_verbatims['Star Rating'].value_counts().sort_index()
-        percentages = (star_counts / total_reviews * 100).round(1)  # Calculate percentages
+        percentages = (star_counts / total_reviews * 100).round(1) if total_reviews > 0 else []
+        
+        # Convert star ratings into labels
         star_labels = [f"{int(star)} stars" for star in star_counts.index]
         
         # Display metrics in a single centered row
@@ -203,149 +207,48 @@ if uploaded_file:
             with col1:
                 st.metric("Total Reviews", f"{total_reviews:,}")
             with col2:
-                st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
+                st.metric("Avg Star Rating", f"{avg_rating:.1f}" if not pd.isna(avg_rating) else "-")
         
-        # Add a star rating distribution as an interactive horizontal bar chart
-        fig_bar_horizontal = go.Figure(go.Bar(
-            x=star_counts.values,
-            y=star_labels,
-            orientation='h',
-            text=[f"{value} reviews ({percentage}%)" for value, percentage in zip(star_counts.values, percentages)],
-            textposition='auto',
-            marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
-            hoverinfo="y+x+text"
-        ))
+        # Star Rating Distribution Chart
+        fig_bar_horizontal = go.Figure()
         
-        fig_bar_horizontal.update_layout(
-            title="<b>Star Rating Distribution</b>",
-            xaxis=dict(
-                title="Number of Reviews",
-                title_font=dict(size=14),
-                tickfont=dict(size=12),
-                showgrid=False,
-            ),
-            yaxis=dict(
-                title="Star Ratings",
-                title_font=dict(size=14),
-                tickfont=dict(size=12),
-                showgrid=False,
-            ),
-            title_font=dict(size=18),
-            plot_bgcolor="white",
-            template="plotly_white",
-            margin=dict(l=50, r=50, t=50, b=50)
-        )
+        # Ensure there is data before attempting to plot
+        if not star_counts.empty:
+            fig_bar_horizontal.add_trace(go.Bar(
+                x=star_counts.values,
+                y=star_labels,
+                orientation='h',
+                text=[f"{value} reviews ({percentage}%)" for value, percentage in zip(star_counts.values, percentages)],
+                textposition='auto',
+                marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
+                hoverinfo="y+x+text"
+            ))
         
-        st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-        # Add country-specific tables
-        st.markdown("### 🌍 Country-Specific Breakdown")
+            fig_bar_horizontal.update_layout(
+                title="<b>Star Rating Distribution</b>",
+                xaxis=dict(
+                    title="Number of Reviews",
+                    title_font=dict(size=14),
+                    tickfont=dict(size=12),
+                    showgrid=False,
+                ),
+                yaxis=dict(
+                    title="Star Ratings",
+                    title_font=dict(size=14),
+                    tickfont=dict(size=12),
+                    showgrid=False,
+                ),
+                title_font=dict(size=18),
+                plot_bgcolor="white",
+                template="plotly_white",
+                margin=dict(l=50, r=50, t=50, b=50)
+            )
         
-        if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
-            # Create a filtered dataframe for rows where 'New Review' is "Yes"
-            new_review_filtered = filtered_verbatims[filtered_verbatims['New Review'].str.upper() == "YES"]
-            
-            # Calculate statistics for all reviews
-            country_source_stats = (
-                filtered_verbatims
-                .groupby(['Country', 'Source'])
-                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
-                .reset_index()
-            )
-            
-            # Calculate statistics for "New Review" rows
-            new_review_stats = (
-                new_review_filtered
-                .groupby(['Country', 'Source'])
-                .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
-                .reset_index()
-            )
-            
-            # Merge the two datasets to include new review metrics
-            country_source_stats = country_source_stats.merge(
-                new_review_stats, 
-                on=['Country', 'Source'], 
-                how='left'
-            )
-            
-            # Calculate overall average and review count by country
-            country_overall = (
-                filtered_verbatims
-                .groupby('Country')
-                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
-                .reset_index()
-            )
-            
-            # Add "New Review" metrics to overall statistics
-            overall_new_review_stats = (
-                new_review_filtered
-                .groupby('Country')
-                .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
-                .reset_index()
-            )
-            country_overall = country_overall.merge(
-                overall_new_review_stats, 
-                on='Country', 
-                how='left'
-            )
-            country_overall['Source'] = 'Overall'
-            
-            for country in country_overall['Country'].unique():
-                st.markdown(f"#### {country}")
-                
-                # Filter for the specific country
-                country_data = country_source_stats[country_source_stats['Country'] == country]
-                overall_data = country_overall[country_overall['Country'] == country]
-                
-                # Combine specific country data with overall and ensure the "Overall" row is at the bottom
-                combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
-                combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
-                    lambda x: 1 if x == 'Overall' else 0
-                )
-                combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
-                
-                # Drop the Country column for the final display
-                combined_country_data = combined_country_data.drop(columns=['Country'])
-                
-                # Rename columns for better readability
-                combined_country_data.rename(columns={
-                    'Source': 'Source',
-                    'Average_Rating': 'Avg Rating',
-                    'Review_Count': 'Review Count',
-                    'New_Review_Average': 'New Review Average',
-                    'New_Review_Count': 'New Review Count'
-                }, inplace=True)
-                
-                # Apply color formatting to Avg Rating
-                def color_avg_rating(value):
-                    if isinstance(value, float):
-                        if value >= 4.5:
-                            return f"<span style='color:green;'>{value:.1f}</span>"
-                        return f"<span style='color:red;'>{value:.1f}</span>"
-                    return value
-                
-                combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(color_avg_rating)
-                combined_country_data['New Review Average'] = combined_country_data['New Review Average'].apply(color_avg_rating)
-                
-                # Bold the last row (Overall row)
-                def format_table(row):
-                    if row.name == len(combined_country_data) - 1:  # Check if it's the last row
-                        return ['font-weight: bold' for _ in row]
-                    return ['' for _ in row]
-                
-                # Render the table as HTML
-                formatted_table = combined_country_data.style.format({
-                    'Avg Rating': '{}',
-                    'Review Count': '{:,}',
-                    'New Review Average': '{}',
-                    'New Review Count': '{:,}'
-                }).apply(format_table, axis=1)
-                
-                st.markdown(
-                    formatted_table.to_html(escape=False, index=False),
-                    unsafe_allow_html=True
-                )
+            st.plotly_chart(fig_bar_horizontal, use_container_width=True)
         else:
-            st.warning("Country or Source data is missing in the uploaded file.")
+            st.warning("No review data available for star rating distribution.")
+        
+
 
                        
         # Graph Over Time
