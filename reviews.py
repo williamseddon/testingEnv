@@ -32,7 +32,7 @@ def main():
         st.sidebar.header("🔍 Data Filters")
         product_filter = st.sidebar.multiselect("Select Products", options=df['Product name'].dropna().unique())
         product_id_filter = st.sidebar.multiselect("Select Product IDs", options=df['Product ID'].dropna().unique())
-        top_level_category_filter = st.sidebar.multiselect("Select Top Level Category", options=df['Top Level Category'].dropna().unique())
+        top_level_category_filter = st.sidebar.multiselect("Select Top Level Category", options=df.columns[df.columns.str.contains('Category', case=False)].tolist()) if 'Top Level Category' in df.columns else []
         rating_filter = st.sidebar.slider("Select Rating Range", min_value=1, max_value=5, value=(1,5))
         moderation_filter = st.sidebar.multiselect("Select Moderation Status", options=df['Moderation status'].dropna().unique())
         search_keyword = st.sidebar.text_input("🔍 Search Reviews (Title & Text)")
@@ -107,7 +107,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
