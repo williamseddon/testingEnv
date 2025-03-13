@@ -27,7 +27,7 @@ def main():
         df = load_data(uploaded_file)
         
         st.sidebar.header("Data Filters")
-        product_filter = st.sidebar.multiselect("Filter by Product", df['Product name'].dropna().unique())
+        product_filter = st.sidebar.multiselect("Filter by Product ID", df['Product ID'].dropna().unique())
         category_filter = st.sidebar.multiselect("Filter by Category", df['Category name'].dropna().unique()) if 'Category name' in df.columns else []
         rating_filter = st.sidebar.slider("Filter by Rating", 1, 5, (1, 5))
         moderation_filter = st.sidebar.multiselect("Filter by Moderation Status", df['Moderation status'].dropna().unique())
@@ -43,7 +43,7 @@ def main():
         sort_option = st.sidebar.selectbox("Sort Reviews By", ["Date", "Rating", "Review Length"], index=0)
         
         if product_filter:
-            df = df[df['Product name'].isin(product_filter)]
+        df = df[df['Product ID'].isin(product_filter)]
         if category_filter:
             df = df[df['Category name'].isin(category_filter)]
         if age_filter:
@@ -78,9 +78,9 @@ def main():
         fig = px.pie(df, names='Moderation status', title='Moderation Status Breakdown')
         st.plotly_chart(fig, use_container_width=True)
         
-        st.write("### Average Rating Per Product")
-        avg_rating_per_product = df.groupby('Product name')['Rating'].mean().reset_index()
-        fig = px.bar(avg_rating_per_product, x='Product name', y='Rating', title="Average Rating Per Product")
+        st.write("### Average Rating Per Product ID")
+        avg_rating_per_product = df.groupby('Product ID')[['Rating']].mean().reset_index()
+        fig = px.bar(avg_rating_per_product, x='Product ID', y='Rating', title="Average Rating Per Product ID")
         st.plotly_chart(fig, use_container_width=True)
         
         st.write("### Rating Distribution")
@@ -98,7 +98,7 @@ def main():
             with st.container():
                 st.markdown(f"**{row['Review title'] if pd.notna(row['Review title']) else 'No Title'}** ({'⭐' * int(row['Rating'])})")
                 st.markdown(f"Date: {row['Submission date'].strftime('%Y-%m-%d')} | Product ID: {row['Product ID']} | Incentivized: {'Yes' if row.get('Incentivized review', False) else 'No'}")
-                st.markdown(f"Gender: {row.get('Gender', 'Unknown')} | Age: {row.get('Age', 'Unknown')}")
+                st.markdown(f"Gender: {row.get('Gender', 'Unknown')} | Age: {row.get('Age', 'Unknown')} | Category: {row.get('Category name', 'Unknown')}")
                 st.write(row['Review text'] if pd.notna(row['Review text']) else "No review text available.")
                 st.write("---")
         
@@ -108,6 +108,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
