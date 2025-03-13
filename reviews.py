@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import matplotlib.pyplot as plt
-import seaborn as sns
+
 from io import BytesIO
 
 def load_data(file):
@@ -107,6 +107,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
