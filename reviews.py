@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 def load_data(file):
     df = pd.read_csv(file)
@@ -18,7 +17,6 @@ def main():
         
         st.sidebar.header("🔍 Data Filters")
         product_filter = st.sidebar.multiselect("Select Products", options=df['Product name'].dropna().unique())
-        product_id_filter = st.sidebar.multiselect("Select Product IDs", options=df['Product ID'].dropna().unique())
         rating_filter = st.sidebar.slider("Select Rating Range", min_value=1, max_value=5, value=(1,5))
         moderation_filter = st.sidebar.multiselect("Select Moderation Status", options=df['Moderation status'].dropna().unique())
         incentivized_filter = st.sidebar.radio("Incentivized Reviews", ["All", "Yes", "No"])
@@ -32,8 +30,6 @@ def main():
         # Apply filters
         if product_filter:
             df = df[df['Product name'].isin(product_filter)]
-        if product_id_filter:
-            df = df[df['Product ID'].isin(product_id_filter)]
         df = df[(df['Rating'] >= rating_filter[0]) & (df['Rating'] <= rating_filter[1])]
         if moderation_filter:
             df = df[df['Moderation status'].isin(moderation_filter)]
@@ -72,10 +68,10 @@ def main():
         avg_rating_per_product = df.groupby('Product name')['Rating'].mean().sort_values()
         st.bar_chart(avg_rating_per_product)
         
-        # Improved Rating Distribution using Seaborn
+        # Rating Distribution
         st.write("### 📊 Rating Distribution")
-        fig, ax = plt.subplots(figsize=(8, 4))
-        sns.histplot(df['Rating'], bins=5, kde=True, ax=ax, color='blue')
+        fig, ax = plt.subplots()
+        df['Rating'].hist(bins=[1,2,3,4,5,6], edgecolor='black', ax=ax)
         ax.set_xlabel("Rating")
         ax.set_ylabel("Count")
         ax.set_title("Distribution of Ratings")
@@ -88,3 +84,4 @@ def main():
         
 if __name__ == "__main__":
     main()
+
