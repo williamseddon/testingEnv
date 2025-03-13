@@ -14,9 +14,14 @@ def download_csv(df):
 
 def download_excel(df):
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Reviews')
-    return output.getvalue()
+    try:
+        import xlsxwriter
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Reviews')
+        return output.getvalue()
+    except ModuleNotFoundError:
+        st.error("Excel export requires the 'xlsxwriter' module. Please install it using: pip install xlsxwriter")
+        return None
 
 def main():
     st.set_page_config(page_title="SharkNinja Review Analysis", layout="wide", initial_sidebar_state="expanded")
@@ -103,11 +108,15 @@ def main():
         st.plotly_chart(fig, use_container_width=True)
 
         st.write("### 📂 Download Filtered Data")
-        st.download_button("Download CSV", download_csv(df), "filtered_reviews.csv", "text/csv")
-        st.download_button("Download Excel", download_excel(df), "filtered_reviews.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        csv_data = download_csv(df)
+        st.download_button("Download CSV", csv_data, "filtered_reviews.csv", "text/csv")
+        excel_data = download_excel(df)
+        if excel_data:
+            st.download_button("Download Excel", excel_data, "filtered_reviews.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == "__main__":
     main()
+
 
 
 
