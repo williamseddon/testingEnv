@@ -30,9 +30,11 @@ def main():
         df = load_data(uploaded_file)
         
         st.sidebar.header("🔍 Data Filters")
+age_filter = st.sidebar.multiselect("Select Age Group", options=df['Age'].dropna().unique()) if 'Age' in df.columns else []
+gender_filter = st.sidebar.multiselect("Select Gender", options=df['Gender'].dropna().unique()) if 'Gender' in df.columns else []
         product_filter = st.sidebar.multiselect("Select Products", options=df['Product name'].dropna().unique())
         product_id_filter = st.sidebar.multiselect("Select Product IDs", options=df['Product ID'].dropna().unique())
-        top_level_category_filter = st.sidebar.multiselect("Select Top Level Category", options=df.columns[df.columns.str.contains('Category', case=False)].tolist()) if 'Top Level Category' in df.columns else []
+        category_name_filter = st.sidebar.multiselect("Select Category Name", options=df['Category name'].dropna().unique()) if 'Category name' in df.columns else []
         rating_filter = st.sidebar.slider("Select Rating Range", min_value=1, max_value=5, value=(1,5))
         moderation_filter = st.sidebar.multiselect("Select Moderation Status", options=df['Moderation status'].dropna().unique())
         search_keyword = st.sidebar.text_input("🔍 Search Reviews (Title & Text)")
@@ -48,7 +50,12 @@ def main():
             df = df[df['Product name'].isin(product_filter)]
         if product_id_filter:
             df = df[df['Product ID'].isin(product_id_filter)]
-        if top_level_category_filter:
+        if category_name_filter:
+            df = df[df['Category name'].isin(category_name_filter)]
+        if age_filter:
+            df = df[df['Age'].isin(age_filter)]
+        if gender_filter:
+            df = df[df['Gender'].isin(gender_filter)]
             df = df[df['Top Level Category'].isin(top_level_category_filter)]
         df = df[(df['Rating'] >= rating_filter[0]) & (df['Rating'] <= rating_filter[1])]
         if moderation_filter:
@@ -94,9 +101,12 @@ def main():
         st.plotly_chart(fig)
         
         st.write("### 📝 Customer Reviews")
+        st.write("Each review includes detailed metadata for better insights.")
         for _, row in df.head(review_display_count).iterrows():
             with st.container():
                 st.markdown(f"**{row['Review title'] if pd.notna(row['Review title']) else 'No Title'}** ({'⭐' * int(row['Rating'])})")
+                st.markdown(f"📅 *{row['Submission date'].strftime('%Y-%m-%d')}* | 🏷 **Product ID:** {row['Product ID']} | 🎁 **Incentivized Review:** {'Yes' if row.get('Incentivized review', False) else 'No'}")
+                st.markdown(f"👤 **Gender:** {row.get('Gender', 'Unknown')} | 🎂 **Age:** {row.get('Age', 'Unknown')}")
                 st.markdown(f"📅 *{row['Submission date'].strftime('%Y-%m-%d')}*")
                 st.write(row['Review text'] if pd.notna(row['Review text']) else "No review text available.")
                 st.write("---")
@@ -107,3 +117,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
