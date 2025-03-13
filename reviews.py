@@ -19,6 +19,13 @@ def main():
         product_filter = st.sidebar.multiselect("Select Products", options=df['Product name'].dropna().unique())
         rating_filter = st.sidebar.slider("Select Rating Range", min_value=1, max_value=5, value=(1,5))
         moderation_filter = st.sidebar.multiselect("Select Moderation Status", options=df['Moderation status'].dropna().unique())
+        incentivized_filter = st.sidebar.radio("Incentivized Reviews", ["All", "Yes", "No"])
+        verified_filter = st.sidebar.radio("Verified Purchasers", ["All", "Yes", "No"])
+        
+        # Convert dates and add date filter
+        df['Submission date'] = pd.to_datetime(df['Submission date'], errors='coerce')
+        min_date, max_date = df['Submission date'].min(), df['Submission date'].max()
+        date_filter = st.sidebar.date_input("Select Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
         
         # Apply filters
         if product_filter:
@@ -26,6 +33,15 @@ def main():
         df = df[(df['Rating'] >= rating_filter[0]) & (df['Rating'] <= rating_filter[1])]
         if moderation_filter:
             df = df[df['Moderation status'].isin(moderation_filter)]
+        if incentivized_filter == "Yes":
+            df = df[df['Incentivized review'] == True]
+        elif incentivized_filter == "No":
+            df = df[df['Incentivized review'] == False]
+        if verified_filter == "Yes":
+            df = df[df['VerifiedPurchaser'] == True]
+        elif verified_filter == "No":
+            df = df[df['VerifiedPurchaser'] == False]
+        df = df[(df['Submission date'] >= pd.to_datetime(date_filter[0])) & (df['Submission date'] <= pd.to_datetime(date_filter[1]))]
         
         st.write("### 🔹 Data Preview:")
         st.dataframe(df.head(20))
@@ -34,11 +50,13 @@ def main():
         total_reviews = df.shape[0]
         avg_rating = df['Rating'].mean()
         verified_purchasers = df['VerifiedPurchaser'].sum()
+        incentivized_reviews = df['Incentivized review'].sum()
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Reviews", total_reviews)
         col2.metric("Average Rating", round(avg_rating, 2))
         col3.metric("Verified Purchasers", verified_purchasers)
+        col4.metric("Incentivized Reviews", incentivized_reviews)
         
         # Moderation Status Breakdown
         st.write("### 📌 Moderation Status Breakdown")
@@ -61,7 +79,6 @@ def main():
         
         # Reviews per Submission Date
         st.write("### 📅 Reviews Over Time")
-        df['Submission date'] = pd.to_datetime(df['Submission date'], errors='coerce')
         reviews_per_date = df.groupby(df['Submission date'].dt.date).size()
         st.line_chart(reviews_per_date)
         
