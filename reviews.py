@@ -10,17 +10,24 @@ def main():
     st.set_page_config(page_title="SharkNinja Review Analysis", layout="wide")
     st.title("📊 SharkNinja Review Analysis Dashboard")
     
-    uploaded_file = st.file_uploader("📂 Upload a CSV file", type=["csv"])
+    # Increase file upload limit
+    st.write("### Maximum File Upload Size: 1GB")
+    st.warning("Larger files may take longer to process")
+    
+    uploaded_file = st.file_uploader("📂 Upload a CSV file", type=["csv"], accept_multiple_files=False)
     
     if uploaded_file is not None:
         df = load_data(uploaded_file)
         
         st.sidebar.header("🔍 Data Filters")
         product_filter = st.sidebar.multiselect("Select Products", options=df['Product name'].dropna().unique())
+        product_id_filter = st.sidebar.multiselect("Select Product IDs", options=df['Product ID'].dropna().unique())
         rating_filter = st.sidebar.slider("Select Rating Range", min_value=1, max_value=5, value=(1,5))
         moderation_filter = st.sidebar.multiselect("Select Moderation Status", options=df['Moderation status'].dropna().unique())
         incentivized_filter = st.sidebar.radio("Incentivized Reviews", ["All", "Yes", "No"])
         verified_filter = st.sidebar.radio("Verified Purchasers", ["All", "Yes", "No"])
+        review_length_filter = st.sidebar.slider("Filter by Review Length", min_value=0, max_value=1000, value=(0,1000))
+        star_rating_filter = st.sidebar.multiselect("Filter by Star Rating", options=df['Rating'].dropna().unique())
         
         # Convert dates and add date filter
         df['Submission date'] = pd.to_datetime(df['Submission date'], errors='coerce')
@@ -30,6 +37,8 @@ def main():
         # Apply filters
         if product_filter:
             df = df[df['Product name'].isin(product_filter)]
+        if product_id_filter:
+            df = df[df['Product ID'].isin(product_id_filter)]
         df = df[(df['Rating'] >= rating_filter[0]) & (df['Rating'] <= rating_filter[1])]
         if moderation_filter:
             df = df[df['Moderation status'].isin(moderation_filter)]
@@ -42,6 +51,9 @@ def main():
         elif verified_filter == "No":
             df = df[df['VerifiedPurchaser'] == False]
         df = df[(df['Submission date'] >= pd.to_datetime(date_filter[0])) & (df['Submission date'] <= pd.to_datetime(date_filter[1]))]
+        df = df[df['Review text'].str.len().between(review_length_filter[0], review_length_filter[1], inclusive="both")]
+        if star_rating_filter:
+            df = df[df['Rating'].isin(star_rating_filter)]
         
         st.write("### 🔹 Data Preview:")
         st.dataframe(df.head(20))
@@ -68,10 +80,10 @@ def main():
         avg_rating_per_product = df.groupby('Product name')['Rating'].mean().sort_values()
         st.bar_chart(avg_rating_per_product)
         
-        # Rating Distribution
+        # Improved Rating Distribution using Matplotlib
         st.write("### 📊 Rating Distribution")
-        fig, ax = plt.subplots()
-        df['Rating'].hist(bins=[1,2,3,4,5,6], edgecolor='black', ax=ax)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        df['Rating'].hist(bins=5, edgecolor='black', alpha=0.7, color='blue')
         ax.set_xlabel("Rating")
         ax.set_ylabel("Count")
         ax.set_title("Distribution of Ratings")
@@ -84,4 +96,5 @@ def main():
         
 if __name__ == "__main__":
     main()
+
 
