@@ -478,7 +478,8 @@ if uploaded_file:
                 return pd.DataFrame(columns=['Item', 'Avg Star', 'Mentions', '% Total'])
 
             # Extract unique non-NaN symptoms
-            unique_items = list({str(item).strip() for col in detractor_columns for item in filtered_verbatims[col].dropna().unique() if str(item).strip()})
+            unique_items = pd.unique(filtered_verbatims[symptom_columns].values.ravel())
+            unique_items = [item for item in unique_items if pd.notna(item) and item]
             
             results = []
 
