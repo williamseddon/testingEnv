@@ -139,30 +139,8 @@ if uploaded_file:
         delighter_symptoms = pd.unique(filtered_verbatims[delighter_columns].values.ravel())
         delighter_symptoms = [symptom for symptom in delighter_symptoms if pd.notna(symptom)]
 
-        # Define the expected detractor columns
-        expected_detractor_columns = [
-            'Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5',
-            'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10'
-        ]
-        
-        # Only use columns that exist in the DataFrame
-        existing_detractor_columns = [col for col in expected_detractor_columns if col in filtered_verbatims.columns]
-        
-        # Build a union of unique, non-empty detractor values while preserving the order of first appearance
-        unique_detractors = []
-        seen = set()
-        for col in existing_detractor_columns:
-            # For each column, drop NaN values, convert to string, strip whitespace, and get unique values
-            for value in filtered_verbatims[col].dropna().astype(str).str.strip().unique():
-                if value and value not in seen:
-                    unique_detractors.append(value)
-                    seen.add(value)
-        
-        detractor_symptoms = unique_detractors
-        
-        # (Optional) Debug output:
-        st.write("Unique detractor symptoms:", detractor_symptoms)
-
+        detractor_symptoms = pd.unique(filtered_verbatims[detractor_columns].values.ravel())
+        detractor_symptoms = [symptom for symptom in detractor_symptoms if pd.notna(symptom)]
 
         # Filters for Delighters and Detractors (Grouped)
         st.sidebar.header("😊 Delighters and 😠 Detractors Filters")
