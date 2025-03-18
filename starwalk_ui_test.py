@@ -135,12 +135,44 @@ if uploaded_file:
         detractor_columns = ['Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5',
                             'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10']
 
-        # Extract unique symptoms for each group
-        delighter_symptoms = pd.unique(filtered_verbatims[delighter_columns].values.ravel())
-        delighter_symptoms = [symptom for symptom in delighter_symptoms if pd.notna(symptom)]
-
-        detractor_symptoms = pd.unique(filtered_verbatims[detractor_columns].values.ravel())
-        detractor_symptoms = [symptom for symptom in detractor_symptoms if pd.notna(symptom)]
+        # Define expected columns for detractors and delighters
+        expected_detractor_columns = [
+            'Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5',
+            'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10'
+        ]
+        expected_delighter_columns = [
+            'Symptom 11', 'Symptom 12', 'Symptom 13', 'Symptom 14', 'Symptom 15',
+            'Symptom 16', 'Symptom 17', 'Symptom 18', 'Symptom 19', 'Symptom 20'
+        ]
+        
+        # Only process columns that exist in the DataFrame
+        existing_detractor_columns = [col for col in expected_detractor_columns if col in filtered_verbatims.columns]
+        existing_delighter_columns = [col for col in expected_delighter_columns if col in filtered_verbatims.columns]
+        
+        # Build a union of unique, non-empty detractor values while preserving order
+        unique_detractors = []
+        seen_detractors = set()
+        for col in existing_detractor_columns:
+            for value in filtered_verbatims[col].dropna().astype(str).str.strip().unique():
+                if value and value not in seen_detractors:
+                    unique_detractors.append(value)
+                    seen_detractors.add(value)
+        detractor_symptoms = unique_detractors
+        
+        # Build a union of unique, non-empty delighter values while preserving order
+        unique_delighters = []
+        seen_delighters = set()
+        for col in existing_delighter_columns:
+            for value in filtered_verbatims[col].dropna().astype(str).str.strip().unique():
+                if value and value not in seen_delighters:
+                    unique_delighters.append(value)
+                    seen_delighters.add(value)
+        delighter_symptoms = unique_delighters
+        
+        # (Optional) Debug output:
+        st.write("Unique detractor symptoms:", detractor_symptoms)
+        st.write("Unique delighter symptoms:", delighter_symptoms)
+        
 
         # Filters for Delighters and Detractors (Grouped)
         st.sidebar.header("😊 Delighters and 😠 Detractors Filters")
