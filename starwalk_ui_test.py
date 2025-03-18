@@ -168,11 +168,6 @@ if uploaded_file:
                     unique_delighters.append(value)
                     seen_delighters.add(value)
         delighter_symptoms = unique_delighters
-        
-        # (Optional) Debug output:
-        st.write("Unique detractor symptoms:", detractor_symptoms)
-        st.write("Unique delighter symptoms:", delighter_symptoms)
-        
 
         # Filters for Delighters and Detractors (Grouped)
         st.sidebar.header("😊 Delighters and 😠 Detractors Filters")
