@@ -6,3 +6,4 @@ wordcloud
 matplotlib
 googletrans 
 xlsxwriter
+serial
