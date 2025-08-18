@@ -1,26 +1,50 @@
-# app.py — Streamlined Streamlit UI for Willow (FW300) BDP control over UART
-# Run: streamlit run app.py
+# app.py — Streamlit UI for Willow (FW300) BDP control over UART + Health Check
+# Run:  pip install streamlit pyserial
+#       streamlit run app.py
 
-import time, re, io
+import io
+import re
+import time
+from dataclasses import dataclass
+
 import streamlit as st
 import serial
 from serial.tools import list_ports
 
-# ---------- Protocol constants ----------
+# ----------------------------- Protocol constants -----------------------------
 BAUD = 115200
 READ_TIMEOUT = 1.0
 INTER_CMD_DELAY = 0.18
 
-LED_TYPES = {"0": "Red", "1": "IR", "2": "Blue", "3": "MSI"}
+LED_TYPES = {"0": "Red", "1": "IR", "2": "Blue", "3": "MSI"}  # *LG<option><state> / ?LG
 LED_STATES = {
-    "0":"Off","1":"Dim","2":"On",
-    "3":"Skin Sustain","4":"Skin Clearing 1","5":"Skin Clearing 2",
-    "6":"Skin Clearing 3","7":"Better Aging"
+    "0": "Off", "1": "Dim", "2": "On",
+    "3": "Skin Sustain", "4": "Skin Clearing 1", "5": "Skin Clearing 2",
+    "6": "Skin Clearing 3", "7": "Better Aging"
 }
-NTC_OPTIONS = {"1":"Peltier 1", "2":"Peltier 2", "3":"Battery", "4":"Q2"}
+NTC_OPTIONS = {"1": "Peltier 1", "2": "Peltier 2", "3": "Battery", "4": "Q2"}
 WX_SERIAL_RE = re.compile(r"\(21\)([A-Za-z0-9]+)")
 
-# ---------- Helpers ----------
+FAULT_BITS = [
+    "OVP", "OCP", "Battery NTC S/O", "Plate1 NTC S/O", "Plate2 NTC S/O", "Mask board not detected",
+    "Battery OTP", "Battery UTP", "Fan blocked/not detected", ">1V cell diff", "UVP",
+    "USB input V out of range", "Charging current abnormal", "Peltier circuit abnormal",
+    "LED driver hard fault", "LED current abnormal", "LED 12V abnormal", "Charging timeout"
+]
+
+# ----------------------------- UI helpers & state -----------------------------
+st.set_page_config(page_title="Willow BDP Controller", layout="wide")
+if "ser" not in st.session_state: st.session_state.ser = None
+if "log" not in st.session_state: st.session_state.log = []
+if "port_name" not in st.session_state: st.session_state.port_name = None
+
+def log(msg: str):
+    stamp = time.strftime("%H:%M:%S")
+    st.session_state.log.append(f"[{stamp}] {msg}")
+    if len(st.session_state.log) > 600:
+        st.session_state.log = st.session_state.log[-600:]
+
+# ----------------------------- Serial helpers --------------------------------
 def win_port_name(name: str) -> str:
     up = name.upper()
     if up.startswith("COM"):
@@ -71,25 +95,26 @@ def parse_signed_16_hex(word_hex: str) -> int:
     v = int(word_hex, 16)
     return v - 0x10000 if v >= 0x8000 else v
 
-# ---- Specific decoders (based on your BDP doc) ----
+# ----------------------------- Decoders (per BDP) -----------------------------
 def decode_BA(raw: str):
     # $BA <volt:word><dischg:word><soc:byte><ntc:word>
     m = re.match(r"^\$BA([0-9A-Fa-f]{4})([0-9A-Fa-f]{4})([0-9A-Fa-f]{2})([0-9A-Fa-f]{4})$", raw or "")
     if not m: return None
-    volt_mv  = int(m.group(1), 16)
-    d_ma     = int(m.group(2), 16)
-    soc_pct  = int(m.group(3), 16)  # duty 0..100 (0x64)
-    ntc_mv   = int(m.group(4), 16)
-    return {"Voltage (mV)": volt_mv, "Discharge (mA)": d_ma, "SoC (%)": soc_pct, "NTC (mV)": ntc_mv}
+    return {
+        "Voltage (mV)": int(m.group(1), 16),
+        "Discharge (mA)": int(m.group(2), 16),
+        "SoC (%)": int(m.group(3), 16),
+        "NTC (mV)": int(m.group(4), 16),
+    }
 
 def decode_BC(raw: str):
-    # $BC <chargerDetect:char><chargerV:word><chargeI:byte/word>
+    # $BC <chargerDetect:char><chargerV:word><chargeI:word/byte>
     m = re.match(r"^\$BC([01])([0-9A-Fa-f]{4})([0-9A-Fa-f]{1,4})$", raw or "")
     if not m: return None
     return {
         "Charger Detected": (m.group(1) == "1"),
         "Charger V (mV)": int(m.group(2), 16),
-        "Charge I (mA)": int(m.group(3), 16)
+        "Charge I (mA)": int(m.group(3), 16),
     }
 
 def decode_BP(raw: str):
@@ -99,17 +124,12 @@ def decode_BP(raw: str):
     return {
         "Cell1 (mV)": int(m.group(1), 16),
         "Cell2 (mV)": int(m.group(2), 16),
-        "State": {"C":"Charge","D":"Discharge","F":"Fault","I":"Idle"}[m.group(3)],
+        "State": {"C":"Charge", "D":"Discharge", "F":"Fault", "I":"Idle"}[m.group(3)],
         "Charge I (mA)": int(m.group(4), 16),
         "Discharge I (mA)": int(m.group(5), 16),
         "Charger V (mV)": int(m.group(6), 16),
     }
 
-FAULT_BITS = [
-    "OVP","OCP","Battery NTC S/O","Plate1 NTC S/O","Plate2 NTC S/O","Mask board not detected","Battery OTP","Battery UTP",
-    "Fan blocked/not detected",">1V cell diff","UVP","USB input V out of range","Charging current abnormal","Peltier circuit abnormal",
-    "LED driver hard fault","LED current abnormal","LED 12V abnormal","Charging timeout"
-]
 def decode_BF(raw: str):
     m = re.match(r"^\$BF([0-9A-Fa-f]{8})$", raw or "")
     if not m: return None
@@ -130,41 +150,128 @@ def decode_WX(raw: str):
     m = WX_SERIAL_RE.search(raw or "")
     return m.group(1) if m else None
 
-def decode_WW_last5(raw: str):
-    return raw[-5:] if raw and raw.startswith("$WW") and len(raw) >= 5 else None
+# ----------------------------- Health Check -----------------------------------
+@dataclass
+class CheckResult:
+    name: str
+    status: str   # "PASS", "WARN", "FAIL"
+    detail: str
 
-# ---------- Streamlit state ----------
-st.set_page_config(page_title="Willow BDP Controller", layout="wide")
-if "ser" not in st.session_state: st.session_state.ser = None
-if "log" not in st.session_state: st.session_state.log = []
-if "port_name" not in st.session_state: st.session_state.port_name = None
+def status_badge(status: str) -> str:
+    return {"PASS":"✅ PASS", "WARN":"⚠️ WARN", "FAIL":"❌ FAIL"}.get(status, status)
 
-def log(msg: str):
-    stamp = time.strftime("%H:%M:%S")
-    st.session_state.log.append(f"[{stamp}] {msg}")
-    if len(st.session_state.log) > 500:
-        st.session_state.log = st.session_state.log[-500:]
+def ok_range(val, lo, hi):
+    return val is not None and lo <= val <= hi
 
+def run_health_check(ser):
+    results: list[CheckResult] = []
+
+    # 0) Comms / Version
+    wz = xfer(ser, "?WZ", wait=0.25)
+    if wz.startswith("$WZ"):
+        results.append(CheckResult("Comms / Version (?WZ)", "PASS", wz))
+    else:
+        results.append(CheckResult("Comms / Version (?WZ)", "FAIL", "No valid $WZ response"))
+        return results  # bail early
+
+    # 1) Fault flags
+    bf_raw = xfer(ser, "?BF", wait=0.2)
+    bf = decode_BF(bf_raw)
+    if bf and bf["Active Faults"] == ["None"]:
+        results.append(CheckResult("Faults (?BF)", "PASS", bf["Raw"]))
+    else:
+        hard_fault_bits = {"Fan blocked/not detected", "LED driver hard fault", "Peltier circuit abnormal", "LED current abnormal"}
+        has_hard = any(any(k in s for k in hard_fault_bits) for s in (bf["Active Faults"] if bf else []))
+        detail = "No decode" if not bf else ", ".join(bf["Active Faults"])
+        results.append(CheckResult("Faults (?BF)", "FAIL" if has_hard else "WARN", detail))
+
+    # 2) Battery set
+    ba_raw = xfer(ser, "?BA", wait=0.2)
+    bp_raw = xfer(ser, "?BP", wait=0.2)
+    bc_raw = xfer(ser, "?BC", wait=0.2)
+    ba = decode_BA(ba_raw); bp = decode_BP(bp_raw); bc = decode_BC(bc_raw)
+
+    batt_checks = []
+    if ba:
+        batt_checks.append(ok_range(ba["Voltage (mV)"], 6000, 9000))  # 2S Li-ion rough window
+        batt_checks.append(ok_range(ba["SoC (%)"], 0, 100))
+    if bp:
+        c1, c2 = bp["Cell1 (mV)"], bp["Cell2 (mV)"]
+        diff = abs(c1 - c2) if (c1 and c2) else None
+        batt_checks.append(diff is not None and diff <= 100)  # basic balance check
+    status = "PASS" if batt_checks and all(batt_checks) else ("WARN" if any(batt_checks) else "FAIL")
+    results.append(CheckResult("Battery (?BA/?BP/?BC)", status, f"{ba_raw} | {bp_raw} | {bc_raw}"))
+
+    # 3) LED Red ON/OFF & current
+    _ = xfer(ser, "*LG02")                              # Red ON
+    lg_on = xfer(ser, "?LG", wait=0.2)                  # $LG<hex mA>
+    led_on = parse_hex_word(lg_on, "$LG")
+    _ = xfer(ser, "*LG00")                              # Red OFF
+    lg_off = xfer(ser, "?LG", wait=0.2)
+    led_off = parse_hex_word(lg_off, "$LG")
+    if (led_on is not None and led_off is not None and led_on > max(1, led_off + 1)):
+        results.append(CheckResult("LED Red current delta", "PASS", f"ON={led_on} mA, OFF={led_off} mA"))
+    else:
+        results.append(CheckResult("LED Red current delta", "WARN", f"ON={led_on}, OFF={led_off}"))
+
+    # 4) Fan ON/OFF & current
+    _ = xfer(ser, "*KF1")
+    kf_on = xfer(ser, "?KF", wait=0.2)
+    fan_on = parse_hex_word(kf_on, "$KF")
+    _ = xfer(ser, "*KF0")
+    kf_off = xfer(ser, "?KF", wait=0.2)
+    fan_off = parse_hex_word(kf_off, "$KF")
+    if (fan_on is not None and fan_off is not None and fan_on > max(1, fan_off + 2)):
+        results.append(CheckResult("Fan current delta", "PASS", f"ON={fan_on} mA, OFF={fan_off} mA"))
+    else:
+        results.append(CheckResult("Fan current delta", "WARN", f"ON={fan_on}, OFF={fan_off}"))
+
+    # 5) Peltier current (index 1 ON)
+    _ = xfer(ser, "*KP11")
+    kp_on = xfer(ser, "?KP", wait=0.2)
+    pel_on = parse_hex_word(kp_on, "$KP")
+    _ = xfer(ser, "*KP10")
+    results.append(CheckResult("Peltier 1 current", "PASS" if pel_on and pel_on >= 100 else "WARN", f"{kp_on} -> {pel_on} mA"))
+
+    # 6) Cooling plate set/readback to ~1000 mV
+    _ = xfer(ser, "*KV03E8")                            # 1000 mV
+    kv_raw = xfer(ser, "?KV", wait=0.2)                 # $KV<hex mV> (or $KP in some examples)
+    plate_mv = parse_hex_word(kv_raw, "$KV") or parse_hex_word(kv_raw, "$KP")
+    results.append(CheckResult("Cooling plate readback", "PASS" if ok_range(plate_mv, 800, 1200) else "WARN", f"{kv_raw} -> {plate_mv} mV"))
+
+    # 7) Battery NTC temp sanity
+    kn3 = xfer(ser, "?KN3", wait=0.2)
+    dec3 = decode_KN(kn3)
+    t_ok = dec3 and (-10.0 <= dec3["Temp (°C)"] <= 60.0)
+    results.append(CheckResult("Battery NTC temp", "PASS" if t_ok else "WARN", f"{kn3} -> {dec3}"))
+
+    # 8) Cap & Keys
+    kc = xfer(ser, "?KC", wait=0.2)
+    results.append(CheckResult("Cap sensor", "PASS" if kc in ("$KC0", "$KC1") else "WARN", kc or "no reply"))
+    ui = xfer(ser, "?UI", wait=0.2)
+    results.append(CheckResult("Keys", "PASS" if ui.startswith("$UI") else "WARN", ui or "no reply"))
+
+    return results
+
+# ----------------------------- Sidebar: connection ----------------------------
 st.title("Willow (FW300) — BDP UART Controller")
 
-# ---------- Sidebar: connection ----------
 with st.sidebar:
     st.header("Connection")
     ports = list_serial_ports()
-    if not ports:
-        st.warning("No serial ports found. Plug the FT232 and click Refresh.")
     chosen = st.selectbox(
         "Serial Port",
-        options=[p.device for p in ports],
+        options=[p.device for p in ports] if ports else [],
         format_func=lambda d: next((f"{p.device} — {p.description}" for p in ports if p.device==d), d),
         index=0 if ports else None,
         key="port_select"
     )
-    cols = st.columns(2)
-    with cols[0]:
+
+    colA, colB = st.columns(2)
+    with colA:
         if st.button("Refresh"):
             st.rerun()
-    with cols[1]:
+    with colB:
         if st.session_state.ser is None:
             if st.button("Connect", type="primary", use_container_width=True, disabled=not ports):
                 try:
@@ -183,13 +290,13 @@ with st.sidebar:
                 st.warning("Disconnected.")
                 log("Disconnected")
 
-    st.caption("Spec: 115200 8N1, commands end with CR (\\r). Try ?WZ first to confirm comms.")
+    st.caption("Spec: 115200 8N1 • Commands end with CR (\\r). Start with ?WZ to confirm comms.")
 
 if st.session_state.ser is None:
     st.info("Connect to a serial port to begin.")
     st.stop()
 
-# ---------- Top metrics / quick actions ----------
+# ----------------------------- Quick Actions ----------------------------------
 q1, q2, q3, q4, q5 = st.columns(5)
 with q1:
     if st.button("Version (?WZ)", use_container_width=True):
@@ -204,7 +311,7 @@ with q2:
             st.success(f"Serial: {sn}")
             log(f"> ?WX\n{raw}\n[Serial]: {sn}")
         else:
-            log(f"> ?WX\n{raw}\nNo (21) in WX; trying WWx...")
+            log(f"> ?WX\n{raw}\nNo (21) in WX; trying WWx…")
             for child in "0123":
                 ww = xfer(st.session_state.ser, f"?WW{child}", wait=0.2)
                 if ww.startswith("$WW"):
@@ -226,7 +333,23 @@ with q5:
 
 st.divider()
 
-# ---------- Tabs for organized controls ----------
+# ----------------------------- Health Check -----------------------------------
+st.subheader("Health Check")
+if st.button("Run Health Check", type="primary"):
+    with st.spinner("Running diagnostics…"):
+        checks = run_health_check(st.session_state.ser)
+    rows = [{"Check": c.name, "Status": status_badge(c.status), "Detail": c.detail} for c in checks]
+    st.dataframe(rows, use_container_width=True)
+    n_pass = sum(1 for c in checks if c.status == "PASS")
+    n_warn = sum(1 for c in checks if c.status == "WARN")
+    n_fail = sum(1 for c in checks if c.status == "FAIL")
+    st.info(f"Summary: {n_pass} PASS • {n_warn} WARN • {n_fail} FAIL")
+    for c in checks:
+        log(f"[HC] {c.name}: {c.status} | {c.detail}")
+
+st.divider()
+
+# ----------------------------- Tabs -------------------------------------------
 tab_led, tab_peltier, tab_sensors, tab_batt, tab_faults, tab_cooling, tab_raw = st.tabs(
     ["LEDs", "Peltiers / Plate", "Sensors & Keys", "Battery", "Faults", "Cooling Test", "Raw"]
 )
@@ -249,7 +372,7 @@ with tab_led:
         if st.button("Read LED current (?LG)", use_container_width=True):
             raw = xfer(st.session_state.ser, "?LG", wait=0.2)
             log(f"> ?LG\n{raw}")
-    st.caption("LED types: 0=Red, 1=IR, 2=Blue, 3=MSI. States: 0..7 presets.")
+    st.caption("LED types: 0=Red, 1=IR, 2=Blue, 3=MSI • States: 0..7 presets.")
 
 with tab_peltier:
     pc1, pc2, pc3, pc4 = st.columns(4)
@@ -279,7 +402,7 @@ with tab_peltier:
             log(f"> {cmd}")
     with kv2:
         if st.button("Read Cooling Plate (?KV)", use_container_width=True):
-            raw = xfer(st.session_state.ser, "?KV", wait=0.2)  # some examples show $KP; handle both
+            raw = xfer(st.session_state.ser, "?KV", wait=0.2)  # sometimes device replies $KP
             mv_parsed = parse_hex_word(raw, "$KV") or parse_hex_word(raw, "$KP")
             st.metric("Plate voltage (mV)", mv_parsed if mv_parsed is not None else "—")
             log(f"> ?KV\n{raw}\n[parsed mV]: {mv_parsed}")
@@ -287,7 +410,8 @@ with tab_peltier:
 with tab_sensors:
     s1, s2, s3, s4 = st.columns(4)
     with s1:
-        opt = st.selectbox("NTC", options=list(NTC_OPTIONS.keys()), format_func=lambda k: f"{k} – {NTC_OPTIONS[k]}")
+        opt = st.selectbox("NTC", options=list(NTC_OPTIONS.keys()),
+                           format_func=lambda k: f"{k} – {NTC_OPTIONS[k]}")
         if st.button("Read NTC (?KNx)", use_container_width=True):
             raw = xfer(st.session_state.ser, f"?KN{opt}", wait=0.2)
             dec = decode_KN(raw)
@@ -383,7 +507,7 @@ with tab_raw:
 
 st.divider()
 st.subheader("Session Log")
-st.text_area("Console", value="\n".join(st.session_state.log), height=260)
+st.text_area("Console", value="\n".join(st.session_state.log), height=280)
 colL, colR = st.columns([1,1])
 with colL:
     if st.button("Clear Log"):
@@ -392,4 +516,3 @@ with colR:
     if st.button("Download Log"):
         buf = io.StringIO("\n".join(st.session_state.log))
         st.download_button("Save log.txt", buf.getvalue(), file_name="willow_bdp_log.txt", mime="text/plain")
-c
