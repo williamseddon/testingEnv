@@ -1,15 +1,15 @@
-import streamlit as st 
+import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from googletrans import Translator
-import pandas as pd
 import io
-        
-        
-# Set widescreen layout
+
+# ---------------------------------------
+# Page config
+# ---------------------------------------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
 # Dashboard Title
@@ -23,7 +23,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Functions for styling ratings
+# ---------------------------------------
+# Utilities
+# ---------------------------------------
 def style_rating_cells(value):
     """Styles cells: Green for ratings 4.5 and above, red for below 4.5."""
     if isinstance(value, (float, int)):
@@ -33,43 +35,142 @@ def style_rating_cells(value):
             return "color: red;"
     return ""
 
-# File Upload Section
+def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str):
+    options = ["ALL"]
+    if column_name in dataframe.columns:
+        # Convert to string dtype for clean filtering; keep NA as NA
+        col = dataframe[column_name].astype("string")
+        options += sorted([x for x in col.dropna().unique().tolist() if str(x).strip() != ""])
+    selected_filter = st.sidebar.multiselect(
+        f"Select {filter_name}",
+        options=options,
+        default=["ALL"]
+    )
+    if "ALL" not in selected_filter and column_name in dataframe.columns:
+        return dataframe[dataframe[column_name].astype("string").isin(selected_filter)], selected_filter
+    return dataframe, ["ALL"]
+
+def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
+    """Collect a unique, ordered list of non-empty symptom strings from provided columns that exist."""
+    vals = []
+    seen = set()
+    for c in cols:
+        if c in df.columns:
+            s = (
+                df[c]
+                .astype("string")
+                .str.strip()
+                .dropna()
+            )
+            for v in pd.unique(s.to_numpy()):
+                item = str(v).strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    vals.append(item)
+    return vals
+
+def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
+    """Analyze delighter/detractor symptoms and calculate metrics, robust to empty/missing columns."""
+    cols = [c for c in symptom_columns if c in filtered_df.columns]
+    if not cols:
+        return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
+
+    s = (
+        filtered_df[cols]
+        .stack(dropna=True)
+        .astype("string")
+        .str.strip()
+        .dropna()
+    )
+    s = s[s != ""]
+    if s.empty:
+        return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
+
+    unique_items = pd.unique(s.to_numpy())
+    results = []
+    total_rows = len(filtered_df)
+
+    for item in unique_items:
+        item_str = str(item).strip()
+        if not item_str:
+            continue
+        mask = filtered_df[cols].isin([item]).any(axis=1)
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        avg_star = filtered_df.loc[mask, "Star Rating"].mean()
+        pct = (count / total_rows * 100) if total_rows else 0
+        results.append({
+            "Item": item_str.title(),
+            "Avg Star": round(avg_star, 1) if pd.notna(avg_star) else None,
+            "Mentions": count,
+            "% Total": f"{round(pct, 1)}%",
+        })
+
+    if not results:
+        return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
+    return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
+
+def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
+    """Flatten text from given columns into a single string for wordcloud generation."""
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        return ""
+    s = (
+        df[cols]
+        .stack(dropna=True)
+        .astype("string")
+        .str.strip()
+        .dropna()
+    )
+    s = s[s != ""]
+    return " ".join(s.tolist())
+
+# ---------------------------------------
+# File Upload
+# ---------------------------------------
 st.markdown("### 📁 File Upload")
 uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 
 if uploaded_file:
     try:
         st.markdown("---")  # Separator line
-        # Load Excel file
-        verbatims = pd.read_excel(uploaded_file, sheet_name='Star Walk scrubbed verbatims')
 
-        # Normalize string columns
-        string_columns = ['Country', 'Source', 'Model (SKU)', 'Seeded', 'New Review']
+        # Load Excel
+        verbatims = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
+
+        # Normalize known string columns (keep NA; uppercase; avoid creating literal 'nan')
+        string_columns = ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]
         for col in string_columns:
             if col in verbatims.columns:
-                verbatims[col] = verbatims[col].astype(str).fillna('').str.upper()
+                verbatims[col] = verbatims[col].astype("string").str.upper()
 
-        # Ensure numeric columns are properly converted back to numeric types
-        numeric_columns = ['Star Rating', 'Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5']  # Add all numeric column names
+        # Coerce ONLY truly numeric columns
+        numeric_columns = ["Star Rating"]  # <-- critical fix: do not coerce Symptom columns to numeric
         for col in numeric_columns:
             if col in verbatims.columns:
-                verbatims[col] = pd.to_numeric(verbatims[col], errors='coerce')
+                verbatims[col] = pd.to_numeric(verbatims[col], errors="coerce")
 
-        # Proceed with further processing (e.g., filtering, aggregations, comparisons)
-        if 'Review Date' in verbatims.columns:
-            verbatims['Review Date'] = pd.to_datetime(verbatims['Review Date'], errors='coerce')
+        # Make ALL symptom columns string dtype so they behave consistently
+        all_symptom_cols = [c for c in verbatims.columns if c.startswith("Symptom")]
+        for c in all_symptom_cols:
+            verbatims[c] = verbatims[c].astype("string")
 
-        # Sidebar Filters Section
+        # Date parsing
+        if "Review Date" in verbatims.columns:
+            verbatims["Review Date"] = pd.to_datetime(verbatims["Review Date"], errors="coerce")
+
+        # ---------------------------------------
+        # Sidebar Filters
+        # ---------------------------------------
         st.sidebar.header("🔍 Filters")
 
-        # Add Timeframe Selector
         timeframe = st.sidebar.selectbox(
             "Select Timeframe",
             options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"]
         )
         today = datetime.today()
 
-        # Add a date range picker for "Custom Range"
         start_date, end_date = None, None
         if timeframe == "Custom Range":
             st.sidebar.markdown("#### Select Date Range")
@@ -81,7 +182,6 @@ if uploaded_file:
                 label_visibility="collapsed"
             )
 
-        # Time-based filtering
         if timeframe == "Last Week":
             start_date = today - timedelta(days=7)
             end_date = today
@@ -92,11 +192,11 @@ if uploaded_file:
             start_date = today - timedelta(days=365)
             end_date = today
 
-        if start_date and end_date and 'Review Date' in verbatims.columns:
+        if start_date and end_date and "Review Date" in verbatims.columns:
             filtered_verbatims = verbatims[
-                (verbatims['Review Date'] >= pd.Timestamp(start_date)) &
-                (verbatims['Review Date'] <= pd.Timestamp(end_date))
-            ]
+                (verbatims["Review Date"] >= pd.Timestamp(start_date)) &
+                (verbatims["Review Date"] <= pd.Timestamp(end_date))
+            ].copy()
         else:
             filtered_verbatims = verbatims.copy()
 
@@ -104,72 +204,38 @@ if uploaded_file:
         st.sidebar.markdown("### 🌟 Filter by Star Rating")
         selected_ratings = st.sidebar.multiselect(
             "Select Star Ratings",
-            options=["All"] + [1, 2, 3, 4, 5],  # Add "All" to the options
+            options=["All"] + [1, 2, 3, 4, 5],
             default=["All"]
         )
+        if "All" not in selected_ratings and "Star Rating" in filtered_verbatims.columns:
+            filtered_verbatims = filtered_verbatims[filtered_verbatims["Star Rating"].isin(selected_ratings)]
 
-        # Apply Star Rating Filter
-        if "All" not in selected_ratings and 'Star Rating' in filtered_verbatims.columns:
-            filtered_verbatims = filtered_verbatims[filtered_verbatims['Star Rating'].isin(selected_ratings)]
+        # Standard filters
+        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Country", "Country")
+        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Source", "Source")
+        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Model (SKU)", "Model (SKU)")
+        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Seeded", "Seeded")
+        filtered_verbatims, _ = apply_filter(filtered_verbatims, "New Review", "New Review")
 
-        # Apply standard filters
-        def apply_filter(dataframe, column_name, filter_name):
-            selected_filter = st.sidebar.multiselect(
-                f"Select {filter_name}",
-                options=["ALL"] + sorted(dataframe[column_name].dropna().unique().tolist()),
-                default=["ALL"]
-            )
-            if "ALL" not in selected_filter:
-                return dataframe[dataframe[column_name].isin(selected_filter)], selected_filter
-            return dataframe, ["ALL"]
+        # ---------------------------------------
+        # Define symptom columns
+        # ---------------------------------------
+        detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
+        delighter_columns = [f"Symptom {i}" for i in range(11, 21)]
 
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, 'Country', 'Country')
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, 'Source', 'Source')
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, 'Model (SKU)', 'Model (SKU)')
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, 'Seeded', 'Seeded')
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, 'New Review', 'New Review')
+        expected_detractor_columns = detractor_columns
+        expected_delighter_columns = delighter_columns
 
-        # Inventory Delighter and Detractor Symptoms
-        delighter_columns = ['Symptom 11', 'Symptom 12', 'Symptom 13', 'Symptom 14', 'Symptom 15',
-                            'Symptom 16', 'Symptom 17', 'Symptom 18', 'Symptom 19', 'Symptom 20']
-        detractor_columns = ['Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5',
-                            'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10']
+        existing_detractor_columns = [c for c in expected_detractor_columns if c in filtered_verbatims.columns]
+        existing_delighter_columns = [c for c in expected_delighter_columns if c in filtered_verbatims.columns]
 
-        # Define expected columns for detractors and delighters
-        expected_detractor_columns = [
-            'Symptom 1', 'Symptom 2', 'Symptom 3', 'Symptom 4', 'Symptom 5',
-            'Symptom 6', 'Symptom 7', 'Symptom 8', 'Symptom 9', 'Symptom 10'
-        ]
-        expected_delighter_columns = [
-            'Symptom 11', 'Symptom 12', 'Symptom 13', 'Symptom 14', 'Symptom 15',
-            'Symptom 16', 'Symptom 17', 'Symptom 18', 'Symptom 19', 'Symptom 20'
-        ]
-        
-        # Only process columns that exist in the DataFrame
-        existing_detractor_columns = [col for col in expected_detractor_columns if col in filtered_verbatims.columns]
-        existing_delighter_columns = [col for col in expected_delighter_columns if col in filtered_verbatims.columns]
-        
-        # Build a union of unique, non-empty detractor values while preserving order
-        unique_detractors = []
-        seen_detractors = set()
-        for col in existing_detractor_columns:
-            for value in filtered_verbatims[col].dropna().astype(str).str.strip().unique():
-                if value and value not in seen_detractors:
-                    unique_detractors.append(value)
-                    seen_detractors.add(value)
-        detractor_symptoms = unique_detractors
-        
-        # Build a union of unique, non-empty delighter values while preserving order
-        unique_delighters = []
-        seen_delighters = set()
-        for col in existing_delighter_columns:
-            for value in filtered_verbatims[col].dropna().astype(str).str.strip().unique():
-                if value and value not in seen_delighters:
-                    unique_delighters.append(value)
-                    seen_delighters.add(value)
-        delighter_symptoms = unique_delighters
+        # Build unique symptom lists for filter options
+        detractor_symptoms = collect_unique_symptoms(filtered_verbatims, existing_detractor_columns)
+        delighter_symptoms = collect_unique_symptoms(filtered_verbatims, existing_delighter_columns)
 
-        # Filters for Delighters and Detractors (Grouped)
+        # ---------------------------------------
+        # Delighter/Detractor Filters
+        # ---------------------------------------
         st.sidebar.header("😊 Delighters and 😠 Detractors Filters")
 
         selected_delighter = st.sidebar.multiselect(
@@ -184,235 +250,204 @@ if uploaded_file:
             default=["All"]
         )
 
-        # Apply Filters for Delighter and Detractor Symptoms
-        if "All" not in selected_delighter:
-            filtered_verbatims = filtered_verbatims[
-                filtered_verbatims[delighter_columns].isin(selected_delighter).any(axis=1)
-            ]
+        # Apply Symptom Filters using EXISTING columns only
+        if "All" not in selected_delighter and existing_delighter_columns:
+            mask = filtered_verbatims[existing_delighter_columns].isin(selected_delighter).any(axis=1)
+            filtered_verbatims = filtered_verbatims[mask]
 
-        if "All" not in selected_detractor:
-            filtered_verbatims = filtered_verbatims[
-                filtered_verbatims[detractor_columns].isin(selected_detractor).any(axis=1)
-            ]
+        if "All" not in selected_detractor and existing_detractor_columns:
+            mask = filtered_verbatims[existing_detractor_columns].isin(selected_detractor).any(axis=1)
+            filtered_verbatims = filtered_verbatims[mask]
 
-        # Dynamic Additional Filters for Columns after Symptom 20
-        additional_columns = verbatims.columns[20:]  # Columns from the 21st onward
+        # ---------------------------------------
+        # Dynamic Additional Filters (post Symptom 20 by index)
+        # ---------------------------------------
+        additional_columns = verbatims.columns[20:]  # columns after the 21st (0-based)
         if len(additional_columns) > 0:
             st.sidebar.header("📋 Additional Filters")
             for column in additional_columns:
-                if column not in delighter_columns + detractor_columns:  # Avoid duplicating delighter/detractor filters
+                if column not in (expected_detractor_columns + expected_delighter_columns):
                     filtered_verbatims, _ = apply_filter(filtered_verbatims, column, column)
         else:
             st.sidebar.info("No additional filters available.")
 
-        st.markdown("---")  # Separator line
+        st.markdown("---")
 
-     
-     # Metrics Summary Section
-        st.markdown("""
+        # ---------------------------------------
+        # Metrics Summary
+        # ---------------------------------------
+        st.markdown(
+            """
             ### ⭐ Star Rating Metrics
             <p style="text-align: center; font-size: 14px; color: gray;">
                 A summary of customer feedback and review distribution.
             </p>
-            """, unsafe_allow_html=True)
-        
-        # Calculate the metrics
+            """,
+            unsafe_allow_html=True
+        )
+
         total_reviews = len(filtered_verbatims)
-        avg_rating = filtered_verbatims['Star Rating'].mean()
-        star_counts = filtered_verbatims['Star Rating'].value_counts().sort_index()
-        percentages = (star_counts / total_reviews * 100).round(1)  # Calculate percentages
+        if total_reviews == 0:
+            st.warning("No data available for the selected filters.")
+        avg_rating = filtered_verbatims["Star Rating"].mean() if total_reviews else 0.0
+        star_counts = filtered_verbatims["Star Rating"].value_counts().sort_index()
+        percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
         star_labels = [f"{int(star)} stars" for star in star_counts.index]
-        
-        # Display metrics in a single centered row
-        metrics_container = st.container()
-        with metrics_container:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Reviews", f"{total_reviews:,}")
-            with col2:
-                st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
-        
-        # Add a star rating distribution as an interactive horizontal bar chart
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Reviews", f"{total_reviews:,}")
+        with col2:
+            st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
+
         fig_bar_horizontal = go.Figure(go.Bar(
             x=star_counts.values,
             y=star_labels,
-            orientation='h',
-            text=[f"{value} reviews ({percentage}%)" for value, percentage in zip(star_counts.values, percentages)],
-            textposition='auto',
-            marker=dict(color=['#FFA07A', '#FA8072', '#FFD700', '#ADFF2F', '#32CD32']),
+            orientation="h",
+            text=[f"{value} reviews ({percentages.get(idx, 0)}%)" for idx, value in zip(star_counts.index, star_counts.values)],
+            textposition="auto",
+            marker=dict(color=["#FFA07A", "#FA8072", "#FFD700", "#ADFF2F", "#32CD32"]),
             hoverinfo="y+x+text"
         ))
-        
+
         fig_bar_horizontal.update_layout(
             title="<b>Star Rating Distribution</b>",
-            xaxis=dict(
-                title="Number of Reviews",
-                title_font=dict(size=14),
-                tickfont=dict(size=12),
-                showgrid=False,
-            ),
-            yaxis=dict(
-                title="Star Ratings",
-                title_font=dict(size=14),
-                tickfont=dict(size=12),
-                showgrid=False,
-            ),
+            xaxis=dict(title="Number of Reviews", title_font=dict(size=14), tickfont=dict(size=12), showgrid=False),
+            yaxis=dict(title="Star Ratings", title_font=dict(size=14), tickfont=dict(size=12), showgrid=False),
             title_font=dict(size=18),
             plot_bgcolor="white",
             template="plotly_white",
             margin=dict(l=50, r=50, t=50, b=50)
         )
-        
+
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-        # Add country-specific tables
+
+        # ---------------------------------------
+        # Country-Specific Breakdown
+        # ---------------------------------------
         st.markdown("### 🌍 Country-Specific Breakdown")
-        
-        if 'Country' in filtered_verbatims.columns and 'Source' in filtered_verbatims.columns:
-            # Create a filtered dataframe for rows where 'New Review' is "Yes"
-            new_review_filtered = filtered_verbatims[filtered_verbatims['New Review'].str.upper() == "YES"]
-            
-            # Calculate statistics for all reviews
+
+        if "Country" in filtered_verbatims.columns and "Source" in filtered_verbatims.columns:
+            new_review_filtered = filtered_verbatims[
+                filtered_verbatims["New Review"].astype("string").str.upper() == "YES"
+            ]
+
             country_source_stats = (
                 filtered_verbatims
-                .groupby(['Country', 'Source'])
-                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .groupby(["Country", "Source"])
+                .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
-            
-            # Calculate statistics for "New Review" rows
+
             new_review_stats = (
                 new_review_filtered
-                .groupby(['Country', 'Source'])
-                .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
+                .groupby(["Country", "Source"])
+                .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
-            
-            # Merge the two datasets to include new review metrics
-            country_source_stats = country_source_stats.merge(
-                new_review_stats, 
-                on=['Country', 'Source'], 
-                how='left'
-            )
-            
-            # Calculate overall average and review count by country
+
+            country_source_stats = country_source_stats.merge(new_review_stats, on=["Country", "Source"], how="left")
+
             country_overall = (
                 filtered_verbatims
-                .groupby('Country')
-                .agg(Average_Rating=('Star Rating', 'mean'), Review_Count=('Star Rating', 'count'))
+                .groupby("Country")
+                .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
-            
-            # Add "New Review" metrics to overall statistics
+
             overall_new_review_stats = (
                 new_review_filtered
-                .groupby('Country')
-                .agg(New_Review_Average=('Star Rating', 'mean'), New_Review_Count=('Star Rating', 'count'))
+                .groupby("Country")
+                .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
-            country_overall = country_overall.merge(
-                overall_new_review_stats, 
-                on='Country', 
-                how='left'
-            )
-            country_overall['Source'] = 'Overall'
-            
-            for country in country_overall['Country'].unique():
+            country_overall = country_overall.merge(overall_new_review_stats, on="Country", how="left")
+            country_overall["Source"] = "Overall"
+
+            for country in country_overall["Country"].unique():
                 st.markdown(f"#### {country}")
-                
-                # Filter for the specific country
-                country_data = country_source_stats[country_source_stats['Country'] == country]
-                overall_data = country_overall[country_overall['Country'] == country]
-                
-                # Combine specific country data with overall and ensure the "Overall" row is at the bottom
+
+                country_data = country_source_stats[country_source_stats["Country"] == country]
+                overall_data = country_overall[country_overall["Country"] == country]
+
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
-                combined_country_data['Sort_Order'] = combined_country_data['Source'].apply(
-                    lambda x: 1 if x == 'Overall' else 0
-                )
-                combined_country_data = combined_country_data.sort_values(by='Sort_Order', ascending=True).drop(columns=['Sort_Order'])
-                
-                # Drop the Country column for the final display
-                combined_country_data = combined_country_data.drop(columns=['Country'])
-                
-                # Rename columns for better readability
+                combined_country_data["Sort_Order"] = combined_country_data["Source"].apply(lambda x: 1 if x == "Overall" else 0)
+                combined_country_data = combined_country_data.sort_values(by="Sort_Order", ascending=True).drop(columns=["Sort_Order"])
+                combined_country_data = combined_country_data.drop(columns=["Country"])
+
                 combined_country_data.rename(columns={
-                    'Source': 'Source',
-                    'Average_Rating': 'Avg Rating',
-                    'Review_Count': 'Review Count',
-                    'New_Review_Average': 'New Review Average',
-                    'New_Review_Count': 'New Review Count'
+                    "Source": "Source",
+                    "Average_Rating": "Avg Rating",
+                    "Review_Count": "Review Count",
+                    "New_Review_Average": "New Review Average",
+                    "New_Review_Count": "New Review Count"
                 }, inplace=True)
-                
-                # Apply color formatting to Avg Rating
+
                 def color_avg_rating(value):
                     if isinstance(value, float):
                         if value >= 4.5:
                             return f"<span style='color:green;'>{value:.1f}</span>"
                         return f"<span style='color:red;'>{value:.1f}</span>"
                     return value
-                
-                combined_country_data['Avg Rating'] = combined_country_data['Avg Rating'].apply(color_avg_rating)
-                combined_country_data['New Review Average'] = combined_country_data['New Review Average'].apply(color_avg_rating)
-                
-                # Bold the last row (Overall row)
+
+                combined_country_data["Avg Rating"] = combined_country_data["Avg Rating"].apply(color_avg_rating)
+                combined_country_data["New Review Average"] = combined_country_data["New Review Average"].apply(color_avg_rating)
+
                 def format_table(row):
-                    if row.name == len(combined_country_data) - 1:  # Check if it's the last row
-                        return ['font-weight: bold' for _ in row]
-                    return ['' for _ in row]
-                
-                # Render the table as HTML
-                formatted_table = combined_country_data.style.format({
-                    'Avg Rating': '{}',
-                    'Review Count': '{:,}',
-                    'New Review Average': '{}',
-                    'New Review Count': '{:,}'
-                }).apply(format_table, axis=1)
-                
-                st.markdown(
-                    formatted_table.to_html(escape=False, index=False),
-                    unsafe_allow_html=True
+                    if row.name == len(combined_country_data) - 1:
+                        return ["font-weight: bold" for _ in row]
+                    return ["" for _ in row]
+
+                formatted_table = (
+                    combined_country_data.style
+                    .format({
+                        "Avg Rating": "{}",
+                        "Review Count": "{:,}",
+                        "New Review Average": "{}",
+                        "New Review Count": "{:,}"
+                    })
+                    .apply(format_table, axis=1)
                 )
+
+                st.markdown(formatted_table.to_html(escape=False, index=False), unsafe_allow_html=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
 
-                       
+        # ---------------------------------------
         # Graph Over Time
+        # ---------------------------------------
         st.markdown("### 📈 Graph Over Time")
 
-        if 'Review Date' not in filtered_verbatims.columns:
+        if "Review Date" not in filtered_verbatims.columns:
             st.error("The 'Review Date' column is missing from the data. Please upload a valid file.")
             st.stop()
 
-        filtered_verbatims['Review Date'] = pd.to_datetime(filtered_verbatims['Review Date'], errors='coerce')
+        filtered_verbatims["Review Date"] = pd.to_datetime(filtered_verbatims["Review Date"], errors="coerce")
 
-        # Add a dropdown for selecting bar size below the graph header
         st.markdown("#### Select Bar Size")
         bar_size = st.selectbox(
             "Choose the aggregation level for review mentions:",
             options=["Daily", "Weekly", "Monthly"]
         )
 
-        # Adjust the aggregation level based on the selected bar size
         if bar_size == "Weekly":
-            filtered_verbatims['TimePeriod'] = filtered_verbatims['Review Date'].dt.to_period("W").dt.start_time
+            filtered_verbatims["TimePeriod"] = filtered_verbatims["Review Date"].dt.to_period("W").dt.start_time
         elif bar_size == "Monthly":
-            filtered_verbatims['TimePeriod'] = filtered_verbatims['Review Date'].dt.to_period("M").dt.start_time
-        else:  # Default to Daily
-            filtered_verbatims['TimePeriod'] = filtered_verbatims['Review Date'].dt.date
+            filtered_verbatims["TimePeriod"] = filtered_verbatims["Review Date"].dt.to_period("M").dt.start_time
+        else:
+            filtered_verbatims["TimePeriod"] = filtered_verbatims["Review Date"].dt.date
 
-        # Sort data by time period to ensure cumulative calculations are accurate
-        filtered_verbatims = filtered_verbatims.sort_values(by=['Country', 'TimePeriod'])
+        filtered_verbatims = filtered_verbatims.sort_values(by=["Country", "TimePeriod"])
 
-        # Calculate cumulative sums and averages for each country
-        filtered_verbatims['Cumulative_Total_Reviews'] = filtered_verbatims.groupby('Country')['Star Rating'].cumcount() + 1
-        filtered_verbatims['Cumulative_Sum_Rating'] = filtered_verbatims.groupby('Country')['Star Rating'].cumsum()
-        filtered_verbatims['Cumulative_Avg_Rating'] = (
-            filtered_verbatims['Cumulative_Sum_Rating'] / filtered_verbatims['Cumulative_Total_Reviews']
+        filtered_verbatims["Cumulative_Total_Reviews"] = filtered_verbatims.groupby("Country")["Star Rating"].cumcount() + 1
+        filtered_verbatims["Cumulative_Sum_Rating"] = filtered_verbatims.groupby("Country")["Star Rating"].cumsum()
+        filtered_verbatims["Cumulative_Avg_Rating"] = (
+            filtered_verbatims["Cumulative_Sum_Rating"] / filtered_verbatims["Cumulative_Total_Reviews"]
         )
 
-        # Aggregate total reviews and cumulative average for plotting
-        grouped = filtered_verbatims.groupby(['TimePeriod', 'Country']).agg(
-            Total_Reviews=('Star Rating', 'count'),
-            Cumulative_Avg_Rating=('Cumulative_Avg_Rating', 'last')  # Take the latest cumulative average for the period
+        grouped = filtered_verbatims.groupby(["TimePeriod", "Country"]).agg(
+            Total_Reviews=("Star Rating", "count"),
+            Cumulative_Avg_Rating=("Cumulative_Avg_Rating", "last")
         ).reset_index()
 
         if grouped.empty:
@@ -421,41 +456,35 @@ if uploaded_file:
 
         fig = go.Figure()
 
-        # Define a consistent color palette for regions
         region_colors = {
-            "UK": "#FF7F50",  # Coral
-            "USA": "#4682B4",  # Steel Blue
-            "Canada": "#32CD32"  # Lime Green
+            "UK": "#FF7F50",
+            "USA": "#4682B4",
+            "Canada": "#32CD32"
         }
+        default_color = "#808080"
 
-        default_color = "#808080"  # Fallback color for undefined regions
-
-        # Add bars for total reviews and lines for cumulative average rating
-        for country in grouped['Country'].unique():
-            country_data = grouped[grouped['Country'] == country]
+        for country in grouped["Country"].unique():
+            country_data = grouped[grouped["Country"] == country]
             color = region_colors.get(country, default_color)
 
-            # Add bar for total review counts
             fig.add_trace(go.Bar(
-                x=country_data['TimePeriod'],
-                y=country_data['Total_Reviews'],
+                x=country_data["TimePeriod"],
+                y=country_data["Total_Reviews"],
                 name=f"{country} Reviews ({bar_size})",
                 marker=dict(color=color),
                 opacity=0.7,
                 yaxis="y"
             ))
 
-            # Add line for cumulative average rating
             fig.add_trace(go.Scatter(
-                x=country_data['TimePeriod'],
-                y=country_data['Cumulative_Avg_Rating'],
-                mode='lines+markers',
+                x=country_data["TimePeriod"],
+                y=country_data["Cumulative_Avg_Rating"],
+                mode="lines+markers",
                 name=f"{country} Cumulative Average Rating",
                 line=dict(color=color, width=2),
                 yaxis="y2"
             ))
 
-        # Update layout for dual-axis
         fig.update_layout(
             title=f"Country-wise Review Mentions and Over-Time Average Ratings ({bar_size})",
             xaxis=dict(title="Time Period", tickformat="%b %d", title_font=dict(size=14)),
@@ -464,33 +493,32 @@ if uploaded_file:
                 title="Cumulative Star Rating (1-5)",
                 overlaying="y",
                 side="right",
-                range=[1, 5.2],  # Added extra headroom above 5 stars
+                range=[1, 5.2],
                 title_font=dict(size=14),
                 showgrid=False
             ),
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
-                y=-0.4,  # Adjusted to move the legend away from the graph axes
+                y=-0.4,
                 xanchor="center",
                 x=0.5
             ),
             barmode="stack",
             template="plotly_white",
-            margin=dict(l=50, r=50, t=70, b=70)  # Adjusted margins for better responsiveness
+            margin=dict(l=50, r=50, t=70, b=70)
         )
 
         st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("---")  # Separator line
+        st.markdown("---")
 
-        # Updated Delighters and Detractors Analysis Section
-
+        # ---------------------------------------
+        # Delighters and Detractors Analysis
+        # ---------------------------------------
         st.markdown("### 🌟 Delighters and Detractors Analysis")
 
-        # Function to style only the 'Avg Star' column
         def style_star_ratings(value):
-            """Styles cells in the Avg Star column: Green for ratings ≥4.5, red for <4.5."""
             if isinstance(value, (float, int)):
                 if value >= 4.5:
                     return "color: green;"
@@ -498,39 +526,9 @@ if uploaded_file:
                     return "color: red;"
             return ""
 
-        def analyze_delighters_detractors(symptom_columns):
-            """Analyze delighter/detractor symptoms and calculate metrics."""
-            # Check if symptom columns contain any valid values
-            if filtered_verbatims[symptom_columns].notna().sum().sum() == 0:
-                return pd.DataFrame(columns=['Item', 'Avg Star', 'Mentions', '% Total'])
+        detractors_results = analyze_delighters_detractors(filtered_verbatims, existing_detractor_columns)
+        delighters_results = analyze_delighters_detractors(filtered_verbatims, existing_delighter_columns)
 
-            # Extract unique non-NaN symptoms
-            unique_items = pd.unique(filtered_verbatims[symptom_columns].values.ravel())
-            unique_items = [item for item in unique_items if pd.notna(item) and item]
-            
-            results = []
-
-            for item in unique_items:
-                matched_rows = filtered_verbatims[filtered_verbatims[symptom_columns].isin([item]).any(axis=1)]
-                total_star_rating = matched_rows['Star Rating'].sum()
-                count = matched_rows['Star Rating'].count()
-                avg_star_rating = total_star_rating / count if count > 0 else 0
-                percentage_mentions = (count / len(filtered_verbatims)) * 100 if len(filtered_verbatims) > 0 else 0
-                results.append({
-                    'Item': item.title(),
-                    'Avg Star': round(avg_star_rating, 1),
-                    'Mentions': count,
-                    '% Total': f"{round(percentage_mentions, 1)}%"  # Format as percentage with % sign
-                })
-
-            results_df = pd.DataFrame(results)
-            return results_df.sort_values(by="Mentions", ascending=False)
-
-        # Process detractors and delighters
-        detractors_results = analyze_delighters_detractors(detractor_columns)
-        delighters_results = analyze_delighters_detractors(delighter_columns)
-
-        # Display results
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("All Detractors")
@@ -538,8 +536,8 @@ if uploaded_file:
                 st.write("No detractor symptoms found.")
             else:
                 st.dataframe(
-                    detractors_results.style.applymap(style_star_ratings, subset=['Avg Star'])  # Style only Avg Star
-                    .format({'Avg Star': '{:.1f}', 'Mentions': '{:.0f}'}),  # Don't format % Total again, it's already a string
+                    detractors_results.style.applymap(style_star_ratings, subset=["Avg Star"])
+                    .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
                     use_container_width=True
                 )
 
@@ -549,77 +547,73 @@ if uploaded_file:
                 st.write("No delighter symptoms found.")
             else:
                 st.dataframe(
-                    delighters_results.style.applymap(style_star_ratings, subset=['Avg Star'])  # Style only Avg Star
-                    .format({'Avg Star': '{:.1f}', 'Mentions': '{:.0f}'}),  # Don't format % Total again, it's already a string
+                    delighters_results.style.applymap(style_star_ratings, subset=["Avg Star"])
+                    .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
                     use_container_width=True
                 )
 
-        st.markdown("---")  # Separator line
+        st.markdown("---")
 
-
-        # Initialize translator
+        # ---------------------------------------
+        # Reviews (with optional translation)
+        # ---------------------------------------
         translator = Translator()
-
-        # Enhanced Reviews Display Section with Pagination
         st.markdown("### 📝 All Reviews")
 
-        # Add the Translate button below the header
         translate_to_english = st.button("Translate All Reviews to English")
 
         reviews_per_page = 10
-
-        # Initialize pagination state
         if "review_page" not in st.session_state:
             st.session_state["review_page"] = 0
 
-        # Function to reset scroll position to the top of the section
         def scroll_to_top():
             st.experimental_rerun()
 
-        # Determine start and end indices for the current page
         current_page = st.session_state["review_page"]
         start_index = current_page * reviews_per_page
         end_index = start_index + reviews_per_page
-
-        # Slice the paginated reviews
         paginated_reviews = filtered_verbatims.iloc[start_index:end_index]
 
         if paginated_reviews.empty:
             st.warning("No reviews match the selected criteria.")
         else:
             for _, row in paginated_reviews.iterrows():
+                review_text = row.get("Verbatim", pd.NA)
+                review_text = "" if pd.isna(review_text) else str(review_text)
+
                 if translate_to_english:
-                    # Translate review if the button is pressed
                     try:
-                        translated_review = translator.translate(row['Verbatim'], dest="en").text
+                        translated_review = translator.translate(review_text, dest="en").text
                     except Exception as e:
                         st.error(f"Error translating review: {e}")
-                        translated_review = row['Verbatim']  # Fallback to original text
+                        translated_review = review_text
                 else:
-                    # Show the original review
-                    translated_review = row['Verbatim']
+                    translated_review = review_text
 
-                # Prepare delighter and detractor badges
                 delighter_badges = [
                     f'<div style="display:inline-block; padding:5px 10px; background-color:lightgreen; color:black; border-radius:5px; margin:5px;">{row[col]}</div>'
-                    for col in delighter_columns if col in row and pd.notna(row[col])
+                    for col in existing_delighter_columns if col in row and pd.notna(row[col])
                 ]
                 detractor_badges = [
                     f'<div style="display:inline-block; padding:5px 10px; background-color:lightcoral; color:black; border-radius:5px; margin:5px;">{row[col]}</div>'
-                    for col in detractor_columns if col in row and pd.notna(row[col])
+                    for col in existing_detractor_columns if col in row and pd.notna(row[col])
                 ]
 
-                # If no delighter or detractor badges are present, display a message
                 delighter_message = "<i>No delighter symptoms reported</i>" if not delighter_badges else " ".join(delighter_badges)
                 detractor_message = "<i>No detractor symptoms reported</i>" if not detractor_badges else " ".join(detractor_badges)
 
-                # Display review
+                star_val = row.get("Star Rating", 0)
+                try:
+                    star_int = int(star_val) if pd.notna(star_val) else 0
+                except Exception:
+                    star_int = 0
+
                 st.markdown(
                     f"""
                     <div style="border: 1px solid #ddd; padding: 15px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;">
-                        <p><strong>Source:</strong> {row['Source']} | <strong>Model:</strong> {row['Model (SKU)']}</p>
-                        <p><strong>Country:</strong> {row['Country']}</p>
-                        <p><strong>Rating:</strong> {'⭐' * int(row['Star Rating'])} ({row['Star Rating']}/5)</p>
+                        <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
+                        <p><strong>Country:</strong> {row.get('Country', '')}</p>
+                        <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
                         <p><strong>Review:</strong> {translated_review}</p>
                         <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
                         <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
@@ -628,75 +622,72 @@ if uploaded_file:
                     unsafe_allow_html=True
                 )
 
-        # Add navigation buttons for pagination
         col1, col2, col3 = st.columns([1, 1, 1])
-
-        # "Go Back" button
         with col1:
             if current_page > 0 and st.button("⬅ Go Back", key="go_back"):
                 st.session_state["review_page"] -= 1
                 scroll_to_top()
-
-        # Page indicator
         with col2:
-            total_pages = (len(filtered_verbatims) + reviews_per_page - 1) // reviews_per_page  # Calculate total pages
+            total_pages = (len(filtered_verbatims) + reviews_per_page - 1) // reviews_per_page
             st.markdown(
-                f"<div style='text-align: center; font-weight: bold;'>Page {current_page + 1} of {total_pages}</div>",
+                f"<div style='text-align: center; font-weight: bold;'>Page {current_page + 1} of {max(total_pages,1)}</div>",
                 unsafe_allow_html=True,
             )
-
-        # "View More" button
         with col3:
             if end_index < len(filtered_verbatims) and st.button("➡ View More", key="view_more"):
                 st.session_state["review_page"] += 1
                 scroll_to_top()
 
-        st.markdown("---")  # Separator line
- 
-        # Word Cloud Visualization
+        st.markdown("---")
+
+        # ---------------------------------------
+        # Word Clouds
+        # ---------------------------------------
         st.markdown("### 🌟 Word Cloud for Delighters and Detractors")
 
-        # Prepare text for detractors and delighters
-        detractors_text = " ".join(filtered_verbatims[detractor_columns].stack())
-        delighters_text = " ".join(filtered_verbatims[delighter_columns].stack())
+        detractors_text = build_wordcloud_text(filtered_verbatims, existing_detractor_columns)
+        delighters_text = build_wordcloud_text(filtered_verbatims, existing_delighter_columns)
 
-        # Generate high-resolution word clouds with better scaling and layout
-        wordcloud_detractors = WordCloud(
-            background_color="white",
-            colormap="Reds",
-            width=1600,  # Higher resolution
-            height=800,
-            max_words=100,  # Limit the number of words
-            contour_width=3,  # Add contour for better visual appeal
-            contour_color="red",
-            scale=3  # Enhance scaling for better clarity
-        ).generate(detractors_text)
-
-        wordcloud_delighters = WordCloud(
-            background_color="white",
-            colormap="Greens",
-            width=1600,  # Higher resolution
-            height=800,
-            max_words=100,
-            contour_width=3,
-            contour_color="green",
-            scale=3
-        ).generate(delighters_text)
-
-        # Display detractors word cloud
         st.markdown("#### 😠 Detractors")
-        fig, ax = plt.subplots(figsize=(10, 5))  # Larger figure size for better clarity
-        ax.imshow(wordcloud_detractors, interpolation='bilinear')
-        ax.axis("off")
-        st.pyplot(fig)
+        if detractors_text:
+            wc_det = WordCloud(
+                background_color="white",
+                colormap="Reds",
+                width=1600,
+                height=800,
+                max_words=100,
+                contour_width=3,
+                contour_color="red",
+                scale=3
+            ).generate(detractors_text)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.imshow(wc_det, interpolation="bilinear")
+            ax.axis("off")
+            st.pyplot(fig)
+        else:
+            st.info("Not enough detractor text to build a word cloud.")
 
-        # Display delighters word cloud
         st.markdown("#### 😊 Delighters")
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.imshow(wordcloud_delighters, interpolation='bilinear')
-        ax.axis("off")
-        st.pyplot(fig)
+        if delighters_text:
+            wc_del = WordCloud(
+                background_color="white",
+                colormap="Greens",
+                width=1600,
+                height=800,
+                max_words=100,
+                contour_width=3,
+                contour_color="green",
+                scale=3
+            ).generate(delighters_text)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.imshow(wc_del, interpolation="bilinear")
+            ax.axis("off")
+            st.pyplot(fig)
+        else:
+            st.info("Not enough delighter text to build a word cloud.")
+
     except Exception as e:
-            st.error(f"An error occurred: {e}")
+        st.error(f"An error occurred: {e}")
+
 else:
     st.info("Please upload an Excel file to get started.")
