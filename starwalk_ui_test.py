@@ -44,6 +44,7 @@ st.markdown(
       .block-container { padding-top: .5rem; padding-bottom: 1rem; }
       section[data-testid="stSidebar"] .block-container { padding-top: .25rem; padding-bottom: .6rem; }
       section[data-testid="stSidebar"] label { font-size: .95rem; }
+      section[data-testid="stSidebar"] .stButton>button { width: 100%; }
 
       section[data-testid="stSidebar"] .divider {
         margin: 10px 0 8px 0;
@@ -89,8 +90,9 @@ st.markdown(
       .table-wrap table { width:100% !important; border-collapse:collapse; }
       .symptom-table th, .symptom-table td { padding: 8px 10px; }
 
-      /* Pagination buffer */
-      .pager { margin: 10px 0 22px 0; }
+      /* Pagination spacing (applies to main area buttons only) */
+      .pager { margin: 18px 0 28px 0; }
+      .pager-zone .stButton>button { padding: 6px 18px; margin: 6px 8px; border-radius: 10px; }
 
       /* Ask form layout */
       .ask-wrap { border:1px solid #ececf2; background:#f8f9fb; border-radius:12px; padding:14px; }
@@ -397,7 +399,7 @@ if uploaded_file:
         # ----- Divider above LLM in sidebar -----
         st.sidebar.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-        # LLM controls ONLY (ask UI moved to main). Add jump buttons incl. "Submit feedback".
+        # LLM controls ONLY (ask UI is in main). “Go to Feedback” moved out & renamed.
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -421,11 +423,12 @@ if uploaded_file:
             if not temp_supported:
                 st.caption("ℹ️ This model uses a fixed temperature; slider disabled.")
 
-            # Jump buttons: Assistant & Feedback (acts like "Submit feedback" access)
             if st.button("Go to AI Assistant"):
                 st.session_state["assistant_scroll_pending"] = True
-            if st.button("Go to Feedback"):
-                st.session_state["feedback_scroll_pending"] = True
+
+        # NEW: separate button below the LLM expander
+        if st.sidebar.button("✉️ Submit Feedback"):
+            st.session_state["feedback_scroll_pending"] = True
 
         # -------- Star Rating Metrics (3 cards) --------
         st.markdown("### ⭐ Star Rating Metrics")
@@ -476,7 +479,7 @@ if uploaded_file:
             unsafe_allow_html=True,
         )
 
-        # Keep distribution chart (current filtered set)
+        # Keep distribution chart
         star_counts = filtered["Star Rating"].value_counts().sort_index()
         total_reviews = len(filtered)
         percentages = ((star_counts/total_reviews*100).round(1)) if total_reviews else (star_counts*0)
@@ -634,35 +637,44 @@ if uploaded_file:
                     """, unsafe_allow_html=True
                 )
 
+        # Pagination with improved spacing
+        st.markdown("<div class='pager'>", unsafe_allow_html=True)
         c1,c2,c3,c4,c5 = st.columns([1,1,2,1,1])
         with c1:
-            st.markdown("<div class='pager'>", unsafe_allow_html=True)
+            st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
             if st.button("⏮ First", disabled=current==0):
                 st.session_state["review_page"]=0; st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
         with c2:
+            st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
             if st.button("⬅ Prev", disabled=current==0):
                 st.session_state["review_page"]=max(current-1,0); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
         with c3:
             showing_from = 0 if total==0 else start+1
             showing_to = min(end, total)
             st.markdown(
-                f"<div class='pager' style='text-align:center;font-weight:bold;'>Page {current+1} of {total_pages} • Showing {showing_from}–{showing_to} of {total}</div>",
+                f"<div style='text-align:center;font-weight:bold;margin-top:8px;'>Page {current+1} of {total_pages} • Showing {showing_from}–{showing_to} of {total}</div>",
                 unsafe_allow_html=True,
             )
         with c4:
+            st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
             if st.button("Next ➡", disabled=current>=total_pages-1):
                 st.session_state["review_page"]=min(current+1,total_pages-1); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
         with c5:
+            st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
             if st.button("Last ⏭", disabled=current>=total_pages-1):
                 st.session_state["review_page"]=total_pages-1; st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # -------- ASK UI (now IN MAIN), second-to-last section --------
+        # -------- ASK UI (IN MAIN), second-to-last section --------
         st.markdown("<div id='assistant-anchor'></div>", unsafe_allow_html=True)
         st.markdown("### 🤖 Ask the Assistant")
         api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
-        # Form: prompt + Ask (out of sidebar)
+        # Ask form
         with st.form("ask_form"):
             st.markdown("<div class='ask-wrap'>", unsafe_allow_html=True)
             prompt = st.text_input(
@@ -673,7 +685,7 @@ if uploaded_file:
             ask_clicked = st.form_submit_button("Ask")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # Render and run LLM
+        # LLM state
         st.session_state.setdefault("qa_messages", [
             {"role":"system","content":"You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. Prefer exact numbers. If unknown, say so."}
         ])
@@ -729,7 +741,6 @@ if uploaded_file:
                 }},
             ]
 
-            # Submit from main form
             if ask_clicked and prompt.strip():
                 st.session_state['qa_messages'].append({"role":"user","content": prompt.strip()})
                 sys_ctx = ("CONTEXT:\n"+context_blob(filtered)+
@@ -772,10 +783,8 @@ if uploaded_file:
                     final_text = msg.content
 
                 st.session_state["qa_messages"].append({"role":"assistant","content": final_text})
-                # Smooth scroll to responses after submit
                 st.session_state["assistant_scroll_pending"] = True
 
-            # Render conversation (under the ask form)
             for m in st.session_state["qa_messages"]:
                 if m["role"] != "system":
                     with st.chat_message(m["role"]):
@@ -791,7 +800,7 @@ if uploaded_file:
             sent = st.form_submit_button("Submit Feedback")
         if sent:
             subject = "Star Walk Dashboard • Feedback"
-            body = f"From: {email or 'anonymous'}\n\n{fb}"
+            body = f"From: {email or 'anonymous'}\\n\\n{fb}"
             ok, info = send_feedback_email(subject, body)
             if ok:
                 st.success("Thanks! Your feedback was sent. 🙌")
