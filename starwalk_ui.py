@@ -7,8 +7,6 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from wordcloud import STOPWORDS  # kept only for stopword set; not rendering WC
-import io
-import asyncio
 import re
 import html as _html
 import os
@@ -70,16 +68,30 @@ st.markdown(
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-      /* Cards */
+      /* Cards (grouped look with more gray) */
       .review-card { border:1px solid #E5E7EB; background:#FFFFFF; border-radius:12px; padding:16px; }
       .review-card p { margin:.25rem 0; line-height:1.45; }
 
-      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:16px; }
+      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:20px; }
       @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
-      .metric-card { border:1px solid #E9EEF5; border-radius:12px; padding:10px 14px; background:#F7FAFE; }
-      .metric-card h4 { margin:.3rem 0 .5rem 0; font-size: 1.05rem; }
-      .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
-      .metric-box { background:#fbfbfc; border:1px solid #f0f0f0; border-radius:10px; padding:10px; text-align:center; }
+
+      .metric-card {
+        background:#F7F9FC;
+        border:1px solid #E3E8F0;
+        border-radius:14px;
+        padding:14px 16px;
+        box-shadow:0 1px 2px rgba(16,24,40,0.04);
+      }
+      .metric-card h4 { margin:.3rem 0 .6rem 0; font-size:1.05rem; color:#111827; }
+
+      .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
+      .metric-box {
+        background:#F2F5FA;
+        border:1px solid #E3E8F0;
+        border-radius:12px;
+        padding:12px;
+        text-align:center;
+      }
       .metric-label { color:#6b7280; font-size:.85rem; }
       .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; }
 
@@ -311,7 +323,6 @@ def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedd
     if not embs:
         return None
     mat = np.vstack(embs).astype(np.float32)
-    # Normalize for cosine/IP
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
     mat_norm = mat / norms
     if _HAS_FAISS:
@@ -328,20 +339,16 @@ def vector_search(query: str, index, api_key: str, top_k: int = 8):
     q = np.array(qemb, dtype=np.float32)
     qn = np.linalg.norm(q) + 1e-8
     qn_vec = q / qn
-    # FAISS
     if isinstance(index, dict) and index.get("backend") == "faiss":
         D, I = index["index"].search(qn_vec.reshape(1,-1), top_k)
         sims = D[0].tolist()
         idxs = I[0].tolist()
         texts = index["texts"]
-        results = [(texts[i], float(sims[j])) for j, i in enumerate(idxs) if i != -1]
-        return results
-    # Numpy fallback
+        return [(texts[i], float(sims[j])) for j, i in enumerate(idxs) if i != -1]
     mat, norms, texts = index
     sims = (mat @ q) / (norms.flatten() * qn)
     idx = np.argsort(-sims)[:top_k]
-    results = [(texts[i], float(sims[i])) for i in idx]
-    return results
+    return [(texts[i], float(sims[i])) for i in idx]
 
 # ---------- Anchors ----------
 def anchor(id_: str):
@@ -385,18 +392,14 @@ if not uploaded_file:
 try:
     st.markdown("---")
     df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
-
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
         if col in df.columns:
             df[col] = df[col].astype("string").str.upper()
-
     if "Star Rating" in df.columns:
         df["Star Rating"] = pd.to_numeric(df["Star Rating"], errors="coerce")
-
     all_symptom_cols = [c for c in df.columns if c.startswith("Symptom")]
     for c in all_symptom_cols:
         df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
-
     if "Verbatim" in df.columns:
         df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
     if "Review Date" in df.columns:
@@ -493,7 +496,7 @@ with st.sidebar.expander("📄 Review List", expanded=False):
         st.session_state["reviews_per_page"] = rpp
         st.session_state["review_page"] = 0
 
-# Place “Clear all filters” just under Review List
+# Clear filters
 if st.sidebar.button("🧹 Clear all filters"):
     for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] + \
              [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
@@ -531,9 +534,63 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     if st.button("Go to Ask AI"):
         scroll_to("askdata-anchor")
 
-# Move this button OUTSIDE the expander (per request)
-if st.sidebar.button("Submit Feedback", key="go_feedback_below_expander"):
-    scroll_to("feedback-anchor")
+# ---- Submit Feedback (modal first; falls back to anchor) ----
+def send_feedback_via_email(subject: str, body: str) -> bool:
+    try:
+        host = st.secrets.get("SMTP_HOST")
+        port = int(st.secrets.get("SMTP_PORT", 587))
+        user = st.secrets.get("SMTP_USER")
+        pwd  = st.secrets.get("SMTP_PASS")
+        sender = st.secrets.get("SMTP_FROM", user or "")
+        to = st.secrets.get("SMTP_TO", "wseddon@sharkninja.com")
+        if not (host and port and sender and to):
+            return False
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to
+        msg.set_content(body)
+        with smtplib.SMTP(host, port) as s:
+            s.starttls()
+            if user and pwd: s.login(user, pwd)
+            s.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+_DIALOG_AVAILABLE = hasattr(st, "dialog")
+
+if _DIALOG_AVAILABLE:
+    @st.dialog("💬 Submit Feedback", width="large")
+    def open_feedback_dialog():
+        st.caption("Tell us what to improve. We care about making this tool user-centric.")
+        with st.form("feedback_modal_form", clear_on_submit=True):
+            name = st.text_input("Your name (optional)", key="fb_modal_name")
+            email = st.text_input("Your email (optional)", key="fb_modal_email")
+            message = st.text_area("Feedback / feature request", height=160, key="fb_modal_msg")
+            send_modal = st.form_submit_button("Submit feedback")
+        if send_modal:
+            if not message.strip():
+                st.warning("Please enter some feedback before submitting.")
+                st.stop()
+            body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
+            ok = send_feedback_via_email("Star Walk — Feedback", body)
+            if ok:
+                st.success("Thanks! Your feedback was sent.")
+            else:
+                st.info("Email sending isn’t configured. Opening your mail client instead.")
+                st.link_button(
+                    "Open email to wseddon@sharkninja.com",
+                    url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={_html.escape(message)}"
+                )
+            st.stop()  # close dialog
+
+# Button outside the expander (per request)
+if st.sidebar.button("Submit Feedback", key="submit_feedback_sidebar"):
+    if _DIALOG_AVAILABLE:
+        open_feedback_dialog()
+    else:
+        scroll_to("feedback-anchor")
 
 st.markdown("---")
 
@@ -840,12 +897,10 @@ elif not api_key:
 else:
     # Build (or reuse cached) vector index for current filtered set
     verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-    ser_hash = _hash_series_for_cache(verb_series)
     index = build_vector_index(verb_series.tolist(), api_key)
 
     # Prepare messages (compact display)
     st.session_state.setdefault("qa_messages", [])
-    # keep the list bounded
     if st.session_state.get("qa_messages") and len(st.session_state["qa_messages"]) > 12:
         st.session_state["qa_messages"] = st.session_state["qa_messages"][-12:]
 
@@ -864,7 +919,7 @@ else:
             st.session_state["qa_messages"] = []
             st.experimental_rerun()
 
-    # Show last few exchanges; older behind expander
+    # Show last few exchanges; older behind an expander
     older = st.session_state["qa_messages"][:-2]
     latest = st.session_state["qa_messages"][-2:]
     if older:
@@ -881,6 +936,7 @@ else:
                          height=80,
                          help="Questions about the CURRENT filtered reviews and the tables above.")
         send = st.form_submit_button("Send")
+
     if send and q.strip():
         st.session_state["ask_ai_text"] = q
         st.session_state["qa_messages"].append(("user", q))
@@ -928,7 +984,7 @@ else:
             pct = (cnt / max(1,len(filtered))) * 100.0
             return {"count": cnt, "pct": pct}
 
-        # Page-insight helpers (LLM can “read” the page)
+        # Page-insight helpers
         def get_metrics_snapshot():
             try:
                 return {
@@ -942,8 +998,10 @@ else:
 
         def get_top_items(kind: str = "detractors", top_n: int = 10):
             try:
-                if kind.lower().startswith("del"): df_res = analyze_delighters_detractors(filtered, existing_delighter_columns)
-                else: df_res = analyze_delighters_detractors(filtered, existing_detractor_columns)
+                if kind.lower().startswith("del"):
+                    df_res = analyze_delighters_detractors(filtered, existing_delighter_columns)
+                else:
+                    df_res = analyze_delighters_detractors(filtered, existing_detractor_columns)
                 return df_res.head(int(top_n)).to_dict(orient="records")
             except Exception as e:
                 return {"error": str(e)}
@@ -951,12 +1009,9 @@ else:
         def country_overview(country: str | None = None):
             try:
                 if "Country" not in filtered.columns: return {"error":"No Country column"}
-                if country:
-                    sub = filtered[filtered["Country"] == country]
-                else:
-                    sub = filtered
+                sub = filtered[filtered["Country"] == country] if country else filtered
                 data = sub.groupby("Country").agg(Average_Rating=("Star Rating","mean"),
-                                                 Review_Count=("Star Rating","count")).reset_index()
+                                                  Review_Count=("Star Rating","count")).reset_index()
                 return data.to_dict(orient="records")
             except Exception as e:
                 return {"error": str(e)}
@@ -1144,7 +1199,7 @@ else:
 
 st.markdown("---")
 
-# ---------- Feedback ----------
+# ---------- Feedback (anchor fallback) ----------
 anchor("feedback-anchor")
 st.markdown("## 💬 Submit Feedback")
 st.caption("Tell us what to improve. We care about making this tool user-centric.")
@@ -1154,30 +1209,6 @@ with st.form("feedback_form", clear_on_submit=True):
     email = st.text_input("Your email (optional)")
     message = st.text_area("Feedback / feature request", placeholder="Type your feedback here…", height=140)
     submitted = st.form_submit_button("Submit feedback")
-
-def send_feedback_via_email(subject: str, body: str) -> bool:
-    """Send mail via SMTP settings in secrets; return True if sent."""
-    try:
-        host = st.secrets.get("SMTP_HOST")
-        port = int(st.secrets.get("SMTP_PORT", 587))
-        user = st.secrets.get("SMTP_USER")
-        pwd  = st.secrets.get("SMTP_PASS")
-        sender = st.secrets.get("SMTP_FROM", user or "")
-        to = st.secrets.get("SMTP_TO", "wseddon@sharkninja.com")
-        if not (host and port and sender and to):
-            return False
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = to
-        msg.set_content(body)
-        with smtplib.SMTP(host, port) as s:
-            s.starttls()
-            if user and pwd: s.login(user, pwd)
-            s.send_message(msg)
-        return True
-    except Exception:
-        return False
 
 if submitted:
     if not message.strip():
@@ -1196,3 +1227,4 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+
