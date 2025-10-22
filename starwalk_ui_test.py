@@ -6,6 +6,7 @@ from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from googletrans import Translator
 import io
+import asyncio
 
 # ---------------------------------------
 # Page config
@@ -139,12 +140,49 @@ def clean_text(x: str) -> str:
     x = str(x)
     # Specific replacements requested
     x = x.replace("â€™", "'")
-    # (Optionally add more common fixes here if needed later)
     return x.strip()
 
 
-def apply_keyword_filter(df: pd.DataFrame, keyword: str, include_symptoms: bool = False) -> pd.DataFrame:
-    """Filter rows where the keyword appears in the Review text (and optionally symptom columns)."""
+# ---- Translation helpers (robust to coroutine return) ----
+async def _translate_async_call(translator: Translator, text: str) -> str:
+    try:
+        res = translator.translate(text, dest="en")
+        if asyncio.iscoroutine(res):
+            res = await res
+        return getattr(res, "text", text)
+    except Exception:
+        return text
+
+
+def safe_translate(translator: Translator, text: str) -> str:
+    """Synchronous wrapper that handles both sync and coroutine returns from translator.translate()."""
+    try:
+        res = translator.translate(text, dest="en")
+        # Typical (sync) path
+        if hasattr(res, "text"):
+            return res.text
+        # If coroutine, run it
+        if asyncio.iscoroutine(res):
+            try:
+                return asyncio.run(_translate_async_call(translator, text))
+            except RuntimeError:
+                # If an event loop is already running, create a new one in a new policy
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    return loop.run_until_complete(_translate_async_call(translator, text))
+                finally:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return text
+
+
+def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
+    """Filter rows where the keyword appears in the Review text only (Verbatim)."""
     if not keyword:
         return df
 
@@ -152,20 +190,12 @@ def apply_keyword_filter(df: pd.DataFrame, keyword: str, include_symptoms: bool 
     if kw == "":
         return df
 
-    # Prepare a boolean mask on Verbatim first
     verb_col = "Verbatim" if "Verbatim" in df.columns else None
     mask = pd.Series([False] * len(df))
 
     if verb_col:
         verb = df[verb_col].astype("string").fillna("").map(clean_text)
         mask = verb.str.contains(kw, case=False, na=False)
-
-    if include_symptoms:
-        sym_cols = [c for c in df.columns if c.startswith("Symptom")]
-        if sym_cols:
-            sym_frame = df[sym_cols].astype("string").fillna("")
-            sym_mask = sym_frame.apply(lambda col: col.str.contains(kw, case=False, na=False)).any(axis=1)
-            mask = mask | sym_mask
 
     return df[mask]
 
@@ -311,14 +341,11 @@ if uploaded_file:
         # NEW 🔎 Keyword Mention Filter (below Delighters/Detractors)
         # ---------------------------------------
         st.sidebar.subheader("🔎 Keyword Mention Filter")
-        kw_col1, kw_col2 = st.sidebar.columns([3, 2])
-        with kw_col1:
-            keyword = st.text_input("Keyword to search (in review text)", value="", help="Case-insensitive contains match in the Review text. Cleaned for â€™ → '.")
-        with kw_col2:
-            include_symptoms = st.checkbox("Also symptoms", value=False, help="Include Symptom columns in the keyword search.")
-
+        keyword = st.sidebar.text_input(
+            "Keyword to search (in review text)", value="", help="Case-insensitive contains match in the Review text. Cleaned for â€™ → '."
+        )
         if keyword:
-            filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword, include_symptoms=include_symptoms)
+            filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword)
 
         # ---------------------------------------
         # Dynamic Additional Filters (post Symptom 20 by index)
@@ -425,6 +452,25 @@ if uploaded_file:
             country_overall = country_overall.merge(overall_new_review_stats, on="Country", how="left")
             country_overall["Source"] = "Overall"
 
+            def color_numeric(val):
+                if pd.isna(val):
+                    return ""
+                try:
+                    v = float(val)
+                except Exception:
+                    return ""
+                if v >= 4.5:
+                    return "color: green;"
+                elif v < 4.5:
+                    return "color: red;"
+                return ""
+
+            def formatter_rating(v):
+                return "-" if pd.isna(v) else f"{v:.1f}"
+
+            def formatter_count(v):
+                return "-" if pd.isna(v) else f"{int(v):,}"
+
             for country in country_overall["Country"].unique():
                 st.markdown(f"#### {country}")
 
@@ -444,33 +490,29 @@ if uploaded_file:
                     "New_Review_Count": "New Review Count"
                 }, inplace=True)
 
-                def color_avg_rating(value):
-                    if isinstance(value, float):
-                        if value >= 4.5:
-                            return f"<span style='color:green;'>{value:.1f}</span>"
-                        return f"<span style='color:red;'>{value:.1f}</span>"
-                    return value
-
-                combined_country_data["Avg Rating"] = combined_country_data["Avg Rating"].apply(color_avg_rating)
-                combined_country_data["New Review Average"] = combined_country_data["New Review Average"].apply(color_avg_rating)
-
-                def format_table(row):
+                def bold_overall(row):
                     if row.name == len(combined_country_data) - 1:
-                        return ["font-weight: bold" for _ in row]
+                        return ["font-weight: bold;" for _ in row]
                     return ["" for _ in row]
 
-                formatted_table = (
+                styled = (
                     combined_country_data.style
                     .format({
-                        "Avg Rating": "{}",
-                        "Review Count": "{:,}",
-                        "New Review Average": "{}",
-                        "New Review Count": "{:,}"
+                        "Avg Rating": formatter_rating,
+                        "Review Count": formatter_count,
+                        "New Review Average": formatter_rating,
+                        "New Review Count": formatter_count,
                     })
-                    .apply(format_table, axis=1)
+                    .applymap(color_numeric, subset=["Avg Rating", "New Review Average"])  # color only numbers
+                    .apply(bold_overall, axis=1)
+                    .set_properties(**{"text-align": "center"})
+                    .set_table_styles([
+                        {"selector": "th", "props": [("text-align", "center")]},
+                        {"selector": "td", "props": [("text-align", "center")]},
+                    ])
                 )
 
-                st.markdown(formatted_table.to_html(escape=False, index=False), unsafe_allow_html=True)
+                st.markdown(styled.to_html(escape=False, index=False), unsafe_allow_html=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
 
@@ -616,7 +658,7 @@ if uploaded_file:
         st.markdown("---")
 
         # ---------------------------------------
-        # Reviews (with optional translation) + NEW Download All (filtered)
+        # Reviews (with optional translation) + Download All (filtered)
         # ---------------------------------------
         translator = Translator()
         st.markdown("### 📝 All Reviews")
@@ -654,11 +696,7 @@ if uploaded_file:
                 review_text = "" if pd.isna(review_text) else clean_text(review_text)
 
                 if translate_to_english:
-                    try:
-                        translated_review = translator.translate(review_text, dest="en").text
-                    except Exception as e:
-                        st.error(f"Error translating review: {e}")
-                        translated_review = review_text
+                    translated_review = safe_translate(translator, review_text)
                 else:
                     translated_review = review_text
 
@@ -682,7 +720,7 @@ if uploaded_file:
 
                 st.markdown(
                     f"""
-                    <div style="border: 1px solid #ddd; padding: 15px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;">
+                    <div style=\"border: 1px solid #ddd; padding: 15px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;\">
                         <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
                         <p><strong>Country:</strong> {row.get('Country', '')}</p>
                         <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
