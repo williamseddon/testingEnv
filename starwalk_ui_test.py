@@ -1,3 +1,5 @@
+# starwalk_ui.py
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -20,7 +22,7 @@ warnings.filterwarnings(
     module="openpyxl",
 )
 
-# Optional: high-quality text fixer
+# Optional: high-quality text fixer (safe if not installed)
 try:
     from ftfy import fix_text as _ftfy_fix
     _HAS_FTFY = True
@@ -28,7 +30,7 @@ except Exception:
     _HAS_FTFY = False
     _ftfy_fix = None
 
-# OpenAI SDK (optional but recommended)
+# Try importing OpenAI SDK; app still runs without it
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
@@ -315,10 +317,29 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
+        # 🤖 LLM settings (model + temperature)
+        with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
+            # Label → model-id pairs (ordered)
+            _model_choices = [
+                ("Fast & economical – 4o-mini", "gpt-4o-mini"),
+                ("Balanced – 4o", "gpt-4o"),
+                ("Advanced – 4.1", "gpt-4.1"),
+                ("Most advanced – GPT-5", "gpt-5"),
+                ("GPT-5 (Chat latest)", "gpt-5-chat-latest"),
+            ]
+            _default_model = st.session_state.get("llm_model", "gpt-4o-mini")
+            _default_idx = next((i for i, (_, mid) in enumerate(_model_choices) if mid == _default_model), 0)
+            _label = st.selectbox("Model", options=[l for (l, _) in _model_choices], index=_default_idx,
+                                  key="llm_model_label")
+            st.session_state["llm_model"] = dict(_model_choices)[_label]
+            st.session_state["llm_temp"] = st.slider(
+                "Creativity (temperature)", 0.0, 1.0, st.session_state.get("llm_temp", 0.2), 0.1
+            )
+
         # Clear All at bottom
         st.sidebar.markdown("---")
         if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
-            for k in ["tf","sr","kw","delight","detract","rpp","review_page"] + \
+            for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] + \
                      [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
                 if k in st.session_state: del st.session_state[k]
             st.rerun()
@@ -438,8 +459,6 @@ if uploaded_file:
         st.markdown("### 🩺 Symptom Tables")
         detractors_results = analyze_delighters_detractors(filtered_verbatims, existing_detractor_columns)
         delighters_results = analyze_delighters_detractors(filtered_verbatims, existing_delighter_columns)
-
-        # keep list concise by default
         detractors_results = detractors_results.head(20)
         delighters_results = delighters_results.head(20)
 
@@ -570,7 +589,7 @@ if uploaded_file:
         st.markdown("### 🤖 Ask your data")
         api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
-        # flag used to trigger scroll only after a fresh response
+        # flag to trigger scroll only after a fresh response
         st.session_state.setdefault("ask_scroll_pending", False)
 
         if not _HAS_OPENAI:
@@ -579,6 +598,7 @@ if uploaded_file:
             st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
         else:
             client = OpenAI(api_key=api_key)
+
             if "qa_messages" not in st.session_state:
                 st.session_state.qa_messages = [
                     {"role": "system", "content":
@@ -643,6 +663,7 @@ if uploaded_file:
                     with st.chat_message(m["role"]):
                         st.markdown(m["content"])
 
+            # Friendly placeholder
             user_q = st.chat_input("Hey! Ask me anything about these filtered reviews 🙂")
             if user_q:
                 st.session_state.qa_messages.append({"role": "user", "content": user_q})
@@ -653,10 +674,14 @@ if uploaded_file:
                            "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. "
                            "If unknown from context+tools, say you don't know.")
 
+                # Use selected model + temperature from sidebar
+                selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
+                llm_temp = float(st.session_state.get("llm_temp", 0.2))
+
                 try:
                     first = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        temperature=0.2,
+                        model=selected_model,
+                        temperature=llm_temp,
                         messages=[*st.session_state.qa_messages, {"role":"system","content": sys_ctx}],
                         tools=tools,
                     )
@@ -672,8 +697,8 @@ if uploaded_file:
                             tool_msgs.append({"tool_call_id": call.id, "role":"tool",
                                               "name": name, "content": json.dumps(out)})
                         follow = client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            temperature=0.2,
+                            model=selected_model,
+                            temperature=llm_temp,
                             messages=[
                                 *st.session_state.qa_messages,
                                 {"role":"system","content": sys_ctx},
@@ -764,3 +789,4 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
+
