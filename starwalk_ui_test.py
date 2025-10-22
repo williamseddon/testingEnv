@@ -15,6 +15,7 @@ import html
 import os
 import warnings
 import json
+import urllib.parse
 from streamlit.components.v1 import html as st_html  # for the hero canvas
 
 # ---------------------------
@@ -51,7 +52,6 @@ except Exception:
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}  # add more if needed
 
 def model_supports_temperature(model_id: str) -> bool:
-    # conservative: block temperature for GPT-5 family by default
     return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
 
 # ---------------------------
@@ -65,7 +65,7 @@ st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 st.markdown(
     """
     <style>
-      :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
+      :root { scroll-padding-top: 96px; }
       .block-container { padding-top: 1rem; padding-bottom: 1rem; }
       section[data-testid="stSidebar"] .block-container { padding-top: .25rem; padding-bottom: .6rem; }
       section[data-testid="stSidebar"] label { font-size: .95rem; }
@@ -86,7 +86,7 @@ st.markdown(
         border-radius: 14px;
         background: radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%);
         border: 1px solid #eee;
-        height: 150px;            /* shorter */
+        height: 150px;
         margin-top: .25rem;
         margin-bottom: 1rem;
       }
@@ -96,55 +96,51 @@ st.markdown(
         align-content: center; justify-items: center;
         text-align: center; pointer-events: none;
       }
-      .hero-title-row {
-        display:flex; align-items:center; gap:14px;
-      }
-      .hero-title {
-        font-size: clamp(24px, 4vw, 44px);
-        font-weight: 800; letter-spacing:.4px; margin:0;
-      }
-      .hero-sub { margin: 4px 0 0 0; color:#667085; font-size: clamp(12px, 1.1vw, 16px); }
+      .hero-title-row { display:flex; align-items:center; gap:12px; }
+      .hero-title { font-size: clamp(24px, 4vw, 44px); font-weight: 800; letter-spacing:.3px; margin:0; }
+      .hero-sub { margin: 6px 0 0 0; color:#667085; font-size: clamp(12px, 1.1vw, 16px); }
       #hero-canvas { position:absolute; inset:0; width:100%; height:100%; }
-      .sn-logo { width: 148px; height:auto; }
+      .sn-logo-img { height: 26px; width: auto; display:block; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------
-# Minimalist hero with starfield + SharkNinja SVG
+# Minimalist hero with starfield + SharkNinja data-URI SVG
 # ---------------------------
-def render_hero():
-    sharkninja_svg = """
-    <svg class="sn-logo" viewBox="0 0 520 90" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="SharkNinja">
+def _sn_logo_data_uri() -> str:
+    svg = '''
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 90">
       <g fill="#111">
         <text x="0" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="800" font-size="52">Shark</text>
         <rect x="225" y="12" width="4" height="66" rx="2" fill="#222"/>
         <text x="245" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="900" font-size="52">NINJA</text>
       </g>
     </svg>
-    """.strip()
+    '''.strip()
+    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
 
+def render_hero():
+    sn_uri = _sn_logo_data_uri()
     st_html(
         f"""
         <div class="hero-wrap" id="top-hero">
           <canvas id="hero-canvas"></canvas>
           <div class="hero-inner">
             <div class="hero-title-row">
-              {sharkninja_svg}
+              <img src="{sn_uri}" alt="SharkNinja" class="sn-logo-img"/>
               <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
             </div>
             <p class="hero-sub">Insights, trends, and ratings — fast.</p>
           </div>
         </div>
-
         <script>
         (function() {{
           const c = document.getElementById('hero-canvas');
           const ctx = c.getContext('2d', {{alpha:true}});
           const DPR = window.devicePixelRatio || 1;
           let w=0,h=0;
-
           function resize(){{
             const r = c.getBoundingClientRect();
             w = Math.max(300, r.width|0);
@@ -154,13 +150,9 @@ def render_hero():
           }}
           window.addEventListener('resize', resize, {{passive:true}});
           resize();
-
-          const N = Math.max(120, Math.floor(w/12)); // more stars across width
+          const N = Math.max(120, Math.floor(w/12));
           const stars = Array.from({{length:N}}, () => ({{
-            x: Math.random()*w,
-            y: Math.random()*h,
-            r: 0.6 + Math.random()*1.4,
-            s: 0.3 + Math.random()*0.9
+            x: Math.random()*w, y: Math.random()*h, r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
           }}));
           let mx=.5, my=.5;
           c.addEventListener('pointermove', e => {{
@@ -173,11 +165,9 @@ def render_hero():
             for(const s of stars){{
               const px = s.x + (mx-0.5)*16*s.s;
               const py = s.y + (my-0.5)*10*s.s;
-              ctx.beginPath();
-              ctx.arc((px%w+w)%w, (py%h+h)%h, s.r, 0, Math.PI*2);
-              ctx.fillStyle = 'rgba(255,200,50,.9)';
-              ctx.fill();
-              s.x = (s.x + 0.12*s.s) % w;   // subtle horizontal drift
+              ctx.beginPath(); ctx.arc((px%w+w)%w, (py%h+h)%h, s.r, 0, Math.PI*2);
+              ctx.fillStyle = 'rgba(255,200,50,.9)'; ctx.fill();
+              s.x = (s.x + 0.12*s.s) % w;
             }}
             requestAnimationFrame(tick);
           }}
@@ -185,7 +175,7 @@ def render_hero():
         }})();
         </script>
         """,
-        height=160,   # shorter visual band
+        height=160,
     )
 
 render_hero()
@@ -450,6 +440,12 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
+        # Toggle to open the chat panel (prevents auto-scroll on first load)
+        st.sidebar.markdown("---")
+        if st.sidebar.button("💬 Ask me anything"):
+            st.session_state["show_ask"] = True
+            st.session_state["ask_scroll_pending"] = True
+
         # LLM settings
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _model_choices = [
@@ -480,7 +476,8 @@ if uploaded_file:
 
         st.sidebar.markdown("---")
         if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
-            for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] + \
+            for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label",
+                      "llm_temp","show_ask","ask_scroll_pending"] + \
                      [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
                 if k in st.session_state: del st.session_state[k]
             st.rerun()
@@ -721,7 +718,8 @@ if uploaded_file:
             showing_from = 0 if total_reviews_count == 0 else start_index + 1
             showing_to = min(end_index, total_reviews_count)
             st.markdown(
-                f"<div style='text-align:center;font-weight:bold;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
+                f"<div style='text-align:center;font-weight:bold;'>Page {current_page + 1} of {total_pages} • "
+                f"Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
                 unsafe_allow_html=True,
             )
         with c4:
@@ -734,158 +732,164 @@ if uploaded_file:
         st.markdown("---")
 
         # ---------------------------
-        # 🤖 Ask your data (chat)
+        # 🤖 Ask your data (chat) – only render when requested
         # ---------------------------
-        st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
-        st.markdown("### 🤖 Ask your data")
-        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+        if st.session_state.get("show_ask"):
+            st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
+            st.markdown("### 🤖 Ask your data")
+            api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
-        st.session_state.setdefault("ask_scroll_pending", False)
+            st.session_state.setdefault("ask_scroll_pending", False)
 
-        if not _HAS_OPENAI:
-            st.info("To enable this panel, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
-        elif not api_key:
-            st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
-        else:
-            client = OpenAI(api_key=api_key)
+            if not _HAS_OPENAI:
+                st.info("To enable this panel, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
+            elif not api_key:
+                st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
+            else:
+                client = OpenAI(api_key=api_key)
 
-            if "qa_messages" not in st.session_state:
-                st.session_state.qa_messages = [
-                    {"role": "system", "content":
-                        "You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. "
-                        "Call tools when you need exact counts/means. If unknown, say you don't know."}
+                if "qa_messages" not in st.session_state:
+                    st.session_state.qa_messages = [
+                        {"role": "system", "content":
+                            "You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. "
+                            "Call tools when you need exact counts/means. If unknown, say you don't know."}
+                    ]
+
+                def context_blob(df: pd.DataFrame, n=25) -> str:
+                    if df.empty: return "No rows after filters."
+                    parts = [f"ROW_COUNT={len(df)}"]
+                    if "Star Rating" in df:
+                        parts.append(f"STAR_COUNTS={df['Star Rating'].value_counts().sort_index().to_dict()}")
+                    cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"] if c in df.columns]
+                    smp = df[cols_keep].sample(min(n, len(df)), random_state=7)
+                    for _, r in smp.iterrows():
+                        try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
+                        except Exception: date_str = str(r.get("Review Date","")) or ""
+                        parts.append(str({
+                            "date": date_str,
+                            "country": str(r.get("Country","")),
+                            "source": str(r.get("Source","")),
+                            "model": str(r.get("Model (SKU)","")),
+                            "stars": str(r.get("Star Rating","")),
+                            "text": clean_text(str(r.get("Verbatim","")))
+                        }))
+                    return "\n".join(parts)
+
+                def pandas_count(query: str) -> dict:
+                    try:
+                        if ";" in query or "__" in query: return {"error": "disallowed pattern"}
+                        res = filtered_verbatims.query(query, engine="python")
+                        return {"count": int(len(res))}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                def pandas_mean(column: str, query: str | None = None) -> dict:
+                    try:
+                        if column not in filtered_verbatims.columns:
+                            return {"error": f"Unknown column {column}"}
+                        df = filtered_verbatims
+                        if query: df = df.query(query, engine="python")
+                        return {"mean": float(df[column].mean())}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                tools = [
+                    {"type":"function","function":{
+                        "name":"pandas_count",
+                        "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
+                        "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+                    }},
+                    {"type":"function","function":{
+                        "name":"pandas_mean",
+                        "description":"Compute mean of a numeric column (optionally with a pandas query).",
+                        "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
+                    }},
                 ]
 
-            def context_blob(df: pd.DataFrame, n=25) -> str:
-                if df.empty: return "No rows after filters."
-                parts = [f"ROW_COUNT={len(df)}"]
-                if "Star Rating" in df:
-                    parts.append(f"STAR_COUNTS={df['Star Rating'].value_counts().sort_index().to_dict()}")
-                cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"] if c in df.columns]
-                smp = df[cols_keep].sample(min(n, len(df)), random_state=7)
-                for _, r in smp.iterrows():
-                    try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
-                    except Exception: date_str = str(r.get("Review Date","")) or ""
-                    parts.append(str({
-                        "date": date_str,
-                        "country": str(r.get("Country","")),
-                        "source": str(r.get("Source","")),
-                        "model": str(r.get("Model (SKU)","")),
-                        "stars": str(r.get("Star Rating","")),
-                        "text": clean_text(str(r.get("Verbatim","")))
-                    }))
-                return "\n".join(parts)
+                # render history
+                for m in st.session_state.qa_messages:
+                    if m["role"] != "system":
+                        with st.chat_message(m["role"]):
+                            st.markdown(m["content"])
 
-            def pandas_count(query: str) -> dict:
-                try:
-                    if ";" in query or "__" in query: return {"error": "disallowed pattern"}
-                    res = filtered_verbatims.query(query, engine="python")
-                    return {"count": int(len(res))}
-                except Exception as e:
-                    return {"error": str(e)}
+                user_q = st.chat_input("Hey! Ask me anything about these filtered reviews 🙂")
+                if user_q:
+                    st.session_state.qa_messages.append({"role": "user", "content": user_q})
+                    with st.chat_message("user"):
+                        st.markdown(user_q)
 
-            def pandas_mean(column: str, query: str | None = None) -> dict:
-                try:
-                    if column not in filtered_verbatims.columns:
-                        return {"error": f"Unknown column {column}"}
-                    df = filtered_verbatims
-                    if query: df = df.query(query, engine="python")
-                    return {"mean": float(df[column].mean())}
-                except Exception as e:
-                    return {"error": str(e)}
+                    sys_ctx = ("CONTEXT:\n" + context_blob(filtered_verbatims) +
+                               "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. "
+                               "If unknown from context+tools, say you don't know.")
 
-            tools = [
-                {"type":"function","function":{
-                    "name":"pandas_count",
-                    "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
-                    "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
-                }},
-                {"type":"function","function":{
-                    "name":"pandas_mean",
-                    "description":"Compute mean of a numeric column (optionally with a pandas query).",
-                    "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
-                }},
-            ]
+                    selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
+                    llm_temp = float(st.session_state.get("llm_temp", 0.2))
 
-            # render history
-            for m in st.session_state.qa_messages:
-                if m["role"] != "system":
-                    with st.chat_message(m["role"]):
-                        st.markdown(m["content"])
-
-            user_q = st.chat_input("Hey! Ask me anything about these filtered reviews 🙂")
-            if user_q:
-                st.session_state.qa_messages.append({"role": "user", "content": user_q})
-                with st.chat_message("user"):
-                    st.markdown(user_q)
-
-                sys_ctx = ("CONTEXT:\n" + context_blob(filtered_verbatims) +
-                           "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. "
-                           "If unknown from context+tools, say you don't know.")
-
-                selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
-                llm_temp = float(st.session_state.get("llm_temp", 0.2))
-
-                # First call (with temperature only if supported)
-                first_kwargs = {
-                    "model": selected_model,
-                    "messages": [*st.session_state.qa_messages, {"role": "system", "content": sys_ctx}],
-                    "tools": tools,
-                }
-                if model_supports_temperature(selected_model):
-                    first_kwargs["temperature"] = llm_temp
-
-                try:
-                    first = client.chat.completions.create(**first_kwargs)
-                except Exception as e:
-                    if "temperature" in str(e).lower() and ("unsupported" in str(e).lower() or "does not support" in str(e).lower()):
-                        first_kwargs.pop("temperature", None)
-                        first = client.chat.completions.create(**first_kwargs)
-                    else:
-                        raise
-
-                msg = first.choices[0].message
-                if msg.tool_calls:
-                    tool_msgs = []
-                    for call in msg.tool_calls:
-                        name = call.function.name
-                        args = json.loads(call.function.arguments or "{}")
-                        out = {"error":"unknown tool"}
-                        if name == "pandas_count": out = pandas_count(args.get("query",""))
-                        if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                        tool_msgs.append({"tool_call_id": call.id, "role":"tool",
-                                          "name": name, "content": json.dumps(out)})
-
-                    follow_kwargs = {
+                    first_kwargs = {
                         "model": selected_model,
-                        "messages": [
-                            *st.session_state.qa_messages,
-                            {"role":"system","content": sys_ctx},
-                            {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                            *tool_msgs
-                        ],
+                        "messages": [*st.session_state.qa_messages, {"role": "system", "content": sys_ctx}],
+                        "tools": tools,
                     }
                     if model_supports_temperature(selected_model):
-                        follow_kwargs["temperature"] = llm_temp
+                        first_kwargs["temperature"] = llm_temp
 
                     try:
-                        follow = client.chat.completions.create(**follow_kwargs)
+                        first = client.chat.completions.create(**first_kwargs)
                     except Exception as e:
                         if "temperature" in str(e).lower() and ("unsupported" in str(e).lower() or "does not support" in str(e).lower()):
-                            follow_kwargs.pop("temperature", None)
-                            follow = client.chat.completions.create(**follow_kwargs)
+                            first_kwargs.pop("temperature", None)
+                            first = client.chat.completions.create(**first_kwargs)
                         else:
                             raise
 
-                    final_text = follow.choices[0].message.content
-                else:
-                    final_text = msg.content
+                    msg = first.choices[0].message
+                    if msg.tool_calls:
+                        tool_msgs = []
+                        for call in msg.tool_calls:
+                            name = call.function.name
+                            args = json.loads(call.function.arguments or "{}")
+                            out = {"error":"unknown tool"}
+                            if name == "pandas_count": out = pandas_count(args.get("query",""))
+                            if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                            tool_msgs.append({"tool_call_id": call.id, "role":"tool",
+                                              "name": name, "content": json.dumps(out)})
 
-                st.session_state.qa_messages.append({"role":"assistant","content": final_text})
-                with st.chat_message("assistant"):
-                    st.markdown(final_text)
-                    st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
-                st.session_state["ask_scroll_pending"] = True
+                        follow_kwargs = {
+                            "model": selected_model,
+                            "messages": [
+                                *st.session_state.qa_messages,
+                                {"role":"system","content": sys_ctx},
+                                {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                                *tool_msgs
+                            ],
+                        }
+                        if model_supports_temperature(selected_model):
+                            follow_kwargs["temperature"] = llm_temp
+
+                        try:
+                            follow = client.chat.completions.create(**follow_kwargs)
+                        except Exception as e:
+                            if "temperature" in str(e).lower() and ("unsupported" in str(e).lower() or "does not support" in str(e).lower()):
+                                follow_kwargs.pop("temperature", None)
+                                follow = client.chat.completions.create(**follow_kwargs)
+                            else:
+                                raise
+
+                        final_text = follow.choices[0].message.content
+                    else:
+                        final_text = msg.content
+
+                    st.session_state.qa_messages.append({"role":"assistant","content": final_text})
+                    with st.chat_message("assistant"):
+                        st.markdown(final_text)
+                        st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
+                    st.session_state["ask_scroll_pending"] = True
+
+            # “Close” control for the chat panel
+            if st.button("Close Ask panel"):
+                st.session_state["show_ask"] = False
+                st.session_state["ask_scroll_pending"] = False
+                st.rerun()
 
         st.markdown("---")
 
@@ -939,15 +943,13 @@ if uploaded_file:
         # ---------------------------
         if st.session_state.get("force_scroll_top_once"):
             st.session_state["force_scroll_top_once"] = False
-            st.markdown(
-                "<script>window.scrollTo({top:0,behavior:'auto'});</script>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
 
         if st.session_state.get("ask_scroll_pending"):
             st.session_state["ask_scroll_pending"] = False
             st.markdown(
-                "<script>const last=document.getElementById('askdata-last');if(last){last.scrollIntoView({behavior:'smooth',block:'start'});}</script>",
+                "<script>const last=document.getElementById('askdata-last');"
+                "if(last){last.scrollIntoView({behavior:'smooth',block:'start'});}</script>",
                 unsafe_allow_html=True,
             )
 
@@ -956,5 +958,6 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
+
 
 
