@@ -508,8 +508,8 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
 
     # Keep only 'Go to Ask AI' here
     if st.button("Go to Ask AI"):
-    st.session_state["force_scroll_anchor"] = "askdata-anchor"
-    st.rerun()
+        st.session_state["force_scroll_anchor"] = "askdata-anchor"
+        st.rerun()
 
 # Move 'Go to Feedback' OUTSIDE the expander, right below it
 if st.sidebar.button("Submit Feedback", key="go_feedback_below_expander"):
@@ -861,12 +861,12 @@ else:
 
     # Input row
     with st.form("ask_ai_form", clear_on_submit=False):
-    q = st.text_area("Ask a question", value=st.session_state.get("ask_ai_text", ""), height=80,
-                     help="Questions about the CURRENT filtered reviews and the tables above.")
-    send = st.form_submit_button("Send")
-if send and q.strip():
-    st.session_state["ask_ai_text"] = q
-    st.session_state["qa_messages"].append(("user", q))
+        q = st.text_area("Ask a question", value=st.session_state.get("ask_ai_text", ""), height=80,
+                         help="Questions about the CURRENT filtered reviews and the tables above.")
+        send = st.form_submit_button("Send")
+    if send and q.strip():
+        st.session_state["ask_ai_text"] = q
+        st.session_state["qa_messages"].append(("user", q))
 
         # Retrieve top matching verbatims for richer answers
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
@@ -971,43 +971,43 @@ def country_overview(country: str | None = None):
         return {"error": str(e)}
 
 
-tools = [
-    {"type":"function","function":{
-        "name":"get_metrics_snapshot",
-        "description":"Return page metrics currently shown: total reviews, avg star, low-star %, and star counts.",
-        "parameters":{"type":"object","properties":{}}
-    }},
-    {"type":"function","function":{
-        "name":"get_top_items",
-        "description":"Return top detractors or delighters with Avg Star and Mentions.",
-        "parameters":{"type":"object","properties":{"kind":{"type":"string"},"top_n":{"type":"integer"}}}
-    }},
-    {"type":"function","function":{
-        "name":"country_overview",
-        "description":"Overview by country for Average_Rating and Review_Count. Optional filter by a specific country.",
-        "parameters":{"type":"object","properties":{"country":{"type":"string"}}}
-    }},
-{"type":"function","function":{
-                "name":"pandas_count",
-                "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
-                "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+        tools = [
+            {"type":"function","function":{
+                "name":"get_metrics_snapshot",
+                "description":"Return page metrics currently shown: total reviews, avg star, low-star %, and star counts.",
+                "parameters":{"type":"object","properties":{}}
             }},
             {"type":"function","function":{
-                "name":"pandas_mean",
-                "description":"Compute mean of a numeric column (optionally with a pandas query).",
-                "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
+                "name":"get_top_items",
+                "description":"Return top detractors or delighters with Avg Star and Mentions.",
+                "parameters":{"type":"object","properties":{"kind":{"type":"string"},"top_n":{"type":"integer"}}}
             }},
             {"type":"function","function":{
-                "name":"symptom_stats",
-                "description":"Get mentions count and average star rating for a symptom across detractor/delighter columns.",
-                "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}
+                "name":"country_overview",
+                "description":"Overview by country for Average_Rating and Review_Count. Optional filter by a specific country.",
+                "parameters":{"type":"object","properties":{"country":{"type":"string"}}}
             }},
-            {"type":"function","function":{
-                "name":"keyword_stats",
-                "description":"Count and percentage of reviews whose Verbatim contains a term (case-insensitive).",
-                "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}
-            }},
-        ]
+        {"type":"function","function":{
+                        "name":"pandas_count",
+                        "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
+                        "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+                    }},
+                    {"type":"function","function":{
+                        "name":"pandas_mean",
+                        "description":"Compute mean of a numeric column (optionally with a pandas query).",
+                        "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
+                    }},
+                    {"type":"function","function":{
+                        "name":"symptom_stats",
+                        "description":"Get mentions count and average star rating for a symptom across detractor/delighter columns.",
+                        "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}
+                    }},
+                    {"type":"function","function":{
+                        "name":"keyword_stats",
+                        "description":"Count and percentage of reviews whose Verbatim contains a term (case-insensitive).",
+                        "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}
+                    }},
+                ]
 
         sys_ctx = (
             "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
