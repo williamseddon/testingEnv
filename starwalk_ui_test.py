@@ -847,7 +847,7 @@ if uploaded_file:
         # ---------------------------
         if st.session_state.get("show_ask"):
             st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
-            st.markdown("### 🤖 Ask your data")
+            st.markdown("### 🤖 Ask your data (Coming Soon!)")
             api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
             st.session_state.setdefault("ask_scroll_pending", False)
