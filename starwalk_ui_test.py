@@ -15,12 +15,30 @@ import html
 # ---------------------------------------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
+# Global CSS polish (compact paddings, pretty <mark>, subtle rounding)
+st.markdown("""
+<style>
+/* tighter top/bottom padding */
+.block-container { padding-top: 0.75rem; padding-bottom: 1rem; }
+/* nice highlight chip */
+mark { background: #fff2a8; padding: 0 .2em; border-radius: 3px; }
+/* sidebar spacing */
+section[data-testid="stSidebar"] .block-container { padding-top: 0.5rem; }
+/* nicer expander */
+div.streamlit-expanderHeader { font-weight: 600; }
+/* cards */
+.review-card { border:1px solid #e6e6e6; background:#fafafa; border-radius:10px; padding:16px; }
+/* make headers a touch bolder */
+h3, h4 { letter-spacing:.2px }
+</style>
+""", unsafe_allow_html=True)
+
 # Dashboard Title
 st.markdown(
     """
-    <h1 style="text-align: center;">🌟 Star Walk Analysis Dashboard</h1>
-    <p style="text-align: center; font-size: 16px;">
-        Dive into insightful metrics, trends, and ratings to make data-driven decisions.
+    <h1 style="text-align: center; margin-bottom:.25rem;">🌟 Star Walk Analysis Dashboard</h1>
+    <p style="text-align: center; font-size: 16px; color:#666; margin-top:0;">
+        Insights, trends, and ratings — fast.
     </p>
     """,
     unsafe_allow_html=True,
@@ -29,7 +47,6 @@ st.markdown(
 # ---------------------------------------
 # Utilities
 # ---------------------------------------
-
 def style_rating_cells(value):
     """Styles cells: Green for ratings 4.5 and above, red for below 4.5."""
     if isinstance(value, (float, int)):
@@ -39,35 +56,26 @@ def style_rating_cells(value):
             return "color: red;"
     return ""
 
-
-def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str):
+def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str, key: str | None = None):
     options = ["ALL"]
     if column_name in dataframe.columns:
-        # Convert to string dtype for clean filtering; keep NA as NA
         col = dataframe[column_name].astype("string")
         options += sorted([x for x in col.dropna().unique().tolist() if str(x).strip() != ""])
     selected_filter = st.sidebar.multiselect(
         f"Select {filter_name}",
         options=options,
-        default=["ALL"]
+        default=["ALL"],
+        key=key
     )
     if "ALL" not in selected_filter and column_name in dataframe.columns:
         return dataframe[dataframe[column_name].astype("string").isin(selected_filter)], selected_filter
     return dataframe, ["ALL"]
 
-
 def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
-    """Collect a unique, ordered list of non-empty symptom strings from provided columns that exist."""
-    vals = []
-    seen = set()
+    vals, seen = [], set()
     for c in cols:
         if c in df.columns:
-            s = (
-                df[c]
-                .astype("string")
-                .str.strip()
-                .dropna()
-            )
+            s = df[c].astype("string").str.strip().dropna()
             for v in pd.unique(s.to_numpy()):
                 item = str(v).strip()
                 if item and item not in seen:
@@ -75,9 +83,7 @@ def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
                     vals.append(item)
     return vals
 
-
 def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
-    """Analyze delighter/detractor symptoms and calculate metrics, robust to empty/missing columns."""
     cols = [c for c in symptom_columns if c in filtered_df.columns]
     if not cols:
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
@@ -118,9 +124,7 @@ def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: li
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
     return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
 
-
 def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
-    """Flatten text from given columns into a single string for wordcloud generation."""
     cols = [c for c in cols if c in df.columns]
     if not cols:
         return ""
@@ -134,28 +138,23 @@ def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
     s = s[s != ""]
     return " ".join(s.tolist())
 
-
 def clean_text(x: str) -> str:
     """Fix common mojibake like â€™ and trim whitespace."""
     if x is None:
         return ""
-    x = str(x)
-    x = x.replace("â€™", "'")
-    return x.strip()
-
+    x = str(x).replace("â€™", "'").strip()
+    return x
 
 def highlight_html(text: str, keyword: str | None) -> str:
-    """Escape text to safe HTML then wrap keyword matches with <mark> tags (case-insensitive)."""
+    """Escape to safe HTML then wrap keyword matches with <mark> (case-insensitive)."""
     safe = html.escape(text or "")
     if keyword:
         try:
             pattern = re.compile(re.escape(keyword), re.IGNORECASE)
             safe = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", safe)
         except re.error:
-            # If the user types an invalid regex-like string, just skip highlighting
             pass
     return safe
-
 
 # ---- Translation helpers (robust to coroutine return) ----
 async def _translate_async_call(translator: Translator, text: str) -> str:
@@ -167,52 +166,35 @@ async def _translate_async_call(translator: Translator, text: str) -> str:
     except Exception:
         return text
 
-
 def safe_translate(translator: Translator, text: str) -> str:
-    """Synchronous wrapper that handles both sync and coroutine returns from translator.translate()."""
     try:
         res = translator.translate(text, dest="en")
-        # Typical (sync) path
         if hasattr(res, "text"):
             return res.text
-        # If coroutine, run it
         if asyncio.iscoroutine(res):
             try:
                 return asyncio.run(_translate_async_call(translator, text))
             except RuntimeError:
-                # If an event loop is already running, create a new one in a new policy
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
                     return loop.run_until_complete(_translate_async_call(translator, text))
                 finally:
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
+                    loop.close()
     except Exception:
         pass
     return text
 
-
 def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
-    """Filter rows where the keyword appears in the Review text only (Verbatim)."""
-    if not keyword:
+    if not keyword or keyword.strip() == "":
         return df
-
     kw = keyword.strip()
-    if kw == "":
-        return df
-
     verb_col = "Verbatim" if "Verbatim" in df.columns else None
     mask = pd.Series([False] * len(df))
-
     if verb_col:
         verb = df[verb_col].astype("string").fillna("").map(clean_text)
         mask = verb.str.contains(kw, case=False, na=False)
-
     return df[mask]
-
 
 # ---------------------------------------
 # File Upload
@@ -222,156 +204,147 @@ uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 
 if uploaded_file:
     try:
-        st.markdown("---")  # Separator line
-
-        # Load Excel
+        st.markdown("---")
         verbatims = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
 
-        # Normalize known string columns (keep NA; uppercase; avoid creating literal 'nan')
-        string_columns = ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]
-        for col in string_columns:
+        # Normalize known string columns
+        for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
             if col in verbatims.columns:
                 verbatims[col] = verbatims[col].astype("string").str.upper()
 
-        # Coerce ONLY truly numeric columns
-        numeric_columns = ["Star Rating"]
-        for col in numeric_columns:
-            if col in verbatims.columns:
-                verbatims[col] = pd.to_numeric(verbatims[col], errors="coerce")
+        # Numerics
+        if "Star Rating" in verbatims.columns:
+            verbatims["Star Rating"] = pd.to_numeric(verbatims["Star Rating"], errors="coerce")
 
-        # Make ALL symptom columns string dtype so they behave consistently
+        # Symptom columns
         all_symptom_cols = [c for c in verbatims.columns if c.startswith("Symptom")]
         for c in all_symptom_cols:
             verbatims[c] = verbatims[c].astype("string")
 
-        # Clean review text for mojibake (â€™ -> ')
+        # Clean text + dates
         if "Verbatim" in verbatims.columns:
             verbatims["Verbatim"] = verbatims["Verbatim"].astype("string").map(clean_text)
-
-        # Date parsing
         if "Review Date" in verbatims.columns:
             verbatims["Review Date"] = pd.to_datetime(verbatims["Review Date"], errors="coerce")
 
-        # ---------------------------------------
-        # Sidebar Filters
-        # ---------------------------------------
+        # -------------- SIDEBAR (condensed) --------------
         st.sidebar.header("🔍 Filters")
+        # Global actions
+        if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
+            for k in [
+                "tf","sr","kw","delight","detract",
+                "f_Country","f_Source","f_Model (SKU)","f_Seeded","f_New Review"
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.session_state["review_page"] = 0
+            st.experimental_rerun()
 
-        timeframe = st.sidebar.selectbox(
-            "Select Timeframe",
-            options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"]
-        )
-        today = datetime.today()
+        with st.sidebar.expander("🗓️ Timeframe", expanded=True):
+            timeframe = st.selectbox(
+                "Select Timeframe",
+                options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
+                key="tf"
+            )
+            today = datetime.today()
+            start_date, end_date = None, None
+            if timeframe == "Custom Range":
+                start_date, end_date = st.date_input(
+                    label="Date Range",
+                    value=(datetime.today() - timedelta(days=30), datetime.today()),
+                    min_value=datetime(2000, 1, 1),
+                    max_value=datetime.today(),
+                    label_visibility="collapsed"
+                )
+            elif timeframe == "Last Week":
+                start_date, end_date = today - timedelta(days=7), today
+            elif timeframe == "Last Month":
+                start_date, end_date = today - timedelta(days=30), today
+            elif timeframe == "Last Year":
+                start_date, end_date = today - timedelta(days=365), today
 
-        start_date, end_date = None, None
-        if timeframe == "Custom Range":
-            st.sidebar.markdown("#### Select Date Range")
-            start_date, end_date = st.sidebar.date_input(
-                label="Date Range",
-                value=(datetime.today() - timedelta(days=30), datetime.today()),
-                min_value=datetime(2000, 1, 1),
-                max_value=datetime.today(),
-                label_visibility="collapsed"
+        with st.sidebar.expander("🌟 Star Rating", expanded=True):
+            selected_ratings = st.multiselect(
+                "Select Star Ratings",
+                options=["All"] + [1, 2, 3, 4, 5],
+                default=["All"],
+                key="sr"
             )
 
-        if timeframe == "Last Week":
-            start_date = today - timedelta(days=7)
-            end_date = today
-        elif timeframe == "Last Month":
-            start_date = today - timedelta(days=30)
-            end_date = today
-        elif timeframe == "Last Year":
-            start_date = today - timedelta(days=365)
-            end_date = today
-
-        if start_date and end_date and "Review Date" in verbatims.columns:
-            filtered_verbatims = verbatims[
-                (verbatims["Review Date"] >= pd.Timestamp(start_date)) &
-                (verbatims["Review Date"] <= pd.Timestamp(end_date))
-            ].copy()
-        else:
+        with st.sidebar.expander("🌍 Core Filters", expanded=True):
             filtered_verbatims = verbatims.copy()
+            if start_date and end_date and "Review Date" in filtered_verbatims.columns:
+                filtered_verbatims = filtered_verbatims[
+                    (filtered_verbatims["Review Date"] >= pd.Timestamp(start_date)) &
+                    (filtered_verbatims["Review Date"] <= pd.Timestamp(end_date))
+                ]
+            if "All" not in selected_ratings and "Star Rating" in filtered_verbatims.columns:
+                filtered_verbatims = filtered_verbatims[filtered_verbatims["Star Rating"].isin(selected_ratings)]
 
-        # Star Rating Filter
-        st.sidebar.markdown("### 🌟 Filter by Star Rating")
-        selected_ratings = st.sidebar.multiselect(
-            "Select Star Ratings",
-            options=["All"] + [1, 2, 3, 4, 5],
-            default=["All"]
-        )
-        if "All" not in selected_ratings and "Star Rating" in filtered_verbatims.columns:
-            filtered_verbatims = filtered_verbatims[filtered_verbatims["Star Rating"].isin(selected_ratings)]
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Country", "Country", key="f_Country")
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Source", "Source", key="f_Source")
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Model (SKU)", "Model (SKU)", key="f_Model (SKU)")
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Seeded", "Seeded", key="f_Seeded")
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "New Review", "New Review", key="f_New Review")
 
-        # Standard filters
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Country", "Country")
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Source", "Source")
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Model (SKU)", "Model (SKU)")
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, "Seeded", "Seeded")
-        filtered_verbatims, _ = apply_filter(filtered_verbatims, "New Review", "New Review")
-
-        # ---------------------------------------
-        # Define symptom columns
-        # ---------------------------------------
+        # Define symptom columns & unique lists
         detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
         delighter_columns = [f"Symptom {i}" for i in range(11, 21)]
-
-        expected_detractor_columns = detractor_columns
-        expected_delighter_columns = delighter_columns
-
-        existing_detractor_columns = [c for c in expected_detractor_columns if c in filtered_verbatims.columns]
-        existing_delighter_columns = [c for c in expected_delighter_columns if c in filtered_verbatims.columns]
-
-        # Build unique symptom lists for filter options
+        existing_detractor_columns = [c for c in detractor_columns if c in filtered_verbatims.columns]
+        existing_delighter_columns = [c for c in delighter_columns if c in filtered_verbatims.columns]
         detractor_symptoms = collect_unique_symptoms(filtered_verbatims, existing_detractor_columns)
         delighter_symptoms = collect_unique_symptoms(filtered_verbatims, existing_delighter_columns)
 
-        # ---------------------------------------
-        # Delighter/Detractor Filters
-        # ---------------------------------------
-        st.sidebar.header("😊 Delighters and 😠 Detractors Filters")
+        with st.sidebar.expander("😊 Delighters & 😠 Detractors", expanded=False):
+            selected_delighter = st.multiselect(
+                "Select Delighter Symptoms",
+                options=["All"] + sorted(delighter_symptoms),
+                default=["All"],
+                key="delight"
+            )
+            selected_detractor = st.multiselect(
+                "Select Detractor Symptoms",
+                options=["All"] + sorted(detractor_symptoms),
+                default=["All"],
+                key="detract"
+            )
 
-        selected_delighter = st.sidebar.multiselect(
-            "Select Delighter Symptoms",
-            options=["All"] + sorted(delighter_symptoms),
-            default=["All"]
-        )
-
-        selected_detractor = st.sidebar.multiselect(
-            "Select Detractor Symptoms",
-            options=["All"] + sorted(detractor_symptoms),
-            default=["All"]
-        )
-
-        # Apply Symptom Filters using EXISTING columns only
+        # Apply symptom filters
         if "All" not in selected_delighter and existing_delighter_columns:
             mask = filtered_verbatims[existing_delighter_columns].isin(selected_delighter).any(axis=1)
             filtered_verbatims = filtered_verbatims[mask]
-
         if "All" not in selected_detractor and existing_detractor_columns:
             mask = filtered_verbatims[existing_detractor_columns].isin(selected_detractor).any(axis=1)
             filtered_verbatims = filtered_verbatims[mask]
 
-        # ---------------------------------------
-        # NEW 🔎 Keyword Mention Filter (below Delighters/Detractors)
-        # ---------------------------------------
-        st.sidebar.subheader("🔎 Keyword Mention Filter")
-        keyword = st.sidebar.text_input(
-            "Keyword to search (in review text)", value="", help="Case-insensitive contains match in the Review text. Cleaned for â€™ → '."
-        )
-        if keyword:
-            filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword)
+        with st.sidebar.expander("🔎 Keyword", expanded=True):
+            keyword = st.text_input("Keyword to search (in review text)", value="", key="kw",
+                                    help="Case-insensitive match in review text. Cleaned for â€™ → ' .")
+            if keyword:
+                filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword)
 
-        # ---------------------------------------
-        # Dynamic Additional Filters (post Symptom 20 by index)
-        # ---------------------------------------
-        additional_columns = verbatims.columns[20:]  # columns after the 21st (0-based)
-        if len(additional_columns) > 0:
-            st.sidebar.header("📋 Additional Filters")
-            for column in additional_columns:
-                if column not in (expected_detractor_columns + expected_delighter_columns):
-                    filtered_verbatims, _ = apply_filter(filtered_verbatims, column, column)
-        else:
-            st.sidebar.info("No additional filters available.")
+        with st.sidebar.expander("📋 Additional Filters", expanded=False):
+            additional_columns = verbatims.columns[20:]
+            if len(additional_columns) > 0:
+                for column in additional_columns:
+                    if column not in (detractor_columns + delighter_columns):
+                        filtered_verbatims, _ = apply_filter(filtered_verbatims, column, column, key=f"f_{column}")
+            else:
+                st.info("No additional filters available.", icon="ℹ️")
+
+        with st.sidebar.expander("📄 Review List", expanded=True):
+            default_rpp = st.session_state.get("reviews_per_page", 10)
+            rpp_options = [10, 20, 50, 100]
+            rpp_index = rpp_options.index(default_rpp) if default_rpp in rpp_options else 0
+            reviews_per_page_select = st.selectbox(
+                "Reviews per page",
+                options=rpp_options,
+                index=rpp_index,
+                help="Defaults to 10. Change to show more reviews per page."
+            )
+            if reviews_per_page_select != default_rpp:
+                st.session_state["reviews_per_page"] = reviews_per_page_select
+                st.session_state["review_page"] = 0
 
         st.markdown("---")
 
@@ -389,17 +362,15 @@ if uploaded_file:
         )
 
         total_reviews = len(filtered_verbatims)
-        if total_reviews == 0:
-            st.warning("No data available for the selected filters.")
         avg_rating = filtered_verbatims["Star Rating"].mean() if total_reviews else 0.0
         star_counts = filtered_verbatims["Star Rating"].value_counts().sort_index()
         percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
         star_labels = [f"{int(star)} stars" for star in star_counts.index]
 
-        col1, col2 = st.columns(2)
-        with col1:
+        mc1, mc2 = st.columns(2)
+        with mc1:
             st.metric("Total Reviews", f"{total_reviews:,}")
-        with col2:
+        with mc2:
             st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
 
         fig_bar_horizontal = go.Figure(go.Bar(
@@ -411,17 +382,14 @@ if uploaded_file:
             marker=dict(color=["#FFA07A", "#FA8072", "#FFD700", "#ADFF2F", "#32CD32"]),
             hoverinfo="y+x+text"
         ))
-
         fig_bar_horizontal.update_layout(
             title="<b>Star Rating Distribution</b>",
-            xaxis=dict(title="Number of Reviews", title_font=dict(size=14), tickfont=dict(size=12), showgrid=False),
-            yaxis=dict(title="Star Ratings", title_font=dict(size=14), tickfont=dict(size=12), showgrid=False),
-            title_font=dict(size=18),
+            xaxis=dict(title="Number of Reviews", showgrid=False),
+            yaxis=dict(title="Star Ratings", showgrid=False),
             plot_bgcolor="white",
             template="plotly_white",
-            margin=dict(l=50, r=50, t=50, b=50)
+            margin=dict(l=40, r=40, t=45, b=40)
         )
-
         st.plotly_chart(fig_bar_horizontal, use_container_width=True)
 
         # ---------------------------------------
@@ -436,14 +404,14 @@ if uploaded_file:
 
             country_source_stats = (
                 filtered_verbatims
-                .groupby(["Country", "Source"])\
+                .groupby(["Country", "Source"])
                 .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
 
             new_review_stats = (
                 new_review_filtered
-                .groupby(["Country", "Source"])\
+                .groupby(["Country", "Source"])
                 .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
@@ -452,14 +420,14 @@ if uploaded_file:
 
             country_overall = (
                 filtered_verbatims
-                .groupby("Country")\
+                .groupby("Country")
                 .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
 
             overall_new_review_stats = (
                 new_review_filtered
-                .groupby("Country")\
+                .groupby("Country")
                 .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
@@ -467,23 +435,17 @@ if uploaded_file:
             country_overall["Source"] = "Overall"
 
             def color_numeric(val):
-                if pd.isna(val):
-                    return ""
+                if pd.isna(val): return ""
                 try:
                     v = float(val)
                 except Exception:
                     return ""
-                if v >= 4.5:
-                    return "color: green;"
-                elif v < 4.5:
-                    return "color: red;"
+                if v >= 4.5: return "color: green;"
+                if v < 4.5:  return "color: red;"
                 return ""
 
-            def formatter_rating(v):
-                return "-" if pd.isna(v) else f"{v:.1f}"
-
-            def formatter_count(v):
-                return "-" if pd.isna(v) else f"{int(v):,}"
+            def formatter_rating(v):  return "-" if pd.isna(v) else f"{v:.1f}"
+            def formatter_count(v):   return "-" if pd.isna(v) else f"{int(v):,}"
 
             for country in country_overall["Country"].unique():
                 st.markdown(f"#### {country}")
@@ -494,20 +456,18 @@ if uploaded_file:
                 combined_country_data = pd.concat([country_data, overall_data], ignore_index=True)
                 combined_country_data["Sort_Order"] = combined_country_data["Source"].apply(lambda x: 1 if x == "Overall" else 0)
                 combined_country_data = combined_country_data.sort_values(by="Sort_Order", ascending=True).drop(columns=["Sort_Order"])
-                combined_country_data = combined_country_data.drop(columns=["Country"])
-
-                combined_country_data.rename(columns={
+                combined_country_data = combined_country_data.drop(columns=["Country"]).rename(columns={
                     "Source": "Source",
                     "Average_Rating": "Avg Rating",
                     "Review_Count": "Review Count",
                     "New_Review_Average": "New Review Average",
                     "New_Review_Count": "New Review Count"
-                }, inplace=True)
+                })
 
                 def bold_overall(row):
                     if row.name == len(combined_country_data) - 1:
                         return ["font-weight: bold;" for _ in row]
-                    return ["" for _ in row]
+                    return [""] * len(row)
 
                 styled = (
                     combined_country_data.style
@@ -517,7 +477,7 @@ if uploaded_file:
                         "New Review Average": formatter_rating,
                         "New Review Count": formatter_count,
                     })
-                    .applymap(color_numeric, subset=["Avg Rating", "New Review Average"])  # color only numbers
+                    .applymap(color_numeric, subset=["Avg Rating", "New Review Average"])
                     .apply(bold_overall, axis=1)
                     .set_properties(**{"text-align": "center"})
                     .set_table_styles([
@@ -525,159 +485,64 @@ if uploaded_file:
                         {"selector": "td", "props": [("text-align", "center")]},
                     ])
                 )
-
                 st.markdown(styled.to_html(escape=False, index=False), unsafe_allow_html=True)
         else:
             st.warning("Country or Source data is missing in the uploaded file.")
 
-        # ---------------------------------------
-        # Graph Over Time
-        # ---------------------------------------
-        st.markdown("### 📈 Graph Over Time")
-
-        if "Review Date" not in filtered_verbatims.columns:
-            st.error("The 'Review Date' column is missing from the data. Please upload a valid file.")
-            st.stop()
-
-        filtered_verbatims["Review Date"] = pd.to_datetime(filtered_verbatims["Review Date"], errors="coerce")
-
-        st.markdown("#### Select Bar Size")
-        bar_size = st.selectbox(
-            "Choose the aggregation level for review mentions:",
-            options=["Daily", "Weekly", "Monthly"]
-        )
-
-        if bar_size == "Weekly":
-            filtered_verbatims["TimePeriod"] = filtered_verbatims["Review Date"].dt.to_period("W").dt.start_time
-        elif bar_size == "Monthly":
-            filtered_verbatims["TimePeriod"] = filtered_verbatims["Review Date"].dt.to_period("M").dt.start_time
-        else:
-            filtered_verbatims["TimePeriod"] = filtered_verbatims["Review Date"].dt.date
-
-        filtered_verbatims = filtered_verbatims.sort_values(by=["Country", "TimePeriod"])
-
-        filtered_verbatims["Cumulative_Total_Reviews"] = filtered_verbatims.groupby("Country")["Star Rating"].cumcount() + 1
-        filtered_verbatims["Cumulative_Sum_Rating"] = filtered_verbatims.groupby("Country")["Star Rating"].cumsum()
-        filtered_verbatims["Cumulative_Avg_Rating"] = (
-            filtered_verbatims["Cumulative_Sum_Rating"] / filtered_verbatims["Cumulative_Total_Reviews"]
-        )
-
-        grouped = filtered_verbatims.groupby(["TimePeriod", "Country"]).agg(
-            Total_Reviews=("Star Rating", "count"),
-            Cumulative_Avg_Rating=("Cumulative_Avg_Rating", "last")
-        ).reset_index()
-
-        if grouped.empty:
-            st.warning("No data available for the selected filters.")
-            st.stop()
-
-        fig = go.Figure()
-
-        region_colors = {
-            "UK": "#FF7F50",
-            "USA": "#4682B4",
-            "Canada": "#32CD32"
-        }
-        default_color = "#808080"
-
-        for country in grouped["Country"].unique():
-            country_data = grouped[grouped["Country"] == country]
-            color = region_colors.get(country, default_color)
-
-            fig.add_trace(go.Bar(
-                x=country_data["TimePeriod"],
-                y=country_data["Total_Reviews"],
-                name=f"{country} Reviews ({bar_size})",
-                marker=dict(color=color),
-                opacity=0.7,
-                yaxis="y"
-            ))
-
-            fig.add_trace(go.Scatter(
-                x=country_data["TimePeriod"],
-                y=country_data["Cumulative_Avg_Rating"],
-                mode="lines+markers",
-                name=f"{country} Cumulative Average Rating",
-                line=dict(color=color, width=2),
-                yaxis="y2"
-            ))
-
-        fig.update_layout(
-            title=f"Country-wise Review Mentions and Over-Time Average Ratings ({bar_size})",
-            xaxis=dict(title="Time Period", tickformat="%b %d", title_font=dict(size=14)),
-            yaxis=dict(title="Review Mentions", title_font=dict(size=14), showgrid=False),
-            yaxis2=dict(
-                title="Cumulative Star Rating (1-5)",
-                overlaying="y",
-                side="right",
-                range=[1, 5.2],
-                title_font=dict(size=14),
-                showgrid=False
-            ),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=-0.4,
-                xanchor="center",
-                x=0.5
-            ),
-            barmode="stack",
-            template="plotly_white",
-            margin=dict(l=50, r=50, t=70, b=70)
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
         st.markdown("---")
 
         # ---------------------------------------
-        # Delighters and Detractors Analysis
+        # Delighters and Detractors Analysis (responsive)
         # ---------------------------------------
         st.markdown("### 🌟 Delighters and Detractors Analysis")
-
-        def style_star_ratings(value):
-            if isinstance(value, (float, int)):
-                if value >= 4.5:
-                    return "color: green;"
-                elif value < 4.5:
-                    return "color: red;"
-            return ""
 
         detractors_results = analyze_delighters_detractors(filtered_verbatims, existing_detractor_columns)
         delighters_results = analyze_delighters_detractors(filtered_verbatims, existing_delighter_columns)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("All Detractors")
-            if detractors_results.empty:
-                st.write("No detractor symptoms found.")
-            else:
-                st.dataframe(
-                    detractors_results.style.applymap(style_star_ratings, subset=["Avg Star"]).\
-                    format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
-                    use_container_width=True
-                )
+        # Responsive layout control
+        view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
 
-        with col2:
-            st.subheader("All Delighters")
-            if delighters_results.empty:
-                st.write("No delighter symptoms found.")
-            else:
-                st.dataframe(
-                    delighters_results.style.applymap(style_star_ratings, subset=["Avg Star"]).\
-                    format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
-                    use_container_width=True
-                )
+        def _styled_table(df: pd.DataFrame):
+            sty = df.style.applymap(style_rating_cells, subset=["Avg Star"]) \
+                          .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}) \
+                          .hide(axis="index")
+            return sty
+
+        if view_mode == "Split":
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.subheader("All Detractors")
+                if detractors_results.empty:
+                    st.write("No detractor symptoms found.")
+                else:
+                    st.dataframe(_styled_table(detractors_results), use_container_width=True, hide_index=True)
+            with c2:
+                st.subheader("All Delighters")
+                if delighters_results.empty:
+                    st.write("No delighter symptoms found.")
+                else:
+                    st.dataframe(_styled_table(delighters_results), use_container_width=True, hide_index=True)
+        else:
+            tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
+            with tab1:
+                if detractors_results.empty:
+                    st.write("No detractor symptoms found.")
+                else:
+                    st.dataframe(_styled_table(detractors_results), use_container_width=True, hide_index=True)
+            with tab2:
+                if delighters_results.empty:
+                    st.write("No delighter symptoms found.")
+                else:
+                    st.dataframe(_styled_table(delighters_results), use_container_width=True, hide_index=True)
 
         st.markdown("---")
 
         # ---------------------------------------
-        # Reviews (with optional translation) + Download All (filtered)
+        # Reviews (translate, highlight, download all, pagination)
         # ---------------------------------------
         translator = Translator()
         st.markdown("### 📝 All Reviews")
 
-        # Download all filtered reviews (not just current page)
         if not filtered_verbatims.empty:
             csv_bytes = filtered_verbatims.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
@@ -688,16 +553,18 @@ if uploaded_file:
                 help="Exports all rows that match the active filters, regardless of pagination."
             )
 
-        translate_to_english = st.button("Translate All Reviews to English")
+        translate_all = st.button("Translate All Reviews to English")
 
-        reviews_per_page = 10
+        reviews_per_page = st.session_state.get("reviews_per_page", 10)
         if "review_page" not in st.session_state:
             st.session_state["review_page"] = 0
 
         def scroll_to_top():
             st.experimental_rerun()
 
-        current_page = st.session_state["review_page"]
+        total_reviews_count = len(filtered_verbatims)
+        total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
+        current_page = min(max(st.session_state["review_page"], 0), total_pages - 1)
         start_index = current_page * reviews_per_page
         end_index = start_index + reviews_per_page
         paginated_reviews = filtered_verbatims.iloc[start_index:end_index]
@@ -709,12 +576,11 @@ if uploaded_file:
                 review_text = row.get("Verbatim", pd.NA)
                 review_text = "" if pd.isna(review_text) else clean_text(review_text)
 
-                if translate_to_english:
+                if translate_all:
                     translated_review = safe_translate(translator, review_text)
                 else:
                     translated_review = review_text
 
-                # Date formatting
                 date_val = row.get("Review Date", pd.NaT)
                 if pd.isna(date_val):
                     date_str = "-"
@@ -728,7 +594,6 @@ if uploaded_file:
                     except Exception:
                         date_str = "-"
 
-                # Highlight keyword in the (possibly translated) review text
                 display_review_html = highlight_html(translated_review, keyword)
 
                 delighter_badges = [
@@ -751,7 +616,7 @@ if uploaded_file:
 
                 st.markdown(
                     f"""
-                    <div style=\"border: 1px solid #ddd; padding: 15px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;\">
+                    <div class="review-card">
                         <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
                         <p><strong>Country:</strong> {row.get('Country', '')}</p>
                         <p><strong>Date:</strong> {date_str}</p>
@@ -764,20 +629,30 @@ if uploaded_file:
                     unsafe_allow_html=True
                 )
 
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col1:
-            if current_page > 0 and st.button("⬅ Go Back", key="go_back"):
-                st.session_state["review_page"] -= 1
+        # Pagination controls
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
+        with c1:
+            if st.button("⏮ First", disabled=current_page == 0):
+                st.session_state["review_page"] = 0
                 scroll_to_top()
-        with col2:
-            total_pages = (len(filtered_verbatims) + reviews_per_page - 1) // reviews_per_page
+        with c2:
+            if st.button("⬅ Prev", disabled=current_page == 0):
+                st.session_state["review_page"] = max(current_page - 1, 0)
+                scroll_to_top()
+        with c3:
+            showing_from = 0 if total_reviews_count == 0 else start_index + 1
+            showing_to = min(end_index, total_reviews_count)
             st.markdown(
-                f"<div style='text-align: center; font-weight: bold;'>Page {current_page + 1} of {max(total_pages,1)}</div>",
+                f"<div style='text-align: center; font-weight: bold;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
                 unsafe_allow_html=True,
             )
-        with col3:
-            if end_index < len(filtered_verbatims) and st.button("➡ View More", key="view_more"):
-                st.session_state["review_page"] += 1
+        with c4:
+            if st.button("Next ➡", disabled=current_page >= total_pages - 1):
+                st.session_state["review_page"] = min(current_page + 1, total_pages - 1)
+                scroll_to_top()
+        with c5:
+            if st.button("Last ⏭", disabled=current_page >= total_pages - 1):
+                st.session_state["review_page"] = total_pages - 1
                 scroll_to_top()
 
         st.markdown("---")
