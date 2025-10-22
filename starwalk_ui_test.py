@@ -59,6 +59,15 @@ st.markdown(
     """
     <style>
       :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
+
+      /* universal box-sizing reset */
+      *, ::before, ::after { box-sizing: border-box; }
+
+      /* make scrollbars thin + invisible where supported */
+      @supports (scrollbar-color: transparent transparent) {
+        * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+      }
+
       .block-container { padding-top: .75rem; padding-bottom: 1rem; }
       section[data-testid="stSidebar"] .block-container { padding-top: .5rem; }
       section[data-testid="stSidebar"] .stButton>button { width: 100%; }
@@ -68,16 +77,16 @@ st.markdown(
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-      /* Cards (grouped look with more gray) */
-      .review-card { border:1px solid #E5E7EB; background:#FFFFFF; border-radius:12px; padding:16px; }
+      /* Cards (grouped look with tuned gray borders) */
+      .review-card { border:1px solid #E6EAF2; background:#FFFFFF; border-radius:12px; padding:16px; }
       .review-card p { margin:.25rem 0; line-height:1.45; }
 
-      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:20px; }
+      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:17px; }
       @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
 
       .metric-card {
         background:#F7F9FC;
-        border:1px solid #E3E8F0;
+        border:1px solid #E4E9F2;     /* updated border color */
         border-radius:14px;
         padding:14px 16px;
         box-shadow:0 1px 2px rgba(16,24,40,0.04);
@@ -87,7 +96,7 @@ st.markdown(
       .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
       .metric-box {
         background:#F2F5FA;
-        border:1px solid #E3E8F0;
+        border:1px solid #E7ECF5;     /* inner box border */
         border-radius:12px;
         padding:12px;
         text-align:center;
@@ -100,19 +109,19 @@ st.markdown(
       .pager .center { text-align:center; font-weight:700; }
 
       /* Chat bubbles */
-      .chat-q { background:#F5F7FB; border:1px solid #E5E7EB; border-radius:14px; padding:10px 12px; }
-      .chat-a { background:#FFF8EB; border:1px solid #FBE3B2; border-radius:14px; padding:12px 12px; }
+      .chat-q { background:#F5F7FB; border:1px solid #E6EAF2; border-radius:14px; padding:10px 12px; }
+      .chat-a { background:#FFF8EB; border:1px solid #F2E3BE; border-radius:14px; padding:12px 12px; }
 
       /* Badges */
       .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
       .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
-      .badge.pos { background:#E7F8EE; color:#065F46; }
-      .badge.neg { background:#FDECEC; color:#7F1D1D; }
+      .badge.pos { background:#E7F8EE; color:#065F46; border:1px solid #CDEFE1; }
+      .badge.neg { background:#FDECEC; color:#7F1D1D; border:1px solid #F7D1D1; }
 
       /* Hero */
       .hero-wrap {
         position: relative; overflow: hidden; border-radius: 14px;
-        border: 1px solid #eee; height: 150px; margin: .25rem 0 1rem 0;
+        border: 1px solid #E6EAF2; height: 150px; margin: .25rem 0 1rem 0;
         background: linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f7f7f7 55%,#f7f7f7 100%);
       }
       #hero-canvas { position:absolute; left:0; top:0; width:55%; height:100%; }
@@ -306,9 +315,7 @@ def _hash_series_for_cache(s: pd.Series) -> str:
 
 @st.cache_resource(show_spinner=False)
 def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
-    """
-    Returns a FAISS index (if available) or (emb_matrix, norms, texts) tuple for cosine similarity search.
-    """
+    """Return FAISS index or (mat, norms, texts) for cosine search."""
     if not _HAS_OPENAI or not texts:
         return None
     client = OpenAI(api_key=api_key)
@@ -498,10 +505,11 @@ if st.sidebar.button("🧹 Clear all filters"):
         if k in st.session_state: del st.session_state[k]
     st.rerun()
 
-# --- Requested: divider before the LLM assistant dropdown
-st.sidebar.markdown("---")
+# --- spacer + divider before LLM assistant (as requested)
+st.sidebar.write("")          # spacer
+st.sidebar.markdown("---")    # divider
 
-# LLM settings (model picker) and anchor buttons
+# LLM settings (model picker) — no "Go to Ask AI" button
 with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     _model_choices = [
         ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -528,9 +536,6 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     )
     if not temp_supported:
         st.caption("ℹ️ This model uses a fixed sampling temperature; the slider is disabled.")
-
-    if st.button("Go to Ask AI"):
-        scroll_to("askdata-anchor")
 
 # ---- Submit Feedback (modal first; falls back to anchor) ----
 def send_feedback_via_email(subject: str, body: str) -> bool:
@@ -583,7 +588,7 @@ if _DIALOG_AVAILABLE:
                 )
             st.stop()  # close dialog
 
-# Button outside the expander (per request)
+# Sidebar button to open modal (kept)
 if st.sidebar.button("Submit Feedback", key="submit_feedback_sidebar"):
     if _DIALOG_AVAILABLE:
         open_feedback_dialog()
@@ -885,7 +890,7 @@ st.markdown("---")
 # ---------- Ask your data (LLM) ----------
 anchor("askdata-anchor")
 st.markdown("## 🤖 Ask your data")
-st.caption("Ask questions about the **currently filtered** reviews. We’ll combine programmatic stats with semantic search over verbatims.")
+st.caption("Ask questions about the **currently filtered** reviews. Each question is answered independently (no chat history).")
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not _HAS_OPENAI:
@@ -893,51 +898,14 @@ if not _HAS_OPENAI:
 elif not api_key:
     st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
 else:
-    # Build (or reuse cached) vector index for current filtered set
+    # Build or reuse cached vector index for current filtered set
     verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
     index = build_vector_index(verb_series.tolist(), api_key)
 
-    # --- Conversation state (Current turn + Previous Q&A) ---
-    st.session_state.setdefault("qa_prev", [])                 # list of {"q": str, "a": str}
-    st.session_state.setdefault("qa_current_user", None)       # str | None
-    st.session_state.setdefault("qa_current_assistant", None)  # str | None
-    st.session_state.setdefault("ask_ai_text", "")
+    # Only keep the current pair (no history)
+    st.session_state.setdefault("qa_current_user", None)
+    st.session_state.setdefault("qa_current_assistant", None)
 
-    # Controls row
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Start new chat"):
-            # Archive current pair (if any), then clear
-            if st.session_state["qa_current_user"] or st.session_state["qa_current_assistant"]:
-                st.session_state["qa_prev"].append({
-                    "q": st.session_state["qa_current_user"] or "",
-                    "a": st.session_state["qa_current_assistant"] or ""
-                })
-            st.session_state["qa_current_user"] = None
-            st.session_state["qa_current_assistant"] = None
-            st.session_state["ask_ai_text"] = ""
-            st.rerun()
-    with c2:
-        if st.button("Clear chat"):
-            st.session_state["qa_prev"] = []
-            st.session_state["qa_current_user"] = None
-            st.session_state["qa_current_assistant"] = None
-            st.session_state["ask_ai_text"] = ""
-            st.rerun()
-
-    # Previous Q&A expander (all old chats go here)
-    prev = st.session_state["qa_prev"]
-    with st.expander(f"Previous Q&A ({len(prev)})", expanded=False):
-        if not prev:
-            st.caption("No previous exchanges yet.")
-        else:
-            for i, pair in enumerate(prev, start=1):
-                if pair.get("q"):
-                    st.markdown(f"<div class='chat-q'><b>User:</b> {pair['q']}</div>", unsafe_allow_html=True)
-                if pair.get("a"):
-                    st.markdown(f"<div class='chat-a'><b>Assistant:</b> {pair['a']}</div>", unsafe_allow_html=True)
-
-    # Show ONLY the current pair inline
     if st.session_state["qa_current_user"]:
         st.markdown(f"<div class='chat-q'><b>User:</b> {st.session_state['qa_current_user']}</div>", unsafe_allow_html=True)
     if st.session_state["qa_current_assistant"]:
@@ -945,25 +913,12 @@ else:
 
     # Input form (not pinned)
     with st.form("ask_ai_form", clear_on_submit=False):
-        q = st.text_area(
-            "Ask a question",
-            value=st.session_state.get("ask_ai_text", ""),
-            height=80,
-            help="Each question is answered independently based on the CURRENT filters and data above."
-        )
+        q = st.text_area("Ask a question", value="", height=80)
         send = st.form_submit_button("Send")
 
     if send and q.strip():
-        # If last question already has an answer, archive that pair first
-        if st.session_state["qa_current_user"] is not None and st.session_state["qa_current_assistant"] is not None:
-            st.session_state["qa_prev"].append({
-                "q": st.session_state["qa_current_user"],
-                "a": st.session_state["qa_current_assistant"]
-            })
-        # Start the new current turn
         st.session_state["qa_current_user"] = q.strip()
-        st.session_state["qa_current_assistant"] = None
-        st.session_state["ask_ai_text"] = ""  # clear the box so it doesn't look like you're re-asking
+        st.session_state["qa_current_assistant"] = None  # will fill below
 
         # Retrieve top matching verbatims for richer answers
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
@@ -973,9 +928,9 @@ else:
             if len(s) > 0:
                 if len(s) > 320: s = s[:317] + "…"
                 quotes.append(f"• “{s}”")
-        quotes_text = "\\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
+        quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
 
-        # Tools the model can call (numbers shown on the page)
+        # Tools the model can call
         def pandas_count(query: str) -> dict:
             try:
                 if ";" in query or "__" in query: return {"error": "disallowed pattern"}
@@ -1075,7 +1030,7 @@ else:
             except Exception as e:
                 return f"(Fallback summary error: {e})"
 
-        # Build context (no prior chat — each Q is independent)
+        # Build context (single-turn)
         def context_blob(df_in: pd.DataFrame, n=25) -> str:
             if df_in.empty: return "No rows after filters."
             parts = [f"ROW_COUNT={len(df_in)}"]
@@ -1166,7 +1121,6 @@ else:
             st.session_state['qa_current_assistant'] = final_text
             st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
             st.caption(':information_source: Shown local summary because the model call failed. ' + str(e))
-            scroll_to("askdata-anchor")
         else:
             msg = first.choices[0].message
 
@@ -1206,12 +1160,10 @@ else:
                     st.caption(':information_source: Shown local summary because the tool-enabled call failed. ' + str(e))
                 st.session_state["qa_current_assistant"] = final_text
                 st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-                scroll_to("askdata-anchor")
             else:
                 final_text = msg.content if msg and getattr(msg, 'content', None) else _local_answer_fallback(q)
                 st.session_state["qa_current_assistant"] = final_text
                 st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-                scroll_to("askdata-anchor")
 
 st.markdown("---")
 
