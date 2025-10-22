@@ -8,11 +8,9 @@ from googletrans import Translator
 import io
 import asyncio
 import re
-import html  # stdlib: used for html.escape
+import html
 
-# ---------------------------------------
-# Optional high-quality text fixer
-# ---------------------------------------
+# Optional: high-quality text fixer for mojibake & emojis
 try:
     from ftfy import fix_text as _ftfy_fix
     _HAS_FTFY = True
@@ -20,22 +18,30 @@ except Exception:
     _HAS_FTFY = False
     _ftfy_fix = None
 
+# ---------------------------------------
+# Page config
+# ---------------------------------------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
-# Global CSS polish (compact sidebar + highlight)
+# Global CSS polish (compact sidebar + highlight + nice badges/cards)
 st.markdown(
     """
     <style>
-    /* tighten main area */
+    /* main area */
     .block-container { padding-top: 0.6rem; padding-bottom: 1rem; }
-    /* sidebar starts higher + compact */
+    /* sidebar: start higher + compact */
     section[data-testid="stSidebar"] .block-container { padding-top: 0.2rem; padding-bottom: 0.6rem; }
     section[data-testid="stSidebar"] label { font-size: 0.95rem; }
     section[data-testid="stSidebar"] .stButton>button { width: 100%; }
-    /* nice keyword highlight */
+    /* keyword highlight */
     mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
     /* review card */
-    .review-card { border:1px solid #e6e6e6; background:#fafafa; border-radius:10px; padding:16px; }
+    .review-card { border:1px solid #e6e6e6; background:#fff; border-radius:12px; padding:18px; box-shadow:0 1px 2px rgba(0,0,0,.03); }
+    .review-card p { margin:.25rem 0; line-height:1.45; }
+    .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+    .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:0.95rem; }
+    .badge.pos { background:#CFF7D6; color:#085a2a; }
+    .badge.neg { background:#FBD3D0; color:#7a0410; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -55,7 +61,6 @@ st.markdown(
 # ---------------------------------------
 # Utilities
 # ---------------------------------------
-
 def style_rating_cells(value):
     """Styles cells: Green for ratings 4.5 and above, red for below 4.5."""
     if isinstance(value, (float, int)):
@@ -65,13 +70,20 @@ def style_rating_cells(value):
             return "color: red;"
     return ""
 
-
-def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str, key: str | None = None):
+def apply_filter(
+    dataframe: pd.DataFrame,
+    column_name: str,
+    filter_name: str,
+    key: str | None = None,
+    ui=None,
+):
+    """Render a multiselect in the provided container (expander/column/sidebar)."""
+    ui = ui or st.sidebar
     options = ["ALL"]
     if column_name in dataframe.columns:
         col = dataframe[column_name].astype("string")
         options += sorted([x for x in col.dropna().unique().tolist() if str(x).strip() != ""])
-    selected_filter = st.sidebar.multiselect(
+    selected_filter = ui.multiselect(
         f"Select {filter_name}",
         options=options,
         default=["ALL"],
@@ -80,7 +92,6 @@ def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str, ke
     if "ALL" not in selected_filter and column_name in dataframe.columns:
         return dataframe[dataframe[column_name].astype("string").isin(selected_filter)], selected_filter
     return dataframe, ["ALL"]
-
 
 def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
     vals, seen = [], set()
@@ -94,20 +105,55 @@ def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
                     vals.append(item)
     return vals
 
+def clean_text(x: str) -> str:
+    """Strong text normalizer: ftfy when available; handles â€™, â€” , stray Â, CP1252/UTF-8 mixups; preserves emoji."""
+    if x is None:
+        return ""
+    s = str(x)
+    # 1) ftfy handles a lot (if installed)
+    if _HAS_FTFY:
+        try:
+            s = _ftfy_fix(s)
+        except Exception:
+            pass
+    # 2) heuristic recode if classic mojibake bytes are present
+    if any(ch in s for ch in ("Ã", "Â", "â", "ï", "€", "™")):
+        try:
+            repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+            if repaired.strip():
+                s = repaired
+        except Exception:
+            pass
+    # 3) targeted replacements
+    fixes = {
+        "â€™": "'", "â€˜": "‘", "â€œ": "“", "â€": "”",
+        "â€“": "–", "â€”": "—", "â€¢": "•", "â€¦": "…",
+        "Â": ""
+    }
+    for bad, good in fixes.items():
+        s = s.replace(bad, good)
+    return s.strip()
+
+def is_valid_symptom_value(x) -> bool:
+    s = "" if x is None else str(x).strip()
+    if not s or s.lower() in {"nan", "none", "null", "n/a"}:
+        return False
+    # drop punctuation-only strings
+    return not bool(re.fullmatch(r"[\W_]+", s))
 
 def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
     cols = [c for c in symptom_columns if c in filtered_df.columns]
     if not cols:
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
-
     s = (
         filtered_df[cols]
         .stack(dropna=True)
         .astype("string")
+        .map(clean_text)
         .str.strip()
         .dropna()
     )
-    s = s[s != ""]
+    s = s[s.map(is_valid_symptom_value)]
     if s.empty:
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
 
@@ -131,14 +177,11 @@ def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: li
             "Mentions": count,
             "% Total": f"{round(pct, 1)}%",
         })
-
     if not results:
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
     return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
 
-
 def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
-    """Flatten text from given columns into a single string for wordcloud generation."""
     cols = [c for c in cols if c in df.columns]
     if not cols:
         return ""
@@ -152,15 +195,6 @@ def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
     )
     s = s[s != ""]
     return " ".join(s.tolist())
-
-
-def clean_text(x: str) -> str:
-    """Fix common mojibake like â€™ and trim whitespace."""
-    if x is None:
-        return ""
-    x = str(x).replace("â€™", "'").strip()
-    return x
-
 
 def highlight_html(text: str, keyword: str | None) -> str:
     """Escape to safe HTML then wrap keyword matches with <mark> (case-insensitive)."""
@@ -183,7 +217,6 @@ async def _translate_async_call(translator: Translator, text: str) -> str:
     except Exception:
         return text
 
-
 def safe_translate(translator: Translator, text: str) -> str:
     try:
         res = translator.translate(text, dest="en")
@@ -202,7 +235,6 @@ def safe_translate(translator: Translator, text: str) -> str:
     except Exception:
         pass
     return text
-
 
 def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
     if not keyword or keyword.strip() == "":
@@ -231,37 +263,27 @@ if uploaded_file:
             if col in verbatims.columns:
                 verbatims[col] = verbatims[col].astype("string").str.upper()
 
-        # Numerics
+        # Numeric
         if "Star Rating" in verbatims.columns:
             verbatims["Star Rating"] = pd.to_numeric(verbatims["Star Rating"], errors="coerce")
 
-        # Symptom columns
+        # Symptom columns -> clean strings
         all_symptom_cols = [c for c in verbatims.columns if c.startswith("Symptom")]
         for c in all_symptom_cols:
             verbatims[c] = verbatims[c].astype("string").map(clean_text)
 
-        # Clean text + dates
+        # Review text & date
         if "Verbatim" in verbatims.columns:
             verbatims["Verbatim"] = verbatims["Verbatim"].astype("string").map(clean_text)
         if "Review Date" in verbatims.columns:
             verbatims["Review Date"] = pd.to_datetime(verbatims["Review Date"], errors="coerce")
 
-        # -------------- SIDEBAR (compact + collapsed) --------------
+        # ------------------ SIDEBAR (compact + collapsed) ------------------
         st.sidebar.header("🔍 Filters")
-        if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
-            for k in [
-                "tf","sr","kw","delight","detract",
-                "f_Country","f_Source","f_Model (SKU)","f_Seeded","f_New Review",
-                "rpp"
-            ]:
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.session_state["review_page"] = 0
-            st.rerun()
 
-        # Timeframe (collapsed by default)
-        with st.sidebar.expander("🗓️ Timeframe", expanded=False):
-            timeframe = st.selectbox(
+        # Timeframe
+        with st.sidebar.expander("🗓️ Timeframe", expanded=False) as x_time:
+            timeframe = x_time.selectbox(
                 "Select Timeframe",
                 options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
                 key="tf"
@@ -269,7 +291,7 @@ if uploaded_file:
             today = datetime.today()
             start_date, end_date = None, None
             if timeframe == "Custom Range":
-                start_date, end_date = st.date_input(
+                start_date, end_date = x_time.date_input(
                     label="Date Range",
                     value=(datetime.today() - timedelta(days=30), datetime.today()),
                     min_value=datetime(2000, 1, 1),
@@ -291,8 +313,8 @@ if uploaded_file:
             ]
 
         # Star rating
-        with st.sidebar.expander("🌟 Star Rating", expanded=False):
-            selected_ratings = st.multiselect(
+        with st.sidebar.expander("🌟 Star Rating", expanded=False) as x_rating:
+            selected_ratings = x_rating.multiselect(
                 "Select Star Ratings",
                 options=["All"] + [1, 2, 3, 4, 5],
                 default=["All"],
@@ -301,13 +323,13 @@ if uploaded_file:
         if "All" not in selected_ratings and "Star Rating" in filtered_verbatims.columns:
             filtered_verbatims = filtered_verbatims[filtered_verbatims["Star Rating"].isin(selected_ratings)]
 
-        # Country/Source/SKU/Seeded/New Review
-        with st.sidebar.expander("🌍 Standard Filters", expanded=False):
-            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Country", "Country", key="f_Country")
-            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Source", "Source", key="f_Source")
-            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Model (SKU)", "Model (SKU)", key="f_Model (SKU)")
-            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Seeded", "Seeded", key="f_Seeded")
-            filtered_verbatims, _ = apply_filter(filtered_verbatims, "New Review", "New Review", key="f_New Review")
+        # Standard Filters (ensure these are INSIDE the expander)
+        with st.sidebar.expander("🌍 Standard Filters", expanded=False) as x_std:
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Country", "Country", key="f_Country", ui=x_std)
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Source", "Source", key="f_Source", ui=x_std)
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Model (SKU)", "Model (SKU)", key="f_Model (SKU)", ui=x_std)
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "Seeded", "Seeded", key="f_Seeded", ui=x_std)
+            filtered_verbatims, _ = apply_filter(filtered_verbatims, "New Review", "New Review", key="f_New Review", ui=x_std)
 
         # Delighters/Detractors
         detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
@@ -317,14 +339,14 @@ if uploaded_file:
         detractor_symptoms = collect_unique_symptoms(filtered_verbatims, existing_detractor_columns)
         delighter_symptoms = collect_unique_symptoms(filtered_verbatims, existing_delighter_columns)
 
-        with st.sidebar.expander("😊 Delighters & 😠 Detractors", expanded=False):
-            selected_delighter = st.multiselect(
+        with st.sidebar.expander("😊 Delighters & 😠 Detractors", expanded=False) as x_sym:
+            selected_delighter = x_sym.multiselect(
                 "Select Delighter Symptoms",
                 options=["All"] + sorted(delighter_symptoms),
                 default=["All"],
                 key="delight"
             )
-            selected_detractor = st.multiselect(
+            selected_detractor = x_sym.multiselect(
                 "Select Detractor Symptoms",
                 options=["All"] + sorted(detractor_symptoms),
                 default=["All"],
@@ -338,31 +360,41 @@ if uploaded_file:
             filtered_verbatims = filtered_verbatims[mask]
 
         # Keyword
-        with st.sidebar.expander("🔎 Keyword", expanded=False):
-            keyword = st.text_input("Keyword to search (in review text)", value="", key="kw",
-                                    help="Case-insensitive match in the Review text. Cleaned for â€™ → '")
+        with st.sidebar.expander("🔎 Keyword", expanded=False) as x_kw:
+            keyword = x_kw.text_input("Keyword to search (in review text)", value="", key="kw",
+                                      help="Case-insensitive match in the Review text. Cleaned for â€™ → '")
             if keyword:
                 filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword)
 
-        # Additional Filters beyond Symptom 20
-        with st.sidebar.expander("📋 Additional Filters", expanded=False):
-            additional_columns = verbatims.columns[20:]
+        # Additional Filters: anything not in standard/symptoms/core goes here (e.g., Hair Type)
+        core_cols = {"Country","Source","Model (SKU)","Seeded","New Review","Star Rating","Review Date","Verbatim"}
+        symptom_cols = set([f"Symptom {i}" for i in range(1,21)])
+        additional_columns = [c for c in verbatims.columns if c not in (core_cols | symptom_cols)]
+        with st.sidebar.expander("📋 Additional Filters", expanded=False) as x_add:
             if len(additional_columns) > 0:
                 for column in additional_columns:
-                    if column not in (detractor_columns + delighter_columns):
-                        filtered_verbatims, _ = apply_filter(filtered_verbatims, column, column, key=f"f_{column}")
+                    filtered_verbatims, _ = apply_filter(filtered_verbatims, column, column, key=f"f_{column}", ui=x_add)
             else:
-                st.info("No additional filters available.")
+                x_add.info("No additional filters available.")
 
         # Review list UI
-        with st.sidebar.expander("📄 Review List", expanded=False):
+        with st.sidebar.expander("📄 Review List", expanded=False) as x_list:
             rpp_options = [10, 20, 50, 100]
             default_rpp = st.session_state.get("reviews_per_page", 10)
             rpp_index = rpp_options.index(default_rpp) if default_rpp in rpp_options else 0
-            reviews_per_page_select = st.selectbox("Reviews per page", options=rpp_options, index=rpp_index, key="rpp")
+            reviews_per_page_select = x_list.selectbox("Reviews per page", options=rpp_options, index=rpp_index, key="rpp")
             if reviews_per_page_select != default_rpp:
                 st.session_state["reviews_per_page"] = reviews_per_page_select
                 st.session_state["review_page"] = 0
+
+        # Clear-all moved to bottom so other items slide up
+        st.sidebar.markdown("---")
+        if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
+            # remove common keys and any dynamic f_* filter keys
+            for k in ["tf","sr","kw","delight","detract","rpp","review_page"] + [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.rerun()
 
         st.markdown("---")
 
@@ -422,14 +454,14 @@ if uploaded_file:
 
             country_source_stats = (
                 filtered_verbatims
-                .groupby(["Country", "Source"])\
+                .groupby(["Country", "Source"])
                 .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
 
             new_review_stats = (
                 new_review_filtered
-                .groupby(["Country", "Source"])\
+                .groupby(["Country", "Source"])
                 .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
@@ -438,14 +470,14 @@ if uploaded_file:
 
             country_overall = (
                 filtered_verbatims
-                .groupby("Country")\
+                .groupby("Country")
                 .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
 
             overall_new_review_stats = (
                 new_review_filtered
-                .groupby("Country")\
+                .groupby("Country")
                 .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
@@ -607,17 +639,18 @@ if uploaded_file:
 
                 display_review_html = highlight_html(translated_review, keyword)
 
-                delighter_badges = [
-                    f'<div style="display:inline-block; padding:5px 10px; background-color:lightgreen; color:black; border-radius:5px; margin:5px;">{row[col]}</div>'
-                    for col in existing_delighter_columns if col in row and pd.notna(row[col])
-                ]
-                detractor_badges = [
-                    f'<div style="display:inline-block; padding:5px 10px; background-color:lightcoral; color:black; border-radius:5px; margin:5px;">{row[col]}</div>'
-                    for col in existing_detractor_columns if col in row and pd.notna(row[col])
-                ]
+                def render_chips(row, columns, css_class):
+                    items = []
+                    for c in columns:
+                        if c in row and pd.notna(row[c]) and is_valid_symptom_value(row[c]):
+                            txt = clean_text(str(row[c]))
+                            items.append(f'<span class="badge {css_class}">{html.escape(txt)}</span>')
+                    if not items:
+                        return "<i>None</i>"
+                    return f'<div class="badges">{"".join(items)}</div>'
 
-                delighter_message = "<i>No delighter symptoms reported</i>" if not delighter_badges else " ".join(delighter_badges)
-                detractor_message = "<i>No detractor symptoms reported</i>" if not detractor_badges else " ".join(detractor_badges)
+                delighter_message = render_chips(row, existing_delighter_columns, "pos")
+                detractor_message = render_chips(row, existing_detractor_columns, "neg")
 
                 star_val = row.get("Star Rating", 0)
                 try:
@@ -627,7 +660,7 @@ if uploaded_file:
 
                 st.markdown(
                     f"""
-                    <div class=\"review-card\"> 
+                    <div class="review-card">
                         <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
                         <p><strong>Country:</strong> {row.get('Country', '')}</p>
                         <p><strong>Date:</strong> {date_str}</p>
