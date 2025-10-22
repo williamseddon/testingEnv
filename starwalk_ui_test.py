@@ -20,7 +20,7 @@ warnings.filterwarnings(
     module="openpyxl",
 )
 
-# Optional: high-quality text fixer (safe if not installed)
+# Optional: high-quality text fixer
 try:
     from ftfy import fix_text as _ftfy_fix
     _HAS_FTFY = True
@@ -28,7 +28,7 @@ except Exception:
     _HAS_FTFY = False
     _ftfy_fix = None
 
-# Try importing OpenAI SDK; app will still run without it
+# OpenAI SDK (optional but recommended)
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
@@ -197,9 +197,6 @@ def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
 st.markdown("### 📁 File Upload")
 uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 
-# default for anchor jumping: NEVER auto-jump unless a button sets this
-st.session_state.setdefault("jump_to", "")
-
 if uploaded_file:
     try:
         st.markdown("---")
@@ -269,7 +266,7 @@ if uploaded_file:
             filtered_verbatims, _ = apply_filter(filtered_verbatims, "Seeded", "Seeded", key="f_Seeded")
             filtered_verbatims, _ = apply_filter(filtered_verbatims, "New Review", "New Review", key="f_New Review")
 
-        # Delighters/Detractors filters
+        # 🩺 Review Symptoms (sidebar)
         detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
         delighter_columns = [f"Symptom {i}" for i in range(11, 21)]
         existing_detractor_columns = [c for c in detractor_columns if c in filtered_verbatims.columns]
@@ -297,7 +294,7 @@ if uploaded_file:
                                     help="Case-insensitive match in Review text. Cleans â€™ → '")
             if keyword: filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword)
 
-        # Additional Filters (anything not core/symptoms)
+        # Additional Filters
         core_cols = {"Country","Source","Model (SKU)","Seeded","New Review","Star Rating","Review Date","Verbatim"}
         symptom_cols = set([f"Symptom {i}" for i in range(1,21)])
         with st.sidebar.expander("📋 Additional Filters", expanded=False):
@@ -318,489 +315,445 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
-        # ---- Quick Links & Section Controls (BOTTOM) ----
+        # Clear All at bottom
         st.sidebar.markdown("---")
-        with st.sidebar.expander("🧭 Quick Links & Section Controls", expanded=False):
-            # section toggles (show/hide)
-            show_metrics = st.checkbox("Show ⭐ Metrics", True, key="show_metrics")
-            show_country = st.checkbox("Show 🌍 Country Breakdown", True, key="show_country")
-            show_dd = st.checkbox("Show 🌟 Detractors/Delighters", True, key="show_dd")
-            show_reviews = st.checkbox("Show 📝 Reviews", True, key="show_reviews")
-            show_ask = st.checkbox("Show 🤖 Ask your data", True, key="show_ask")
-            show_clouds = st.checkbox("Show ☁️ Word Clouds", True, key="show_clouds")
-
-            st.markdown("**Country Breakdown Options**")
-            st.session_state["min_country_count"] = st.number_input(
-                "Minimum Review Count to display (per Source)",
-                min_value=0, max_value=100000, value=1, key="min_country_count_input"
-            )
-
-            st.markdown("**D&D Options**")
-            st.session_state["topn_dd"] = st.slider("Top N items per list", 5, 100, 20, key="topn_dd_input")
-
-            st.markdown("**Word Cloud Options**")
-            st.session_state["wc_max_words"] = st.slider("Max words", 20, 300, 180, key="wc_max_words_input")
-            st.session_state["wc_extra_stop"] = st.text_input("Extra stopwords (comma-separated)", "", key="wc_extra_stop_input")
-
-            st.markdown("**Jump to…**")
-            if st.button("⭐ Metrics"): st.session_state["jump_to"] = "metrics-anchor"; st.rerun()
-            if st.button("🌍 Country Breakdown"): st.session_state["jump_to"] = "country-anchor"; st.rerun()
-            if st.button("🌟 Detractors/Delighters"): st.session_state["jump_to"] = "dd-anchor"; st.rerun()
-            if st.button("📝 Reviews"): st.session_state["jump_to"] = "reviews-anchor"; st.rerun()
-            if st.button("🤖 Ask your data"): st.session_state["jump_to"] = "askdata-anchor"; st.rerun()
-            if st.button("☁️ Word Clouds"): st.session_state["jump_to"] = "wordcloud-anchor"; st.rerun()
-
-        # Clear All at absolute bottom
         if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
-            for k in ["tf","sr","kw","delight","detract","rpp","review_page",
-                      "min_country_count_input","topn_dd_input","wc_max_words_input","wc_extra_stop_input",
-                      "show_metrics","show_country","show_dd","show_reviews","show_ask","show_clouds"] \
-                      + [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
+            for k in ["tf","sr","kw","delight","detract","rpp","review_page"] + \
+                     [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
                 if k in st.session_state: del st.session_state[k]
-            st.session_state["jump_to"] = ""  # never auto-jump after clear
             st.rerun()
 
         st.markdown("---")
 
         # ========== ⭐ Metrics ==========
-        st.markdown("<div id='metrics-anchor'></div>", unsafe_allow_html=True)
-        if st.session_state.get("show_metrics", True):
-            st.markdown(
-                """
-                ### ⭐ Star Rating Metrics
-                <p style="text-align:center;font-size:14px;color:gray;">A summary of customer feedback and review distribution.</p>
-                """,
-                unsafe_allow_html=True
+        st.markdown("### ⭐ Star Rating Metrics")
+        total_reviews = len(filtered_verbatims)
+        avg_rating = filtered_verbatims["Star Rating"].mean() if total_reviews else 0.0
+        star_counts = filtered_verbatims["Star Rating"].value_counts().sort_index()
+        percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
+        star_labels = [f"{int(star)} stars" for star in star_counts.index]
+
+        mc1, mc2 = st.columns(2)
+        with mc1: st.metric("Total Reviews", f"{total_reviews:,}")
+        with mc2: st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
+
+        fig_bar_horizontal = go.Figure(go.Bar(
+            x=star_counts.values, y=star_labels, orientation="h",
+            text=[f"{value} reviews ({percentages.get(idx, 0)}%)"
+                  for idx, value in zip(star_counts.index, star_counts.values)],
+            textposition="auto",
+            marker=dict(color=["#FFA07A", "#FA8072", "#FFD700", "#ADFF2F", "#32CD32"]),
+            hoverinfo="y+x+text"
+        ))
+        fig_bar_horizontal.update_layout(
+            title="<b>Star Rating Distribution</b>",
+            xaxis=dict(title="Number of Reviews", showgrid=False),
+            yaxis=dict(title="Star Ratings", showgrid=False),
+            plot_bgcolor="white",
+            template="plotly_white",
+            margin=dict(l=40, r=40, t=45, b=40)
+        )
+        st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+
+        # ========== 🌍 Country Breakdown ==========
+        st.markdown("### 🌍 Country-Specific Breakdown")
+        if "Country" in filtered_verbatims.columns and "Source" in filtered_verbatims.columns:
+            new_review_filtered = filtered_verbatims[
+                filtered_verbatims["New Review"].astype("string").str.upper() == "YES"
+            ]
+            country_source_stats = (
+                filtered_verbatims.groupby(["Country", "Source"])
+                .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
+                .reset_index()
             )
-            total_reviews = len(filtered_verbatims)
-            avg_rating = filtered_verbatims["Star Rating"].mean() if total_reviews else 0.0
-            star_counts = filtered_verbatims["Star Rating"].value_counts().sort_index()
-            percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
-            star_labels = [f"{int(star)} stars" for star in star_counts.index]
-
-            mc1, mc2 = st.columns(2)
-            with mc1: st.metric("Total Reviews", f"{total_reviews:,}")
-            with mc2: st.metric("Avg Star Rating", f"{avg_rating:.1f}", delta_color="inverse")
-
-            fig_bar_horizontal = go.Figure(go.Bar(
-                x=star_counts.values, y=star_labels, orientation="h",
-                text=[f"{value} reviews ({percentages.get(idx, 0)}%)"
-                      for idx, value in zip(star_counts.index, star_counts.values)],
-                textposition="auto",
-                marker=dict(color=["#FFA07A", "#FA8072", "#FFD700", "#ADFF2F", "#32CD32"]),
-                hoverinfo="y+x+text"
-            ))
-            fig_bar_horizontal.update_layout(
-                title="<b>Star Rating Distribution</b>",
-                xaxis=dict(title="Number of Reviews", showgrid=False),
-                yaxis=dict(title="Star Ratings", showgrid=False),
-                plot_bgcolor="white",
-                template="plotly_white",
-                margin=dict(l=40, r=40, t=45, b=40)
+            new_review_stats = (
+                new_review_filtered.groupby(["Country", "Source"])
+                .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
+                .reset_index()
             )
-            st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+            country_source_stats = country_source_stats.merge(new_review_stats, on=["Country","Source"], how="left")
+            country_overall = (
+                filtered_verbatims.groupby("Country")
+                .agg(Average_Rating=("Star Rating","mean"), Review_Count=("Star Rating","count"))
+                .reset_index()
+            )
+            overall_new_review_stats = (
+                new_review_filtered.groupby("Country")
+                .agg(New_Review_Average=("Star Rating","mean"), New_Review_Count=("Star Rating","count"))
+                .reset_index()
+            )
+            country_overall = country_overall.merge(overall_new_review_stats, on="Country", how="left")
+            country_overall["Source"] = "Overall"
 
-        # ========== 🌍 Country ==========
-        st.markdown("<div id='country-anchor'></div>", unsafe_allow_html=True)
-        if st.session_state.get("show_country", True):
-            st.markdown("### 🌍 Country-Specific Breakdown")
-            if "Country" in filtered_verbatims.columns and "Source" in filtered_verbatims.columns:
-                new_review_filtered = filtered_verbatims[
-                    filtered_verbatims["New Review"].astype("string").str.upper() == "YES"
-                ]
-                country_source_stats = (
-                    filtered_verbatims.groupby(["Country", "Source"])
-                    .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
-                    .reset_index()
+            def color_numeric(val):
+                if pd.isna(val): return ""
+                try: v = float(val)
+                except Exception: return ""
+                if v >= 4.5: return "color: green;"
+                if v < 4.5:  return "color: red;"
+                return ""
+
+            def fmt_rating(v): return "-" if pd.isna(v) else f"{v:.1f}"
+            def fmt_count(v):  return "-" if pd.isna(v) else f"{int(v):,}"
+
+            for country in country_overall["Country"].unique():
+                st.markdown(f"#### {country}")
+                country_data = country_source_stats[country_source_stats["Country"] == country]
+                overall_data = country_overall[country_overall["Country"] == country]
+                combined = pd.concat([country_data, overall_data], ignore_index=True)
+                combined["Sort_Order"] = combined["Source"].apply(lambda x: 1 if x == "Overall" else 0)
+                combined = combined.sort_values(by="Sort_Order", ascending=True).drop(columns=["Sort_Order"])
+                combined = combined.drop(columns=["Country"]).rename(columns={
+                    "Source": "Source",
+                    "Average_Rating": "Avg Rating",
+                    "Review_Count": "Review Count",
+                    "New_Review_Average": "New Review Average",
+                    "New_Review_Count": "New Review Count"
+                })
+
+                def bold_overall(row):
+                    if row["Source"] == "Overall":
+                        return ["font-weight: bold;"] * len(row)
+                    return [""] * len(row)
+
+                styled = (
+                    combined.style
+                    .format({"Avg Rating": fmt_rating, "Review Count": fmt_count,
+                             "New Review Average": fmt_rating, "New Review Count": fmt_count})
+                    .applymap(color_numeric, subset=["Avg Rating", "New Review Average"])
+                    .apply(bold_overall, axis=1)
+                    .set_properties(**{"text-align": "center"})
+                    .set_table_styles([
+                        {"selector": "th", "props": [("text-align", "center")]},
+                        {"selector": "td", "props": [("text-align", "center")]},
+                    ])
                 )
-                new_review_stats = (
-                    new_review_filtered.groupby(["Country", "Source"])
-                    .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
-                    .reset_index()
-                )
-                country_source_stats = country_source_stats.merge(new_review_stats, on=["Country","Source"], how="left")
-                country_overall = (
-                    filtered_verbatims.groupby("Country")
-                    .agg(Average_Rating=("Star Rating","mean"), Review_Count=("Star Rating","count"))
-                    .reset_index()
-                )
-                overall_new_review_stats = (
-                    new_review_filtered.groupby("Country")
-                    .agg(New_Review_Average=("Star Rating","mean"), New_Review_Count=("Star Rating","count"))
-                    .reset_index()
-                )
-                country_overall = country_overall.merge(overall_new_review_stats, on="Country", how="left")
-                country_overall["Source"] = "Overall"
-
-                def color_numeric(val):
-                    if pd.isna(val): return ""
-                    try: v = float(val)
-                    except Exception: return ""
-                    if v >= 4.5: return "color: green;"
-                    if v < 4.5:  return "color: red;"
-                    return ""
-
-                def fmt_rating(v): return "-" if pd.isna(v) else f"{v:.1f}"
-                def fmt_count(v):  return "-" if pd.isna(v) else f"{int(v):,}"
-
-                min_count = int(st.session_state.get("min_country_count", 1))
-
-                for country in country_overall["Country"].unique():
-                    st.markdown(f"#### {country}")
-                    country_data = country_source_stats[country_source_stats["Country"] == country]
-                    overall_data = country_overall[country_overall["Country"] == country]
-                    combined = pd.concat([country_data, overall_data], ignore_index=True)
-                    combined["Sort_Order"] = combined["Source"].apply(lambda x: 1 if x == "Overall" else 0)
-                    combined = combined.sort_values(by="Sort_Order", ascending=True).drop(columns=["Sort_Order"])
-                    combined = combined.drop(columns=["Country"]).rename(columns={
-                        "Source": "Source",
-                        "Average_Rating": "Avg Rating",
-                        "Review_Count": "Review Count",
-                        "New_Review_Average": "New Review Average",
-                        "New_Review_Count": "New Review Count"
-                    })
-                    # apply threshold but always keep Overall
-                    combined = combined[(combined["Source"].eq("Overall")) |
-                                        (combined["Review Count"].fillna(0) >= min_count)]
-
-                    def bold_overall(row):
-                        if row["Source"] == "Overall":
-                            return ["font-weight: bold;"] * len(row)
-                        return [""] * len(row)
-
-                    styled = (
-                        combined.style
-                        .format({"Avg Rating": fmt_rating, "Review Count": fmt_count,
-                                 "New Review Average": fmt_rating, "New Review Count": fmt_count})
-                        .applymap(color_numeric, subset=["Avg Rating", "New Review Average"])
-                        .apply(bold_overall, axis=1)
-                        .set_properties(**{"text-align": "center"})
-                        .set_table_styles([
-                            {"selector": "th", "props": [("text-align", "center")]},
-                            {"selector": "td", "props": [("text-align", "center")]},
-                        ])
-                    )
-                    st.markdown(styled.to_html(escape=False, index=False), unsafe_allow_html=True)
-            else:
-                st.warning("Country or Source data is missing in the uploaded file.")
-
-        # ========== 🌟 Detractors/Delighters ==========
-        st.markdown("<div id='dd-anchor'></div>", unsafe_allow_html=True)
-        if st.session_state.get("show_dd", True):
-            st.markdown("### 🌟 Delighters and Detractors Analysis")
-            detractors_results = analyze_delighters_detractors(filtered_verbatims, existing_detractor_columns)
-            delighters_results = analyze_delighters_detractors(filtered_verbatims, existing_delighter_columns)
-
-            topn = int(st.session_state.get("topn_dd", 20))
-            detractors_results = detractors_results.head(topn)
-            delighters_results = delighters_results.head(topn)
-
-            view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
-
-            def _styled_table(df: pd.DataFrame):
-                return df.style.applymap(style_rating_cells, subset=["Avg Star"])\
-                               .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})\
-                               .hide(axis="index")
-
-            if view_mode == "Split":
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    st.subheader("All Detractors")
-                    st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
-                                 use_container_width=True, hide_index=True)
-                with c2:
-                    st.subheader("All Delighters")
-                    st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
-                                 use_container_width=True, hide_index=True)
-            else:
-                tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
-                with tab1:
-                    st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
-                                 use_container_width=True, hide_index=True)
-                with tab2:
-                    st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
-                                 use_container_width=True, hide_index=True)
-
-        # ========== 📝 Reviews ==========
-        st.markdown("<div id='reviews-anchor'></div>", unsafe_allow_html=True)
-        if st.session_state.get("show_reviews", True):
-            translator = Translator()
-            st.markdown("### 📝 All Reviews")
-
-            if not filtered_verbatims.empty:
-                csv_bytes = filtered_verbatims.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("⬇️ Download ALL filtered reviews (CSV)", csv_bytes,
-                                   file_name="filtered_reviews.csv", mime="text/csv")
-
-            translate_all = st.button("Translate All Reviews to English")
-
-            reviews_per_page = st.session_state.get("reviews_per_page", 10)
-            if "review_page" not in st.session_state: st.session_state["review_page"] = 0
-
-            def rerun_top(): st.rerun()
-
-            total_reviews_count = len(filtered_verbatims)
-            total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
-            current_page = min(max(st.session_state["review_page"], 0), total_pages - 1)
-            start_index = current_page * reviews_per_page
-            end_index = start_index + reviews_per_page
-            paginated_reviews = filtered_verbatims.iloc[start_index:end_index]
-
-            if paginated_reviews.empty:
-                st.warning("No reviews match the selected criteria.")
-            else:
-                for _, row in paginated_reviews.iterrows():
-                    review_text = row.get("Verbatim", pd.NA)
-                    review_text = "" if pd.isna(review_text) else clean_text(review_text)
-                    translated_review = safe_translate(translator, review_text) if translate_all else review_text
-
-                    date_val = row.get("Review Date", pd.NaT)
-                    if pd.isna(date_val): date_str = "-"
-                    else:
-                        try:
-                            date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
-                        except Exception:
-                            date_str = "-"
-
-                    display_review_html = highlight_html(translated_review, st.session_state.get("kw", ""))
-
-                    def render_chips(row, columns, css_class):
-                        items = []
-                        for c in columns:
-                            val = row.get(c, pd.NA)
-                            if pd.isna(val): continue
-                            s = str(val).strip()
-                            if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}: continue
-                            items.append(f'<span class="badge {css_class}">{html.escape(s)}</span>')
-                        if not items: return "<i>None</i>"
-                        return f'<div class="badges">{"".join(items)}</div>'
-
-                    delighter_message = render_chips(row, existing_delighter_columns, "pos")
-                    detractor_message = render_chips(row, existing_detractor_columns, "neg")
-
-                    star_val = row.get("Star Rating", 0)
-                    try: star_int = int(star_val) if pd.notna(star_val) else 0
-                    except Exception: star_int = 0
-
-                    st.markdown(
-                        f"""
-                        <div class="review-card">
-                            <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
-                            <p><strong>Country:</strong> {row.get('Country', '')}</p>
-                            <p><strong>Date:</strong> {date_str}</p>
-                            <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
-                            <p><strong>Review:</strong> {display_review_html}</p>
-                            <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
-                            <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-            c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
-            with c1:
-                if st.button("⏮ First", disabled=current_page == 0):
-                    st.session_state["review_page"] = 0; rerun_top()
-            with c2:
-                if st.button("⬅ Prev", disabled=current_page == 0):
-                    st.session_state["review_page"] = max(current_page - 1, 0); rerun_top()
-            with c3:
-                showing_from = 0 if total_reviews_count == 0 else start_index + 1
-                showing_to = min(end_index, total_reviews_count)
-                st.markdown(
-                    f"<div style='text-align:center;font-weight:bold;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
-                    unsafe_allow_html=True,
-                )
-            with c4:
-                if st.button("Next ➡", disabled=current_page >= total_pages - 1):
-                    st.session_state["review_page"] = min(current_page + 1, total_pages - 1); rerun_top()
-            with c5:
-                if st.button("Last ⏭", disabled=current_page >= total_pages - 1):
-                    st.session_state["review_page"] = total_pages - 1; rerun_top()
+                st.markdown(styled.to_html(escape=False, index=False), unsafe_allow_html=True)
+        else:
+            st.warning("Country or Source data is missing in the uploaded file.")
 
         st.markdown("---")
 
-        # ========== 🤖 Ask your data (above Word Clouds) ==========
+        # ========== 🩺 Symptom Tables ==========
+        st.markdown("### 🩺 Symptom Tables")
+        detractors_results = analyze_delighters_detractors(filtered_verbatims, existing_detractor_columns)
+        delighters_results = analyze_delighters_detractors(filtered_verbatims, existing_delighter_columns)
+
+        # keep list concise by default
+        detractors_results = detractors_results.head(20)
+        delighters_results = delighters_results.head(20)
+
+        view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
+
+        def _styled_table(df: pd.DataFrame):
+            return df.style.applymap(style_rating_cells, subset=["Avg Star"])\
+                           .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})\
+                           .hide(axis="index")
+
+        if view_mode == "Split":
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.subheader("All Detractors")
+                st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
+                             use_container_width=True, hide_index=True)
+            with c2:
+                st.subheader("All Delighters")
+                st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
+                             use_container_width=True, hide_index=True)
+        else:
+            tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
+            with tab1:
+                st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
+                             use_container_width=True, hide_index=True)
+            with tab2:
+                st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
+                             use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ========== 📝 Reviews ==========
+        st.markdown("### 📝 All Reviews")
+        translator = Translator()
+
+        if not filtered_verbatims.empty:
+            csv_bytes = filtered_verbatims.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("⬇️ Download ALL filtered reviews (CSV)", csv_bytes,
+                               file_name="filtered_reviews.csv", mime="text/csv")
+
+        translate_all = st.button("Translate All Reviews to English")
+
+        reviews_per_page = st.session_state.get("reviews_per_page", 10)
+        if "review_page" not in st.session_state: st.session_state["review_page"] = 0
+
+        def rerun_top(): st.rerun()
+
+        total_reviews_count = len(filtered_verbatims)
+        total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
+        current_page = min(max(st.session_state["review_page"], 0), total_pages - 1)
+        start_index = current_page * reviews_per_page
+        end_index = start_index + reviews_per_page
+        paginated_reviews = filtered_verbatims.iloc[start_index:end_index]
+
+        if paginated_reviews.empty:
+            st.warning("No reviews match the selected criteria.")
+        else:
+            for _, row in paginated_reviews.iterrows():
+                review_text = row.get("Verbatim", pd.NA)
+                review_text = "" if pd.isna(review_text) else clean_text(review_text)
+                translated_review = safe_translate(translator, review_text) if translate_all else review_text
+
+                date_val = row.get("Review Date", pd.NaT)
+                if pd.isna(date_val): date_str = "-"
+                else:
+                    try: date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
+                    except Exception: date_str = "-"
+
+                display_review_html = highlight_html(translated_review, st.session_state.get("kw", ""))
+
+                def render_chips(row, columns, css_class):
+                    items = []
+                    for c in columns:
+                        val = row.get(c, pd.NA)
+                        if pd.isna(val): continue
+                        s = str(val).strip()
+                        if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}: continue
+                        items.append(f'<span class="badge {css_class}">{html.escape(s)}</span>')
+                    return f'<div class="badges">{"".join(items)}</div>' if items else "<i>None</i>"
+
+                delighter_message = render_chips(row, existing_delighter_columns, "pos")
+                detractor_message = render_chips(row, existing_detractor_columns, "neg")
+
+                star_val = row.get("Star Rating", 0)
+                try: star_int = int(star_val) if pd.notna(star_val) else 0
+                except Exception: star_int = 0
+
+                st.markdown(
+                    f"""
+                    <div class="review-card">
+                        <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
+                        <p><strong>Country:</strong> {row.get('Country', '')}</p>
+                        <p><strong>Date:</strong> {date_str}</p>
+                        <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
+                        <p><strong>Review:</strong> {display_review_html}</p>
+                        <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
+                        <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
+        with c1:
+            if st.button("⏮ First", disabled=current_page == 0):
+                st.session_state["review_page"] = 0; rerun_top()
+        with c2:
+            if st.button("⬅ Prev", disabled=current_page == 0):
+                st.session_state["review_page"] = max(current_page - 1, 0); rerun_top()
+        with c3:
+            showing_from = 0 if total_reviews_count == 0 else start_index + 1
+            showing_to = min(end_index, total_reviews_count)
+            st.markdown(
+                f"<div style='text-align:center;font-weight:bold;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
+                unsafe_allow_html=True,
+            )
+        with c4:
+            if st.button("Next ➡", disabled=current_page >= total_pages - 1):
+                st.session_state["review_page"] = min(current_page + 1, total_pages - 1); rerun_top()
+        with c5:
+            if st.button("Last ⏭", disabled=current_page >= total_pages - 1):
+                st.session_state["review_page"] = total_pages - 1; rerun_top()
+
+        st.markdown("---")
+
+        # ========== 🤖 Ask your data (auto-scroll to newest answer) ==========
         st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
-        if st.session_state.get("show_ask", True):
-            st.markdown("### 🤖 Ask your data")
-            api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+        st.markdown("### 🤖 Ask your data")
+        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
-            if not _HAS_OPENAI:
-                st.info("To enable this panel, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
-            elif not api_key:
-                st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
-            else:
-                client = OpenAI(api_key=api_key)
-                if "qa_messages" not in st.session_state:
-                    st.session_state.qa_messages = [
-                        {"role": "system", "content":
-                            "You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. "
-                            "Call tools when you need exact counts/means. If unknown, say you don't know."}
-                    ]
+        # flag used to trigger scroll only after a fresh response
+        st.session_state.setdefault("ask_scroll_pending", False)
 
-                def context_blob(df: pd.DataFrame, n=25) -> str:
-                    if df.empty: return "No rows after filters."
-                    parts = [f"ROW_COUNT={len(df)}"]
-                    if "Star Rating" in df:
-                        parts.append(f"STAR_COUNTS={df['Star Rating'].value_counts().sort_index().to_dict()}")
-                    cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"] if c in df.columns]
-                    smp = df[cols_keep].sample(min(n, len(df)), random_state=7)
-                    for _, r in smp.iterrows():
-                        try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
-                        except Exception: date_str = str(r.get("Review Date","")) or ""
-                        parts.append(str({
-                            "date": date_str,
-                            "country": str(r.get("Country","")),
-                            "source": str(r.get("Source","")),
-                            "model": str(r.get("Model (SKU)","")),
-                            "stars": str(r.get("Star Rating","")),
-                            "text": clean_text(str(r.get("Verbatim","")))
-                        }))
-                    return "\n".join(parts)
-
-                def pandas_count(query: str) -> dict:
-                    try:
-                        if ";" in query or "__" in query: return {"error": "disallowed pattern"}
-                        res = filtered_verbatims.query(query, engine="python")
-                        return {"count": int(len(res))}
-                    except Exception as e:
-                        return {"error": str(e)}
-
-                def pandas_mean(column: str, query: str | None = None) -> dict:
-                    try:
-                        if column not in filtered_verbatims.columns:
-                            return {"error": f"Unknown column {column}"}
-                        df = filtered_verbatims
-                        if query: df = df.query(query, engine="python")
-                        return {"mean": float(df[column].mean())}
-                    except Exception as e:
-                        return {"error": str(e)}
-
-                tools = [
-                    {"type":"function","function":{
-                        "name":"pandas_count",
-                        "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
-                        "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
-                    }},
-                    {"type":"function","function":{
-                        "name":"pandas_mean",
-                        "description":"Compute mean of a numeric column (optionally with a pandas query).",
-                        "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
-                    }},
+        if not _HAS_OPENAI:
+            st.info("To enable this panel, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
+        elif not api_key:
+            st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
+        else:
+            client = OpenAI(api_key=api_key)
+            if "qa_messages" not in st.session_state:
+                st.session_state.qa_messages = [
+                    {"role": "system", "content":
+                        "You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. "
+                        "Call tools when you need exact counts/means. If unknown, say you don't know."}
                 ]
 
-                for m in st.session_state.qa_messages:
-                    if m["role"] != "system":
-                        with st.chat_message(m["role"]):
-                            st.markdown(m["content"])
+            def context_blob(df: pd.DataFrame, n=25) -> str:
+                if df.empty: return "No rows after filters."
+                parts = [f"ROW_COUNT={len(df)}"]
+                if "Star Rating" in df:
+                    parts.append(f"STAR_COUNTS={df['Star Rating'].value_counts().sort_index().to_dict()}")
+                cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"] if c in df.columns]
+                smp = df[cols_keep].sample(min(n, len(df)), random_state=7)
+                for _, r in smp.iterrows():
+                    try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
+                    except Exception: date_str = str(r.get("Review Date","")) or ""
+                    parts.append(str({
+                        "date": date_str,
+                        "country": str(r.get("Country","")),
+                        "source": str(r.get("Source","")),
+                        "model": str(r.get("Model (SKU)","")),
+                        "stars": str(r.get("Star Rating","")),
+                        "text": clean_text(str(r.get("Verbatim","")))
+                    }))
+                return "\n".join(parts)
 
-                user_q = st.chat_input("Ask a question about the CURRENTLY FILTERED reviews…")
-                if user_q:
-                    st.session_state.qa_messages.append({"role": "user", "content": user_q})
-                    with st.chat_message("user"): st.markdown(user_q)
+            def pandas_count(query: str) -> dict:
+                try:
+                    if ";" in query or "__" in query: return {"error": "disallowed pattern"}
+                    res = filtered_verbatims.query(query, engine="python")
+                    return {"count": int(len(res))}
+                except Exception as e:
+                    return {"error": str(e)}
 
-                    sys_ctx = ("CONTEXT:\n" + context_blob(filtered_verbatims) +
-                               "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. "
-                               "If unknown from context+tools, say you don't know.")
+            def pandas_mean(column: str, query: str | None = None) -> dict:
+                try:
+                    if column not in filtered_verbatims.columns:
+                        return {"error": f"Unknown column {column}"}
+                    df = filtered_verbatims
+                    if query: df = df.query(query, engine="python")
+                    return {"mean": float(df[column].mean())}
+                except Exception as e:
+                    return {"error": str(e)}
 
-                    try:
-                        first = client.chat.completions.create(
+            tools = [
+                {"type":"function","function":{
+                    "name":"pandas_count",
+                    "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
+                    "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+                }},
+                {"type":"function","function":{
+                    "name":"pandas_mean",
+                    "description":"Compute mean of a numeric column (optionally with a pandas query).",
+                    "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
+                }},
+            ]
+
+            # Render chat history
+            for m in st.session_state.qa_messages:
+                if m["role"] != "system":
+                    with st.chat_message(m["role"]):
+                        st.markdown(m["content"])
+
+            user_q = st.chat_input("Ask a question about the CURRENTLY FILTERED reviews…")
+            if user_q:
+                st.session_state.qa_messages.append({"role": "user", "content": user_q})
+                with st.chat_message("user"):
+                    st.markdown(user_q)
+
+                sys_ctx = ("CONTEXT:\n" + context_blob(filtered_verbatims) +
+                           "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. "
+                           "If unknown from context+tools, say you don't know.")
+
+                try:
+                    first = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        temperature=0.2,
+                        messages=[*st.session_state.qa_messages, {"role":"system","content": sys_ctx}],
+                        tools=tools,
+                    )
+                    msg = first.choices[0].message
+                    if msg.tool_calls:
+                        tool_msgs = []
+                        for call in msg.tool_calls:
+                            name = call.function.name
+                            args = json.loads(call.function.arguments or "{}")
+                            out = {"error":"unknown tool"}
+                            if name == "pandas_count": out = pandas_count(args.get("query",""))
+                            if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                            tool_msgs.append({"tool_call_id": call.id, "role":"tool",
+                                              "name": name, "content": json.dumps(out)})
+                        follow = client.chat.completions.create(
                             model="gpt-4o-mini",
                             temperature=0.2,
-                            messages=[*st.session_state.qa_messages, {"role":"system","content": sys_ctx}],
-                            tools=tools,
+                            messages=[
+                                *st.session_state.qa_messages,
+                                {"role":"system","content": sys_ctx},
+                                {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                                *tool_msgs
+                            ],
                         )
-                        msg = first.choices[0].message
-                        if msg.tool_calls:
-                            tool_msgs = []
-                            for call in msg.tool_calls:
-                                name = call.function.name
-                                args = json.loads(call.function.arguments or "{}")
-                                out = {"error":"unknown tool"}
-                                if name == "pandas_count": out = pandas_count(args.get("query",""))
-                                if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                                tool_msgs.append({"tool_call_id": call.id, "role":"tool",
-                                                  "name": name, "content": json.dumps(out)})
-                            follow = client.chat.completions.create(
-                                model="gpt-4o-mini",
-                                temperature=0.2,
-                                messages=[
-                                    *st.session_state.qa_messages,
-                                    {"role":"system","content": sys_ctx},
-                                    {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                                    *tool_msgs
-                                ],
-                            )
-                            final_text = follow.choices[0].message.content
-                        else:
-                            final_text = msg.content
+                        final_text = follow.choices[0].message.content
+                    else:
+                        final_text = msg.content
 
-                        st.session_state.qa_messages.append({"role":"assistant","content": final_text})
-                        with st.chat_message("assistant"): st.markdown(final_text)
+                    st.session_state.qa_messages.append({"role":"assistant","content": final_text})
+                    with st.chat_message("assistant"):
+                        st.markdown(final_text)
+                        # anchor we can scroll to after the response renders
+                        st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
+                    # trigger one-time scroll
+                    st.session_state["ask_scroll_pending"] = True
 
-                    except Exception as e:
-                        err = f"LLM error: {e}"
-                        st.session_state.qa_messages.append({"role":"assistant","content": err})
-                        with st.chat_message("assistant"): st.error(err)
+                except Exception as e:
+                    err = f"LLM error: {e}"
+                    st.session_state.qa_messages.append({"role":"assistant","content": err})
+                    with st.chat_message("assistant"):
+                        st.error(err)
+                        st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
+                    st.session_state["ask_scroll_pending"] = True
 
         st.markdown("---")
 
         # ========== ☁️ Word Clouds ==========
-        st.markdown("<div id='wordcloud-anchor'></div>", unsafe_allow_html=True)
-        if st.session_state.get("show_clouds", True):
-            st.markdown("### 🌟 Word Cloud for Delighters and Detractors")
-            detractors_text = build_wordcloud_text(filtered_verbatims, existing_detractor_columns)
-            delighters_text = build_wordcloud_text(filtered_verbatims, existing_delighter_columns)
+        st.markdown("### 🌟 Word Cloud for Delighters and Detractors")
+        detractors_text = build_wordcloud_text(filtered_verbatims, existing_detractor_columns)
+        delighters_text = build_wordcloud_text(filtered_verbatims, existing_delighter_columns)
 
-            extra = set([w.strip().lower() for w in st.session_state.get("wc_extra_stop","").split(",") if w.strip()])
-            custom_stopwords = set(STOPWORDS) | {"na","n/a","none","null","etc","amp","https","http"} | extra
-            wc_max_words = int(st.session_state.get("wc_max_words", 180))
+        custom_stopwords = set(STOPWORDS) | {"na","n/a","none","null","etc","amp","https","http"}
 
-            @st.cache_data(show_spinner=False)
-            def make_wordcloud_png(text: str, colormap: str, width: int, height: int, max_words: int, stops: tuple) -> bytes | None:
-                text = (text or "").strip()
-                if not text: return None
-                try:
-                    wc = WordCloud(
-                        background_color="white",
-                        colormap=colormap,
-                        width=width, height=height,
-                        max_words=max_words,
-                        contour_width=2,
-                        collocations=False,
-                        normalize_plurals=True,
-                        stopwords=set(stops),
-                        regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
-                        random_state=42,
-                        scale=2,
-                    ).generate(text)
-                except ValueError:
-                    return None
-                import matplotlib.pyplot as _plt
-                fig = _plt.figure(figsize=(10, 5))
-                _plt.imshow(wc, interpolation="bilinear"); _plt.axis("off")
-                buf = io.BytesIO(); _plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0); _plt.close(fig)
-                return buf.getvalue()
+        @st.cache_data(show_spinner=False)
+        def make_wordcloud_png(text: str, colormap: str, width: int, height: int, max_words: int, stops: tuple) -> bytes | None:
+            text = (text or "").strip()
+            if not text: return None
+            try:
+                wc = WordCloud(
+                    background_color="white",
+                    colormap=colormap,
+                    width=width, height=height,
+                    max_words=max_words,
+                    contour_width=2,
+                    collocations=False,
+                    normalize_plurals=True,
+                    stopwords=set(stops),
+                    regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
+                    random_state=42,
+                    scale=2,
+                ).generate(text)
+            except ValueError:
+                return None
+            import matplotlib.pyplot as _plt
+            fig = _plt.figure(figsize=(10, 5))
+            _plt.imshow(wc, interpolation="bilinear"); _plt.axis("off")
+            buf = io.BytesIO(); _plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0); _plt.close(fig)
+            return buf.getvalue()
 
-            st.markdown("#### 😠 Detractors")
-            det_png = make_wordcloud_png(detractors_text, "Reds", 1600, 800, wc_max_words, tuple(custom_stopwords))
-            if det_png: st.image(det_png, use_container_width=True)
-            else:       st.info("Not enough detractor text to build a word cloud.")
+        det_png = make_wordcloud_png(detractors_text, "Reds", 1600, 800, 180, tuple(custom_stopwords))
+        st.markdown("#### 😠 Detractors")
+        if det_png: st.image(det_png, use_container_width=True)
+        else:       st.info("Not enough detractor text to build a word cloud.")
 
-            st.markdown("#### 😊 Delighters")
-            del_png = make_wordcloud_png(delighters_text, "Greens", 1600, 800, wc_max_words, tuple(custom_stopwords))
-            if del_png: st.image(del_png, use_container_width=True)
-            else:       st.info("Not enough delighter text to build a word cloud.")
+        del_png = make_wordcloud_png(delighters_text, "Greens", 1600, 800, 180, tuple(custom_stopwords))
+        st.markdown("#### 😊 Delighters")
+        if del_png: st.image(del_png, use_container_width=True)
+        else:       st.info("Not enough delighter text to build a word cloud.")
 
-        # ---------- Smooth-scroll only if user clicked a Quick Link ----------
-        if st.session_state.get("jump_to"):
-            anchor_id = st.session_state.pop("jump_to", "")
+        # ---------- Auto-scroll to the latest LLM answer (only after submit) ----------
+        if st.session_state.get("ask_scroll_pending"):
+            st.session_state["ask_scroll_pending"] = False
             st.markdown(
-                f"""
+                """
                 <script>
-                  const el = document.getElementById('{anchor_id}');
-                  if (el) el.scrollIntoView({{behavior:'smooth', block:'start'}});
+                const last = document.getElementById('askdata-last');
+                if (last) { last.scrollIntoView({behavior:'smooth', block:'start'}); }
                 </script>
                 """,
                 unsafe_allow_html=True,
@@ -811,4 +764,3 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
-
