@@ -914,8 +914,7 @@ else:
                     "stars": str(r.get("Star Rating","")),
                     "text": clean_text(str(r.get("Verbatim","")))
                 }))
-            return "
-".join(parts)
+            return "\n".join(parts)
 
         selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
         llm_temp = float(st.session_state.get("llm_temp", 0.2))
@@ -1074,4 +1073,5 @@ if st.session_state.get("force_scroll_top_once"):
 if st.session_state.get("force_scroll_anchor"):
     scroll_to(st.session_state["force_scroll_anchor"])
     st.session_state["force_scroll_anchor"] = None
+
 
