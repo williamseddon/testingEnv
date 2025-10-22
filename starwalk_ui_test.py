@@ -1,4 +1,4 @@
-import streamlit as st
+import streamlit as st 
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
@@ -26,6 +26,7 @@ st.markdown(
 # ---------------------------------------
 # Utilities
 # ---------------------------------------
+
 def style_rating_cells(value):
     """Styles cells: Green for ratings 4.5 and above, red for below 4.5."""
     if isinstance(value, (float, int)):
@@ -34,6 +35,7 @@ def style_rating_cells(value):
         elif value < 4.5:
             return "color: red;"
     return ""
+
 
 def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str):
     options = ["ALL"]
@@ -49,6 +51,7 @@ def apply_filter(dataframe: pd.DataFrame, column_name: str, filter_name: str):
     if "ALL" not in selected_filter and column_name in dataframe.columns:
         return dataframe[dataframe[column_name].astype("string").isin(selected_filter)], selected_filter
     return dataframe, ["ALL"]
+
 
 def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
     """Collect a unique, ordered list of non-empty symptom strings from provided columns that exist."""
@@ -68,6 +71,7 @@ def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
                     seen.add(item)
                     vals.append(item)
     return vals
+
 
 def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
     """Analyze delighter/detractor symptoms and calculate metrics, robust to empty/missing columns."""
@@ -111,6 +115,7 @@ def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: li
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
     return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
 
+
 def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
     """Flatten text from given columns into a single string for wordcloud generation."""
     cols = [c for c in cols if c in df.columns]
@@ -125,6 +130,45 @@ def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
     )
     s = s[s != ""]
     return " ".join(s.tolist())
+
+
+def clean_text(x: str) -> str:
+    """Fix common mojibake like â€™ and trim whitespace."""
+    if x is None:
+        return ""
+    x = str(x)
+    # Specific replacements requested
+    x = x.replace("â€™", "'")
+    # (Optionally add more common fixes here if needed later)
+    return x.strip()
+
+
+def apply_keyword_filter(df: pd.DataFrame, keyword: str, include_symptoms: bool = False) -> pd.DataFrame:
+    """Filter rows where the keyword appears in the Review text (and optionally symptom columns)."""
+    if not keyword:
+        return df
+
+    kw = keyword.strip()
+    if kw == "":
+        return df
+
+    # Prepare a boolean mask on Verbatim first
+    verb_col = "Verbatim" if "Verbatim" in df.columns else None
+    mask = pd.Series([False] * len(df))
+
+    if verb_col:
+        verb = df[verb_col].astype("string").fillna("").map(clean_text)
+        mask = verb.str.contains(kw, case=False, na=False)
+
+    if include_symptoms:
+        sym_cols = [c for c in df.columns if c.startswith("Symptom")]
+        if sym_cols:
+            sym_frame = df[sym_cols].astype("string").fillna("")
+            sym_mask = sym_frame.apply(lambda col: col.str.contains(kw, case=False, na=False)).any(axis=1)
+            mask = mask | sym_mask
+
+    return df[mask]
+
 
 # ---------------------------------------
 # File Upload
@@ -146,7 +190,7 @@ if uploaded_file:
                 verbatims[col] = verbatims[col].astype("string").str.upper()
 
         # Coerce ONLY truly numeric columns
-        numeric_columns = ["Star Rating"]  # <-- critical fix: do not coerce Symptom columns to numeric
+        numeric_columns = ["Star Rating"]
         for col in numeric_columns:
             if col in verbatims.columns:
                 verbatims[col] = pd.to_numeric(verbatims[col], errors="coerce")
@@ -155,6 +199,10 @@ if uploaded_file:
         all_symptom_cols = [c for c in verbatims.columns if c.startswith("Symptom")]
         for c in all_symptom_cols:
             verbatims[c] = verbatims[c].astype("string")
+
+        # Clean review text for mojibake (â€™ -> ')
+        if "Verbatim" in verbatims.columns:
+            verbatims["Verbatim"] = verbatims["Verbatim"].astype("string").map(clean_text)
 
         # Date parsing
         if "Review Date" in verbatims.columns:
@@ -260,6 +308,19 @@ if uploaded_file:
             filtered_verbatims = filtered_verbatims[mask]
 
         # ---------------------------------------
+        # NEW 🔎 Keyword Mention Filter (below Delighters/Detractors)
+        # ---------------------------------------
+        st.sidebar.subheader("🔎 Keyword Mention Filter")
+        kw_col1, kw_col2 = st.sidebar.columns([3, 2])
+        with kw_col1:
+            keyword = st.text_input("Keyword to search (in review text)", value="", help="Case-insensitive contains match in the Review text. Cleaned for â€™ → '.")
+        with kw_col2:
+            include_symptoms = st.checkbox("Also symptoms", value=False, help="Include Symptom columns in the keyword search.")
+
+        if keyword:
+            filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword, include_symptoms=include_symptoms)
+
+        # ---------------------------------------
         # Dynamic Additional Filters (post Symptom 20 by index)
         # ---------------------------------------
         additional_columns = verbatims.columns[20:]  # columns after the 21st (0-based)
@@ -334,14 +395,14 @@ if uploaded_file:
 
             country_source_stats = (
                 filtered_verbatims
-                .groupby(["Country", "Source"])
+                .groupby(["Country", "Source"])\
                 .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
 
             new_review_stats = (
                 new_review_filtered
-                .groupby(["Country", "Source"])
+                .groupby(["Country", "Source"])\
                 .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
@@ -350,14 +411,14 @@ if uploaded_file:
 
             country_overall = (
                 filtered_verbatims
-                .groupby("Country")
+                .groupby("Country")\
                 .agg(Average_Rating=("Star Rating", "mean"), Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
 
             overall_new_review_stats = (
                 new_review_filtered
-                .groupby("Country")
+                .groupby("Country")\
                 .agg(New_Review_Average=("Star Rating", "mean"), New_Review_Count=("Star Rating", "count"))
                 .reset_index()
             )
@@ -536,8 +597,8 @@ if uploaded_file:
                 st.write("No detractor symptoms found.")
             else:
                 st.dataframe(
-                    detractors_results.style.applymap(style_star_ratings, subset=["Avg Star"])
-                    .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
+                    detractors_results.style.applymap(style_star_ratings, subset=["Avg Star"]).\
+                    format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
                     use_container_width=True
                 )
 
@@ -547,18 +608,29 @@ if uploaded_file:
                 st.write("No delighter symptoms found.")
             else:
                 st.dataframe(
-                    delighters_results.style.applymap(style_star_ratings, subset=["Avg Star"])
-                    .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
+                    delighters_results.style.applymap(style_star_ratings, subset=["Avg Star"]).\
+                    format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"}),
                     use_container_width=True
                 )
 
         st.markdown("---")
 
         # ---------------------------------------
-        # Reviews (with optional translation)
+        # Reviews (with optional translation) + NEW Download All (filtered)
         # ---------------------------------------
         translator = Translator()
         st.markdown("### 📝 All Reviews")
+
+        # Download all filtered reviews (not just current page)
+        if not filtered_verbatims.empty:
+            csv_bytes = filtered_verbatims.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="⬇️ Download ALL filtered reviews (CSV)",
+                data=csv_bytes,
+                file_name="filtered_reviews.csv",
+                mime="text/csv",
+                help="Exports all rows that match the active filters, regardless of pagination."
+            )
 
         translate_to_english = st.button("Translate All Reviews to English")
 
@@ -579,7 +651,7 @@ if uploaded_file:
         else:
             for _, row in paginated_reviews.iterrows():
                 review_text = row.get("Verbatim", pd.NA)
-                review_text = "" if pd.isna(review_text) else str(review_text)
+                review_text = "" if pd.isna(review_text) else clean_text(review_text)
 
                 if translate_to_english:
                     try:
