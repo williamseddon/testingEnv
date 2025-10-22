@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from googletrans import Translator
 import io
 import asyncio
+import re
+import html
 
 # ---------------------------------------
 # Page config
@@ -138,9 +140,21 @@ def clean_text(x: str) -> str:
     if x is None:
         return ""
     x = str(x)
-    # Specific replacements requested
     x = x.replace("â€™", "'")
     return x.strip()
+
+
+def highlight_html(text: str, keyword: str | None) -> str:
+    """Escape text to safe HTML then wrap keyword matches with <mark> tags (case-insensitive)."""
+    safe = html.escape(text or "")
+    if keyword:
+        try:
+            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+            safe = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", safe)
+        except re.error:
+            # If the user types an invalid regex-like string, just skip highlighting
+            pass
+    return safe
 
 
 # ---- Translation helpers (robust to coroutine return) ----
@@ -700,6 +714,23 @@ if uploaded_file:
                 else:
                     translated_review = review_text
 
+                # Date formatting
+                date_val = row.get("Review Date", pd.NaT)
+                if pd.isna(date_val):
+                    date_str = "-"
+                else:
+                    try:
+                        if isinstance(date_val, (pd.Timestamp, datetime)):
+                            date_str = date_val.strftime("%Y-%m-%d")
+                        else:
+                            parsed = pd.to_datetime(date_val, errors="coerce")
+                            date_str = "-" if pd.isna(parsed) else parsed.strftime("%Y-%m-%d")
+                    except Exception:
+                        date_str = "-"
+
+                # Highlight keyword in the (possibly translated) review text
+                display_review_html = highlight_html(translated_review, keyword)
+
                 delighter_badges = [
                     f'<div style="display:inline-block; padding:5px 10px; background-color:lightgreen; color:black; border-radius:5px; margin:5px;">{row[col]}</div>'
                     for col in existing_delighter_columns if col in row and pd.notna(row[col])
@@ -723,8 +754,9 @@ if uploaded_file:
                     <div style=\"border: 1px solid #ddd; padding: 15px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;\">
                         <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
                         <p><strong>Country:</strong> {row.get('Country', '')}</p>
+                        <p><strong>Date:</strong> {date_str}</p>
                         <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
-                        <p><strong>Review:</strong> {translated_review}</p>
+                        <p><strong>Review:</strong> {display_review_html}</p>
                         <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
                         <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
                     </div>
