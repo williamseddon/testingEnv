@@ -4,9 +4,10 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from googletrans import Translator
-import io, re, html, os, warnings, json, asyncio, smtplib
+import io, re, html, os, warnings, json, asyncio, smtplib, hashlib
 from email.message import EmailMessage
 from streamlit.components.v1 import html as st_html
+import numpy as np
 
 # Silence openpyxl warning
 warnings.filterwarnings(
@@ -30,6 +31,7 @@ try:
 except Exception:
     _HAS_OPENAI = False
 
+EMBED_MODEL = "text-embedding-3-small"  # vector index model
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
 def model_supports_temperature(model_id: str) -> bool:
     return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
@@ -45,12 +47,7 @@ st.markdown(
       section[data-testid="stSidebar"] .block-container { padding-top: .25rem; padding-bottom: .6rem; }
       section[data-testid="stSidebar"] label { font-size: .95rem; }
       section[data-testid="stSidebar"] .stButton>button { width: 100%; }
-
-      section[data-testid="stSidebar"] .divider {
-        margin: 10px 0 8px 0;
-        border-top: 1px dashed #d9d9df;
-        height: 1px;
-      }
+      section[data-testid="stSidebar"] .divider { margin: 10px 0 8px 0; border-top: 1px dashed #d9d9df; height: 1px; }
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
       .review-card { border:1px solid #e6e6e6; background:#fafafa; border-radius:12px; padding:16px; }
@@ -60,12 +57,7 @@ st.markdown(
       .badge.pos { background:#CFF7D6; color:#085a2a; }
       .badge.neg { background:#FBD3D0; color:#7a0410; }
 
-      /* Hero band */
-      .hero-wrap {
-        position: relative; overflow: hidden; border-radius: 14px;
-        background: radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%);
-        border: 1px solid #eee; height: 150px; margin-top: .25rem; margin-bottom: 1rem;
-      }
+      .hero-wrap { position: relative; overflow: hidden; border-radius: 14px; background: radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%); border: 1px solid #eee; height: 150px; margin-top: .25rem; margin-bottom: 1rem; }
       #hero-canvas { position:absolute; inset:0; width:100%; height:100%; z-index:1; }
       .hero-inner { position:absolute; inset:0; display:grid; align-content:center; justify-items:center; text-align:center; pointer-events:none; z-index:2; }
       .hero-title-row { display:flex; align-items:center; gap:14px; justify-content:space-between; width: min(1100px, 92%); margin: 0 auto; }
@@ -73,28 +65,21 @@ st.markdown(
       .hero-sub { margin: 4px 0 0 0; color:#667085; font-size: clamp(12px, 1.1vw, 16px); }
       .sn-logo { width: 148px; height:auto; }
 
-      /* Metrics cards */
       .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px,1fr)); gap:16px; }
-      .metric-card {
-        background:#fff; border:1px solid #e9e9ee; border-radius:14px; padding:14px 16px;
-        box-shadow: 0 1px 0 rgba(16,24,40,.02), 0 1px 3px rgba(16,24,40,.04);
-      }
+      .metric-card { background:#fff; border:1px solid #e9e9ee; border-radius:14px; padding:14px 16px; box-shadow: 0 1px 0 rgba(16,24,40,.02), 0 1px 3px rgba(16,24,40,.04); }
       .metric-card h4 { margin:0 0 10px; font-weight:800; font-size:1.05rem; }
       .metric-row { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; }
       .metric-box { background:#f7f7fb; border:1px solid #eee; border-radius:10px; padding:10px 12px; }
       .metric-label { color:#667085; font-size:.85rem; margin-bottom:4px; }
       .metric-kpi { font-weight:800; font-size:1.6rem; }
 
-      /* Symptom tables responsive */
       .table-wrap { width:100%; overflow-x:auto; }
       .table-wrap table { width:100% !important; border-collapse:collapse; }
       .symptom-table th, .symptom-table td { padding: 8px 10px; }
 
-      /* Pagination spacing */
       .pager { margin: 18px 0 28px 0; }
       .pager-zone .stButton>button { padding: 6px 18px; margin: 6px 8px; border-radius: 10px; }
 
-      /* Ask form layout */
       .ask-wrap { border:1px solid #ececf2; background:#f8f9fb; border-radius:12px; padding:14px; }
     </style>
     """,
@@ -132,21 +117,12 @@ def render_hero():
           const ctx = c.getContext('2d', {{alpha:true}});
           const DPR = window.devicePixelRatio || 1;
           let w=0,h=0;
-          function resize(){{
-            const r = c.getBoundingClientRect();
-            w = Math.max(300, r.width|0);
-            h = Math.max(120, r.height|0);
-            c.width = w*DPR; c.height = h*DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
-          }}
+          function resize(){{ const r=c.getBoundingClientRect(); w=Math.max(300,r.width|0); h=Math.max(120,r.height|0); c.width=w*DPR; c.height=h*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); }}
           window.addEventListener('resize', resize, {{passive:true}}); resize();
           const N = Math.max(120, Math.floor(w/12));
           function randLeft(){{ return Math.pow(Math.random(), 1.9) * (w*0.7); }}
           const stars = Array.from({{length:N}}, () => ({{ x:randLeft(), y:Math.random()*h, r:.6+Math.random()*1.4, s:.3+Math.random()*0.9 }}));
-          function tick(){{
-            ctx.clearRect(0,0,w,h);
-            for(const s of stars){{ ctx.beginPath(); ctx.arc((s.x%w+w)%w,(s.y%h+h)%h,s.r,0,Math.PI*2); ctx.fillStyle='rgba(255,200,50,.9)'; ctx.fill(); s.x=(s.x+0.10*s.s)%w; }}
-            requestAnimationFrame(tick);
-          }} tick();
+          function tick(){{ ctx.clearRect(0,0,w,h); for(const s of stars){{ ctx.beginPath(); ctx.arc((s.x%w+w)%w,(s.y%h+h)%h,s.r,0,Math.PI*2); ctx.fillStyle='rgba(255,200,50,.9)'; ctx.fill(); s.x=(s.x+0.10*s.s)%w; }} requestAnimationFrame(tick); }} tick();
         }})();
         </script>
         """,
@@ -167,10 +143,8 @@ def clean_text(x: str, keep_na: bool=False) -> str:
             repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
             if repaired.strip(): s = repaired
         except Exception: pass
-    for bad, good in {
-        "â€™": "'", "â€˜": "‘", "â€œ": "“", "â€\x9d": "”",
-        "â€“": "–", "â€”": "—", "Â": ""
-    }.items(): s = s.replace(bad, good)
+    for bad, good in {"â€™": "'", "â€˜": "‘", "â€œ": "“", "â€\x9d": "”", "â€“": "–", "â€”": "—", "Â": ""}.items():
+        s = s.replace(bad, good)
     s = s.strip()
     if s.upper() in {"<NA>","NA","N/A","NULL","NONE"}:
         return pd.NA if keep_na else ""
@@ -264,7 +238,6 @@ def apply_keyword_filter(df, kw):
     return df[verb.str.contains(kw.strip(), case=False, na=False)]
 
 def send_feedback_email(subject: str, body: str) -> tuple[bool, str]:
-    """Try SMTP if configured in secrets; otherwise return False with reason."""
     cfg = st.secrets.get("SMTP", None)
     if not cfg:
         return False, "SMTP not configured in secrets."
@@ -288,41 +261,45 @@ def send_feedback_email(subject: str, body: str) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-# -------- Stats builders for LLM tools --------
-def _build_symptom_frame(filtered: pd.DataFrame) -> pd.DataFrame:
-    if filtered is None or filtered.empty:
-        return pd.DataFrame(columns=["symptom","kind","mentions","avg_star","percent_total"])
-    det_cols = [c for c in filtered.columns if re.fullmatch(r"Symptom [1-9]|Symptom 10", c)]
-    del_cols = [c for c in filtered.columns if re.fullmatch(r"Symptom (1[1-9]|20)", c)]
-    rows=[]
-    total = len(filtered)
-    def add_rows(cols, kind):
-        if not cols: return
-        s = (filtered[cols].stack(dropna=True)
-             .map(lambda v: clean_text(v, keep_na=True)).dropna().astype("string").str.strip())
-        s = s[s.map(is_valid_symptom_value)]
-        if s.empty: return
-        for val, cnt in s.value_counts().items():
-            mask = filtered[cols].isin([val]).any(axis=1)
-            avg = filtered.loc[mask, "Star Rating"].mean()
-            rows.append({
-                "symptom": str(val),
-                "kind": kind,
-                "mentions": int(cnt),
-                "avg_star": float(avg) if pd.notna(avg) else None,
-                "percent_total": float((cnt/total*100) if total else 0)
-            })
-    add_rows(det_cols, "detractor")
-    add_rows(del_cols, "delighter")
-    return pd.DataFrame(rows)
+def _truncate_sentence(t: str, max_chars: int = 360) -> str:
+    t = (t or "").strip()
+    if len(t) <= max_chars: return t
+    cut = t[:max_chars]
+    p = cut.rfind(".")
+    if p >= max_chars * 0.5: cut = cut[:p+1]
+    return cut + "…"
 
-def _match_symptoms(sf: pd.DataFrame, query: str, kind: str, exact: bool) -> pd.DataFrame:
-    if sf.empty or not query: return sf.iloc[0:0]
-    qq = query.strip().lower()
-    view = sf if kind=="any" else sf[sf["kind"]==kind]
-    if exact:
-        return view[view["symptom"].str.lower()==qq]
-    return view[view["symptom"].str.lower().str.contains(re.escape(qq))]
+# ---------- Vector index helpers ----------
+def _fingerprint_filtered(df: pd.DataFrame) -> str:
+    # small stable hash for cache key
+    if df.empty or "Verbatim" not in df.columns:
+        return "empty"
+    s = df["Verbatim"].fillna("").astype(str)
+    if "Review Date" in df.columns:
+        s = s + "|" + df["Review Date"].astype(str).fillna("")
+    raw = "||".join(s.tolist())
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+@st.cache_resource(show_spinner=False)
+def build_index_cached(fingerprint: str, texts: tuple[str, ...], model: str, api_key: str):
+    """Return L2-normalized embedding matrix (n, d) for given texts."""
+    client = OpenAI(api_key=api_key)
+    if len(texts) == 0:
+        return np.zeros((0, 1536), dtype="float32")
+    vecs = []
+    bs = 128
+    for i in range(0, len(texts), bs):
+        resp = client.embeddings.create(model=model, input=list(texts[i:i+bs]))
+        vecs.extend([d.embedding for d in resp.data])
+    arr = np.array(vecs, dtype="float32")
+    arr /= (np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9)
+    return arr  # cached by fingerprint
+
+def cosine_topk(matrix: np.ndarray, q: np.ndarray, k: int) -> np.ndarray:
+    # matrix: (n,d) already normalized; q: (d,)
+    sims = matrix @ q  # cosine
+    k = max(1, min(k, len(matrix)))
+    return np.argsort(-sims)[:k], sims
 
 # ------------- Upload -------------
 st.markdown("### 📁 File Upload")
@@ -424,7 +401,7 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
-        # Clear all (higher up in sidebar)
+        # Clear all (higher up)
         if st.sidebar.button("🧹 Clear all filters", help="Reset filters to defaults."):
             for k in ["tf","sr","kw","delight","detract","rpp","review_page",
                       "llm_model","llm_model_label","llm_temp","ask_main_text"] + \
@@ -432,10 +409,10 @@ if uploaded_file:
                 if k in st.session_state: del st.session_state[k]
             st.rerun()
 
-        # ----- Divider above LLM in sidebar -----
+        # Divider above LLM
         st.sidebar.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-        # LLM controls ONLY (ask UI is in main). Buttons below are page anchors.
+        # LLM controls (ask UI is in MAIN)
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -458,15 +435,11 @@ if uploaded_file:
             )
             if not temp_supported:
                 st.caption("ℹ️ This model uses a fixed temperature; slider disabled.")
+            if st.button("Go to AI Assistant"): st.session_state["assistant_scroll_pending"]=True
 
-            if st.button("Go to AI Assistant"):
-                st.session_state["assistant_scroll_pending"] = True
+        if st.sidebar.button("✉️ Submit Feedback"): st.session_state["feedback_scroll_pending"]=True
 
-        # separate anchor button for feedback
-        if st.sidebar.button("✉️ Submit Feedback"):
-            st.session_state["feedback_scroll_pending"] = True
-
-        # -------- Star Rating Metrics (3 cards) --------
+        # -------- Star Rating Metrics --------
         st.markdown("### ⭐ Star Rating Metrics")
         st.caption("All metrics below reflect the **currently filtered** dataset.")
 
@@ -489,30 +462,17 @@ if uploaded_file:
             <div class="metric-card">
               <h4>{title}</h4>
               <div class="metric-row">
-                <div class="metric-box">
-                  <div class="metric-label">Count</div>
-                  <div class="metric-kpi">{count:,}</div>
-                </div>
-                <div class="metric-box">
-                  <div class="metric-label">Avg ★</div>
-                  <div class="metric-kpi">{avg:.1f}</div>
-                </div>
-                <div class="metric-box">
-                  <div class="metric-label">% 1–2★</div>
-                  <div class="metric-kpi">{pct:.1f}%</div>
-                </div>
+                <div class="metric-box"><div class="metric-label">Count</div><div class="metric-kpi">{count:,}</div></div>
+                <div class="metric-box"><div class="metric-label">Avg ★</div><div class="metric-kpi">{avg:.1f}</div></div>
+                <div class="metric-box"><div class="metric-label">% 1–2★</div><div class="metric-kpi">{pct:.1f}%</div></div>
               </div>
             </div>"""
-
         st.markdown(
-            f"""
-            <div class="metrics-grid">
+            f"""<div class="metrics-grid">
               {card_html("All Reviews", tot_all, avg_all, low_all)}
               {card_html("Organic (non-Seeded)", tot_org, avg_org, low_org)}
               {card_html("Seeded", tot_seed, avg_seed, low_seed)}
-            </div>
-            """,
-            unsafe_allow_html=True,
+            </div>""", unsafe_allow_html=True,
         )
 
         # Distribution chart
@@ -568,11 +528,9 @@ if uploaded_file:
                     "Average_Rating":"Avg Rating","Review Count":"Review Count",
                     "New_Review_Average":"New Review Average","New_Review_Count":"New Review Count"
                 })
-                def bold_overall(row):
-                    return ["font-weight:bold;"]*len(row) if row["Source"]=="Overall" else [""]*len(row)
+                def bold_overall(row): return ["font-weight:bold;"]*len(row) if row["Source"]=="Overall" else [""]*len(row)
                 styled = (comb.style
-                          .format({"Avg Rating":fmt_r,"Review Count":fmt_c,
-                                   "New Review Average":fmt_r,"New Review Count":fmt_c})
+                          .format({"Avg Rating":fmt_r,"Review Count":fmt_c,"New Review Average":fmt_r,"New Review Count":fmt_c})
                           .applymap(color_num, subset=["Avg Rating","New Review Average"])
                           .apply(bold_overall, axis=1)
                           .set_properties(**{"text-align":"center"})
@@ -585,7 +543,7 @@ if uploaded_file:
 
         st.markdown("---")
 
-        # -------- Symptom Tables (responsive) --------
+        # -------- Symptom Tables --------
         st.markdown("### 🩺 Symptom Tables")
         det_tbl = analyze_delighters_detractors(filtered, ex_det).head(20)
         del_tbl = analyze_delighters_detractors(filtered, ex_del).head(20)
@@ -653,8 +611,7 @@ if uploaded_file:
                         items.append(f'<span class="badge {css}">{html.escape(s)}</span>')
                     return f'<div class="badges">{"".join(items)}</div>' if items else "<i>None</i>"
 
-                del_msgs = chips(row, ex_del, "pos")
-                det_msgs = chips(row, ex_det, "neg")
+                del_msgs = chips(row, ex_del, "pos"); det_msgs = chips(row, ex_det, "neg")
                 star_val = row.get("Star Rating", 0)
                 try: star_int = int(star_val) if pd.notna(star_val) else 0
                 except: star_int=0
@@ -678,143 +635,223 @@ if uploaded_file:
         c1,c2,c3,c4,c5 = st.columns([1,1,2,1,1])
         with c1:
             st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
-            if st.button("⏮ First", disabled=current==0):
-                st.session_state["review_page"]=0; st.rerun()
+            if st.button("⏮ First", disabled=current==0): st.session_state["review_page"]=0; st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         with c2:
             st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
-            if st.button("⬅ Prev", disabled=current==0):
-                st.session_state["review_page"]=max(current-1,0); st.rerun()
+            if st.button("⬅ Prev", disabled=current==0): st.session_state["review_page"]=max(current-1,0); st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         with c3:
             showing_from = 0 if total==0 else start+1
             showing_to = min(end, total)
-            st.markdown(
-                f"<div style='text-align:center;font-weight:bold;margin-top:8px;'>Page {current+1} of {total_pages} • Showing {showing_from}–{showing_to} of {total}</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<div style='text-align:center;font-weight:bold;margin-top:8px;'>Page {current+1} of {total_pages} • Showing {showing_from}–{showing_to} of {total}</div>", unsafe_allow_html=True)
         with c4:
             st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
-            if st.button("Next ➡", disabled=current>=total_pages-1):
-                st.session_state["review_page"]=min(current+1,total_pages-1); st.rerun()
+            if st.button("Next ➡", disabled=current>=total_pages-1): st.session_state["review_page"]=min(current+1,total_pages-1); st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         with c5:
             st.markdown("<div class='pager-zone'>", unsafe_allow_html=True)
-            if st.button("Last ⏭", disabled=current>=total_pages-1):
-                st.session_state["review_page"]=total_pages-1; st.rerun()
+            if st.button("Last ⏭", disabled=current>=total_pages-1): st.session_state["review_page"]=total_pages-1; st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # -------- ASK UI (IN MAIN), second-to-last section --------
+        # -------- Build/Cache VECTOR INDEX for CURRENT FILTER --------
+        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+        vector_ready = False
+        vector_index = None
+        vec_texts = []
+        vec_meta = []
+        if _HAS_OPENAI and api_key and "Verbatim" in filtered.columns and not filtered.empty:
+            vec_texts = filtered["Verbatim"].fillna("").map(clean_text).tolist()
+            fingerprint = _fingerprint_filtered(filtered)
+            vector_index = build_index_cached(fingerprint, tuple(vec_texts), EMBED_MODEL, api_key)
+            # metadata aligned with vec_texts order
+            filt_reset = filtered.reset_index(drop=True)
+            for i, r in filt_reset.iterrows():
+                try:
+                    dt = "-" if pd.isna(r.get("Review Date", pd.NaT)) else pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
+                except Exception:
+                    dt = "-"
+                vec_meta.append({
+                    "text": vec_texts[i],
+                    "stars": None if pd.isna(r.get("Star Rating", None)) else float(r.get("Star Rating")),
+                    "date": dt,
+                    "country": str(r.get("Country","")),
+                    "source": str(r.get("Source","")),
+                    "model": str(r.get("Model (SKU)",""))
+                })
+            vector_ready = vector_index is not None and vector_index.shape[0] == len(vec_texts)
+
+        # -------- ASK UI (MAIN) --------
         st.markdown("<div id='assistant-anchor'></div>", unsafe_allow_html=True)
         st.markdown("### 🤖 Ask the Assistant")
-        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-
-        # Ask form
         with st.form("ask_form"):
             st.markdown("<div class='ask-wrap'>", unsafe_allow_html=True)
-            prompt = st.text_input(
-                "Hey! Ask anything about the CURRENTLY FILTERED reviews 🙂",
-                key="ask_main_text",
-                placeholder="e.g., What do first-time users in UK dislike most?",
-            )
+            prompt = st.text_input("Hey! Ask anything about the CURRENTLY FILTERED reviews 🙂",
+                                   key="ask_main_text",
+                                   placeholder="e.g., What do first-time users in UK dislike most?")
             ask_clicked = st.form_submit_button("Ask")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # LLM state (collapsed UI — keep history but don't clutter)
         st.session_state.setdefault("qa_messages", [
             {"role":"system","content":"You are a helpful analyst of review data. When asked for metrics (counts, percentages, averages, top lists, or symptom/keyword mentions), you MUST call the provided tools to compute exact numbers on the CURRENT filtered dataset. If something is unknown, say so rather than guessing."}
         ])
 
-        # ====== rich toolset for accurate recall ======
+        # ----- Stats frames for tools
+        def _build_symptom_frame(filtered: pd.DataFrame) -> pd.DataFrame:
+            if filtered is None or filtered.empty:
+                return pd.DataFrame(columns=["symptom","kind","mentions","avg_star","percent_total"])
+            det_cols_local = [c for c in filtered.columns if re.fullmatch(r"Symptom [1-9]|Symptom 10", c)]
+            del_cols_local = [c for c in filtered.columns if re.fullmatch(r"Symptom (1[1-9]|20)", c)]
+            rows=[]; total=len(filtered)
+            def add_rows(cols, kind):
+                if not cols: return
+                s = (filtered[cols].stack(dropna=True)
+                     .map(lambda v: clean_text(v, keep_na=True)).dropna().astype("string").str.strip())
+                s = s[s.map(is_valid_symptom_value)]
+                if s.empty: return
+                for val, cnt in s.value_counts().items():
+                    mask = filtered[cols].isin([val]).any(axis=1)
+                    avg = filtered.loc[mask, "Star Rating"].mean()
+                    rows.append({
+                        "symptom": str(val), "kind": kind, "mentions": int(cnt),
+                        "avg_star": float(avg) if pd.notna(avg) else None,
+                        "percent_total": float((cnt/total*100) if total else 0)
+                    })
+            add_rows(det_cols_local, "detractor"); add_rows(del_cols_local, "delighter")
+            return pd.DataFrame(rows)
+
         symptom_frame = _build_symptom_frame(filtered)
 
+        # ---- TOOLS (including semantic_search) ----
         def overall_stats_tool() -> dict:
             def _calc(df_):
-                total = len(df_)
-                avg = float(df_["Star Rating"].mean()) if total else 0.0
+                total = len(df_); avg = float(df_["Star Rating"].mean()) if total else 0.0
                 denom = int(df_["Star Rating"].notna().sum())
                 low = int(df_.loc[df_["Star Rating"].isin([1,2])].shape[0]) if denom else 0
                 pct_low = (low/denom*100.0) if denom else 0.0
                 return total, avg, pct_low
-            seeded_mask_local = filtered["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in filtered.columns else pd.Series(False, index=filtered.index)
-            df_all, df_org, df_seed = filtered, filtered.loc[~seeded_mask_local], filtered.loc[seeded_mask_local]
+            mask = filtered["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in filtered.columns else pd.Series(False, index=filtered.index)
+            df_all, df_org, df_seed = filtered, filtered.loc[~mask], filtered.loc[mask]
             (tot_all, avg_all, low_all)   = _calc(df_all)
             (tot_org, avg_org, low_org)   = _calc(df_org)
             (tot_seed, avg_seed, low_seed)= _calc(df_seed)
             star_counts_local = filtered["Star Rating"].value_counts().sort_index().to_dict()
-            return {
-                "all": {"count": tot_all, "avg": avg_all, "pct_1_2": low_all, "star_counts": star_counts_local},
-                "organic": {"count": tot_org, "avg": avg_org, "pct_1_2": low_org},
-                "seeded": {"count": tot_seed, "avg": avg_seed, "pct_1_2": low_seed}
-            }
+            return {"all":{"count":tot_all,"avg":avg_all,"pct_1_2":low_all,"star_counts":star_counts_local},
+                    "organic":{"count":tot_org,"avg":avg_org,"pct_1_2":low_org},
+                    "seeded":{"count":tot_seed,"avg":avg_seed,"pct_1_2":low_seed}}
 
         def symptom_stats_tool(query: str, kind: str="any", exact: bool=False, top: int|None=None) -> dict:
             sf = symptom_frame
-            if query:
-                view = _match_symptoms(sf, query, kind, exact)
+            if sf.empty: return {"results": [], "total_reviews": int(len(filtered))}
+            qq = (query or "").strip()
+            if qq:
+                view = sf if kind=="any" else sf[sf["kind"]==kind]
+                if exact: view = view[view["symptom"].str.lower()==qq.lower()]
+                else:     view = view[view["symptom"].str.lower().str.contains(re.escape(qq.lower()))]
             else:
                 view = sf if kind=="any" else sf[sf["kind"]==kind]
-            if top is not None:
-                view = view.sort_values("mentions", ascending=False).head(int(top))
-            return {
-                "results": [
-                    {
-                        "symptom": r["symptom"],
-                        "kind": r["kind"],
-                        "mentions": int(r["mentions"]),
-                        "percent_total": float(r["percent_total"]),
-                        "avg_star": None if pd.isna(r["avg_star"]) else float(r["avg_star"])
-                    } for _, r in view.iterrows()
-                ],
-                "total_reviews": int(len(filtered))
-            }
+            if top is not None: view = view.sort_values("mentions", ascending=False).head(int(top))
+            return {"results":[{"symptom":r["symptom"],"kind":r["kind"],"mentions":int(r["mentions"]),
+                                "percent_total":float(r["percent_total"]),
+                                "avg_star":None if pd.isna(r["avg_star"]) else float(r["avg_star"])}
+                               for _,r in view.iterrows()],
+                    "total_reviews": int(len(filtered))}
 
         def keyword_stats_tool(keyword: str) -> dict:
             if not keyword or "Verbatim" not in filtered.columns:
-                return {"error": "keyword missing or no Verbatim column"}
+                return {"error":"keyword missing or no Verbatim column"}
             mask = filtered["Verbatim"].astype("string").str.contains(keyword, case=False, na=False)
             dfk = filtered[mask]
-            return {
-                "keyword": keyword,
-                "mentions": int(mask.sum()),
-                "percent_total": float((mask.sum()/len(filtered)*100) if len(filtered) else 0),
-                "avg_star": None if dfk.empty else float(dfk["Star Rating"].mean()),
-                "total_reviews": int(len(filtered))
-            }
+            return {"keyword":keyword, "mentions":int(mask.sum()),
+                    "percent_total":float((mask.sum()/len(filtered)*100) if len(filtered) else 0),
+                    "avg_star": None if dfk.empty else float(dfk["Star Rating"].mean()),
+                    "total_reviews": int(len(filtered))}
+
+        def review_snippets_tool(keyword: str|None=None, symptom_query: str|None=None, kind: str="any", exact: bool=False, n: int=5) -> dict:
+            rows = filtered
+            if rows.empty: return {"results": [], "total_reviews": 0}
+            # keyword
+            if keyword and "Verbatim" in rows.columns:
+                mask_kw = rows["Verbatim"].astype("string").str.contains(keyword, case=False, na=False)
+                rows_kw = rows[mask_kw]
+            else: rows_kw = rows.iloc[0:0]
+            # symptom
+            if symptom_query:
+                det_cols_local = [c for c in rows.columns if re.fullmatch(r"Symptom [1-9]|Symptom 10", c)]
+                del_cols_local = [c for c in rows.columns if re.fullmatch(r"Symptom (1[1-9]|20)", c)]
+                cols_pick = det_cols_local + del_cols_local
+                if kind=="detractor": cols_pick = det_cols_local
+                elif kind=="delighter": cols_pick = del_cols_local
+                if cols_pick:
+                    if exact:
+                        mask_sym = rows[cols_pick].astype("string").apply(lambda s: s.str.lower()==symptom_query.lower()).any(axis=1)
+                    else:
+                        mask_sym = rows[cols_pick].astype("string").apply(lambda s: s.str.lower().str.contains(re.escape(symptom_query.lower()), na=False)).any(axis=1)
+                    rows_sym = rows[mask_sym]
+                else: rows_sym = rows.iloc[0:0]
+            else: rows_sym = rows.iloc[0:0]
+
+            if keyword and symptom_query: combined = pd.concat([rows_kw, rows_sym], axis=0).drop_duplicates()
+            elif keyword: combined = rows_kw
+            elif symptom_query: combined = rows_sym
+            else: combined = rows
+
+            if combined.empty: return {"results": [], "total_reviews": int(len(filtered))}
+            if "Review Date" in combined.columns:
+                combined = combined.sort_values("Review Date", ascending=False)
+            else:
+                combined = combined.sort_values("Star Rating", ascending=True)
+
+            t = Translator(); out=[]
+            for _, r in combined.head(int(max(1,n))).iterrows():
+                txt = clean_text(r.get("Verbatim","")); txt = safe_translate(t, txt)
+                try: dt = "-" if pd.isna(r.get("Review Date", pd.NaT)) else pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
+                except Exception: dt = "-"
+                out.append({"text": _truncate_sentence(txt), "stars": None if pd.isna(r.get("Star Rating",None)) else float(r.get("Star Rating")),
+                            "date": dt, "country": str(r.get("Country","")), "source": str(r.get("Source","")), "model": str(r.get("Model (SKU)",""))})
+            return {"results": out, "total_reviews": int(len(filtered))}
+
+        # NEW: semantic vector search over Verbatim
+        def semantic_search_tool(query: str, k: int = 5) -> dict:
+            if not query or not vector_ready:
+                return {"results": [], "total_reviews": int(len(filtered)), "error": "vector index not available or empty query"}
+            client = OpenAI(api_key=api_key)
+            emb = client.embeddings.create(model=EMBED_MODEL, input=[query]).data[0].embedding
+            q = np.array(emb, dtype="float32"); q /= (np.linalg.norm(q) + 1e-9)
+            idxs, sims = cosine_topk(vector_index, q, int(k))
+            t = Translator()
+            results=[]
+            for i in idxs:
+                m = vec_meta[int(i)]
+                txt = _truncate_sentence(safe_translate(t, m["text"]))
+                results.append({
+                    "text": txt, "similarity": float(sims[int(i)]),
+                    "stars": m["stars"], "date": m["date"], "country": m["country"],
+                    "source": m["source"], "model": m["model"]
+                })
+            return {"results": results, "total_reviews": int(len(filtered))}
 
         tools = [
-            {"type":"function","function":{
-                "name":"overall_stats",
-                "description":"Overall counts/averages/low-star% for current filtered dataset (and organic vs seeded breakdown).",
-                "parameters":{"type":"object","properties":{}}}},
-            {"type":"function","function":{
-                "name":"symptom_stats",
-                "description":"Get stats for symptoms. Use query='' to list top symptoms. kind: any|delighter|detractor. exact: exact match vs substring. top: limit results.",
-                "parameters":{"type":"object","properties":{
-                    "query":{"type":"string"},
-                    "kind":{"type":"string","enum":["any","delighter","detractor"],"default":"any"},
-                    "exact":{"type":"boolean","default":False},
-                    "top":{"type":"integer"}
-                }}}},
-            {"type":"function","function":{
-                "name":"keyword_stats",
-                "description":"Mentions/percent/avg star for a keyword in Verbatim text (case-insensitive).",
-                "parameters":{"type":"object","properties":{
-                    "keyword":{"type":"string"}
-                },"required":["keyword"]}}},
+            {"type":"function","function":{"name":"overall_stats","description":"Overall counts/averages/low-star% for current filtered dataset (and organic vs seeded).","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"symptom_stats","description":"Stats for symptoms; kind any|delighter|detractor; exact match optional; top N.","parameters":{"type":"object","properties":{"query":{"type":"string"},"kind":{"type":"string","enum":["any","delighter","detractor"],"default":"any"},"exact":{"type":"boolean","default":False},"top":{"type":"integer"}}}}},
+            {"type":"function","function":{"name":"keyword_stats","description":"Mentions/percent/avg star for a keyword in Verbatim.","parameters":{"type":"object","properties":{"keyword":{"type":"string"}},"required":["keyword"]}}},
+            {"type":"function","function":{"name":"review_snippets","description":"Return short translated quotes matching a keyword and/or a symptom.","parameters":{"type":"object","properties":{"keyword":{"type":"string"},"symptom_query":{"type":"string"},"kind":{"type":"string","enum":["any","delighter","detractor"],"default":"any"},"exact":{"type":"boolean","default":False},"n":{"type":"integer","default":5}}}}},
+            {"type":"function","function":{"name":"semantic_search","description":"Semantic vector search over Verbatim on CURRENT filtered dataset; returns top-k most relevant quotes with metadata.","parameters":{"type":"object","properties":{"query":{"type":"string"},"k":{"type":"integer","default":5}},"required":["query"]}}}
         ]
 
         def call_tool(name, args):
             try:
-                if name=="overall_stats": return overall_stats_tool()
-                if name=="symptom_stats": return symptom_stats_tool(args.get("query",""), args.get("kind","any"), bool(args.get("exact",False)), args.get("top"))
-                if name=="keyword_stats": return keyword_stats_tool(args.get("keyword",""))
+                if name=="overall_stats":  return overall_stats_tool()
+                if name=="symptom_stats":  return symptom_stats_tool(args.get("query",""), args.get("kind","any"), bool(args.get("exact",False)), args.get("top"))
+                if name=="keyword_stats":  return keyword_stats_tool(args.get("keyword",""))
+                if name=="review_snippets": return review_snippets_tool(args.get("keyword"), args.get("symptom_query"), args.get("kind","any"), bool(args.get("exact",False)), int(args.get("n",5)))
+                if name=="semantic_search": return semantic_search_tool(args.get("query",""), int(args.get("k",5)))
                 return {"error":"unknown tool"}
             except Exception as e:
                 return {"error": str(e)}
 
-        # --- Ask/answer logic ---
+        # ---- Ask flow
         if not _HAS_OPENAI:
             st.info("To enable Q&A, add `openai` to requirements and redeploy, then set `OPENAI_API_KEY`.")
         elif not api_key:
@@ -827,21 +864,17 @@ if uploaded_file:
                 st.session_state['qa_messages'].append({"role":"user","content": user_q})
 
                 sys_ctx = (
-                    "You are analyzing product reviews. The user sees filters on the page; all tools operate on the CURRENT filtered dataset. "
-                    "For anything about counts, percentages, averages, top-N lists, or symptom/keyword mentions, you MUST call the tools "
-                    "(`symptom_stats`, `keyword_stats`, `overall_stats`) to compute exact values. When returning percentages, round to one decimal place. "
-                    "When asked about a symptom by name (e.g., 'battery life'), use symptom_stats with substring matching (exact=false). "
-                    "If no results are found, say so clearly."
+                    "You analyze reviews with tool access. For metrics (counts, %, averages, top items), call `overall_stats`, `symptom_stats`, or `keyword_stats`. "
+                    "When the user asks what customers *say* about a topic or wants *examples/quotes*, FIRST call `semantic_search` with the user's topic to retrieve the most relevant reviews; "
+                    "you MAY also call `review_snippets` or `keyword_stats` to augment with exact percentages. "
+                    "Always include 1–5 concise quotes (date, country, stars) when the question is qualitative."
                 )
 
                 model_id = st.session_state.get("llm_model","gpt-4o-mini")
                 temp = float(st.session_state.get("llm_temp",0.2))
-
-                first_kwargs = {
-                    "model": model_id,
-                    "messages": [*st.session_state["qa_messages"], {"role":"system","content": sys_ctx}],
-                    "tools": tools,
-                }
+                first_kwargs = {"model": model_id,
+                                "messages": [*st.session_state["qa_messages"], {"role":"system","content": sys_ctx}],
+                                "tools": tools}
                 if model_supports_temperature(model_id): first_kwargs["temperature"]=temp
 
                 try:
@@ -860,20 +893,14 @@ if uploaded_file:
                         name = call.function.name
                         args = json.loads(call.function.arguments or "{}")
                         out = call_tool(name, args)
-                        tool_msgs.append({
-                            "tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)
-                        })
+                        tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
 
                 if tool_msgs:
-                    follow_kwargs = {
-                        "model": model_id,
-                        "messages": [
-                            *st.session_state["qa_messages"],
-                            {"role":"system","content": sys_ctx},
-                            {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                            *tool_msgs
-                        ],
-                    }
+                    follow_kwargs = {"model": model_id,
+                                     "messages": [*st.session_state["qa_messages"],
+                                                  {"role":"system","content": sys_ctx},
+                                                  {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                                                  *tool_msgs]}
                     if model_supports_temperature(model_id): follow_kwargs["temperature"]=temp
                     try:
                         follow = client.chat.completions.create(**follow_kwargs)
@@ -890,34 +917,22 @@ if uploaded_file:
                 st.session_state["qa_messages"].append({"role":"assistant","content": final_text})
                 st.session_state["assistant_scroll_pending"] = True
 
-            # ---- Render chat compactly: show only latest Q&A, rest collapsed ----
+            # Compact render: latest pair inline, older collapsed
             msgs_no_sys = [m for m in st.session_state["qa_messages"] if m["role"]!="system"]
-            # Decide which to show inline (latest answer at bottom)
-            if len(msgs_no_sys) <= 2:
-                inline_msgs = msgs_no_sys
-                older_msgs = []
-            else:
-                inline_msgs = msgs_no_sys[-2:]   # last user + last assistant
-                older_msgs = msgs_no_sys[:-2]
-
+            inline_msgs = msgs_no_sys if len(msgs_no_sys)<=2 else msgs_no_sys[-2:]
+            older_msgs = [] if len(msgs_no_sys)<=2 else msgs_no_sys[:-2]
             if older_msgs:
                 with st.expander(f"Previous Q&A (history) — {len(older_msgs)} older", expanded=False):
                     for m in older_msgs:
-                        with st.chat_message(m["role"]):
-                            st.markdown(m["content"])
+                        with st.chat_message(m["role"]): st.markdown(m["content"])
                     if st.button("Clear history (keeps latest pair)"):
-                        # Keep only last two (or fewer) messages and system prompt
                         st.session_state["qa_messages"] = [st.session_state["qa_messages"][0], *inline_msgs]
                         st.experimental_rerun()
-
             for m in inline_msgs:
-                with st.chat_message(m["role"]):
-                    st.markdown(m["content"])
-
-            # Anchor at bottom of latest answer
+                with st.chat_message(m["role"]): st.markdown(m["content"])
             st.markdown("<div id='assistant-last'></div>", unsafe_allow_html=True)
 
-        # -------- Feedback (LAST section) --------
+        # -------- Feedback (LAST) --------
         st.markdown("<div id='feedback-anchor'></div>", unsafe_allow_html=True)
         st.markdown("### 💬 Submit Feedback / Feature Requests")
         with st.form("feedback_form"):
@@ -929,14 +944,13 @@ if uploaded_file:
             subject = "Star Walk Dashboard • Feedback"
             body = f"From: {email or 'anonymous'}\\n\\n{fb}"
             ok, info = send_feedback_email(subject, body)
-            if ok:
-                st.success("Thanks! Your feedback was sent. 🙌")
+            if ok: st.success("Thanks! Your feedback was sent. 🙌")
             else:
                 mailto = f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Dashboard%20Feedback&body={body.replace(' ','%20')}"
                 st.info("Could not send via SMTP (not configured). You can click below to send via your email client.")
                 st.link_button("Open email draft to wseddon@sharkninja.com", mailto)
 
-        # ----- one-time scroll behaviors -----
+        # One-time scroll behaviors
         if st.session_state.get("force_scroll_top_once"):
             st.session_state["force_scroll_top_once"]=False
             st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
@@ -952,4 +966,5 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
+
 
