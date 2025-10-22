@@ -288,9 +288,8 @@ def send_feedback_email(subject: str, body: str) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-# -------- NEW: Stats builders for LLM tools --------
+# -------- Stats builders for LLM tools --------
 def _build_symptom_frame(filtered: pd.DataFrame) -> pd.DataFrame:
-    """Flatten symptoms with kind, mentions, avg, percent across CURRENT filtered df."""
     if filtered is None or filtered.empty:
         return pd.DataFrame(columns=["symptom","kind","mentions","avg_star","percent_total"])
     det_cols = [c for c in filtered.columns if re.fullmatch(r"Symptom [1-9]|Symptom 10", c)]
@@ -463,7 +462,7 @@ if uploaded_file:
             if st.button("Go to AI Assistant"):
                 st.session_state["assistant_scroll_pending"] = True
 
-        # NEW: separate buttons (page anchors)
+        # separate anchor button for feedback
         if st.sidebar.button("✉️ Submit Feedback"):
             st.session_state["feedback_scroll_pending"] = True
 
@@ -516,7 +515,7 @@ if uploaded_file:
             unsafe_allow_html=True,
         )
 
-        # Keep distribution chart
+        # Distribution chart
         star_counts = filtered["Star Rating"].value_counts().sort_index()
         total_reviews = len(filtered)
         percentages = ((star_counts/total_reviews*100).round(1)) if total_reviews else (star_counts*0)
@@ -566,7 +565,7 @@ if uploaded_file:
                 comb["Sort_Order"] = comb["Source"].apply(lambda x: 1 if x=="Overall" else 0)
                 comb = comb.sort_values("Sort_Order").drop(columns=["Sort_Order"])
                 comb = comb.drop(columns=["Country"]).rename(columns={
-                    "Average_Rating":"Avg Rating","Review_Count":"Review Count",
+                    "Average_Rating":"Avg Rating","Review Count":"Review Count",
                     "New_Review_Average":"New Review Average","New_Review_Count":"New Review Count"
                 })
                 def bold_overall(row):
@@ -674,7 +673,7 @@ if uploaded_file:
                     """, unsafe_allow_html=True
                 )
 
-        # Pagination with improved spacing
+        # Pagination
         st.markdown("<div class='pager'>", unsafe_allow_html=True)
         c1,c2,c3,c4,c5 = st.columns([1,1,2,1,1])
         with c1:
@@ -722,13 +721,12 @@ if uploaded_file:
             ask_clicked = st.form_submit_button("Ask")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # LLM state
+        # LLM state (collapsed UI — keep history but don't clutter)
         st.session_state.setdefault("qa_messages", [
             {"role":"system","content":"You are a helpful analyst of review data. When asked for metrics (counts, percentages, averages, top lists, or symptom/keyword mentions), you MUST call the provided tools to compute exact numbers on the CURRENT filtered dataset. If something is unknown, say so rather than guessing."}
         ])
 
-        # ====== NEW: rich toolset for accurate recall ======
-        # Build symptom frame once per render so tools are fast & consistent
+        # ====== rich toolset for accurate recall ======
         symptom_frame = _build_symptom_frame(filtered)
 
         def overall_stats_tool() -> dict:
@@ -785,7 +783,6 @@ if uploaded_file:
                 "total_reviews": int(len(filtered))
             }
 
-        # Define tool schema for OpenAI
         tools = [
             {"type":"function","function":{
                 "name":"overall_stats",
@@ -808,20 +805,16 @@ if uploaded_file:
                 },"required":["keyword"]}}},
         ]
 
-        # Tool “router”
         def call_tool(name, args):
             try:
-                if name=="overall_stats":
-                    return overall_stats_tool()
-                if name=="symptom_stats":
-                    return symptom_stats_tool(args.get("query",""), args.get("kind","any"), bool(args.get("exact",False)), args.get("top"))
-                if name=="keyword_stats":
-                    return keyword_stats_tool(args.get("keyword",""))
+                if name=="overall_stats": return overall_stats_tool()
+                if name=="symptom_stats": return symptom_stats_tool(args.get("query",""), args.get("kind","any"), bool(args.get("exact",False)), args.get("top"))
+                if name=="keyword_stats": return keyword_stats_tool(args.get("keyword",""))
                 return {"error":"unknown tool"}
             except Exception as e:
                 return {"error": str(e)}
 
-        # Ask/answer
+        # --- Ask/answer logic ---
         if not _HAS_OPENAI:
             st.info("To enable Q&A, add `openai` to requirements and redeploy, then set `OPENAI_API_KEY`.")
         elif not api_key:
@@ -833,7 +826,6 @@ if uploaded_file:
                 user_q = prompt.strip()
                 st.session_state['qa_messages'].append({"role":"user","content": user_q})
 
-                # System context that nudges the model to use tools
                 sys_ctx = (
                     "You are analyzing product reviews. The user sees filters on the page; all tools operate on the CURRENT filtered dataset. "
                     "For anything about counts, percentages, averages, top-N lists, or symptom/keyword mentions, you MUST call the tools "
@@ -893,17 +885,37 @@ if uploaded_file:
                             raise
                     final_text = follow.choices[0].message.content
                 else:
-                    # No tool calls — still answer, but tools are preferred
                     final_text = msg.content
 
                 st.session_state["qa_messages"].append({"role":"assistant","content": final_text})
                 st.session_state["assistant_scroll_pending"] = True
 
-            # History
-            for m in st.session_state["qa_messages"]:
-                if m["role"] != "system":
-                    with st.chat_message(m["role"]):
-                        st.markdown(m["content"])
+            # ---- Render chat compactly: show only latest Q&A, rest collapsed ----
+            msgs_no_sys = [m for m in st.session_state["qa_messages"] if m["role"]!="system"]
+            # Decide which to show inline (latest answer at bottom)
+            if len(msgs_no_sys) <= 2:
+                inline_msgs = msgs_no_sys
+                older_msgs = []
+            else:
+                inline_msgs = msgs_no_sys[-2:]   # last user + last assistant
+                older_msgs = msgs_no_sys[:-2]
+
+            if older_msgs:
+                with st.expander(f"Previous Q&A (history) — {len(older_msgs)} older", expanded=False):
+                    for m in older_msgs:
+                        with st.chat_message(m["role"]):
+                            st.markdown(m["content"])
+                    if st.button("Clear history (keeps latest pair)"):
+                        # Keep only last two (or fewer) messages and system prompt
+                        st.session_state["qa_messages"] = [st.session_state["qa_messages"][0], *inline_msgs]
+                        st.experimental_rerun()
+
+            for m in inline_msgs:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+
+            # Anchor at bottom of latest answer
+            st.markdown("<div id='assistant-last'></div>", unsafe_allow_html=True)
 
         # -------- Feedback (LAST section) --------
         st.markdown("<div id='feedback-anchor'></div>", unsafe_allow_html=True)
@@ -930,7 +942,7 @@ if uploaded_file:
             st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
         if st.session_state.get("assistant_scroll_pending"):
             st.session_state["assistant_scroll_pending"]=False
-            st.markdown("<script>const el=document.getElementById('assistant-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>", unsafe_allow_html=True)
+            st.markdown("<script>const el=document.getElementById('assistant-last')||document.getElementById('assistant-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>", unsafe_allow_html=True)
         if st.session_state.get("feedback_scroll_pending"):
             st.session_state["feedback_scroll_pending"]=False
             st.markdown("<script>const el=document.getElementById('feedback-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>", unsafe_allow_html=True)
