@@ -44,6 +44,7 @@ st.markdown(
       .block-container { padding-top: .5rem; padding-bottom: 1rem; }
       section[data-testid="stSidebar"] .block-container { padding-top: .25rem; padding-bottom: .6rem; }
       section[data-testid="stSidebar"] label { font-size: .95rem; }
+
       section[data-testid="stSidebar"] .divider {
         margin: 10px 0 8px 0;
         border-top: 1px dashed #d9d9df;
@@ -90,6 +91,9 @@ st.markdown(
 
       /* Pagination buffer */
       .pager { margin: 10px 0 22px 0; }
+
+      /* Ask form layout */
+      .ask-wrap { border:1px solid #ececf2; background:#f8f9fb; border-radius:12px; padding:14px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -382,9 +386,10 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
+        # Clear all (higher up in sidebar)
         if st.sidebar.button("🧹 Clear all filters", help="Reset filters to defaults."):
             for k in ["tf","sr","kw","delight","detract","rpp","review_page",
-                      "llm_model","llm_model_label","llm_temp","ask_text"] + \
+                      "llm_model","llm_model_label","llm_temp","ask_main_text"] + \
                      [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
                 if k in st.session_state: del st.session_state[k]
             st.rerun()
@@ -392,7 +397,7 @@ if uploaded_file:
         # ----- Divider above LLM in sidebar -----
         st.sidebar.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-        # LLM controls (ask inside this expander)
+        # LLM controls ONLY (ask UI moved to main). Add jump buttons incl. "Submit feedback".
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -416,12 +421,10 @@ if uploaded_file:
             if not temp_supported:
                 st.caption("ℹ️ This model uses a fixed temperature; slider disabled.")
 
-            st.text_input("Hey! Ask anything about the CURRENTLY FILTERED reviews 🙂",
-                          key="ask_text", placeholder="e.g., What do first-time users in UK dislike most?")
-            ask_clicked = st.button("Ask")
-            if st.button("Jump to AI responses"):
-                st.session_state["ask_scroll_pending"] = True
-            if st.button("Jump to Feedback"):
+            # Jump buttons: Assistant & Feedback (acts like "Submit feedback" access)
+            if st.button("Go to AI Assistant"):
+                st.session_state["assistant_scroll_pending"] = True
+            if st.button("Go to Feedback"):
                 st.session_state["feedback_scroll_pending"] = True
 
         # -------- Star Rating Metrics (3 cards) --------
@@ -654,20 +657,33 @@ if uploaded_file:
                 st.session_state["review_page"]=total_pages-1; st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # -------- AI Assistant — Responses --------
-        st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
-        st.markdown("### 🤖 AI Assistant — Responses")
-
+        # -------- ASK UI (now IN MAIN), second-to-last section --------
+        st.markdown("<div id='assistant-anchor'></div>", unsafe_allow_html=True)
+        st.markdown("### 🤖 Ask the Assistant")
         api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+
+        # Form: prompt + Ask (out of sidebar)
+        with st.form("ask_form"):
+            st.markdown("<div class='ask-wrap'>", unsafe_allow_html=True)
+            prompt = st.text_input(
+                "Hey! Ask anything about the CURRENTLY FILTERED reviews 🙂",
+                key="ask_main_text",
+                placeholder="e.g., What do first-time users in UK dislike most?",
+            )
+            ask_clicked = st.form_submit_button("Ask")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Render and run LLM
+        st.session_state.setdefault("qa_messages", [
+            {"role":"system","content":"You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. Prefer exact numbers. If unknown, say so."}
+        ])
+
         if not _HAS_OPENAI:
             st.info("To enable Q&A, add `openai` to requirements and redeploy, then set `OPENAI_API_KEY`.")
         elif not api_key:
             st.info("Set your `OPENAI_API_KEY` (env or .streamlit/secrets.toml) to chat with the filtered data.")
         else:
             client = OpenAI(api_key=api_key)
-            st.session_state.setdefault("qa_messages", [
-                {"role":"system","content":"You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. Prefer exact numbers. If unknown, say so."}
-            ])
 
             def context_blob(df_, n_small=25, n_tail=10) -> str:
                 if df_.empty: return "No rows after filters."
@@ -713,11 +729,9 @@ if uploaded_file:
                 }},
             ]
 
-            # Trigger on sidebar "Ask"
-            if 'ask_text' in st.session_state and (ask_clicked and st.session_state['ask_text'].strip()):
-                user_q = st.session_state['ask_text'].strip()
-                st.session_state['qa_messages'].append({"role":"user","content": user_q})
-
+            # Submit from main form
+            if ask_clicked and prompt.strip():
+                st.session_state['qa_messages'].append({"role":"user","content": prompt.strip()})
                 sys_ctx = ("CONTEXT:\n"+context_blob(filtered)+
                            "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. If unknown from context+tools, say you don't know.")
                 model_id = st.session_state.get("llm_model","gpt-4o-mini")
@@ -758,17 +772,18 @@ if uploaded_file:
                     final_text = msg.content
 
                 st.session_state["qa_messages"].append({"role":"assistant","content": final_text})
-                st.session_state["ask_scroll_pending"] = True
+                # Smooth scroll to responses after submit
+                st.session_state["assistant_scroll_pending"] = True
 
-            # Render conversation
+            # Render conversation (under the ask form)
             for m in st.session_state["qa_messages"]:
                 if m["role"] != "system":
                     with st.chat_message(m["role"]):
                         st.markdown(m["content"])
 
-        # -------- Feedback (immediately under AI responses, no section divide) --------
+        # -------- Feedback (LAST section) --------
         st.markdown("<div id='feedback-anchor'></div>", unsafe_allow_html=True)
-        st.markdown("#### 💬 Submit Feedback / Feature Requests")
+        st.markdown("### 💬 Submit Feedback / Feature Requests")
         with st.form("feedback_form"):
             fb = st.text_area("We care about making this tool user-centric — tell us what to improve or build next:", height=140,
                               placeholder="Feature ideas, UI nits, bugs, data questions…")
@@ -789,9 +804,9 @@ if uploaded_file:
         if st.session_state.get("force_scroll_top_once"):
             st.session_state["force_scroll_top_once"]=False
             st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
-        if st.session_state.get("ask_scroll_pending"):
-            st.session_state["ask_scroll_pending"]=False
-            st.markdown("<script>const el=document.getElementById('askdata-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>", unsafe_allow_html=True)
+        if st.session_state.get("assistant_scroll_pending"):
+            st.session_state["assistant_scroll_pending"]=False
+            st.markdown("<script>const el=document.getElementById('assistant-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>", unsafe_allow_html=True)
         if st.session_state.get("feedback_scroll_pending"):
             st.session_state["feedback_scroll_pending"]=False
             st.markdown("<script>const el=document.getElementById('feedback-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>", unsafe_allow_html=True)
