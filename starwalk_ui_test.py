@@ -285,7 +285,13 @@ if uploaded_file:
         if "Review Date" in verbatims.columns:
             verbatims["Review Date"] = pd.to_datetime(verbatims["Review Date"], errors="coerce")
 
-        # ---------------- Sidebar (all collapsed) ----------------
+        # ---------------- Sidebar ----------------
+        # Quick links (ANCHOR JUMP)
+        with st.sidebar.expander("🧭 Quick Links", expanded=False):
+            if st.button("Go to 🤖 Ask your data", key="go_ask"):
+                st.session_state["jump_to_ask"] = True
+                st.rerun()
+
         st.sidebar.header("🔍 Filters")
 
         # Timeframe
@@ -377,7 +383,7 @@ if uploaded_file:
             if keyword:
                 filtered_verbatims = apply_keyword_filter(filtered_verbatims, keyword)
 
-        # Additional Filters (anything not core/symptoms—e.g., Hair Type—if present after col 20)
+        # Additional Filters (anything not core/symptoms)
         core_cols = {"Country","Source","Model (SKU)","Seeded","New Review","Star Rating","Review Date","Verbatim"}
         symptom_cols = set([f"Symptom {i}" for i in range(1,21)])
         with st.sidebar.expander("📋 Additional Filters", expanded=False):
@@ -716,66 +722,12 @@ if uploaded_file:
 
         st.markdown("---")
 
-        # ---------------------------------------
-        # Word Clouds (robust + cached)
-        # ---------------------------------------
-        st.markdown("### 🌟 Word Cloud for Delighters and Detractors")
-
-        detractors_text = build_wordcloud_text(filtered_verbatims, existing_detractor_columns)
-        delighters_text = build_wordcloud_text(filtered_verbatims, existing_delighter_columns)
-
-        custom_stopwords = set(STOPWORDS) | {"na", "n/a", "none", "null", "etc", "amp", "https", "http"}
-
-        @st.cache_data(show_spinner=False)
-        def make_wordcloud_png(text: str, colormap: str, width: int = 1600, height: int = 800) -> bytes | None:
-            text = (text or "").strip()
-            if not text:
-                return None
-            try:
-                wc = WordCloud(
-                    background_color="white",
-                    colormap=colormap,
-                    width=width,
-                    height=height,
-                    max_words=180,
-                    contour_width=2,
-                    collocations=False,
-                    normalize_plurals=True,
-                    stopwords=custom_stopwords,
-                    regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
-                    random_state=42,
-                    scale=2,
-                ).generate(text)
-            except ValueError:
-                return None
-
-            import matplotlib.pyplot as _plt
-            fig = _plt.figure(figsize=(10, 5))
-            _plt.imshow(wc, interpolation="bilinear")
-            _plt.axis("off")
-            buf = io.BytesIO()
-            _plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
-            _plt.close(fig)
-            return buf.getvalue()
-
-        st.markdown("#### 😠 Detractors")
-        det_png = make_wordcloud_png(detractors_text, "Reds")
-        if det_png:
-            st.image(det_png, use_container_width=True)
-        else:
-            st.info("Not enough detractor text to build a word cloud.")
-
-        st.markdown("#### 😊 Delighters")
-        del_png = make_wordcloud_png(delighters_text, "Greens")
-        if del_png:
-            st.image(del_png, use_container_width=True)
-        else:
-            st.info("Not enough delighter text to build a word cloud.")
-
-        # ---------------------------------------
-        # 🤖 Ask your data (LLM chat; gated)
-        # ---------------------------------------
+        # =======================================
+        # 🤖 Ask your data  (MOVED ABOVE WORDCLOUD)
+        # =======================================
+        st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
         st.markdown("### 🤖 Ask your data")
+
         api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
         if not _HAS_OPENAI:
@@ -919,6 +871,76 @@ if uploaded_file:
                     st.session_state.qa_messages.append({"role":"assistant","content": err})
                     with st.chat_message("assistant"):
                         st.error(err)
+
+        # If sidebar button was clicked, smooth-scroll to this anchor
+        if st.session_state.pop("jump_to_ask", False):
+            st.markdown(
+                """
+                <script>
+                var el = document.getElementById('askdata-anchor');
+                if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
+                </script>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+        # =======================================
+        # Word Clouds (robust + cached) — now below the LLM
+        # =======================================
+        st.markdown("### 🌟 Word Cloud for Delighters and Detractors")
+
+        detractors_text = build_wordcloud_text(filtered_verbatims, existing_detractor_columns)
+        delighters_text = build_wordcloud_text(filtered_verbatims, existing_delighter_columns)
+
+        custom_stopwords = set(STOPWORDS) | {"na", "n/a", "none", "null", "etc", "amp", "https", "http"}
+
+        @st.cache_data(show_spinner=False)
+        def make_wordcloud_png(text: str, colormap: str, width: int = 1600, height: int = 800) -> bytes | None:
+            text = (text or "").strip()
+            if not text:
+                return None
+            try:
+                wc = WordCloud(
+                    background_color="white",
+                    colormap=colormap,
+                    width=width,
+                    height=height,
+                    max_words=180,
+                    contour_width=2,
+                    collocations=False,
+                    normalize_plurals=True,
+                    stopwords=custom_stopwords,
+                    regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
+                    random_state=42,
+                    scale=2,
+                ).generate(text)
+            except ValueError:
+                return None
+
+            import matplotlib.pyplot as _plt
+            fig = _plt.figure(figsize=(10, 5))
+            _plt.imshow(wc, interpolation="bilinear")
+            _plt.axis("off")
+            buf = io.BytesIO()
+            _plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
+            _plt.close(fig)
+            return buf.getvalue()
+
+        st.markdown("#### 😠 Detractors")
+        det_png = make_wordcloud_png(detractors_text, "Reds")
+        if det_png:
+            st.image(det_png, use_container_width=True)
+        else:
+            st.info("Not enough detractor text to build a word cloud.")
+
+        st.markdown("#### 😊 Delighters")
+        del_png = make_wordcloud_png(delighters_text, "Greens")
+        if del_png:
+            st.image(del_png, use_container_width=True)
+        else:
+            st.info("Not enough delighter text to build a word cloud.")
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
