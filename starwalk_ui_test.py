@@ -78,7 +78,14 @@ st.markdown(
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
       /* Cards (grouped look with tuned gray borders) */
-      .review-card { border:1px solid #E6EAF2; background:#FFFFFF; border-radius:12px; padding:16px; }
+      .review-card {
+        border:1px solid #E6EAF2;
+        background:#FFFFFF;
+        border-radius:12px;
+        padding:16px;
+        margin: 10px 0 14px;
+        box-shadow:0 1px 2px rgba(16,24,40,0.04);
+      }
       .review-card p { margin:.25rem 0; line-height:1.45; }
 
       .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:17px; }
@@ -86,7 +93,7 @@ st.markdown(
 
       .metric-card {
         background:#F7F9FC;
-        border:1px solid #E4E9F2;     /* updated border color */
+        border:1px solid #E4E9F2;   /* outer border */
         border-radius:14px;
         padding:14px 16px;
         box-shadow:0 1px 2px rgba(16,24,40,0.04);
@@ -96,7 +103,7 @@ st.markdown(
       .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
       .metric-box {
         background:#F2F5FA;
-        border:1px solid #E7ECF5;     /* inner box border */
+        border:1px solid #E7ECF5;   /* inner box border */
         border-radius:12px;
         padding:12px;
         text-align:center;
@@ -509,7 +516,7 @@ if st.sidebar.button("🧹 Clear all filters"):
 st.sidebar.write("")          # spacer
 st.sidebar.markdown("---")    # divider
 
-# LLM settings (model picker) — no "Go to Ask AI" button
+# LLM settings (model picker) — no “Go to Ask AI” button
 with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     _model_choices = [
         ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -588,7 +595,7 @@ if _DIALOG_AVAILABLE:
                 )
             st.stop()  # close dialog
 
-# Sidebar button to open modal (kept)
+# Sidebar button to open modal
 if st.sidebar.button("Submit Feedback", key="submit_feedback_sidebar"):
     if _DIALOG_AVAILABLE:
         open_feedback_dialog()
@@ -890,7 +897,7 @@ st.markdown("---")
 # ---------- Ask your data (LLM) ----------
 anchor("askdata-anchor")
 st.markdown("## 🤖 Ask your data")
-st.caption("Ask questions about the **currently filtered** reviews. Each question is answered independently (no chat history).")
+st.caption("Ask questions about the **currently filtered** reviews. Each question is answered independently and archived below.")
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not _HAS_OPENAI:
@@ -902,23 +909,27 @@ else:
     verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
     index = build_vector_index(verb_series.tolist(), api_key)
 
-    # Only keep the current pair (no history)
-    st.session_state.setdefault("qa_current_user", None)
-    st.session_state.setdefault("qa_current_assistant", None)
+    # Archive state: only previous Q&A (no inline current)
+    st.session_state.setdefault("qa_prev", [])  # list of {"q": str, "a": str}
 
-    if st.session_state["qa_current_user"]:
-        st.markdown(f"<div class='chat-q'><b>User:</b> {st.session_state['qa_current_user']}</div>", unsafe_allow_html=True)
-    if st.session_state["qa_current_assistant"]:
-        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {st.session_state['qa_current_assistant']}</div>", unsafe_allow_html=True)
+    # Previous Q&A expander (expanded by default)
+    with st.expander(f"Previous Q&A ({len(st.session_state['qa_prev'])})", expanded=True):
+        if not st.session_state["qa_prev"]:
+            st.caption("No previous exchanges yet.")
+        else:
+            for i, pair in enumerate(st.session_state["qa_prev"], start=1):
+                if pair.get("q"):
+                    st.markdown(f"<div class='chat-q'><b>User:</b> {pair['q']}</div>", unsafe_allow_html=True)
+                if pair.get("a"):
+                    st.markdown(f"<div class='chat-a'><b>Assistant:</b> {pair['a']}</div>", unsafe_allow_html=True)
 
     # Input form (not pinned)
-    with st.form("ask_ai_form", clear_on_submit=False):
+    with st.form("ask_ai_form", clear_on_submit=True):
         q = st.text_area("Ask a question", value="", height=80)
         send = st.form_submit_button("Send")
 
     if send and q.strip():
-        st.session_state["qa_current_user"] = q.strip()
-        st.session_state["qa_current_assistant"] = None  # will fill below
+        q = q.strip()
 
         # Retrieve top matching verbatims for richer answers
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
@@ -1005,7 +1016,7 @@ else:
                 deli = analyze_delighters_detractors(filtered, existing_delighter_columns).head(5)
                 def _fmt_rows(df):
                     if df.empty: return "None"
-                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
+                    return "; ".join([f\"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)\" for _, r in df.iterrows()])
                 parts.append("**Top detractors:** " + _fmt_rows(detr))
                 parts.append("**Top delighters:** " + _fmt_rows(deli))
 
@@ -1118,9 +1129,6 @@ else:
                 first = client.chat.completions.create(**first_kwargs)
         except Exception as e:
             final_text = _local_answer_fallback(q)
-            st.session_state['qa_current_assistant'] = final_text
-            st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-            st.caption(':information_source: Shown local summary because the model call failed. ' + str(e))
         else:
             msg = first.choices[0].message
 
@@ -1155,15 +1163,17 @@ else:
                 try:
                     follow = client.chat.completions.create(**follow_kwargs)
                     final_text = follow.choices[0].message.content
-                except Exception as e:
+                except Exception:
                     final_text = _local_answer_fallback(q)
-                    st.caption(':information_source: Shown local summary because the tool-enabled call failed. ' + str(e))
-                st.session_state["qa_current_assistant"] = final_text
-                st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
             else:
                 final_text = msg.content if msg and getattr(msg, 'content', None) else _local_answer_fallback(q)
-                st.session_state["qa_current_assistant"] = final_text
-                st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+
+        # Append to archive (last 30) and refresh so it shows in "Previous Q&A"
+        qa = st.session_state["qa_prev"]
+        qa.append({"q": q, "a": final_text})
+        if len(qa) > 30:
+            st.session_state["qa_prev"] = qa[-30:]
+        st.rerun()  # ensures the expander above reflects this new pair immediately
 
 st.markdown("---")
 
