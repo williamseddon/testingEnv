@@ -18,7 +18,7 @@ import json
 import hashlib
 import numpy as np
 import urllib.parse
-from streamlit.components.v1 import html as st_html  # for the hero canvas
+from streamlit.components.v1 import html as st_html  # hero canvas
 
 # ---------------------------
 # Openpyxl warning silencer
@@ -52,15 +52,14 @@ except Exception:
 # LLM capability helpers
 # ---------------------------
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}  # add more if needed
-
 def model_supports_temperature(model_id: str) -> bool:
     return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
 
 # ---------------------------
-# Page config
+# Page config & session defaults
 # ---------------------------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
-st.session_state.setdefault("show_ask", False)  # prevent auto-open
+st.session_state.setdefault("show_ask", False)  # only open Ask section on button click
 
 # ---------------------------
 # Global CSS
@@ -88,18 +87,17 @@ st.markdown(
         overflow: hidden;
         border-radius: 14px;
         border: 1px solid #eee;
-        height: 150px; /* short and wide */
+        height: 150px;
         margin-top: .25rem;
         margin-bottom: 1rem;
         display: grid;
-        grid-template-columns: minmax(420px, 1fr) 260px; /* left stars, right logo */
+        grid-template-columns: minmax(420px, 1fr) 260px;
         background: #fff;
       }
       .hero-left {
         position: relative;
         padding: 12px 14px;
-        background:
-          radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%);
+        background: radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%);
       }
       #hero-canvas { position:absolute; inset:0; width:100%; height:100%; }
       .hero-title { position: relative; z-index: 1; margin:0; padding-top: 8px;
@@ -108,8 +106,7 @@ st.markdown(
         font-size: clamp(12px, 1.05vw, 16px); }
 
       .hero-right {
-        display:flex; align-items:center; justify-content:center;
-        padding-right: 10px;
+        display:flex; align-items:center; justify-content:center; padding-right: 10px;
       }
       .sn-logo-img { height: 28px; width: auto; display:block; opacity:.92; }
     </style>
@@ -161,7 +158,7 @@ def render_hero():
           }}
           window.addEventListener('resize', resize, {{passive:true}});
           resize();
-          const N = Math.max(120, Math.floor(w/10)); // denser across width
+          const N = Math.max(120, Math.floor(w/10)); // dense, left
           const stars = Array.from({{length:N}}, () => ({{
             x: Math.random()*w, y: Math.random()*h, r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
           }}));
@@ -173,7 +170,6 @@ def render_hero():
           }});
           function tick(){{
             ctx.clearRect(0,0,w,h);
-            // fade the RIGHT 34% so logo area stays calm
             const grd = ctx.createLinearGradient(w*0.66,0,w,0);
             grd.addColorStop(0,'rgba(255,255,255,0)'); grd.addColorStop(1,'rgba(255,255,255,1)');
             for(const s of stars){{
@@ -324,7 +320,6 @@ def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
     return df[mask]
 
 def dataset_signature(df: pd.DataFrame) -> str:
-    """Stable signature for filtered dataset to know when to rebuild RAG index."""
     texts = df.get("Verbatim")
     if texts is None:
         texts = pd.Series([], dtype="string")
@@ -339,7 +334,7 @@ def dataset_signature(df: pd.DataFrame) -> str:
 st.markdown("### 📁 File Upload")
 uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 
-# Track “just uploaded” to block any auto-scroll to bottom
+# Prevent auto-scroll when a new file is uploaded
 if uploaded_file:
     if st.session_state.get("last_uploaded_name") != uploaded_file.name:
         st.session_state["last_uploaded_name"] = uploaded_file.name
@@ -465,13 +460,14 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
-        # Ask button (prevents auto-scroll on load)
+        # Sidebar Ask button → open section & page-anchor
         st.sidebar.markdown("---")
         if st.sidebar.button("💬 Ask me anything"):
             st.session_state["show_ask"] = True
-            st.session_state["ask_scroll_pending"] = True
+            st.session_state["scroll_target_id"] = "askdata-anchor"
+            st.rerun()
 
-        # LLM settings + RAG
+        # LLM settings + RAG toggles
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _model_choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -505,13 +501,13 @@ if uploaded_file:
             )
             st.session_state["llm_evidence"] = st.checkbox(
                 "Show evidence in answers", value=st.session_state.get("llm_evidence", True),
-                help="Append the exact review snippets used so you can verify answers."
+                help="Append exact review snippets used so you can verify answers."
             )
 
         st.sidebar.markdown("---")
         if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
             for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label",
-                      "llm_temp","show_ask","ask_scroll_pending","llm_rag","llm_evidence"] + \
+                      "llm_temp","show_ask","scroll_target_id","llm_rag","llm_evidence"] + \
                      [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
                 if k in st.session_state: del st.session_state[k]
             st.rerun()
@@ -775,45 +771,47 @@ if uploaded_file:
             docs = texts.astype("string").fillna("").map(clean_text).tolist()
             ids = list(range(len(docs)))
 
-            # Preferred: OpenAI embeddings
+            # Preferred: OpenAI embeddings (object-safe)
             if api_key and _HAS_OPENAI:
                 cli = OpenAI(api_key=api_key)
-                emb = []
+                emb_vectors = []
                 for i in range(0, len(docs), 128):
                     chunk = docs[i:i+128]
                     resp = cli.embeddings.create(model="text-embedding-3-small", input=chunk)
-                    emb.extend([np.array(d["embedding"], dtype=np.float32) for d in resp.data])
-                mat = np.vstack(emb)
+                    for item in resp.data:
+                        vec = np.array(getattr(item, "embedding", None), dtype=np.float32)
+                        emb_vectors.append(vec)
+                mat = np.vstack(emb_vectors)
                 norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
                 mat = mat / norms
                 return {"ids": ids, "texts": docs, "emb": mat}
-            else:
-                # Fallback: TF–IDF with explicit vocab + idf so the query matches the same space
-                vocab = {}
-                vecs = []
-                for t in docs:
-                    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", t.lower())
-                    counts = {}
-                    for tok in tokens:
-                        if tok not in vocab: vocab[tok] = len(vocab)
-                        idx = vocab[tok]
-                        counts[idx] = counts.get(idx, 0) + 1
-                    vecs.append(counts)
-                dfreq = {}
-                for v in vecs:
-                    for idx in v.keys():
-                        dfreq[idx] = dfreq.get(idx, 0) + 1
-                n = len(vecs)
-                idf = np.zeros((len(vocab),), dtype=np.float32)
-                for idx, dfc in dfreq.items():
-                    idf[idx] = np.log((1+n)/(1+dfc)) + 1.0
-                dense = np.zeros((n, len(vocab)), dtype=np.float32)
-                for i, counts in enumerate(vecs):
-                    for idx, cnt in counts.items():
-                        dense[i, idx] = cnt * idf[idx]
-                norms = np.linalg.norm(dense, axis=1, keepdims=True) + 1e-9
-                dense = dense / norms
-                return {"ids": ids, "texts": docs, "emb": dense, "vocab": vocab, "idf": idf}
+
+            # Fallback: TF–IDF with explicit vocab + idf
+            vocab = {}
+            vecs = []
+            for t in docs:
+                tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", t.lower())
+                counts = {}
+                for tok in tokens:
+                    if tok not in vocab: vocab[tok] = len(vocab)
+                    idx = vocab[tok]
+                    counts[idx] = counts.get(idx, 0) + 1
+                vecs.append(counts)
+            dfreq = {}
+            for v in vecs:
+                for idx in v.keys():
+                    dfreq[idx] = dfreq.get(idx, 0) + 1
+            n = len(vecs)
+            idf = np.zeros((len(vocab),), dtype=np.float32)
+            for idx, dfc in dfreq.items():
+                idf[idx] = np.log((1+n)/(1+dfc)) + 1.0
+            dense = np.zeros((n, len(vocab)), dtype=np.float32)
+            for i, counts in enumerate(vecs):
+                for idx, cnt in counts.items():
+                    dense[i, idx] = cnt * idf[idx]
+            norms = np.linalg.norm(dense, axis=1, keepdims=True) + 1e-9
+            dense = dense / norms
+            return {"ids": ids, "texts": docs, "emb": dense, "vocab": vocab, "idf": idf}
 
         def rag_topk(index: dict, q: str, api_key: str | None, k: int = 30) -> list[tuple[int, float]]:
             if index is None or not q.strip(): return []
@@ -829,8 +827,7 @@ if uploaded_file:
             else:
                 vocab = index.get("vocab", {})
                 idf = index.get("idf", None)
-                if not vocab:
-                    return []
+                if not vocab: return []
                 qvec = np.zeros((len(vocab),), dtype=np.float32)
                 for tok in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", qtext.lower()):
                     if tok in vocab:
@@ -843,14 +840,12 @@ if uploaded_file:
             return [(int(i), float(sims[i])) for i in top]
 
         # ---------------------------
-        # 🤖 Ask your data (chat) – only render when requested
+        # 🤖 Ask your data (chat) — render only when requested
         # ---------------------------
         if st.session_state.get("show_ask"):
             st.markdown("<div id='askdata-anchor'></div>", unsafe_allow_html=True)
-            st.markdown("### 🤖 Ask your data (Coming Soon!)")
+            st.markdown("### 🤖 Ask your data")
             api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-
-            st.session_state.setdefault("ask_scroll_pending", False)
 
             # Build RAG index when needed or filters changed
             if st.session_state.get("llm_rag", True):
@@ -863,7 +858,7 @@ if uploaded_file:
             if not _HAS_OPENAI:
                 st.info("To enable the assistant, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
             elif not api_key:
-                st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
+                st.info("Set your `OPENAI_API_KEY` (env or .streamlit/secrets.toml) to chat with the filtered data.")
             else:
                 client = OpenAI(api_key=api_key)
 
@@ -874,7 +869,7 @@ if uploaded_file:
                             "Call tools when you need exact counts/means. If unknown, say you don't know."}
                     ]
 
-                # — Context builders —
+                # Base context
                 def context_blob_base(df: pd.DataFrame, n=25) -> str:
                     if df.empty: return "No rows after filters."
                     parts = [f"ROW_COUNT={len(df)}"]
@@ -898,7 +893,7 @@ if uploaded_file:
 
                 def context_blob_with_evidence(question: str, df: pd.DataFrame, top_k=30) -> tuple[str, list[dict]]:
                     evidence_rows = []
-                    ctx = context_blob_base(df, n=20)  # small base summary
+                    ctx = context_blob_base(df, n=20)
                     if not st.session_state.get("llm_rag", True):
                         return ctx, evidence_rows
                     rag_state = st.session_state.get("rag_index", {})
@@ -929,7 +924,7 @@ if uploaded_file:
                     ctx2 = ctx + ("\n\nTOP_MATCHING_REVIEWS:\n" + ev_text if ev_text else "")
                     return ctx2, evidence_rows
 
-                # — Tools —
+                # Tools
                 def pandas_count(query: str) -> dict:
                     try:
                         if ";" in query or "__" in query: return {"error": "disallowed pattern"}
@@ -991,7 +986,7 @@ if uploaded_file:
                     }},
                 ]
 
-                # render history
+                # render prior messages
                 for m in st.session_state.qa_messages:
                     if m["role"] != "system":
                         with st.chat_message(m["role"]):
@@ -1075,12 +1070,13 @@ if uploaded_file:
                     st.session_state.qa_messages.append({"role":"assistant","content": final_text})
                     with st.chat_message("assistant"):
                         st.markdown(final_text)
-                        st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
-                    st.session_state["ask_scroll_pending"] = True
+                    st.session_state["scroll_target_id"] = "askdata-anchor"  # keep anchor sticky on answer
+                    st.rerun()
 
+            # Close panel
             if st.button("Close Ask panel"):
                 st.session_state["show_ask"] = False
-                st.session_state["ask_scroll_pending"] = False
+                st.session_state.pop("scroll_target_id", None)
                 st.rerun()
 
         st.markdown("---")
@@ -1131,17 +1127,17 @@ if uploaded_file:
         else:       st.info("Not enough delighter text to build a word cloud.")
 
         # ---------------------------
-        # One-time scroll behaviors
+        # One-time scroll behaviors (top / anchors)
         # ---------------------------
         if st.session_state.get("force_scroll_top_once"):
             st.session_state["force_scroll_top_once"] = False
             st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
 
-        if st.session_state.get("ask_scroll_pending"):
-            st.session_state["ask_scroll_pending"] = False
+        target = st.session_state.pop("scroll_target_id", None)
+        if target:
             st.markdown(
-                "<script>const last=document.getElementById('askdata-last');"
-                "if(last){last.scrollIntoView({behavior:'smooth',block:'start'});}</script>",
+                f"<script>const el=document.getElementById('{target}');"
+                f"if(el) el.scrollIntoView({{behavior:'smooth',block:'start'}});</script>",
                 unsafe_allow_html=True,
             )
 
@@ -1150,8 +1146,3 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
-
-
-
-
-
