@@ -1,4 +1,4 @@
-# starwalk_ui.py 
+# starwalk_ui.py
 # Streamlit 1.38+
 
 import streamlit as st
@@ -42,7 +42,7 @@ except Exception:
     _HAS_OPENAI = False
     OpenAI = None  # type: ignore
 
-# Optional FAISS for faster vector search
+# Optional FAISS for fast vector search
 try:
     import faiss  # type: ignore
     _HAS_FAISS = True
@@ -69,8 +69,29 @@ st.markdown(
       section[data-testid="stSidebar"] .stExpander { border-radius: 10px; }
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
-      .review-card { border:1px solid #e5e7eb; background:#ffffff; border-radius:12px; padding:16px; }
+
+      /* Cards */
+      .review-card { border:1px solid #E5E7EB; background:#FFFFFF; border-radius:12px; padding:16px; }
       .review-card p { margin:.25rem 0; line-height:1.45; }
+
+      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:16px; }
+      @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
+      .metric-card { border:1px solid #E9EEF5; border-radius:12px; padding:10px 14px; background:#F7FAFE; }
+      .metric-card h4 { margin:.3rem 0 .5rem 0; font-size: 1.05rem; }
+      .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+      .metric-box { background:#fbfbfc; border:1px solid #f0f0f0; border-radius:10px; padding:10px; text-align:center; }
+      .metric-label { color:#6b7280; font-size:.85rem; }
+      .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; }
+
+      /* Pager */
+      .pager { margin: 22px 0 14px; display:grid; grid-template-columns: 140px 140px 1fr 140px 140px; gap:18px; align-items:center; }
+      .pager .center { text-align:center; font-weight:700; }
+
+      /* Chat bubbles */
+      .chat-q { background:#F5F7FB; border:1px solid #E5E7EB; border-radius:14px; padding:10px 12px; }
+      .chat-a { background:#FFF8EB; border:1px solid #FBE3B2; border-radius:14px; padding:12px 12px; }
+
+      /* Badges */
       .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
       .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
       .badge.pos { background:#E7F8EE; color:#065F46; }
@@ -93,28 +114,11 @@ st.markdown(
       .sn-logo { width: 170px; height:auto; }
       .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; }
 
-      /* Metrics cards */
-      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:16px; }
-      @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
-      .metric-card { border:1px solid #eee; border-radius:12px; padding:10px 14px; background:white; }
-      .metric-card h4 { margin:.3rem 0 .5rem 0; font-size: 1.05rem; }
-      .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
-      .metric-box { background:#fbfbfc; border:1px solid #f0f0f0; border-radius:10px; padding:10px; text-align:center; }
-      .metric-label { color:#6b7280; font-size:.85rem; }
-      .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; }
-
-      /* Pager */
-      .pager { margin: 22px 0 14px; display:grid; grid-template-columns: 140px 140px 1fr 140px 140px; gap:18px; align-items:center; }
-      .pager .center { text-align:center; font-weight:700; }
-
-      /* Chat bubbles */
-      .chat-q { background:#F5F7FB; border:1px solid #E5E7EB; border-radius:14px; padding:10px 12px; }
-      .chat-a { background:#FFF8EB; border:1px solid #FBE3B2; border-radius:14px; padding:12px 12px; }
-
       /* Section dividers */
       .section-divider { height:1px; background:#eee; margin:24px 0 14px; }
       .mini-caption { color:#6b7280; font-size:.9rem; margin-bottom:.4rem; }
 
+      /* Dark theme readability */
       @media (prefers-color-scheme: dark){
         .review-card, .metric-card, .metric-box, .chat-q, .chat-a {
           background: rgba(255,255,255,0.06) !important;
@@ -123,8 +127,7 @@ st.markdown(
         .metric-label { color: rgba(255,255,255,0.75); }
         .hero-wrap { border-color: rgba(255,255,255,0.18); }
       }
-</style>
-
+    </style>
     """,
     unsafe_allow_html=True,
 )
@@ -172,7 +175,7 @@ def render_hero():
           resize();
 
           let N = 140;
-          let stars = Array.from({{length:N}}, () => ({{ 
+          let stars = Array.from({{length:N}}, () => ({{
             x: Math.random()*w, y: Math.random()*h,
             r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
           }}));
@@ -286,10 +289,8 @@ def highlight_html(text: str, keyword: str | None) -> str:
 
 # LLM helpers ---------------------------------------------------
 def _hash_series_for_cache(s: pd.Series) -> str:
-    # stable hash for cache; use text after cleaning
     data = "|".join(map(str, s.fillna("").tolist()))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
 
 @st.cache_resource(show_spinner=False)
 def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
@@ -297,6 +298,8 @@ def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedd
     Returns a FAISS index (if available) or (emb_matrix, norms, texts) tuple for cosine similarity search.
     """
     if not _HAS_OPENAI:
+        return None
+    if not texts:
         return None
     client = OpenAI(api_key=api_key)
     batch = 512
@@ -319,14 +322,13 @@ def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedd
         return (mat, norms, texts)
 
 def vector_search(query: str, index, api_key: str, top_k: int = 8):
-    if not _HAS_OPENAI or index is None:
-        return []
+    if not _HAS_OPENAI or index is None: return []
     client = OpenAI(api_key=api_key)
     qemb = client.embeddings.create(model="text-embedding-3-small", input=[query]).data[0].embedding
     q = np.array(qemb, dtype=np.float32)
     qn = np.linalg.norm(q) + 1e-8
     qn_vec = q / qn
-    # FAISS backend
+    # FAISS
     if isinstance(index, dict) and index.get("backend") == "faiss":
         D, I = index["index"].search(qn_vec.reshape(1,-1), top_k)
         sims = D[0].tolist()
@@ -346,7 +348,26 @@ def anchor(id_: str):
     st.markdown(f"<div id='{id_}'></div>", unsafe_allow_html=True)
 
 def scroll_to(id_: str):
-    st.markdown(f"<script>document.getElementById('{id_}')?.scrollIntoView({{behavior:'smooth',block:'start'}});</script>", unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <script>
+        (function(id){{
+          function jump(){{
+            const el = document.getElementById(id);
+            if(el) {{
+              el.scrollIntoView({{behavior:'smooth', block:'start'}});
+              window.location.hash = id;
+            }}
+          }}
+          setTimeout(jump, 0);
+          setTimeout(jump, 150);
+          setTimeout(jump, 300);
+          setTimeout(jump, 600);
+        }})('{id_}');
+        </script>
+        """,
+        unsafe_allow_html=True
+    )
 
 # ---------- File Upload ----------
 st.markdown("### 📁 File Upload")
@@ -474,7 +495,8 @@ with st.sidebar.expander("📄 Review List", expanded=False):
 
 # Place “Clear all filters” just under Review List
 if st.sidebar.button("🧹 Clear all filters"):
-    for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] +              [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
+    for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] + \
+             [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
         if k in st.session_state: del st.session_state[k]
     st.rerun()
 
@@ -506,15 +528,12 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     if not temp_supported:
         st.caption("ℹ️ This model uses a fixed sampling temperature; the slider is disabled.")
 
-    # Keep only 'Go to Ask AI' here
     if st.button("Go to Ask AI"):
-        st.session_state["force_scroll_anchor"] = "askdata-anchor"
-        st.rerun()
+        scroll_to("askdata-anchor")
 
-# Move 'Go to Feedback' OUTSIDE the expander, right below it
+# Move this button OUTSIDE the expander (per request)
 if st.sidebar.button("Submit Feedback", key="go_feedback_below_expander"):
-    st.session_state["force_scroll_anchor"] = "feedback-anchor"
-    st.rerun()
+    scroll_to("feedback-anchor")
 
 st.markdown("---")
 
@@ -687,8 +706,8 @@ view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
 
 def _styled_table(df_in: pd.DataFrame):
     if df_in.empty: return df_in
-    # hide index, ensure responsive
-    return df_in.style.applymap(style_rating_cells, subset=["Avg Star"])                       .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})
+    return df_in.style.applymap(style_rating_cells, subset=["Avg Star"]) \
+                      .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})
 
 if view_mode == "Split":
     c1, c2 = st.columns([1, 1])
@@ -813,31 +832,6 @@ anchor("askdata-anchor")
 st.markdown("## 🤖 Ask your data")
 st.caption("Ask questions about the **currently filtered** reviews. We’ll combine programmatic stats with semantic search over verbatims.")
 
-# Chat state + archiving helpers
-st.session_state.setdefault("qa_messages", [])
-st.session_state.setdefault("qa_archive", [])
-
-# Top control bar — archive and start fresh
-ctrl1, ctrl2, ctrl3 = st.columns([1,1,3])
-with ctrl1:
-    if st.button("Start new chat", key="btn_new_chat", help="Archive current and start a fresh conversation"):
-        if st.session_state["qa_messages"]:
-            st.session_state["qa_archive"].append({
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "label": f"Chat {len(st.session_state['qa_archive'])+1}",
-                "messages": st.session_state["qa_messages"].copy(),
-            })
-        st.session_state["qa_messages"] = []
-        st.session_state["force_scroll_anchor"] = "askdata-anchor"
-        st.rerun()
-with ctrl2:
-    if st.button("Clear chat", key="btn_clear_chat", help="Discard current conversation"):
-        st.session_state["qa_messages"] = []
-        st.session_state["force_scroll_anchor"] = "askdata-anchor"
-        st.rerun()
-with ctrl3:
-    pass
-
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not _HAS_OPENAI:
     st.info("To enable this panel, add `openai` to your requirements and redeploy. Then set `OPENAI_API_KEY`.")
@@ -849,7 +843,28 @@ else:
     ser_hash = _hash_series_for_cache(verb_series)
     index = build_vector_index(verb_series.tolist(), api_key)
 
-    # Display chat: last two messages; older tucked away
+    # Prepare messages (compact display)
+    st.session_state.setdefault("qa_messages", [])
+    # keep the list bounded
+    if st.session_state.get("qa_messages") and len(st.session_state["qa_messages"]) > 12:
+        st.session_state["qa_messages"] = st.session_state["qa_messages"][-12:]
+
+    # Controls row
+    cc1, cc2 = st.columns([1,1])
+    with cc1:
+        if st.button("Start new chat"):
+            archives = st.session_state.get("qa_archives", [])
+            if st.session_state["qa_messages"]:
+                archives.append(st.session_state["qa_messages"])
+                st.session_state["qa_archives"] = archives
+            st.session_state["qa_messages"] = []
+            st.experimental_rerun()
+    with cc2:
+        if st.button("Clear chat"):
+            st.session_state["qa_messages"] = []
+            st.experimental_rerun()
+
+    # Show last few exchanges; older behind expander
     older = st.session_state["qa_messages"][:-2]
     latest = st.session_state["qa_messages"][-2:]
     if older:
@@ -859,9 +874,11 @@ else:
     for role, content in latest:
         st.markdown(f"<div class='chat-{'q' if role=='user' else 'a'}'><b>{role.title()}:</b> {content}</div>", unsafe_allow_html=True)
 
-    # Input row
+    # Input form (NOT pinned)
     with st.form("ask_ai_form", clear_on_submit=False):
-        q = st.text_area("Ask a question", value=st.session_state.get("ask_ai_text", ""), height=80,
+        q = st.text_area("Ask a question",
+                         value=st.session_state.get("ask_ai_text", ""),
+                         height=80,
                          help="Questions about the CURRENT filtered reviews and the tables above.")
         send = st.form_submit_button("Send")
     if send and q.strip():
@@ -870,10 +887,9 @@ else:
 
         # Retrieve top matching verbatims for richer answers
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
-        # Sample snippets for quoting
         quotes = []
         for txt, sim in retrieved[:5]:
-            s = txt.strip()
+            s = (txt or "").strip()
             if len(s) > 0:
                 if len(s) > 320: s = s[:317] + "…"
                 quotes.append(f"• “{s}”")
@@ -912,7 +928,78 @@ else:
             pct = (cnt / max(1,len(filtered))) * 100.0
             return {"count": cnt, "pct": pct}
 
-        # Build system/context
+        # Page-insight helpers (LLM can “read” the page)
+        def get_metrics_snapshot():
+            try:
+                return {
+                    "total_reviews": int(len(filtered)),
+                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) else 0.0,
+                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) else 0.0,
+                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered else {},
+                }
+            except Exception as e:
+                return {"error": str(e)}
+
+        def get_top_items(kind: str = "detractors", top_n: int = 10):
+            try:
+                if kind.lower().startswith("del"): df_res = analyze_delighters_detractors(filtered, existing_delighter_columns)
+                else: df_res = analyze_delighters_detractors(filtered, existing_detractor_columns)
+                return df_res.head(int(top_n)).to_dict(orient="records")
+            except Exception as e:
+                return {"error": str(e)}
+
+        def country_overview(country: str | None = None):
+            try:
+                if "Country" not in filtered.columns: return {"error":"No Country column"}
+                if country:
+                    sub = filtered[filtered["Country"] == country]
+                else:
+                    sub = filtered
+                data = sub.groupby("Country").agg(Average_Rating=("Star Rating","mean"),
+                                                 Review_Count=("Star Rating","count")).reset_index()
+                return data.to_dict(orient="records")
+            except Exception as e:
+                return {"error": str(e)}
+
+        # Local fallback if model fails
+        def _local_answer_fallback(question: str) -> str:
+            try:
+                parts = []
+                total = int(len(filtered))
+                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total else 0.0
+                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total else 0.0
+                parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
+
+                detr = analyze_delighters_detractors(filtered, existing_detractor_columns).head(5)
+                deli = analyze_delighters_detractors(filtered, existing_delighter_columns).head(5)
+                def _fmt_rows(df):
+                    if df.empty: return "None"
+                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
+                parts.append("**Top detractors:** " + _fmt_rows(detr))
+                parts.append("**Top delighters:** " + _fmt_rows(deli))
+
+                key = None
+                tokens = re.findall(r"[A-Za-z]{4,}", (question or "").lower())
+                common = {"about","from","with","what","when","where","which","that","this","they","them","good","bad","great","poor","very","more"}
+                for t in tokens:
+                    if t not in common:
+                        key = t; break
+
+                quotes = []
+                if "Verbatim" in filtered.columns:
+                    ser = filtered["Verbatim"].astype("string").fillna("")
+                    sample = ser[ser.str.contains(re.escape(key), case=False, na=False)].head(4).tolist() if key else ser.head(3).tolist()
+                    for s in sample:
+                        s2 = s.strip()
+                        if len(s2) > 300: s2 = s2[:297] + "…"
+                        if s2: quotes.append(f"• “{s2}”")
+                if quotes:
+                    parts.append("**Example quotes:**\n" + "\n".join(quotes))
+                return "\n\n".join(parts)
+            except Exception as e:
+                return f"(Fallback summary error: {e})"
+
+        # Build system/context for the LLM
         def context_blob(df_in: pd.DataFrame, n=25) -> str:
             if df_in.empty: return "No rows after filters."
             parts = [f"ROW_COUNT={len(df_in)}"]
@@ -936,42 +1023,27 @@ else:
         selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
         llm_temp = float(st.session_state.get("llm_temp", 0.2))
 
-        
-# Page insights helpers so the LLM can fetch what's on the page
-def get_metrics_snapshot():
-    try:
-        return {
-            "total_reviews": int(len(filtered)),
-            "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) else 0.0,
-            "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) else 0.0,
-            "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered else {},
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-def get_top_items(kind: str = "detractors", top_n: int = 10):
-    try:
-        if kind.lower().startswith("del"): df_res = analyze_delighters_detractors(filtered, existing_delighter_columns)
-        else: df_res = analyze_delighters_detractors(filtered, existing_detractor_columns)
-        return df_res.head(int(top_n)).to_dict(orient="records")
-    except Exception as e:
-        return {"error": str(e)}
-
-def country_overview(country: str | None = None):
-    try:
-        if "Country" not in filtered.columns: return {"error":"No Country column"}
-        if country:
-            sub = filtered[filtered["Country"] == country]
-        else:
-            sub = filtered
-        data = sub.groupby("Country").agg(Average_Rating=("Star Rating","mean"),
-                                         Review_Count=("Star Rating","count")).reset_index()
-        return data.to_dict(orient="records")
-    except Exception as e:
-        return {"error": str(e)}
-
-
         tools = [
+            {"type":"function","function":{
+                "name":"pandas_count",
+                "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
+                "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+            }},
+            {"type":"function","function":{
+                "name":"pandas_mean",
+                "description":"Compute mean of a numeric column (optionally with a pandas query).",
+                "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
+            }},
+            {"type":"function","function":{
+                "name":"symptom_stats",
+                "description":"Get mentions count and average star rating for a symptom across detractor/delighter columns.",
+                "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}
+            }},
+            {"type":"function","function":{
+                "name":"keyword_stats",
+                "description":"Count and percentage of reviews whose Verbatim contains a term (case-insensitive).",
+                "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}
+            }},
             {"type":"function","function":{
                 "name":"get_metrics_snapshot",
                 "description":"Return page metrics currently shown: total reviews, avg star, low-star %, and star counts.",
@@ -987,27 +1059,7 @@ def country_overview(country: str | None = None):
                 "description":"Overview by country for Average_Rating and Review_Count. Optional filter by a specific country.",
                 "parameters":{"type":"object","properties":{"country":{"type":"string"}}}
             }},
-        {"type":"function","function":{
-                        "name":"pandas_count",
-                        "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
-                        "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
-                    }},
-                    {"type":"function","function":{
-                        "name":"pandas_mean",
-                        "description":"Compute mean of a numeric column (optionally with a pandas query).",
-                        "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
-                    }},
-                    {"type":"function","function":{
-                        "name":"symptom_stats",
-                        "description":"Get mentions count and average star rating for a symptom across detractor/delighter columns.",
-                        "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}
-                    }},
-                    {"type":"function","function":{
-                        "name":"keyword_stats",
-                        "description":"Count and percentage of reviews whose Verbatim contains a term (case-insensitive).",
-                        "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}
-                    }},
-                ]
+        ]
 
         sys_ctx = (
             "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
@@ -1029,59 +1081,66 @@ def country_overview(country: str | None = None):
         if model_supports_temperature(selected_model):
             first_kwargs["temperature"] = llm_temp
 
+        # First call with robust fallback
         try:
-            first = client.chat.completions.create(**first_kwargs)
-        except Exception as e:
-            if "temperature" in str(e).lower() and "unsupported" in str(e).lower():
-                first_kwargs.pop("temperature", None)
+            with st.spinner("Thinking..."):
                 first = client.chat.completions.create(**first_kwargs)
-            else:
-                raise
-
-        msg = first.choices[0].message
-
-        tool_msgs = []
-        if msg.tool_calls:
-            for call in msg.tool_calls:
-                name = call.function.name
-                args = json.loads(call.function.arguments or "{}")
-                out = {"error":"unknown tool"}
-                if name == "pandas_count": out = pandas_count(args.get("query",""))
-                if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
-                if name == "keyword_stats": out = keyword_stats(args.get("term",""))
-                tool_msgs.append({"tool_call_id": call.id, "role":"tool",
-                                  "name": name, "content": json.dumps(out)})
-
-        if tool_msgs:
-            follow_kwargs = {
-                "model": selected_model,
-                "messages": [
-                    {"role":"system","content": sys_ctx},
-                    *[{"role": r, "content": c} for (r,c) in st.session_state["qa_messages"]],
-                    {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                    *tool_msgs
-                ],
-            }
-            if model_supports_temperature(selected_model):
-                follow_kwargs["temperature"] = llm_temp
-
-            try:
-                follow = client.chat.completions.create(**follow_kwargs)
-            except Exception as e:
-                if "temperature" in str(e).lower() and "unsupported" in str(e).lower():
-                    follow_kwargs.pop("temperature", None)
-                    follow = client.chat.completions.create(**follow_kwargs)
-                else:
-                    raise
-            final_text = follow.choices[0].message.content
+        except Exception as e:
+            final_text = _local_answer_fallback(q)
+            st.session_state['qa_messages'].append(('assistant', final_text))
+            st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+            st.caption(':information_source: Shown local summary because the model call failed. ' + str(e))
+            scroll_to("askdata-anchor")
         else:
-            final_text = msg.content
+            msg = first.choices[0].message
 
-        st.session_state["qa_messages"].append(("assistant", final_text))
-        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-        st.session_state["force_scroll_anchor"] = "askdata-anchor"
-        st.rerun()
+            tool_msgs = []
+            if msg.tool_calls:
+                for call in msg.tool_calls:
+                    name = call.function.name
+                    args = json.loads(call.function.arguments or "{}")
+                    out = {"error":"unknown tool"}
+                    if name == "pandas_count": out = pandas_count(args.get("query",""))
+                    if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                    if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
+                    if name == "keyword_stats": out = keyword_stats(args.get("term",""))
+                    if name == "get_metrics_snapshot": out = get_metrics_snapshot()
+                    if name == "get_top_items": out = get_top_items(args.get("kind","detractors"), int(args.get("top_n", 10)))
+                    if name == "country_overview": out = country_overview(args.get("country"))
+                    tool_msgs.append({"tool_call_id": call.id, "role":"tool",
+                                      "name": name, "content": json.dumps(out)})
+
+            if tool_msgs:
+                follow_kwargs = {
+                    "model": selected_model,
+                    "messages": [
+                        {"role":"system","content": sys_ctx},
+                        *[{"role": r, "content": c} for (r,c) in st.session_state["qa_messages"]],
+                        {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                        *tool_msgs
+                    ],
+                }
+                if model_supports_temperature(selected_model):
+                    follow_kwargs["temperature"] = llm_temp
+
+                try:
+                    follow = client.chat.completions.create(**follow_kwargs)
+                    final_text = follow.choices[0].message.content
+                except Exception as e:
+                    final_text = _local_answer_fallback(q)
+                    st.session_state['qa_messages'].append(('assistant', final_text))
+                    st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+                    st.caption(':information_source: Shown local summary because the tool-enabled call failed. ' + str(e))
+                    scroll_to("askdata-anchor")
+                else:
+                    st.session_state["qa_messages"].append(("assistant", final_text))
+                    st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+                    scroll_to("askdata-anchor")
+            else:
+                final_text = msg.content if msg and getattr(msg, 'content', None) else _local_answer_fallback(q)
+                st.session_state["qa_messages"].append(("assistant", final_text))
+                st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+                scroll_to("askdata-anchor")
 
 st.markdown("---")
 
@@ -1137,8 +1196,3 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
-
-# Honor anchor scrolling requests set in state
-if st.session_state.get("force_scroll_anchor"):
-    scroll_to(st.session_state["force_scroll_anchor"])
-    st.session_state["force_scroll_anchor"] = None
