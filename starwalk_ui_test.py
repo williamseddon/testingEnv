@@ -5,8 +5,6 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from wordcloud import WordCloud, STOPWORDS
-import matplotlib.pyplot as plt
 from googletrans import Translator
 import io
 import asyncio
@@ -160,7 +158,7 @@ def render_hero():
           }}
           window.addEventListener('resize', resize, {{passive:true}});
           resize();
-          const N = Math.max(120, Math.floor(w/10)); // dense, left
+          const N = Math.max(120, Math.floor(w/10));
           const stars = Array.from({{length:N}}, () => ({{
             x: Math.random()*w, y: Math.random()*h, r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
           }}));
@@ -172,8 +170,6 @@ def render_hero():
           }});
           function tick(){{
             ctx.clearRect(0,0,w,h);
-            const grd = ctx.createLinearGradient(w*0.66,0,w,0);
-            grd.addColorStop(0,'rgba(255,255,255,0)'); grd.addColorStop(1,'rgba(255,255,255,1)');
             for(const s of stars){{
               const px = s.x + (mx-0.5)*16*s.s;
               const py = s.y + (my-0.5)*10*s.s;
@@ -181,7 +177,6 @@ def render_hero():
               ctx.fillStyle = 'rgba(255,200,50,.9)'; ctx.fill();
               s.x = (s.x + 0.12*s.s) % w;
             }}
-            ctx.fillStyle = grd; ctx.fillRect(w*0.66,0,w*0.34,h);
             requestAnimationFrame(tick);
           }}
           tick();
@@ -275,13 +270,8 @@ def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: li
     return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
 
 def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
-    cols = [c for c in cols if c in df.columns]
-    if not cols: return ""
-    s = (df[cols].stack(dropna=True)
-         .map(lambda v: clean_text(v, keep_na=True)).dropna()
-         .astype("string").str.strip())
-    s = s[s != ""]
-    return " ".join(s.tolist())
+    # (kept for compatibility if you referenced it elsewhere; returns empty string now)
+    return ""
 
 def highlight_html(text: str, keyword: str | None) -> str:
     safe = html.escape(text or "")
@@ -484,7 +474,7 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
-        # >>> Moved here: Clear filters (higher up, just under Review List)
+        # >>> Clear filters (just under Review List)
         if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
             for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label",
                       "llm_temp","show_ask","scroll_target_id","llm_rag","llm_evidence"] + \
@@ -801,7 +791,7 @@ if uploaded_file:
             docs = texts.astype("string").fillna("").map(clean_text).tolist()
             ids = list(range(len(docs)))
 
-            # Preferred: OpenAI embeddings (object-safe)
+            # Preferred: OpenAI embeddings
             if api_key and _HAS_OPENAI:
                 cli = OpenAI(api_key=api_key)
                 emb_vectors = []
@@ -816,7 +806,7 @@ if uploaded_file:
                 mat = mat / norms
                 return {"ids": ids, "texts": docs, "emb": mat}
 
-            # Fallback: TF–IDF with explicit vocab + idf
+            # Fallback: TF–IDF
             vocab = {}
             vecs = []
             for t in docs:
@@ -1112,51 +1102,6 @@ if uploaded_file:
         st.markdown("---")
 
         # ---------------------------
-        # ☁️ Word Clouds (resilient)
-        # ---------------------------
-        st.markdown("### 🌟 Word Cloud for Delighters and Detractors")
-        detractors_text = build_wordcloud_text(filtered_verbatims, existing_detractor_columns)
-        delighters_text = build_wordcloud_text(filtered_verbatims, existing_delighter_columns)
-
-        custom_stopwords = set(STOPWORDS) | {"na","n/a","none","null","etc","amp","https","http"}
-
-        @st.cache_data(show_spinner=False)
-        def make_wordcloud_png(text: str, colormap: str, width: int, height: int, max_words: int, stops: tuple) -> bytes | None:
-            text = (text or "").strip()
-            if not text: return None
-            try:
-                wc = WordCloud(
-                    background_color="white",
-                    colormap=colormap,
-                    width=width, height=height,
-                    max_words=max_words,
-                    contour_width=2,
-                    collocations=False,
-                    normalize_plurals=True,
-                    stopwords=set(stops),
-                    regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
-                    random_state=42,
-                    scale=2,
-                ).generate(text)
-            except ValueError:
-                return None
-            import matplotlib.pyplot as _plt
-            fig = _plt.figure(figsize=(10, 5))
-            _plt.imshow(wc, interpolation="bilinear"); _plt.axis("off")
-            buf = io.BytesIO(); _plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0); _plt.close(fig)
-            return buf.getvalue()
-
-        det_png = make_wordcloud_png(detractors_text, "Reds", 1600, 800, 180, tuple(custom_stopwords))
-        st.markdown("#### 😠 Detractors")
-        if det_png: st.image(det_png, use_container_width=True)
-        else:       st.info("Not enough detractor text to build a word cloud.")
-
-        del_png = make_wordcloud_png(delighters_text, "Greens", 1600, 800, 180, tuple(custom_stopwords))
-        st.markdown("#### 😊 Delighters")
-        if del_png: st.image(del_png, use_container_width=True)
-        else:       st.info("Not enough delighter text to build a word cloud.")
-
-        # ---------------------------
         # 💌 Feedback / Feature Requests (BOTTOM)
         # ---------------------------
         st.markdown("<div id='feedback-anchor'></div>", unsafe_allow_html=True)
@@ -1240,5 +1185,3 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
-
-
