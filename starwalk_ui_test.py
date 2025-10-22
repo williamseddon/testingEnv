@@ -90,7 +90,7 @@ st.markdown(
       .table-wrap table { width:100% !important; border-collapse:collapse; }
       .symptom-table th, .symptom-table td { padding: 8px 10px; }
 
-      /* Pagination spacing (applies to main area buttons only) */
+      /* Pagination spacing */
       .pager { margin: 18px 0 28px 0; }
       .pager-zone .stButton>button { padding: 6px 18px; margin: 6px 8px; border-radius: 10px; }
 
@@ -288,6 +288,43 @@ def send_feedback_email(subject: str, body: str) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+# -------- NEW: Stats builders for LLM tools --------
+def _build_symptom_frame(filtered: pd.DataFrame) -> pd.DataFrame:
+    """Flatten symptoms with kind, mentions, avg, percent across CURRENT filtered df."""
+    if filtered is None or filtered.empty:
+        return pd.DataFrame(columns=["symptom","kind","mentions","avg_star","percent_total"])
+    det_cols = [c for c in filtered.columns if re.fullmatch(r"Symptom [1-9]|Symptom 10", c)]
+    del_cols = [c for c in filtered.columns if re.fullmatch(r"Symptom (1[1-9]|20)", c)]
+    rows=[]
+    total = len(filtered)
+    def add_rows(cols, kind):
+        if not cols: return
+        s = (filtered[cols].stack(dropna=True)
+             .map(lambda v: clean_text(v, keep_na=True)).dropna().astype("string").str.strip())
+        s = s[s.map(is_valid_symptom_value)]
+        if s.empty: return
+        for val, cnt in s.value_counts().items():
+            mask = filtered[cols].isin([val]).any(axis=1)
+            avg = filtered.loc[mask, "Star Rating"].mean()
+            rows.append({
+                "symptom": str(val),
+                "kind": kind,
+                "mentions": int(cnt),
+                "avg_star": float(avg) if pd.notna(avg) else None,
+                "percent_total": float((cnt/total*100) if total else 0)
+            })
+    add_rows(det_cols, "detractor")
+    add_rows(del_cols, "delighter")
+    return pd.DataFrame(rows)
+
+def _match_symptoms(sf: pd.DataFrame, query: str, kind: str, exact: bool) -> pd.DataFrame:
+    if sf.empty or not query: return sf.iloc[0:0]
+    qq = query.strip().lower()
+    view = sf if kind=="any" else sf[sf["kind"]==kind]
+    if exact:
+        return view[view["symptom"].str.lower()==qq]
+    return view[view["symptom"].str.lower().str.contains(re.escape(qq))]
+
 # ------------- Upload -------------
 st.markdown("### 📁 File Upload")
 uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
@@ -399,7 +436,7 @@ if uploaded_file:
         # ----- Divider above LLM in sidebar -----
         st.sidebar.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-        # LLM controls ONLY (ask UI is in main). “Go to Feedback” moved out & renamed.
+        # LLM controls ONLY (ask UI is in main). Buttons below are page anchors.
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -426,7 +463,7 @@ if uploaded_file:
             if st.button("Go to AI Assistant"):
                 st.session_state["assistant_scroll_pending"] = True
 
-        # NEW: separate button below the LLM expander
+        # NEW: separate buttons (page anchors)
         if st.sidebar.button("✉️ Submit Feedback"):
             st.session_state["feedback_scroll_pending"] = True
 
@@ -687,9 +724,104 @@ if uploaded_file:
 
         # LLM state
         st.session_state.setdefault("qa_messages", [
-            {"role":"system","content":"You are a helpful analyst. Use ONLY the provided context from the CURRENT filtered dataset. Prefer exact numbers. If unknown, say so."}
+            {"role":"system","content":"You are a helpful analyst of review data. When asked for metrics (counts, percentages, averages, top lists, or symptom/keyword mentions), you MUST call the provided tools to compute exact numbers on the CURRENT filtered dataset. If something is unknown, say so rather than guessing."}
         ])
 
+        # ====== NEW: rich toolset for accurate recall ======
+        # Build symptom frame once per render so tools are fast & consistent
+        symptom_frame = _build_symptom_frame(filtered)
+
+        def overall_stats_tool() -> dict:
+            def _calc(df_):
+                total = len(df_)
+                avg = float(df_["Star Rating"].mean()) if total else 0.0
+                denom = int(df_["Star Rating"].notna().sum())
+                low = int(df_.loc[df_["Star Rating"].isin([1,2])].shape[0]) if denom else 0
+                pct_low = (low/denom*100.0) if denom else 0.0
+                return total, avg, pct_low
+            seeded_mask_local = filtered["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in filtered.columns else pd.Series(False, index=filtered.index)
+            df_all, df_org, df_seed = filtered, filtered.loc[~seeded_mask_local], filtered.loc[seeded_mask_local]
+            (tot_all, avg_all, low_all)   = _calc(df_all)
+            (tot_org, avg_org, low_org)   = _calc(df_org)
+            (tot_seed, avg_seed, low_seed)= _calc(df_seed)
+            star_counts_local = filtered["Star Rating"].value_counts().sort_index().to_dict()
+            return {
+                "all": {"count": tot_all, "avg": avg_all, "pct_1_2": low_all, "star_counts": star_counts_local},
+                "organic": {"count": tot_org, "avg": avg_org, "pct_1_2": low_org},
+                "seeded": {"count": tot_seed, "avg": avg_seed, "pct_1_2": low_seed}
+            }
+
+        def symptom_stats_tool(query: str, kind: str="any", exact: bool=False, top: int|None=None) -> dict:
+            sf = symptom_frame
+            if query:
+                view = _match_symptoms(sf, query, kind, exact)
+            else:
+                view = sf if kind=="any" else sf[sf["kind"]==kind]
+            if top is not None:
+                view = view.sort_values("mentions", ascending=False).head(int(top))
+            return {
+                "results": [
+                    {
+                        "symptom": r["symptom"],
+                        "kind": r["kind"],
+                        "mentions": int(r["mentions"]),
+                        "percent_total": float(r["percent_total"]),
+                        "avg_star": None if pd.isna(r["avg_star"]) else float(r["avg_star"])
+                    } for _, r in view.iterrows()
+                ],
+                "total_reviews": int(len(filtered))
+            }
+
+        def keyword_stats_tool(keyword: str) -> dict:
+            if not keyword or "Verbatim" not in filtered.columns:
+                return {"error": "keyword missing or no Verbatim column"}
+            mask = filtered["Verbatim"].astype("string").str.contains(keyword, case=False, na=False)
+            dfk = filtered[mask]
+            return {
+                "keyword": keyword,
+                "mentions": int(mask.sum()),
+                "percent_total": float((mask.sum()/len(filtered)*100) if len(filtered) else 0),
+                "avg_star": None if dfk.empty else float(dfk["Star Rating"].mean()),
+                "total_reviews": int(len(filtered))
+            }
+
+        # Define tool schema for OpenAI
+        tools = [
+            {"type":"function","function":{
+                "name":"overall_stats",
+                "description":"Overall counts/averages/low-star% for current filtered dataset (and organic vs seeded breakdown).",
+                "parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{
+                "name":"symptom_stats",
+                "description":"Get stats for symptoms. Use query='' to list top symptoms. kind: any|delighter|detractor. exact: exact match vs substring. top: limit results.",
+                "parameters":{"type":"object","properties":{
+                    "query":{"type":"string"},
+                    "kind":{"type":"string","enum":["any","delighter","detractor"],"default":"any"},
+                    "exact":{"type":"boolean","default":False},
+                    "top":{"type":"integer"}
+                }}}},
+            {"type":"function","function":{
+                "name":"keyword_stats",
+                "description":"Mentions/percent/avg star for a keyword in Verbatim text (case-insensitive).",
+                "parameters":{"type":"object","properties":{
+                    "keyword":{"type":"string"}
+                },"required":["keyword"]}}},
+        ]
+
+        # Tool “router”
+        def call_tool(name, args):
+            try:
+                if name=="overall_stats":
+                    return overall_stats_tool()
+                if name=="symptom_stats":
+                    return symptom_stats_tool(args.get("query",""), args.get("kind","any"), bool(args.get("exact",False)), args.get("top"))
+                if name=="keyword_stats":
+                    return keyword_stats_tool(args.get("keyword",""))
+                return {"error":"unknown tool"}
+            except Exception as e:
+                return {"error": str(e)}
+
+        # Ask/answer
         if not _HAS_OPENAI:
             st.info("To enable Q&A, add `openai` to requirements and redeploy, then set `OPENAI_API_KEY`.")
         elif not api_key:
@@ -697,58 +829,29 @@ if uploaded_file:
         else:
             client = OpenAI(api_key=api_key)
 
-            def context_blob(df_, n_small=25, n_tail=10) -> str:
-                if df_.empty: return "No rows after filters."
-                parts = [f"ROW_COUNT={len(df_)}"]
-                if "Star Rating" in df_.columns:
-                    parts.append(f"STAR_COUNTS={df_['Star Rating'].value_counts().sort_index().to_dict()}")
-                keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"] if c in df_.columns]
-                pool = pd.concat([df_.head(n_small), df_.tail(n_tail), df_.sample(min(n_small, len(df_)), random_state=7)]).drop_duplicates()
-                for _, r in pool[keep].iterrows():
-                    try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
-                    except Exception: date_str = str(r.get("Review Date","")) or ""
-                    parts.append(str({
-                        "date": date_str, "country": str(r.get("Country","")), "source": str(r.get("Source","")),
-                        "model": str(r.get("Model (SKU)","")), "stars": str(r.get("Star Rating","")),
-                        "text": clean_text(str(r.get("Verbatim","")))
-                    }))
-                return "\n".join(parts)
+            if ask_clicked and (prompt or "").strip():
+                user_q = prompt.strip()
+                st.session_state['qa_messages'].append({"role":"user","content": user_q})
 
-            def pandas_count(query: str) -> dict:
-                try:
-                    if ";" in query or "__" in query: return {"error":"disallowed pattern"}
-                    res = filtered.query(query, engine="python")
-                    return {"count": int(len(res))}
-                except Exception as e: return {"error": str(e)}
+                # System context that nudges the model to use tools
+                sys_ctx = (
+                    "You are analyzing product reviews. The user sees filters on the page; all tools operate on the CURRENT filtered dataset. "
+                    "For anything about counts, percentages, averages, top-N lists, or symptom/keyword mentions, you MUST call the tools "
+                    "(`symptom_stats`, `keyword_stats`, `overall_stats`) to compute exact values. When returning percentages, round to one decimal place. "
+                    "When asked about a symptom by name (e.g., 'battery life'), use symptom_stats with substring matching (exact=false). "
+                    "If no results are found, say so clearly."
+                )
 
-            def pandas_mean(column: str, query: str|None=None) -> dict:
-                try:
-                    if column not in filtered.columns: return {"error": f"Unknown column {column}"}
-                    dfq = filtered.query(query, engine="python") if query else filtered
-                    return {"mean": float(dfq[column].mean())}
-                except Exception as e: return {"error": str(e)}
-
-            tools = [
-                {"type":"function","function":{
-                    "name":"pandas_count",
-                    "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
-                    "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
-                }},
-                {"type":"function","function":{
-                    "name":"pandas_mean",
-                    "description":"Compute mean of a numeric column (optionally with a pandas query).",
-                    "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
-                }},
-            ]
-
-            if ask_clicked and prompt.strip():
-                st.session_state['qa_messages'].append({"role":"user","content": prompt.strip()})
-                sys_ctx = ("CONTEXT:\n"+context_blob(filtered)+
-                           "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. If unknown from context+tools, say you don't know.")
                 model_id = st.session_state.get("llm_model","gpt-4o-mini")
                 temp = float(st.session_state.get("llm_temp",0.2))
-                first_kwargs = {"model": model_id, "messages":[*st.session_state["qa_messages"], {"role":"system","content":sys_ctx}], "tools": tools}
+
+                first_kwargs = {
+                    "model": model_id,
+                    "messages": [*st.session_state["qa_messages"], {"role":"system","content": sys_ctx}],
+                    "tools": tools,
+                }
                 if model_supports_temperature(model_id): first_kwargs["temperature"]=temp
+
                 try:
                     first = client.chat.completions.create(**first_kwargs)
                 except Exception as e:
@@ -759,16 +862,26 @@ if uploaded_file:
                         raise
 
                 msg = first.choices[0].message
+                tool_msgs=[]
                 if msg.tool_calls:
-                    tool_msgs=[]
                     for call in msg.tool_calls:
                         name = call.function.name
                         args = json.loads(call.function.arguments or "{}")
-                        out={"error":"unknown tool"}
-                        if name=="pandas_count": out = pandas_count(args.get("query",""))
-                        if name=="pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                        tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name":name, "content":json.dumps(out)})
-                    follow_kwargs = {"model":model_id, "messages":[*st.session_state["qa_messages"], {"role":"system","content":sys_ctx}, {"role":"assistant","tool_calls": msg.tool_calls, "content": None}, *tool_msgs]}
+                        out = call_tool(name, args)
+                        tool_msgs.append({
+                            "tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)
+                        })
+
+                if tool_msgs:
+                    follow_kwargs = {
+                        "model": model_id,
+                        "messages": [
+                            *st.session_state["qa_messages"],
+                            {"role":"system","content": sys_ctx},
+                            {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                            *tool_msgs
+                        ],
+                    }
                     if model_supports_temperature(model_id): follow_kwargs["temperature"]=temp
                     try:
                         follow = client.chat.completions.create(**follow_kwargs)
@@ -780,11 +893,13 @@ if uploaded_file:
                             raise
                     final_text = follow.choices[0].message.content
                 else:
+                    # No tool calls — still answer, but tools are preferred
                     final_text = msg.content
 
                 st.session_state["qa_messages"].append({"role":"assistant","content": final_text})
                 st.session_state["assistant_scroll_pending"] = True
 
+            # History
             for m in st.session_state["qa_messages"]:
                 if m["role"] != "system":
                     with st.chat_message(m["role"]):
