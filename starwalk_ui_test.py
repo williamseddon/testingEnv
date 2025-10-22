@@ -1,16 +1,25 @@
-import streamlit as st 
+import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from wordcloud import WordCloud
+from wordcloud import WordCloud, STOPWORDS
 import matplotlib.pyplot as plt
 from googletrans import Translator
 import io
 import asyncio
 import re
-import html-------------------------------
-# Page config
+import html  # stdlib: used for html.escape
+
 # ---------------------------------------
+# Optional high-quality text fixer
+# ---------------------------------------
+try:
+    from ftfy import fix_text as _ftfy_fix
+    _HAS_FTFY = True
+except Exception:
+    _HAS_FTFY = False
+    _ftfy_fix = None
+
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
 # Global CSS polish (compact sidebar + highlight)
@@ -146,7 +155,15 @@ def build_wordcloud_text(df: pd.DataFrame, cols: list[str]) -> str:
 
 
 def clean_text(x: str) -> str:
-    """Fix common mojibake like â€™ and trim to safe HTML then wrap keyword matches with <mark> (case-insensitive)."""
+    """Fix common mojibake like â€™ and trim whitespace."""
+    if x is None:
+        return ""
+    x = str(x).replace("â€™", "'").strip()
+    return x
+
+
+def highlight_html(text: str, keyword: str | None) -> str:
+    """Escape to safe HTML then wrap keyword matches with <mark> (case-insensitive)."""
     safe = html.escape(text or "")
     if keyword:
         try:
