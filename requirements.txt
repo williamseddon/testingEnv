@@ -8,3 +8,4 @@ googletrans
 xlsxwriter
 serial
 pyserial
+openai
