@@ -389,7 +389,8 @@ try:
     for c in all_symptom_cols:
         df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
 
-    if "Verbatim" in df.columns":
+    # ✅ fixed stray quote here
+    if "Verbatim" in df.columns:
         df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
     if "Review Date" in df.columns:
         df["Review Date"] = pd.to_datetime(df["Review Date"], errors="coerce")
@@ -569,8 +570,12 @@ if _DIALOG_AVAILABLE:
                 )
             st.stop()
 
+# Sidebar button: open modal if available, otherwise scroll to on-page form
 if st.sidebar.button("Submit Feedback"):
-    if _DIALOG_AVAILABLE: open_feedback_dialog()
+    if _DIALOG_AVAILABLE:
+        open_feedback_dialog()
+    else:
+        scroll_to("feedback-anchor")
 
 st.markdown("---")
 
@@ -738,8 +743,8 @@ else:
                 items.append(f'<span class="badge {css_class}">{_html.escape(s)}</span>')
             return f'<div class="badges">{"".join(items)}</div>' if items else "<i>None</i>"
 
-        delighter_message = chips(row, [c for c in [f"Symptom {i}" for i in range(11,21)] if c in paginated.columns], "pos")
-        detractor_message = chips(row, [c for c in [f"Symptom {i}" for i in range(1,11)] if c in paginated.columns], "neg")
+        delighter_message = chips(row, existing_delighter_columns, "pos")
+        detractor_message = chips(row, existing_detractor_columns, "neg")
 
         star_val = row.get("Star Rating", 0)
         try: star_int = int(star_val) if pd.notna(star_val) else 0
@@ -865,8 +870,8 @@ else:
                 low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total else 0.0
                 parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
 
-                detr = analyze_delighters_detractors(filtered, [f"Symptom {i}" for i in range(1,11) if f"Symptom {i}" in filtered.columns]).head(5)
-                deli = analyze_delighters_detractors(filtered, [f"Symptom {i}" for i in range(11,21) if f"Symptom {i}" in filtered.columns]).head(5)
+                detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
+                deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
                 def fmt(df):
                     if df.empty: return "None"
                     return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
@@ -966,3 +971,4 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+
