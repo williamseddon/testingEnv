@@ -18,6 +18,8 @@ import json
 import hashlib
 import numpy as np
 import urllib.parse
+import smtplib
+from email.message import EmailMessage
 from streamlit.components.v1 import html as st_html  # hero canvas
 
 # ---------------------------
@@ -328,6 +330,28 @@ def dataset_signature(df: pd.DataFrame) -> str:
     joined = "|".join(texts.tolist())
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
+def filters_summary_text() -> str:
+    """Summarize current filters from session state."""
+    parts = []
+    tf = st.session_state.get("tf")
+    if tf: parts.append(f"Timeframe: {tf}")
+    sr = st.session_state.get("sr")
+    if sr and isinstance(sr, list) and "All" not in sr:
+        parts.append(f"Star Ratings: {', '.join(map(str, sr))}")
+    kw = st.session_state.get("kw")
+    if kw: parts.append(f"Keyword: {kw}")
+    delighters = st.session_state.get("delight")
+    detractors = st.session_state.get("detract")
+    if delighters and "All" not in delighters: parts.append(f"Delighters: {', '.join(delighters)}")
+    if detractors and "All" not in detractors: parts.append(f"Detractors: {', '.join(detractors)}")
+    extra = []
+    for k, v in st.session_state.items():
+        if k.startswith("f_") and isinstance(v, list) and "ALL" not in v:
+            extra.append(f"{k[2:]}: {', '.join(map(str, v))}")
+    if extra:
+        parts.append("Additional: " + " | ".join(extra))
+    return "\n".join(parts) if parts else "None"
+
 # ---------------------------
 # File upload
 # ---------------------------
@@ -460,6 +484,14 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
+        # >>> Moved here: Clear filters (higher up, just under Review List)
+        if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
+            for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label",
+                      "llm_temp","show_ask","scroll_target_id","llm_rag","llm_evidence"] + \
+                     [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
+                if k in st.session_state: del st.session_state[k]
+            st.rerun()
+
         # Sidebar Ask button → open section & page-anchor
         st.sidebar.markdown("---")
         if st.sidebar.button("💬 Ask me anything"):
@@ -504,12 +536,10 @@ if uploaded_file:
                 help="Append exact review snippets used so you can verify answers."
             )
 
+        # Bottom of sidebar: Submit feedback anchor button
         st.sidebar.markdown("---")
-        if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
-            for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label",
-                      "llm_temp","show_ask","scroll_target_id","llm_rag","llm_evidence"] + \
-                     [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
-                if k in st.session_state: del st.session_state[k]
+        if st.sidebar.button("📝 Submit feedback"):
+            st.session_state["scroll_target_id"] = "feedback-anchor"
             st.rerun()
 
         st.markdown("---")
@@ -1127,6 +1157,70 @@ if uploaded_file:
         else:       st.info("Not enough delighter text to build a word cloud.")
 
         # ---------------------------
+        # 💌 Feedback / Feature Requests (BOTTOM)
+        # ---------------------------
+        st.markdown("<div id='feedback-anchor'></div>", unsafe_allow_html=True)
+        st.markdown("### 💌 Submit feedback & feature requests")
+        st.caption("We care about your voice. Tell us what would make this better.")
+
+        def send_feedback_email(subject: str, body: str, to_addr: str) -> tuple[bool, str]:
+            host = st.secrets.get("SMTP_HOST", os.getenv("SMTP_HOST"))
+            port = int(st.secrets.get("SMTP_PORT", os.getenv("SMTP_PORT", "587")))
+            user = st.secrets.get("SMTP_USER", os.getenv("SMTP_USER"))
+            pwd  = st.secrets.get("SMTP_PASS", os.getenv("SMTP_PASS"))
+            try:
+                if not (host and user and pwd and to_addr):
+                    return False, "SMTP not configured"
+                msg = EmailMessage()
+                msg["From"] = user
+                msg["To"] = to_addr
+                msg["Subject"] = subject
+                msg.set_content(body)
+                with smtplib.SMTP(host, port, timeout=12) as s:
+                    s.starttls()
+                    s.login(user, pwd)
+                    s.send_message(msg)
+                return True, "sent"
+            except Exception as e:
+                return False, str(e)
+
+        with st.form("feedback_form"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                fb_name = st.text_input("Your name (optional)")
+            with col_b:
+                fb_reply = st.text_input("Your email (optional)")
+            fb_type = st.selectbox("Type", ["Feature request", "Bug report", "Question", "Praise", "Other"])
+            fb_text = st.text_area("Message", placeholder="What would make this tool more useful for you?")
+            fb_include = st.checkbox("Include current filter summary", value=True)
+            submitted = st.form_submit_button("Send feedback ✉️")
+
+            if submitted:
+                filt_summary = filters_summary_text() if fb_include else "Skipped"
+                row_count = len(filtered_verbatims)
+                subject = f"[StarWalk Feedback] {fb_type} — {fb_name or 'Anonymous'}"
+                body = (
+                    f"From: {fb_name or 'Anonymous'}\n"
+                    f"Reply-to: {fb_reply or 'N/A'}\n"
+                    f"Type: {fb_type}\n"
+                    f"Dataset rows (after filters): {row_count}\n"
+                    f"Filters:\n{filt_summary}\n\n"
+                    f"Message:\n{fb_text}\n"
+                )
+                ok, info = send_feedback_email(subject, body, "wseddon@sharkninja.com")
+                if ok:
+                    st.success("Thanks! Your feedback was sent. 💙")
+                else:
+                    # Fallback: open mail client with prefilled subject/body
+                    st.warning("Email service not configured. Opening your mail client instead.")
+                    mailto = (
+                        "mailto:wseddon@sharkninja.com?"
+                        f"subject={urllib.parse.quote(subject)}&"
+                        f"body={urllib.parse.quote(body[:2000])}"
+                    )
+                    st.link_button("Open mail client", mailto, use_container_width=False)
+
+        # ---------------------------
         # One-time scroll behaviors (top / anchors)
         # ---------------------------
         if st.session_state.get("force_scroll_top_once"):
@@ -1146,4 +1240,5 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
+
 
