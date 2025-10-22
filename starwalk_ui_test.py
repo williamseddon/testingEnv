@@ -14,6 +14,7 @@ import html
 import os
 import warnings
 import json
+from streamlit.components.v1 import html as st_html  # for the hero canvas
 
 # Silence openpyxl validation warning spam
 warnings.filterwarnings(
@@ -44,30 +45,129 @@ st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 0.6rem; padding-bottom: 1rem; }
-    section[data-testid="stSidebar"] .block-container { padding-top: 0.2rem; padding-bottom: 0.6rem; }
-    section[data-testid="stSidebar"] label { font-size: 0.95rem; }
-    section[data-testid="stSidebar"] .stButton>button { width: 100%; }
-    mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
-    .review-card { border:1px solid #e6e6e6; background:#fafafa; border-radius:10px; padding:16px; }
-    .review-card p { margin:.25rem 0; line-height:1.45; }
-    .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-    .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:0.95rem; }
-    .badge.pos { background:#CFF7D6; color:#085a2a; }
-    .badge.neg { background:#FBD3D0; color:#7a0410; }
+      :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
+      .block-container { padding-top: 1.25rem; padding-bottom: 1rem; }
+      section[data-testid="stSidebar"] .block-container { padding-top: 0.2rem; padding-bottom: 0.6rem; }
+      section[data-testid="stSidebar"] label { font-size: 0.95rem; }
+      section[data-testid="stSidebar"] .stButton>button { width: 100%; }
+      mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
+      .review-card { border:1px solid #e6e6e6; background:#fafafa; border-radius:10px; padding:16px; }
+      .review-card p { margin:.25rem 0; line-height:1.45; }
+      .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+      .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:0.95rem; }
+      .badge.pos { background:#CFF7D6; color:#085a2a; }
+      .badge.neg { background:#FBD3D0; color:#7a0410; }
+
+      /* Hero styles */
+      .hero-wrap {
+        position: relative;
+        overflow: hidden;
+        border-radius: 18px;
+        background: radial-gradient(1200px 400px at 10% -10%, #fff7cf 0%, #ffffff 55%, #ffffff 100%);
+        border: 1px solid #eee;
+        height: 220px;
+        margin-top: .25rem;
+        margin-bottom: 1.25rem;
+      }
+      .hero-inner {
+        position: absolute; inset: 0;
+        display: grid; place-items: center;
+        text-align: center;
+        pointer-events: none;
+      }
+      .hero-title {
+        font-size: clamp(26px, 4.4vw, 56px);
+        font-weight: 800;
+        letter-spacing: .5px;
+        margin: 0;
+      }
+      .hero-sub {
+        margin: 6px 0 0 0; color: #667085; font-size: clamp(13px, 1.2vw, 18px);
+      }
+      .hero-emoji {
+        font-size: clamp(20px, 3vw, 32px);
+        filter: drop-shadow(0 2px 4px rgba(0,0,0,.08));
+        margin-bottom: 4px;
+      }
+      #hero-canvas {
+        position:absolute; inset:0; width:100%; height:100%;
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ---------- Title ----------
-st.markdown(
-    """
-    <h1 style="text-align:center;margin-bottom:.25rem;">🌟 Star Walk Analysis Dashboard</h1>
-    <p style="text-align:center;font-size:16px;color:#666;margin-top:0;">Insights, trends, and ratings — fast.</p>
-    """,
-    unsafe_allow_html=True,
-)
+# ---------- Minimal interactive hero ----------
+def render_hero():
+    st_html(
+        """
+        <div class="hero-wrap" id="top-hero">
+          <canvas id="hero-canvas"></canvas>
+          <div class="hero-inner">
+            <div class="hero-emoji">✨</div>
+            <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
+            <p class="hero-sub">Insights, trends, and ratings — fast.</p>
+          </div>
+        </div>
+
+        <script>
+        // Tiny parallax starfield (no libs)
+        (function() {
+          const c = document.getElementById('hero-canvas');
+          const ctx = c.getContext('2d', {alpha: true});
+          const DPR = window.devicePixelRatio || 1;
+          let w=0, h=0;
+
+          function resize(){
+            const r = c.getBoundingClientRect();
+            w = Math.max(300, r.width|0);
+            h = Math.max(150, r.height|0);
+            c.width = w * DPR;
+            c.height = h * DPR;
+            ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+          }
+          window.addEventListener('resize', resize, {passive:true});
+          resize();
+
+          const N = 90; // number of dots
+          const stars = Array.from({length:N}, () => ({
+            x: Math.random()*w,
+            y: Math.random()*h,
+            r: 0.6 + Math.random()*1.6,
+            s: 0.25 + Math.random()*0.9
+          }));
+
+          let mx = 0.5, my = 0.5;
+          c.addEventListener('pointermove', e => {
+            const r = c.getBoundingClientRect();
+            mx = (e.clientX - r.left) / r.width;
+            my = (e.clientY - r.top) / r.height;
+          });
+
+          function tick(){
+            ctx.clearRect(0,0,w,h);
+            for(const s of stars){
+              // subtle parallax drift
+              const px = s.x + (mx-0.5)*12*s.s;
+              const py = s.y + (my-0.5)*12*s.s;
+              ctx.beginPath();
+              ctx.arc((px%w+w)%w, (py%h+h)%h, s.r, 0, Math.PI*2);
+              ctx.fillStyle = 'rgba(255, 200, 50, 0.9)'; // golden dots
+              ctx.fill();
+              // slow drift to the right
+              s.x = (s.x + 0.08*s.s) % w;
+            }
+            requestAnimationFrame(tick);
+          }
+          tick();
+        })();
+        </script>
+        """,
+        height=230,
+    )
+
+# ---------- Title / Hero ----------
+render_hero()
 
 # ---------- Utils ----------
 def style_rating_cells(value):
@@ -319,7 +419,6 @@ if uploaded_file:
 
         # 🤖 LLM settings (model + temperature)
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
-            # Label → model-id pairs (ordered)
             _model_choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
                 ("Balanced – 4o", "gpt-4o"),
@@ -713,9 +812,7 @@ if uploaded_file:
                     st.session_state.qa_messages.append({"role":"assistant","content": final_text})
                     with st.chat_message("assistant"):
                         st.markdown(final_text)
-                        # anchor we can scroll to after the response renders
                         st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
-                    # trigger one-time scroll
                     st.session_state["ask_scroll_pending"] = True
 
                 except Exception as e:
@@ -749,7 +846,7 @@ if uploaded_file:
                     collocations=False,
                     normalize_plurals=True,
                     stopwords=set(stops),
-                    regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
+                    regexp=r"[A-Za-zÀ-ÖØ-öø-ÿ'’\\-]+",
                     random_state=42,
                     scale=2,
                 ).generate(text)
@@ -789,4 +886,3 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
-
