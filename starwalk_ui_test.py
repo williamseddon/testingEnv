@@ -643,7 +643,7 @@ if uploaded_file:
                     with st.chat_message(m["role"]):
                         st.markdown(m["content"])
 
-            user_q = st.chat_input("Ask a question about the CURRENTLY FILTERED reviews…")
+            user_q = st.chat_input("Hey! Ask me anything about these filtered reviews 🙂")
             if user_q:
                 st.session_state.qa_messages.append({"role": "user", "content": user_q})
                 with st.chat_message("user"):
