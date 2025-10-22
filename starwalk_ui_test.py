@@ -346,7 +346,7 @@ if uploaded_file:
         detractor_symptoms = collect_unique_symptoms(filtered_verbatims, existing_detractor_columns)
         delighter_symptoms = collect_unique_symptoms(filtered_verbatims, existing_delighter_columns)
 
-        with st.sidebar.expander("😊 Delighters & 😠 Detractors", expanded=False):
+        with st.sidebar.expander("🩺 Review Symptoms", expanded=False):
             selected_delighter = st.multiselect(
                 "Select Delighter Symptoms",
                 options=["All"] + sorted(delighter_symptoms),
