@@ -15,6 +15,8 @@ import html
 import os
 import warnings
 import json
+import hashlib
+import numpy as np
 import urllib.parse
 from streamlit.components.v1 import html as st_html  # for the hero canvas
 
@@ -79,35 +81,43 @@ st.markdown(
       .badge.pos { background:#CFF7D6; color:#085a2a; }
       .badge.neg { background:#FBD3D0; color:#7a0410; }
 
-      /* Hero */
+      /* Hero layout: stars LEFT, logo RIGHT */
       .hero-wrap {
         position: relative;
         overflow: hidden;
         border-radius: 14px;
-        background: radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%);
         border: 1px solid #eee;
-        height: 150px;
+        height: 150px; /* short and wide */
         margin-top: .25rem;
         margin-bottom: 1rem;
+        display: grid;
+        grid-template-columns: minmax(420px, 1fr) 260px; /* left stars, right logo */
+        background: #fff;
       }
-      .hero-inner {
-        position: absolute; inset: 0;
-        display: grid; grid-template-columns: 1fr;
-        align-content: center; justify-items: center;
-        text-align: center; pointer-events: none;
+      .hero-left {
+        position: relative;
+        padding: 12px 14px;
+        background:
+          radial-gradient(1100px 320px at 8% -18%, #fff8d9 0%, #ffffff 55%, #ffffff 100%);
       }
-      .hero-title-row { display:flex; align-items:center; gap:12px; }
-      .hero-title { font-size: clamp(24px, 4vw, 44px); font-weight: 800; letter-spacing:.3px; margin:0; }
-      .hero-sub { margin: 6px 0 0 0; color:#667085; font-size: clamp(12px, 1.1vw, 16px); }
       #hero-canvas { position:absolute; inset:0; width:100%; height:100%; }
-      .sn-logo-img { height: 26px; width: auto; display:block; }
+      .hero-title { position: relative; z-index: 1; margin:0; padding-top: 8px;
+        font-size: clamp(22px, 3.6vw, 40px); font-weight: 800; letter-spacing:.3px; }
+      .hero-sub { position: relative; z-index: 1; margin:6px 0 0 0; color:#667085;
+        font-size: clamp(12px, 1.05vw, 16px); }
+
+      .hero-right {
+        display:flex; align-items:center; justify-content:center;
+        padding-right: 10px;
+      }
+      .sn-logo-img { height: 28px; width: auto; display:block; opacity:.92; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------
-# Minimalist hero with starfield + SharkNinja data-URI SVG
+# Minimalist hero with starfield LEFT + SharkNinja data-URI SVG RIGHT
 # ---------------------------
 def _sn_logo_data_uri() -> str:
     svg = '''
@@ -126,13 +136,13 @@ def render_hero():
     st_html(
         f"""
         <div class="hero-wrap" id="top-hero">
-          <canvas id="hero-canvas"></canvas>
-          <div class="hero-inner">
-            <div class="hero-title-row">
-              <img src="{sn_uri}" alt="SharkNinja" class="sn-logo-img"/>
-              <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
-            </div>
+          <div class="hero-left">
+            <canvas id="hero-canvas"></canvas>
+            <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
             <p class="hero-sub">Insights, trends, and ratings — fast.</p>
+          </div>
+          <div class="hero-right">
+            <img src="{sn_uri}" alt="SharkNinja" class="sn-logo-img"/>
           </div>
         </div>
         <script>
@@ -150,7 +160,7 @@ def render_hero():
           }}
           window.addEventListener('resize', resize, {{passive:true}});
           resize();
-          const N = Math.max(120, Math.floor(w/12));
+          const N = Math.max(120, Math.floor(w/10)); // denser across width
           const stars = Array.from({{length:N}}, () => ({{
             x: Math.random()*w, y: Math.random()*h, r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
           }}));
@@ -162,6 +172,9 @@ def render_hero():
           }});
           function tick(){{
             ctx.clearRect(0,0,w,h);
+            // fade the RIGHT 34% so logo area stays calm
+            const grd = ctx.createLinearGradient(w*0.66,0,w,0);
+            grd.addColorStop(0,'rgba(255,255,255,0)'); grd.addColorStop(1,'rgba(255,255,255,1)');
             for(const s of stars){{
               const px = s.x + (mx-0.5)*16*s.s;
               const py = s.y + (my-0.5)*10*s.s;
@@ -169,6 +182,7 @@ def render_hero():
               ctx.fillStyle = 'rgba(255,200,50,.9)'; ctx.fill();
               s.x = (s.x + 0.12*s.s) % w;
             }}
+            ctx.fillStyle = grd; ctx.fillRect(w*0.66,0,w*0.34,h);
             requestAnimationFrame(tick);
           }}
           tick();
@@ -308,6 +322,11 @@ def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
     mask = verb.str.contains(keyword.strip(), case=False, na=False)
     return df[mask]
 
+def dataset_signature(df: pd.DataFrame) -> str:
+    """Stable signature for filtered dataset to know when to rebuild RAG index."""
+    text = "|".join((df.get("Verbatim") or pd.Series([], dtype="string")).astype("string").fillna("").tolist())
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 # ---------------------------
 # File upload
 # ---------------------------
@@ -440,13 +459,13 @@ if uploaded_file:
                 st.session_state["reviews_per_page"] = rpp
                 st.session_state["review_page"] = 0
 
-        # Toggle to open the chat panel (prevents auto-scroll on first load)
+        # Ask button (prevents auto-scroll on load)
         st.sidebar.markdown("---")
         if st.sidebar.button("💬 Ask me anything"):
             st.session_state["show_ask"] = True
             st.session_state["ask_scroll_pending"] = True
 
-        # LLM settings
+        # LLM settings + RAG
         with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
             _model_choices = [
                 ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -474,10 +493,19 @@ if uploaded_file:
             if not temp_supported:
                 st.caption("ℹ️ This model uses a fixed sampling temperature; the slider is disabled.")
 
+            st.session_state["llm_rag"] = st.checkbox(
+                "Use retrieval (RAG) on filtered reviews", value=st.session_state.get("llm_rag", True),
+                help="Pull the top-matching reviews into context using embeddings (best) or TF-IDF (fallback)."
+            )
+            st.session_state["llm_evidence"] = st.checkbox(
+                "Show evidence in answers", value=st.session_state.get("llm_evidence", True),
+                help="Append the exact review snippets used so you can verify answers."
+            )
+
         st.sidebar.markdown("---")
         if st.sidebar.button("🧹 Clear all filters", help="Reset all filters to defaults."):
             for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label",
-                      "llm_temp","show_ask","ask_scroll_pending"] + \
+                      "llm_temp","show_ask","ask_scroll_pending","llm_rag","llm_evidence"] + \
                      [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
                 if k in st.session_state: del st.session_state[k]
             st.rerun()
@@ -731,6 +759,86 @@ if uploaded_file:
 
         st.markdown("---")
 
+        # ===========================
+        # 🔎 Build / use RAG index
+        # ===========================
+        def build_rag_index(df: pd.DataFrame, api_key: str | None) -> dict | None:
+            texts = df.get("Verbatim")
+            if texts is None or texts.empty:
+                return None
+            docs = texts.astype("string").fillna("").map(clean_text).tolist()
+            ids = list(range(len(docs)))
+
+            # Preferred: OpenAI embeddings
+            if api_key and _HAS_OPENAI:
+                cli = OpenAI(api_key=api_key)
+                # batch embed to respect token limits
+                emb = []
+                for i in range(0, len(docs), 128):
+                    chunk = docs[i:i+128]
+                    resp = cli.embeddings.create(model="text-embedding-3-small", input=chunk)
+                    emb.extend([np.array(d["embedding"], dtype=np.float32) for d in resp.data])
+                mat = np.vstack(emb)
+                # normalize for cosine
+                norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
+                mat = mat / norms
+                return {"ids": ids, "texts": docs, "emb": mat}
+            else:
+                # Fallback: simple TF-IDF-ish vectors with hashing
+                vocab = {}
+                vecs = []
+                for t in docs:
+                    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", t.lower())
+                    counts = {}
+                    for tok in tokens:
+                        if tok not in vocab: vocab[tok] = len(vocab)
+                        idx = vocab[tok]
+                        counts[idx] = counts.get(idx, 0) + 1
+                    vecs.append(counts)
+                dfreq = {}
+                for v in vecs:
+                    for idx in v.keys():
+                        dfreq[idx] = dfreq.get(idx, 0) + 1
+                n = len(vecs)
+                dense = np.zeros((n, len(vocab)), dtype=np.float32)
+                for i, counts in enumerate(vecs):
+                    for idx, cnt in counts.items():
+                        idf = np.log((1+n)/(1+dfreq[idx])) + 1.0
+                        dense[i, idx] = cnt * idf
+                # L2 normalize
+                norms = np.linalg.norm(dense, axis=1, keepdims=True) + 1e-9
+                dense = dense / norms
+                return {"ids": ids, "texts": docs, "emb": dense}
+
+        def rag_topk(index: dict, q: str, api_key: str | None, k: int = 30) -> list[tuple[int, float]]:
+            if index is None or not q.strip(): return []
+            qtext = clean_text(q)
+            # Preferred: embed query
+            if api_key and _HAS_OPENAI and index["emb"].shape[1] > 0:
+                cli = OpenAI(api_key=api_key)
+                qv = np.array(
+                    cli.embeddings.create(model="text-embedding-3-small", input=[qtext]).data[0].embedding,
+                    dtype=np.float32
+                )
+                qv = qv / (np.linalg.norm(qv) + 1e-9)
+                sims = (index["emb"] @ qv)
+            else:
+                # crude token vec
+                vocab_size = index["emb"].shape[1]
+                qvec = np.zeros((vocab_size,), dtype=np.float32)
+                toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", qtext.lower())
+                if vocab_size > 0:
+                    # assume hashed TF-IDF already normalized -> approximate with freq
+                    for t in toks:
+                        h = hash(t) % vocab_size
+                        qvec[h] += 1.0
+                    qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
+                    sims = (index["emb"] @ qvec)
+                else:
+                    sims = np.zeros((len(index["ids"]),), dtype=np.float32)
+            top = np.argsort(-sims)[:k]
+            return [(int(i), float(sims[i])) for i in top]
+
         # ---------------------------
         # 🤖 Ask your data (chat) – only render when requested
         # ---------------------------
@@ -741,8 +849,16 @@ if uploaded_file:
 
             st.session_state.setdefault("ask_scroll_pending", False)
 
+            # Build RAG index when needed or filters changed
+            if st.session_state.get("llm_rag", True):
+                sig = dataset_signature(filtered_verbatims)
+                idx = st.session_state.get("rag_index")
+                if idx is None or idx.get("sig") != sig:
+                    built = build_rag_index(filtered_verbatims, api_key)
+                    st.session_state["rag_index"] = {"sig": sig, "index": built}
+
             if not _HAS_OPENAI:
-                st.info("To enable this panel, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
+                st.info("To enable the assistant, add `openai` to requirements and redeploy. Then set `OPENAI_API_KEY`.")
             elif not api_key:
                 st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
             else:
@@ -755,12 +871,14 @@ if uploaded_file:
                             "Call tools when you need exact counts/means. If unknown, say you don't know."}
                     ]
 
-                def context_blob(df: pd.DataFrame, n=25) -> str:
+                # — Context builders —
+                def context_blob_base(df: pd.DataFrame, n=25) -> str:
                     if df.empty: return "No rows after filters."
                     parts = [f"ROW_COUNT={len(df)}"]
                     if "Star Rating" in df:
                         parts.append(f"STAR_COUNTS={df['Star Rating'].value_counts().sort_index().to_dict()}")
-                    cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"] if c in df.columns]
+                    cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"]
+                                 if c in df.columns]
                     smp = df[cols_keep].sample(min(n, len(df)), random_state=7)
                     for _, r in smp.iterrows():
                         try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
@@ -775,6 +893,40 @@ if uploaded_file:
                         }))
                     return "\n".join(parts)
 
+                def context_blob_with_evidence(question: str, df: pd.DataFrame, top_k=30) -> tuple[str, list[dict]]:
+                    evidence_rows = []
+                    ctx = context_blob_base(df, n=20)  # small base summary
+                    if not st.session_state.get("llm_rag", True):
+                        return ctx, evidence_rows
+                    rag = st.session_state.get("rag_index", {}).get("index")
+                    if rag is None:
+                        return ctx, evidence_rows
+                    hits = rag_topk(rag, question, api_key, k=top_k)
+                    texts = rag["texts"]
+                    for idx, score in hits:
+                        txt = texts[idx]
+                        if not txt.strip(): continue
+                        # find metadata from df
+                        row = df.iloc[idx]
+                        try: date_str = pd.to_datetime(row.get("Review Date")).strftime("%Y-%m-%d")
+                        except Exception: date_str = str(row.get("Review Date","")) or ""
+                        evidence_rows.append({
+                            "i": int(idx),
+                            "score": round(float(score), 3),
+                            "date": date_str,
+                            "country": str(row.get("Country","")),
+                            "source": str(row.get("Source","")),
+                            "model": str(row.get("Model (SKU)","")),
+                            "stars": str(row.get("Star Rating","")),
+                            "text": clean_text(txt)
+                        })
+                    ev_text = "\n".join([f"EVIDENCE {e['i']} (score={e['score']}, date={e['date']}, "
+                                         f"country={e['country']}, stars={e['stars']}): {e['text']}"
+                                         for e in evidence_rows[:top_k]])
+                    ctx2 = ctx + ("\n\nTOP_MATCHING_REVIEWS:\n" + ev_text if ev_text else "")
+                    return ctx2, evidence_rows
+
+                # — Tools —
                 def pandas_count(query: str) -> dict:
                     try:
                         if ";" in query or "__" in query: return {"error": "disallowed pattern"}
@@ -793,6 +945,28 @@ if uploaded_file:
                     except Exception as e:
                         return {"error": str(e)}
 
+                def keyword_examples(keyword: str, limit: int = 5) -> dict:
+                    try:
+                        v = filtered_verbatims.get("Verbatim")
+                        if v is None: return {"examples": []}
+                        kw = keyword.strip()
+                        if not kw: return {"examples": []}
+                        mask = v.astype("string").fillna("").str.contains(kw, case=False, na=False)
+                        rows = filtered_verbatims[mask].head(limit)
+                        ex = []
+                        for _, r in rows.iterrows():
+                            try: date_str = pd.to_datetime(r.get("Review Date")).strftime("%Y-%m-%d")
+                            except Exception: date_str = str(r.get("Review Date","")) or ""
+                            ex.append({
+                                "date": date_str,
+                                "country": str(r.get("Country","")),
+                                "stars": str(r.get("Star Rating","")),
+                                "text": clean_text(str(r.get("Verbatim","")))
+                            })
+                        return {"examples": ex}
+                    except Exception as e:
+                        return {"error": str(e)}
+
                 tools = [
                     {"type":"function","function":{
                         "name":"pandas_count",
@@ -803,6 +977,14 @@ if uploaded_file:
                         "name":"pandas_mean",
                         "description":"Compute mean of a numeric column (optionally with a pandas query).",
                         "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}
+                    }},
+                    {"type":"function","function":{
+                        "name":"keyword_examples",
+                        "description":"Return a few verbatim review examples containing a given keyword.",
+                        "parameters":{"type":"object","properties":{
+                            "keyword":{"type":"string"},
+                            "limit":{"type":"integer","default":5}
+                        },"required":["keyword"]}
                     }},
                 ]
 
@@ -818,9 +1000,10 @@ if uploaded_file:
                     with st.chat_message("user"):
                         st.markdown(user_q)
 
-                    sys_ctx = ("CONTEXT:\n" + context_blob(filtered_verbatims) +
+                    ctx_text, evidence = context_blob_with_evidence(user_q, filtered_verbatims, top_k=30)
+                    sys_ctx = ("CONTEXT:\n" + ctx_text +
                                "\n\nINSTRUCTIONS: Prefer calling tools for exact numbers. "
-                               "If unknown from context+tools, say you don't know.")
+                               "Cite evidence IDs if shown. If unknown, say you don't know.")
 
                     selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
                     llm_temp = float(st.session_state.get("llm_temp", 0.2))
@@ -851,6 +1034,7 @@ if uploaded_file:
                             out = {"error":"unknown tool"}
                             if name == "pandas_count": out = pandas_count(args.get("query",""))
                             if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                            if name == "keyword_examples": out = keyword_examples(args.get("keyword",""), args.get("limit",5))
                             tool_msgs.append({"tool_call_id": call.id, "role":"tool",
                                               "name": name, "content": json.dumps(out)})
 
@@ -878,6 +1062,13 @@ if uploaded_file:
                         final_text = follow.choices[0].message.content
                     else:
                         final_text = msg.content
+
+                    # Append evidence if requested
+                    if st.session_state.get("llm_evidence", True) and evidence:
+                        ev_md = "\n\n**Evidence (top matches):**\n"
+                        for e in evidence[:8]:
+                            ev_md += f"- **ID {e['i']}** · {e['date']} · {e['country']} · ⭐ {e['stars']}: {e['text'][:220]}...\n"
+                        final_text = (final_text or "") + ev_md
 
                     st.session_state.qa_messages.append({"role":"assistant","content": final_text})
                     with st.chat_message("assistant"):
@@ -958,6 +1149,7 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
+
 
 
 
