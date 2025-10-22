@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from wordcloud import STOPWORDS  # kept only for stopword set; not rendering WC
+from wordcloud import STOPWORDS  # keep for stopword set; not rendering WC
 import re
 import html as _html
 import os
@@ -24,7 +24,7 @@ warnings.filterwarnings(
     module="openpyxl",
 )
 
-# ---------- Optional high-quality text fixer ----------
+# ---------- Optional text fixer ----------
 try:
     from ftfy import fix_text as _ftfy_fix
     _HAS_FTFY = True
@@ -40,7 +40,7 @@ except Exception:
     _HAS_OPENAI = False
     OpenAI = None  # type: ignore
 
-# Optional FAISS (if present) for fast vector search
+# Optional FAISS for fast vector similarity
 try:
     import faiss  # type: ignore
     _HAS_FAISS = True
@@ -54,14 +54,14 @@ def model_supports_temperature(model_id: str) -> bool:
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
-# ---------- Global CSS (focus on borders & grouping) ----------
+# ---------- Global CSS (focus: borders & grouping) ----------
 st.markdown(
     """
     <style>
       :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
       *, ::before, ::after { box-sizing: border-box; }
 
-      /* thin transparent scrollbars where supported */
+      /* subtle scrollbars where supported */
       @supports (scrollbar-color: transparent transparent) {
         * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
       }
@@ -75,11 +75,11 @@ st.markdown(
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-      /* Core palette for borders */
+      /* Border palette */
       :root {
-        --border-outer: #DDE3EE;   /* strong outline */
-        --border-inner: #E6EAF2;   /* inner box outline */
-        --border-soft:  #E9EDF6;   /* soft separators */
+        --border-outer: #D5DDEB;    /* emphasized outline */
+        --border-inner: #E3E8F3;    /* inner tiles */
+        --border-soft:  #EDF1F8;    /* separators */
         --bg-card:      #FFFFFF;
         --bg-subtle:    #F9FAFC;
       }
@@ -90,7 +90,7 @@ st.markdown(
 
       .metric-card {
         background: var(--bg-card);
-        border: 1.5px solid var(--border-outer);
+        border: 2px solid var(--border-outer);
         border-radius: 14px;
         padding: 16px;
         box-shadow: 0 1px 2px rgba(16,24,40,0.04);
@@ -100,7 +100,7 @@ st.markdown(
       .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
       .metric-box {
         background: var(--bg-subtle);
-        border:1.25px solid var(--border-inner);
+        border:1.5px solid var(--border-inner);
         border-radius:12px;
         padding:12px;
         text-align:center;
@@ -108,12 +108,11 @@ st.markdown(
       .metric-label { color:#6b7280; font-size:.85rem; }
       .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; }
 
-      /* Section divider */
       .section-divider { height:1px; background:var(--border-soft); margin:24px 0 14px; }
 
-      /* Review cards (in 📝 All Reviews) */
+      /* Review cards (📝 All Reviews) */
       .review-card {
-        border:1.5px solid var(--border-outer);
+        border:2px solid var(--border-outer);
         background:var(--bg-card);
         border-radius:12px;
         padding:16px;
@@ -127,14 +126,14 @@ st.markdown(
       .badge.pos { background:#E7F8EE; color:#065F46; border:1px solid #CDEFE1; }
       .badge.neg { background:#FDECEC; color:#7F1D1D; border:1px solid #F7D1D1; }
 
-      /* Chat bubbles (single latest pair only) */
-      .chat-q { background:#F5F7FB; border:1.25px solid var(--border-inner); border-radius:14px; padding:10px 12px; }
-      .chat-a { background:#FFF8EB; border:1.25px solid #F2E3BE; border-radius:14px; padding:12px 12px; }
+      /* Chat bubbles (single latest pair only, not stored) */
+      .chat-q { background:#F5F7FB; border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; }
+      .chat-a { background:#FFF8EB; border:1.5px solid #F2E3BE; border-radius:14px; padding:12px 12px; }
 
       /* Hero */
       .hero-wrap {
         position: relative; overflow: hidden; border-radius: 14px;
-        border: 1.5px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
+        border: 2px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
         background: linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f7f7f7 55%,#f7f7f7 100%);
       }
       #hero-canvas { position:absolute; left:0; top:0; width:55%; height:100%; }
@@ -229,7 +228,7 @@ def clean_text(x: str, keep_na: bool = False) -> str:
     if _HAS_FTFY:
         try: s = _ftfy_fix(s)
         except Exception: pass
-    if any(ch in s for ch in ("Ã", "Â", "â", "ï", "€", "™")):
+    if any(ch in s for ch in ("Ã","Â","â","ï","€","™")):
         try:
             repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
             if repaired.strip(): s = repaired
@@ -257,9 +256,9 @@ def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
         if c in df.columns:
             s = df[c].astype("string").str.strip().dropna()
             for v in pd.unique(s.to_numpy()):
-                item = str(v).strip()
-                if item and item not in seen:
-                    seen.add(item); vals.append(item)
+                v = str(v).strip()
+                if v and v not in seen:
+                    seen.add(v); vals.append(v)
     return vals
 
 def is_valid_symptom_value(x) -> bool:
@@ -303,24 +302,18 @@ def highlight_html(text: str, keyword: str | None) -> str:
     return safe
 
 # LLM helpers ---------------------------------------------------
-def _hash_series_for_cache(s: pd.Series) -> str:
-    data = "|".join(map(str, s.fillna("").tolist()))
-    import hashlib as _hash
-    return _hash.sha256(data.encode("utf-8")).hexdigest()
-
 @st.cache_resource(show_spinner=False)
 def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
     if not _HAS_OPENAI or not texts:
         return None
     client = OpenAI(api_key=api_key)
-    batch = 512
     embs = []
+    batch = 512
     for i in range(0, len(texts), batch):
         chunk = texts[i:i+batch]
         resp = client.embeddings.create(model=model, input=chunk)
         embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
-    if not embs:
-        return None
+    if not embs: return None
     mat = np.vstack(embs).astype(np.float32)
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
     mat_norm = mat / norms
@@ -389,7 +382,6 @@ try:
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
         if col in df.columns:
             df[col] = df[col].astype("string").str.upper()
-
     if "Star Rating" in df.columns:
         df["Star Rating"] = pd.to_numeric(df["Star Rating"], errors="coerce")
 
@@ -397,7 +389,7 @@ try:
     for c in all_symptom_cols:
         df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
 
-    if "Verbatim" in df.columns:
+    if "Verbatim" in df.columns":
         df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
     if "Review Date" in df.columns:
         df["Review Date"] = pd.to_datetime(df["Review Date"], errors="coerce")
@@ -461,11 +453,9 @@ with st.sidebar.expander("🩺 Review Symptoms", expanded=False):
                                         options=["All"] + sorted(detractor_symptoms),
                                         default=["All"], key="detract")
 if "All" not in selected_delighter and existing_delighter_columns:
-    mask = filtered[existing_delighter_columns].isin(selected_delighter).any(axis=1)
-    filtered = filtered[mask]
+    filtered = filtered[filtered[existing_delighter_columns].isin(selected_delighter).any(axis=1)]
 if "All" not in selected_detractor and existing_detractor_columns:
-    mask = filtered[existing_detractor_columns].isin(selected_detractor).any(axis=1)
-    filtered = filtered[mask]
+    filtered = filtered[filtered[existing_detractor_columns].isin(selected_detractor).any(axis=1)]
 
 with st.sidebar.expander("🔎 Keyword", expanded=False):
     keyword = st.text_input("Keyword to search (in review text)", value="", key="kw",
@@ -504,7 +494,7 @@ if st.sidebar.button("🧹 Clear all filters"):
 st.sidebar.write("")
 st.sidebar.markdown("---")
 
-# LLM settings (no "go to AI" buttons; nothing pinned)
+# LLM settings (no archive, no nav buttons)
 with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     _model_choices = [
         ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -526,13 +516,12 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
         value=float(st.session_state.get("llm_temp", 0.2)),
         step=0.1,
         disabled=not temp_supported,
-        help=("Controls randomness: lower = more deterministic, higher = more creative. "
-              "Some models (e.g., GPT-5 family) use a fixed temperature and ignore this setting.")
+        help=("Lower = more deterministic, higher = more creative. Some models ignore this.")
     )
     if not temp_supported:
-        st.caption("ℹ️ This model uses a fixed sampling temperature; the slider is disabled.")
+        st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
 
-# ---- Feedback modal (button remains in sidebar) ----
+# ---- Feedback modal (button lives in sidebar) ----
 def send_feedback_via_email(subject: str, body: str) -> bool:
     try:
         host = st.secrets.get("SMTP_HOST")
@@ -557,7 +546,6 @@ def send_feedback_via_email(subject: str, body: str) -> bool:
         return False
 
 _DIALOG_AVAILABLE = hasattr(st, "dialog")
-
 if _DIALOG_AVAILABLE:
     @st.dialog("💬 Submit Feedback", width="large")
     def open_feedback_dialog():
@@ -573,17 +561,15 @@ if _DIALOG_AVAILABLE:
                 st.stop()
             body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
             ok = send_feedback_via_email("Star Walk — Feedback", body)
-            if ok:
-                st.success("Thanks! Your feedback was sent.")
+            if ok: st.success("Thanks! Your feedback was sent.")
             else:
-                st.info("Email sending isn’t configured. Opening your mail client instead.")
                 st.link_button(
                     "Open email to wseddon@sharkninja.com",
                     url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={_html.escape(message)}"
                 )
             st.stop()
 
-if st.sidebar.button("Submit Feedback", key="submit_feedback_sidebar"):
+if st.sidebar.button("Submit Feedback"):
     if _DIALOG_AVAILABLE: open_feedback_dialog()
 
 st.markdown("---")
@@ -594,8 +580,7 @@ st.caption("All metrics below reflect the **currently filtered** dataset.")
 
 def pct_12(series: pd.Series) -> float:
     s = pd.to_numeric(series, errors="coerce").dropna()
-    if s.empty: return 0.0
-    return float((s <= 2).mean() * 100)
+    return float((s <= 2).mean() * 100) if not s.empty else 0.0
 
 def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
     cnt = len(sub)
@@ -684,8 +669,8 @@ def _styled_table(df_in: pd.DataFrame):
         if pd.isna(v): return ""
         try:
             v = float(v)
-            if v >= 4.5: return "color: #065F46; font-weight:600;"
-            if v < 4.5:  return "color: #7F1D1D; font-weight:600;"
+            if v >= 4.5: return "color:#065F46;font-weight:600;"
+            if v < 4.5:  return "color:#7F1D1D;font-weight:600;"
         except: pass
         return ""
     return df_in.style.applymap(colstyle, subset=["Avg Star"]) \
@@ -695,20 +680,20 @@ if view_mode == "Split":
     c1, c2 = st.columns([1, 1])
     with c1:
         st.subheader("All Detractors")
-        if detractors_results.empty: st.write("None")
-        else: st.dataframe(_styled_table(detractors_results), use_container_width=True, hide_index=True)
+        st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
+                     use_container_width=True, hide_index=True)
     with c2:
         st.subheader("All Delighters")
-        if delighters_results.empty: st.write("None")
-        else: st.dataframe(_styled_table(delighters_results), use_container_width=True, hide_index=True)
+        st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
+                     use_container_width=True, hide_index=True)
 else:
     tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
     with tab1:
-        if detractors_results.empty: st.write("None")
-        else: st.dataframe(_styled_table(detractors_results), use_container_width=True, hide_index=True)
+        st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
+                     use_container_width=True, hide_index=True)
     with tab2:
-        if delighters_results.empty: st.write("None")
-        else: st.dataframe(_styled_table(delighters_results), use_container_width=True, hide_index=True)
+        st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
+                     use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
@@ -753,8 +738,8 @@ else:
                 items.append(f'<span class="badge {css_class}">{_html.escape(s)}</span>')
             return f'<div class="badges">{"".join(items)}</div>' if items else "<i>None</i>"
 
-        delighter_message = chips(row, existing_delighter_columns, "pos")
-        detractor_message = chips(row, existing_detractor_columns, "neg")
+        delighter_message = chips(row, [c for c in [f"Symptom {i}" for i in range(11,21)] if c in paginated.columns], "pos")
+        detractor_message = chips(row, [c for c in [f"Symptom {i}" for i in range(1,11)] if c in paginated.columns], "neg")
 
         star_val = row.get("Star Rating", 0)
         try: star_int = int(star_val) if pd.notna(star_val) else 0
@@ -798,10 +783,10 @@ with p5:
 
 st.markdown("---")
 
-# ---------- Ask your data (LLM) — SINGLE latest response only ----------
+# ---------- Ask your data (LLM) — ONLY current response, not stored ----------
 anchor("askdata-anchor")
 st.markdown("## 🤖 Ask your data")
-st.caption("Ask a question about the **currently filtered** reviews. We’ll compute stats and search verbatims. Only the latest response is shown.")
+st.caption("Ask one question about the **currently filtered** reviews. The response shows below and is not saved.")
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not _HAS_OPENAI:
@@ -809,27 +794,17 @@ if not _HAS_OPENAI:
 elif not api_key:
     st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
 else:
-    # Build (cached) vector index for current filtered set
     verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
     index = build_vector_index(verb_series.tolist(), api_key)
 
-    # Show the last (single) Q/A if present
-    st.session_state.setdefault("qa_last", None)
-    if st.session_state["qa_last"]:
-        q_last = st.session_state["qa_last"]["q"]
-        a_last = st.session_state["qa_last"]["a"]
-        st.markdown(f"<div class='chat-q'><b>User:</b> {q_last}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {a_last}</div>", unsafe_allow_html=True)
-
-    # Input form — submitting replaces the single last response
+    # Ask form; no state is kept after this run
     with st.form("ask_ai_form", clear_on_submit=True):
         q = st.text_area("Ask a question", value="", height=80)
         send = st.form_submit_button("Send")
 
     if send and q.strip():
         q = q.strip()
-
-        # Retrieval
+        # retrieval
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
         quotes = []
         for txt, sim in retrieved[:5]:
@@ -839,10 +814,10 @@ else:
                 quotes.append(f"• “{s}”")
         quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
 
-        # Tools the model can call
+        # tools
         def pandas_count(query: str) -> dict:
             try:
-                if ";" in query or "__" in query: return {"error": "disallowed pattern"}
+                if ";" in query or "__" in query: return {"error":"disallowed pattern"}
                 res = filtered.query(query, engine="python")
                 return {"count": int(len(res))}
             except Exception as e:
@@ -857,8 +832,8 @@ else:
                 return {"error": str(e)}
 
         def symptom_stats(symptom: str) -> dict:
-            cols = existing_detractor_columns + existing_delighter_columns
-            if not cols: return {"count": 0, "avg_star": None}
+            cols = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in filtered.columns]
+            if not cols: return {"count":0,"avg_star":None}
             mask = filtered[cols].isin([symptom]).any(axis=1)
             d = filtered[mask]
             return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) else None}
@@ -881,8 +856,8 @@ else:
             except Exception as e:
                 return {"error": str(e)}
 
-        # Local fallback answer
-        def _local_answer_fallback(question: str) -> str:
+        # local fallback
+        def _local_answer_fallback() -> str:
             try:
                 parts = []
                 total = int(len(filtered))
@@ -890,62 +865,51 @@ else:
                 low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total else 0.0
                 parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
 
-                detr = analyze_delighters_detractors(filtered, existing_detractor_columns).head(5)
-                deli = analyze_delighters_detractors(filtered, existing_delighter_columns).head(5)
-                def _fmt_rows(df):
+                detr = analyze_delighters_detractors(filtered, [f"Symptom {i}" for i in range(1,11) if f"Symptom {i}" in filtered.columns]).head(5)
+                deli = analyze_delighters_detractors(filtered, [f"Symptom {i}" for i in range(11,21) if f"Symptom {i}" in filtered.columns]).head(5)
+                def fmt(df):
                     if df.empty: return "None"
-                    return "; ".join([f\"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)\" for _, r in df.iterrows()])
-                parts.append("**Top detractors:** " + _fmt_rows(detr))
-                parts.append("**Top delighters:** " + _fmt_rows(deli))
+                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
+                parts.append("**Top detractors:** " + fmt(detr))
+                parts.append("**Top delighters:** " + fmt(deli))
                 return "\\n\\n".join(parts)
             except Exception as e:
                 return f"(Fallback summary error: {e})"
 
-        # Compose single-turn request
+        # compose single-turn request
         selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
         llm_temp = float(st.session_state.get("llm_temp", 0.2))
-
         tools = [
             {"type":"function","function":{
                 "name":"pandas_count","description":"Count rows matching a pandas query over the CURRENT filtered dataset.",
                 "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
             {"type":"function","function":{
-                "name":"pandas_mean","description":"Compute mean of a numeric column (optionally with a pandas query).",
+                "name":"pandas_mean","description":"Mean of a numeric column (optional pandas query).",
                 "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}}},
             {"type":"function","function":{
-                "name":"symptom_stats","description":"Get mentions count and average star rating for a symptom across detractor/delighter columns.",
+                "name":"symptom_stats","description":"Mentions + avg star for a symptom across Symptom 1–20.",
                 "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}}},
             {"type":"function","function":{
-                "name":"keyword_stats","description":"Count and percentage of reviews with a term in Verbatim.",
+                "name":"keyword_stats","description":"Count + % of reviews with term in Verbatim.",
                 "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}}},
             {"type":"function","function":{
-                "name":"get_metrics_snapshot","description":"Return current page-level metrics.",
+                "name":"get_metrics_snapshot","description":"Return current page metrics.",
                 "parameters":{"type":"object","properties":{}}}},
         ]
-
         sys_ctx = (
             "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\\n"
-            "When relevant, include short quotes from retrieved snippets to illustrate what customers said.\\n"
-            "If exact numbers are needed, prefer calling tools. If unknown, say you don't know.\\n\\n"
-            "RETRIEVED_SNIPPETS:\\n" + (quotes_text or "(none)") + "\\n\\n"
-            f"ROW_COUNT={len(filtered)}"
+            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\\n\\n"
+            "RETRIEVED_SNIPPETS:\\n" + (quotes_text or "(none)") + f"\\n\\nROW_COUNT={len(filtered)}"
         )
 
-        client = OpenAI(api_key=api_key)
-        first_kwargs = {
-            "model": selected_model,
-            "messages": [
-                {"role": "system", "content": sys_ctx},
-                {"role": "user", "content": q},
-            ],
-            "tools": tools,
-        }
-        if model_supports_temperature(selected_model):
-            first_kwargs["temperature"] = llm_temp
-
         try:
+            client = OpenAI(api_key=api_key)
+            req = {"model": selected_model,
+                   "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
+                   "tools": tools}
+            if model_supports_temperature(selected_model): req["temperature"] = llm_temp
             with st.spinner("Thinking..."):
-                first = client.chat.completions.create(**first_kwargs)
+                first = client.chat.completions.create(**req)
             msg = first.choices[0].message
             tool_msgs = []
             if msg.tool_calls:
@@ -959,50 +923,41 @@ else:
                     if name == "keyword_stats": out = keyword_stats(args.get("term",""))
                     if name == "get_metrics_snapshot": out = get_metrics_snapshot()
                     tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
-
             if tool_msgs:
-                follow_kwargs = {
-                    "model": selected_model,
-                    "messages": [
-                        {"role":"system","content": sys_ctx},
-                        {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                        *tool_msgs
-                    ],
-                }
-                if model_supports_temperature(selected_model):
-                    follow_kwargs["temperature"] = llm_temp
-                follow = client.chat.completions.create(**follow_kwargs)
-                final_text = follow.choices[0].message.content
+                follow = {"model": selected_model,
+                          "messages":[{"role":"system","content":sys_ctx},
+                                      {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                                      *tool_msgs]}
+                if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
+                res2 = client.chat.completions.create(**follow)
+                final_text = res2.choices[0].message.content
             else:
                 final_text = msg.content
         except Exception:
-            final_text = _local_answer_fallback(q)
+            final_text = _local_answer_fallback()
 
-        # Replace the single last pair and render
-        st.session_state["qa_last"] = {"q": q, "a": final_text}
-        st.rerun()
+        # show the single Q/A (not stored)
+        st.markdown(f"<div class='chat-q'><b>User:</b> {q}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
 
 st.markdown("---")
 
-# ---------- Feedback (anchor fallback for older Streamlit) ----------
+# ---------- Feedback (anchor fallback) ----------
 anchor("feedback-anchor")
 st.markdown("## 💬 Submit Feedback")
 st.caption("Tell us what to improve. We care about making this tool user-centric.")
-
 with st.form("feedback_form", clear_on_submit=True):
     name = st.text_input("Your name (optional)")
     email = st.text_input("Your email (optional)")
     message = st.text_area("Feedback / feature request", placeholder="Type your feedback here…", height=140)
     submitted = st.form_submit_button("Submit feedback")
-
 if submitted:
     if not message.strip():
         st.warning("Please enter some feedback before submitting.")
     else:
         body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
         ok = send_feedback_via_email("Star Walk — Feedback", body)
-        if ok:
-            st.success("Thanks! Your feedback was sent.")
+        if ok: st.success("Thanks! Your feedback was sent.")
         else:
             st.link_button("Open email to wseddon@sharkninja.com",
                            url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={_html.escape(message)}")
@@ -1011,5 +966,3 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
-
-
