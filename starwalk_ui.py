@@ -42,6 +42,13 @@ except Exception:
     _HAS_OPENAI = False
     OpenAI = None  # type: ignore
 
+# Optional FAISS for faster vector search
+try:
+    import faiss  # type: ignore
+    _HAS_FAISS = True
+except Exception:
+    _HAS_FAISS = False
+
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
 def model_supports_temperature(model_id: str) -> bool:
     return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
@@ -107,7 +114,17 @@ st.markdown(
       /* Section dividers */
       .section-divider { height:1px; background:#eee; margin:24px 0 14px; }
       .mini-caption { color:#6b7280; font-size:.9rem; margin-bottom:.4rem; }
-    </style>
+
+      @media (prefers-color-scheme: dark){
+        .review-card, .metric-card, .metric-box, .chat-q, .chat-a {
+          background: rgba(255,255,255,0.06) !important;
+          border-color: rgba(255,255,255,0.18) !important;
+        }
+        .metric-label { color: rgba(255,255,255,0.75); }
+        .hero-wrap { border-color: rgba(255,255,255,0.18); }
+      }
+</style>
+
     """,
     unsafe_allow_html=True,
 )
@@ -273,35 +290,52 @@ def _hash_series_for_cache(s: pd.Series) -> str:
     data = "|".join(map(str, s.fillna("").tolist()))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
+
 @st.cache_resource(show_spinner=False)
 def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
     """
-    Returns (emb_matrix, norms, texts) for cosine similarity search.
+    Returns a FAISS index (if available) or (emb_matrix, norms, texts) tuple for cosine similarity search.
     """
     if not _HAS_OPENAI:
         return None
     client = OpenAI(api_key=api_key)
-    # chunk into batches to avoid payload limits
     batch = 512
     embs = []
     for i in range(0, len(texts), batch):
         chunk = texts[i:i+batch]
         resp = client.embeddings.create(model=model, input=chunk)
-        # Proper access: resp.data[i].embedding
         embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
     if not embs:
         return None
-    mat = np.vstack(embs)
+    mat = np.vstack(embs).astype(np.float32)
+    # Normalize for cosine/IP
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
-    return (mat, norms, texts)
+    mat_norm = mat / norms
+    if _HAS_FAISS:
+        index = faiss.IndexFlatIP(mat_norm.shape[1])
+        index.add(mat_norm)
+        return {"backend":"faiss","index":index,"texts":texts}
+    else:
+        return (mat, norms, texts)
 
 def vector_search(query: str, index, api_key: str, top_k: int = 8):
-    if not _HAS_OPENAI or index is None: return []
-    mat, norms, texts = index
+    if not _HAS_OPENAI or index is None:
+        return []
     client = OpenAI(api_key=api_key)
     qemb = client.embeddings.create(model="text-embedding-3-small", input=[query]).data[0].embedding
     q = np.array(qemb, dtype=np.float32)
     qn = np.linalg.norm(q) + 1e-8
+    qn_vec = q / qn
+    # FAISS backend
+    if isinstance(index, dict) and index.get("backend") == "faiss":
+        D, I = index["index"].search(qn_vec.reshape(1,-1), top_k)
+        sims = D[0].tolist()
+        idxs = I[0].tolist()
+        texts = index["texts"]
+        results = [(texts[i], float(sims[j])) for j, i in enumerate(idxs) if i != -1]
+        return results
+    # Numpy fallback
+    mat, norms, texts = index
     sims = (mat @ q) / (norms.flatten() * qn)
     idx = np.argsort(-sims)[:top_k]
     results = [(texts[i], float(sims[i])) for i in idx]
@@ -474,33 +508,13 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
 
     # Keep only 'Go to Ask AI' here
     if st.button("Go to Ask AI"):
-        scroll_to("askdata-anchor")
+    st.session_state["force_scroll_anchor"] = "askdata-anchor"
+    st.rerun()
 
 # Move 'Go to Feedback' OUTSIDE the expander, right below it
-if st.sidebar.button("Go to Feedback", key="go_feedback_below_expander"):
-    scroll_to("feedback-anchor")
-
-# Archived chats management in sidebar
-with st.sidebar.expander("💾 Archived chats", expanded=False):
-    st.session_state.setdefault("qa_archive", [])
-    if not st.session_state["qa_archive"]:
-        st.caption("No archived chats yet.")
-    else:
-        # Show newest first
-        for idx, sess in enumerate(reversed(st.session_state["qa_archive"])):
-            label = sess.get("label") or sess.get("ts") or f"Session {len(st.session_state['qa_archive'])-idx}"
-            preview = next((m[1] for m in sess.get("messages", []) if m[0] == "user"), "")
-            st.write(f"**{label}** — {preview[:48]}{'…' if len(preview)>48 else ''}")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Restore", key=f"restore_arch_{idx}"):
-                    st.session_state["qa_messages"] = sess.get("messages", []).copy()
-                    st.session_state["force_scroll_anchor"] = "askdata-anchor"
-                    st.rerun()
-            with c2:
-                if st.button("Delete", key=f"delete_arch_{idx}"):
-                    del st.session_state["qa_archive"][len(st.session_state["qa_archive"]) - 1 - idx]
-                    st.rerun()
+if st.sidebar.button("Submit Feedback", key="go_feedback_below_expander"):
+    st.session_state["force_scroll_anchor"] = "feedback-anchor"
+    st.rerun()
 
 st.markdown("---")
 
@@ -822,8 +836,7 @@ with ctrl2:
         st.session_state["force_scroll_anchor"] = "askdata-anchor"
         st.rerun()
 with ctrl3:
-    if st.session_state.get("qa_archive"):
-        st.caption(f"Archived chats available: {len(st.session_state['qa_archive'])} (see sidebar)")
+    pass
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not _HAS_OPENAI:
@@ -847,9 +860,13 @@ else:
         st.markdown(f"<div class='chat-{'q' if role=='user' else 'a'}'><b>{role.title()}:</b> {content}</div>", unsafe_allow_html=True)
 
     # Input row
-    q = st.chat_input("Hey! Please feel free to ask me any questions about these reviews and what’s **filtered** right now 🙂")
-    if q:
-        st.session_state["qa_messages"].append(("user", q))
+    with st.form("ask_ai_form", clear_on_submit=False):
+    q = st.text_area("Ask a question", value=st.session_state.get("ask_ai_text", ""), height=80,
+                     help="Questions about the CURRENT filtered reviews and the tables above.")
+    send = st.form_submit_button("Send")
+if send and q.strip():
+    st.session_state["ask_ai_text"] = q
+    st.session_state["qa_messages"].append(("user", q))
 
         # Retrieve top matching verbatims for richer answers
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
@@ -919,8 +936,58 @@ else:
         selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
         llm_temp = float(st.session_state.get("llm_temp", 0.2))
 
-        tools = [
-            {"type":"function","function":{
+        
+# Page insights helpers so the LLM can fetch what's on the page
+def get_metrics_snapshot():
+    try:
+        return {
+            "total_reviews": int(len(filtered)),
+            "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) else 0.0,
+            "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) else 0.0,
+            "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered else {},
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_top_items(kind: str = "detractors", top_n: int = 10):
+    try:
+        if kind.lower().startswith("del"): df_res = analyze_delighters_detractors(filtered, existing_delighter_columns)
+        else: df_res = analyze_delighters_detractors(filtered, existing_detractor_columns)
+        return df_res.head(int(top_n)).to_dict(orient="records")
+    except Exception as e:
+        return {"error": str(e)}
+
+def country_overview(country: str | None = None):
+    try:
+        if "Country" not in filtered.columns: return {"error":"No Country column"}
+        if country:
+            sub = filtered[filtered["Country"] == country]
+        else:
+            sub = filtered
+        data = sub.groupby("Country").agg(Average_Rating=("Star Rating","mean"),
+                                         Review_Count=("Star Rating","count")).reset_index()
+        return data.to_dict(orient="records")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+tools = [
+    {"type":"function","function":{
+        "name":"get_metrics_snapshot",
+        "description":"Return page metrics currently shown: total reviews, avg star, low-star %, and star counts.",
+        "parameters":{"type":"object","properties":{}}
+    }},
+    {"type":"function","function":{
+        "name":"get_top_items",
+        "description":"Return top detractors or delighters with Avg Star and Mentions.",
+        "parameters":{"type":"object","properties":{"kind":{"type":"string"},"top_n":{"type":"integer"}}}
+    }},
+    {"type":"function","function":{
+        "name":"country_overview",
+        "description":"Overview by country for Average_Rating and Review_Count. Optional filter by a specific country.",
+        "parameters":{"type":"object","properties":{"country":{"type":"string"}}}
+    }},
+{"type":"function","function":{
                 "name":"pandas_count",
                 "description":"Count rows matching a pandas query over the CURRENT filtered dataset. Wrap columns with spaces in backticks.",
                 "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
@@ -1073,5 +1140,6 @@ if st.session_state.get("force_scroll_top_once"):
 if st.session_state.get("force_scroll_anchor"):
     scroll_to(st.session_state["force_scroll_anchor"])
     st.session_state["force_scroll_anchor"] = None
+
 
 
