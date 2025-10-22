@@ -60,6 +60,7 @@ def model_supports_temperature(model_id: str) -> bool:
 # Page config
 # ---------------------------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
+st.session_state.setdefault("show_ask", False)  # prevent auto-open
 
 # ---------------------------
 # Global CSS
@@ -324,8 +325,13 @@ def apply_keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
 
 def dataset_signature(df: pd.DataFrame) -> str:
     """Stable signature for filtered dataset to know when to rebuild RAG index."""
-    text = "|".join((df.get("Verbatim") or pd.Series([], dtype="string")).astype("string").fillna("").tolist())
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    texts = df.get("Verbatim")
+    if texts is None:
+        texts = pd.Series([], dtype="string")
+    else:
+        texts = texts.astype("string").fillna("")
+    joined = "|".join(texts.tolist())
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 # ---------------------------
 # File upload
@@ -772,19 +778,17 @@ if uploaded_file:
             # Preferred: OpenAI embeddings
             if api_key and _HAS_OPENAI:
                 cli = OpenAI(api_key=api_key)
-                # batch embed to respect token limits
                 emb = []
                 for i in range(0, len(docs), 128):
                     chunk = docs[i:i+128]
                     resp = cli.embeddings.create(model="text-embedding-3-small", input=chunk)
                     emb.extend([np.array(d["embedding"], dtype=np.float32) for d in resp.data])
                 mat = np.vstack(emb)
-                # normalize for cosine
                 norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
                 mat = mat / norms
                 return {"ids": ids, "texts": docs, "emb": mat}
             else:
-                # Fallback: simple TF-IDF-ish vectors with hashing
+                # Fallback: TF–IDF with explicit vocab + idf so the query matches the same space
                 vocab = {}
                 vecs = []
                 for t in docs:
@@ -800,21 +804,21 @@ if uploaded_file:
                     for idx in v.keys():
                         dfreq[idx] = dfreq.get(idx, 0) + 1
                 n = len(vecs)
+                idf = np.zeros((len(vocab),), dtype=np.float32)
+                for idx, dfc in dfreq.items():
+                    idf[idx] = np.log((1+n)/(1+dfc)) + 1.0
                 dense = np.zeros((n, len(vocab)), dtype=np.float32)
                 for i, counts in enumerate(vecs):
                     for idx, cnt in counts.items():
-                        idf = np.log((1+n)/(1+dfreq[idx])) + 1.0
-                        dense[i, idx] = cnt * idf
-                # L2 normalize
+                        dense[i, idx] = cnt * idf[idx]
                 norms = np.linalg.norm(dense, axis=1, keepdims=True) + 1e-9
                 dense = dense / norms
-                return {"ids": ids, "texts": docs, "emb": dense}
+                return {"ids": ids, "texts": docs, "emb": dense, "vocab": vocab, "idf": idf}
 
         def rag_topk(index: dict, q: str, api_key: str | None, k: int = 30) -> list[tuple[int, float]]:
             if index is None or not q.strip(): return []
             qtext = clean_text(q)
-            # Preferred: embed query
-            if api_key and _HAS_OPENAI and index["emb"].shape[1] > 0:
+            if api_key and _HAS_OPENAI and index["emb"].shape[1] > 0 and "vocab" not in index:
                 cli = OpenAI(api_key=api_key)
                 qv = np.array(
                     cli.embeddings.create(model="text-embedding-3-small", input=[qtext]).data[0].embedding,
@@ -823,19 +827,18 @@ if uploaded_file:
                 qv = qv / (np.linalg.norm(qv) + 1e-9)
                 sims = (index["emb"] @ qv)
             else:
-                # crude token vec
-                vocab_size = index["emb"].shape[1]
-                qvec = np.zeros((vocab_size,), dtype=np.float32)
-                toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", qtext.lower())
-                if vocab_size > 0:
-                    # assume hashed TF-IDF already normalized -> approximate with freq
-                    for t in toks:
-                        h = hash(t) % vocab_size
-                        qvec[h] += 1.0
-                    qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
-                    sims = (index["emb"] @ qvec)
-                else:
-                    sims = np.zeros((len(index["ids"]),), dtype=np.float32)
+                vocab = index.get("vocab", {})
+                idf = index.get("idf", None)
+                if not vocab:
+                    return []
+                qvec = np.zeros((len(vocab),), dtype=np.float32)
+                for tok in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", qtext.lower()):
+                    if tok in vocab:
+                        qvec[vocab[tok]] += 1.0
+                if idf is not None:
+                    qvec = qvec * idf
+                qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
+                sims = (index["emb"] @ qvec)
             top = np.argsort(-sims)[:k]
             return [(int(i), float(sims[i])) for i in top]
 
@@ -875,7 +878,7 @@ if uploaded_file:
                 def context_blob_base(df: pd.DataFrame, n=25) -> str:
                     if df.empty: return "No rows after filters."
                     parts = [f"ROW_COUNT={len(df)}"]
-                    if "Star Rating" in df:
+                    if "Star Rating" in df.columns:
                         parts.append(f"STAR_COUNTS={df['Star Rating'].value_counts().sort_index().to_dict()}")
                     cols_keep = [c for c in ["Review Date","Country","Source","Model (SKU)","Star Rating","Verbatim"]
                                  if c in df.columns]
@@ -898,20 +901,20 @@ if uploaded_file:
                     ctx = context_blob_base(df, n=20)  # small base summary
                     if not st.session_state.get("llm_rag", True):
                         return ctx, evidence_rows
-                    rag = st.session_state.get("rag_index", {}).get("index")
+                    rag_state = st.session_state.get("rag_index", {})
+                    rag = rag_state.get("index")
                     if rag is None:
                         return ctx, evidence_rows
                     hits = rag_topk(rag, question, api_key, k=top_k)
                     texts = rag["texts"]
-                    for idx, score in hits:
-                        txt = texts[idx]
+                    for idx_i, score in hits:
+                        txt = texts[idx_i]
                         if not txt.strip(): continue
-                        # find metadata from df
-                        row = df.iloc[idx]
+                        row = df.iloc[idx_i]
                         try: date_str = pd.to_datetime(row.get("Review Date")).strftime("%Y-%m-%d")
                         except Exception: date_str = str(row.get("Review Date","")) or ""
                         evidence_rows.append({
-                            "i": int(idx),
+                            "i": int(idx_i),
                             "score": round(float(score), 3),
                             "date": date_str,
                             "country": str(row.get("Country","")),
@@ -1063,7 +1066,6 @@ if uploaded_file:
                     else:
                         final_text = msg.content
 
-                    # Append evidence if requested
                     if st.session_state.get("llm_evidence", True) and evidence:
                         ev_md = "\n\n**Evidence (top matches):**\n"
                         for e in evidence[:8]:
@@ -1076,7 +1078,6 @@ if uploaded_file:
                         st.markdown("<div id='askdata-last'></div>", unsafe_allow_html=True)
                     st.session_state["ask_scroll_pending"] = True
 
-            # “Close” control for the chat panel
             if st.button("Close Ask panel"):
                 st.session_state["show_ask"] = False
                 st.session_state["ask_scroll_pending"] = False
@@ -1149,6 +1150,7 @@ if uploaded_file:
 
 else:
     st.info("Please upload an Excel file to get started.")
+
 
 
 
