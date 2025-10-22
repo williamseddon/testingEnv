@@ -69,12 +69,12 @@ st.markdown(
       section[data-testid="stSidebar"] .stExpander { border-radius: 10px; }
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
-      .review-card { border:1px solid #eaeaea; background:#fafafa; border-radius:12px; padding:16px; }
+      .review-card { border:1px solid #e5e7eb; background:#ffffff; border-radius:12px; padding:16px; }
       .review-card p { margin:.25rem 0; line-height:1.45; }
       .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
       .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
-      .badge.pos { background:#CFF7D6; color:#085a2a; }
-      .badge.neg { background:#FBD3D0; color:#7a0410; }
+      .badge.pos { background:#E7F8EE; color:#065F46; }
+      .badge.neg { background:#FDECEC; color:#7F1D1D; }
 
       /* Hero */
       .hero-wrap {
@@ -108,8 +108,8 @@ st.markdown(
       .pager .center { text-align:center; font-weight:700; }
 
       /* Chat bubbles */
-      .chat-q { background:#f3f5f8; border:1px solid #e8eaef; border-radius:14px; padding:10px 12px; }
-      .chat-a { background:#fffaf3; border:1px solid #ffe9c6; border-radius:14px; padding:12px 12px; }
+      .chat-q { background:#F5F7FB; border:1px solid #E5E7EB; border-radius:14px; padding:10px 12px; }
+      .chat-a { background:#FFF8EB; border:1px solid #FBE3B2; border-radius:14px; padding:12px 12px; }
 
       /* Section dividers */
       .section-divider { height:1px; background:#eee; margin:24px 0 14px; }
@@ -586,7 +586,7 @@ fig_bar_horizontal = go.Figure(go.Bar(
     text=[f"{value} reviews ({percentages.get(idx, 0)}%)"
           for idx, value in zip(star_counts.index, star_counts.values)],
     textposition="auto",
-    marker=dict(color=["#FFA07A", "#FA8072", "#FFD700", "#ADFF2F", "#32CD32"]),
+    marker=dict(color=["#EF4444", "#F59E0B", "#EAB308", "#10B981", "#22C55E"]),
     hoverinfo="y+x+text"
 ))
 fig_bar_horizontal.update_layout(
@@ -1080,6 +1080,8 @@ def country_overview(country: str | None = None):
 
         st.session_state["qa_messages"].append(("assistant", final_text))
         st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+        st.session_state["force_scroll_anchor"] = "askdata-anchor"
+        st.rerun()
 
 st.markdown("---")
 
@@ -1140,6 +1142,3 @@ if st.session_state.get("force_scroll_top_once"):
 if st.session_state.get("force_scroll_anchor"):
     scroll_to(st.session_state["force_scroll_anchor"])
     st.session_state["force_scroll_anchor"] = None
-
-
-
