@@ -143,8 +143,8 @@ st.markdown(
       .sn-logo { width: 170px; height:auto; }
       .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; }
 
-      /* Dark scheme polish */
-      @media (prefers-color-scheme: light){
+      /* Dark scheme polish (apply only when user prefers dark) */
+      @media (prefers-color-scheme: dark){
         .metric-card, .metric-box, .review-card, .chat-q, .chat-a, .hero-wrap {
           background: rgba(255,255,255,0.06) !important;
           border-color: rgba(255,255,255,0.18) !important;
@@ -240,6 +240,10 @@ def clean_text(x: str, keep_na: bool = False) -> str:
         return pd.NA if keep_na else ""
     return s
 
+def esc(x) -> str:
+    """HTML-escape any dynamic value used inside unsafe_allow_html blocks."""
+    return _html.escape("" if pd.isna(x) else str(x))
+
 def apply_filter(df: pd.DataFrame, column_name: str, label: str, key: str | None = None):
     options = ["ALL"]
     if column_name in df.columns:
@@ -282,7 +286,7 @@ def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: li
         mask = filtered_df[cols].isin([item]).any(axis=1)
         count = int(mask.sum())
         if count == 0: continue
-        avg_star = filtered_df.loc[mask, "Star Rating"].mean()
+        avg_star = filtered_df.loc[mask, "Star Rating"].mean() if "Star Rating" in filtered_df.columns else np.nan
         pct = (count / total_rows * 100) if total_rows else 0
         results.append({"Item": item_str.title(),
                         "Avg Star": round(avg_star,1) if pd.notna(avg_star) else None,
@@ -377,7 +381,11 @@ if not uploaded_file:
 # ---------- Load & clean ----------
 try:
     st.markdown("---")
-    df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
+    except ValueError:
+        # Fallback to first sheet if the named sheet doesn't exist
+        df = pd.read_excel(uploaded_file)
 
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
         if col in df.columns:
@@ -389,7 +397,6 @@ try:
     for c in all_symptom_cols:
         df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
 
-    # ✅ fixed stray quote here
     if "Verbatim" in df.columns:
         df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
     if "Review Date" in df.columns:
@@ -405,14 +412,14 @@ with st.sidebar.expander("🗓️ Timeframe", expanded=False):
     timeframe = st.selectbox("Select Timeframe",
                              options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
                              key="tf")
-    today = datetime.today()
+    today = datetime.today().date()
     start_date, end_date = None, None
     if timeframe == "Custom Range":
         start_date, end_date = st.date_input(
             label="Date Range",
-            value=(datetime.today() - timedelta(days=30), datetime.today()),
-            min_value=datetime(2000, 1, 1),
-            max_value=datetime.today(),
+            value=(today - timedelta(days=30), today),
+            min_value=datetime(2000, 1, 1).date(),
+            max_value=today,
             label_visibility="collapsed"
         )
     elif timeframe == "Last Week":  start_date, end_date = today - timedelta(days=7), today
@@ -560,7 +567,7 @@ if _DIALOG_AVAILABLE:
             if not message.strip():
                 st.warning("Please enter some feedback before submitting.")
                 st.stop()
-            body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
+            body = f"Name: {name or '-'}\nEmail: {email or '-'}\n\nFeedback:\n{message}"
             ok = send_feedback_via_email("Star Walk — Feedback", body)
             if ok: st.success("Thanks! Your feedback was sent.")
             else:
@@ -589,13 +596,21 @@ def pct_12(series: pd.Series) -> float:
 
 def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
     cnt = len(sub)
-    avg = float(sub["Star Rating"].mean()) if cnt else 0.0
-    pct = pct_12(sub["Star Rating"]) if cnt else 0.0
+    if cnt == 0 or "Star Rating" not in sub.columns:
+        return 0, 0.0, 0.0
+    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
+    pct = pct_12(sub["Star Rating"])
     return cnt, avg, pct
 
+# Robust Seeded split (handles missing column)
+if "Seeded" in filtered.columns:
+    seed_mask = filtered["Seeded"].astype("string").str.upper().eq("YES")
+else:
+    seed_mask = pd.Series(False, index=filtered.index)
+
 all_cnt, all_avg, all_low = section_stats(filtered)
-org = filtered[filtered.get("Seeded","").astype("string").str.upper() != "YES"]
-seed = filtered[filtered.get("Seeded","").astype("string").str.upper() == "YES"]
+org = filtered[~seed_mask]
+seed = filtered[seed_mask]
 org_cnt, org_avg, org_low = section_stats(org)
 seed_cnt, seed_avg, seed_low = section_stats(seed)
 
@@ -631,8 +646,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Distribution chart
-star_counts = filtered["Star Rating"].value_counts().sort_index()
+# Distribution chart (guard for missing column)
+if "Star Rating" in filtered.columns:
+    star_counts = pd.to_numeric(filtered["Star Rating"], errors="coerce").dropna().value_counts().sort_index()
+else:
+    star_counts = pd.Series([], dtype="int")
 total_reviews = len(filtered)
 percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
 star_labels = [f"{int(star)} stars" for star in star_counts.index]
@@ -749,9 +767,9 @@ else:
         st.markdown(
             f"""
             <div class="review-card">
-                <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
-                <p><strong>Country:</strong> {row.get('Country', '')} | <strong>Date:</strong> {date_str}</p>
-                <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
+                <p><strong>Source:</strong> {esc(row.get('Source'))} | <strong>Model:</strong> {esc(row.get('Model (SKU)'))}</p>
+                <p><strong>Country:</strong> {esc(row.get('Country'))} | <strong>Date:</strong> {esc(date_str)}</p>
+                <p><strong>Rating:</strong> {'⭐' * star_int} ({esc(row.get('Star Rating'))}/5)</p>
                 <p><strong>Review:</strong> {display_review_html}</p>
                 <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
                 <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
@@ -815,11 +833,18 @@ else:
                 quotes.append(f"• “{s}”")
         quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
 
+        # ------ Safe helpers for pandas.query ------
+        def _safe_query(qs: str) -> bool:
+            if not qs or len(qs) > 200: return False
+            bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`"]
+            if any(t in qs.lower() for t in bad): return False
+            return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
+
         # tools
         def pandas_count(query: str) -> dict:
             try:
-                if ";" in query or "__" in query: return {"error":"disallowed pattern"}
-                res = filtered.query(query, engine="python")
+                if not _safe_query(query): return {"error":"unsafe query"}
+                res = filtered.query(query)  # default engine (numexpr where possible)
                 return {"count": int(len(res))}
             except Exception as e:
                 return {"error": str(e)}
@@ -827,7 +852,8 @@ else:
         def pandas_mean(column: str, query: str | None = None) -> dict:
             try:
                 if column not in filtered.columns: return {"error": f"Unknown column {column}"}
-                d = filtered if not query else filtered.query(query, engine="python")
+                d = filtered if not query else (filtered.query(query) if _safe_query(query) else None)
+                if d is None: return {"error":"unsafe query"}
                 return {"mean": float(pd.to_numeric(d[column], errors='coerce').mean())}
             except Exception as e:
                 return {"error": str(e)}
@@ -837,7 +863,7 @@ else:
             if not cols: return {"count":0,"avg_star":None}
             mask = filtered[cols].isin([symptom]).any(axis=1)
             d = filtered[mask]
-            return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) else None}
+            return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) and "Star Rating" in d.columns else None}
 
         def keyword_stats(term: str) -> dict:
             if "Verbatim" not in filtered.columns: return {"count": 0, "pct": 0.0}
@@ -850,9 +876,9 @@ else:
             try:
                 return {
                     "total_reviews": int(len(filtered)),
-                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) else 0.0,
-                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) else 0.0,
-                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered else {},
+                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
+                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
+                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered.columns else {},
                 }
             except Exception as e:
                 return {"error": str(e)}
@@ -862,8 +888,8 @@ else:
             try:
                 parts = []
                 total = int(len(filtered))
-                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total else 0.0
-                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total else 0.0
+                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total and "Star Rating" in filtered.columns else 0.0
+                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total and "Star Rating" in filtered.columns else 0.0
                 parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
 
                 detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
@@ -873,7 +899,7 @@ else:
                     return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
                 parts.append("**Top detractors:** " + fmt(detr))
                 parts.append("**Top delighters:** " + fmt(deli))
-                return "\\n\\n".join(parts)
+                return "\n\n".join(parts)
             except Exception as e:
                 return f"(Fallback summary error: {e})"
 
@@ -898,9 +924,9 @@ else:
                 "parameters":{"type":"object","properties":{}}}},
         ]
         sys_ctx = (
-            "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\\n"
-            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\\n\\n"
-            "RETRIEVED_SNIPPETS:\\n" + (quotes_text or "(none)") + f"\\n\\nROW_COUNT={len(filtered)}"
+            "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
+            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
+            "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
         )
 
         try:
@@ -926,9 +952,11 @@ else:
                     tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
             if tool_msgs:
                 follow = {"model": selected_model,
-                          "messages":[{"role":"system","content":sys_ctx},
-                                      {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                                      *tool_msgs]}
+                          "messages":[
+                              {"role":"system","content":sys_ctx},
+                              {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                              *tool_msgs
+                          ]}
                 if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
                 res2 = client.chat.completions.create(**follow)
                 final_text = res2.choices[0].message.content
@@ -938,7 +966,7 @@ else:
             final_text = _local_answer_fallback()
 
         # show the single Q/A (not stored)
-        st.markdown(f"<div class='chat-q'><b>User:</b> {q}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
 
 st.markdown("---")
@@ -956,7 +984,7 @@ if submitted:
     if not message.strip():
         st.warning("Please enter some feedback before submitting.")
     else:
-        body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
+        body = f"Name: {name or '-'}\nEmail: {email or '-'}\n\nFeedback:\n{message}"
         ok = send_feedback_via_email("Star Walk — Feedback", body)
         if ok: st.success("Thanks! Your feedback was sent.")
         else:
@@ -967,3 +995,4 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+
