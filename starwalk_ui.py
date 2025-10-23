@@ -921,7 +921,7 @@ else:
                 deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
                 def fmt(df):
                     if df.empty: return "None"
-                    return "; ".join([f\"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)\" for _, r in df.iterrows()])
+                    return "; ".join([f\"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
                 parts.append("**Top detractors:** " + fmt(detr))
                 parts.append("**Top delighters:** " + fmt(deli))
                 return "\\n\\n".join(parts)
