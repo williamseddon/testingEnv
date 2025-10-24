@@ -55,6 +55,7 @@ def model_supports_temperature(model_id: str) -> bool:
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
 # ---------- Global CSS (dark/light safe) ----------
+# ---------- Global CSS (light-mode visibility tuned) ----------
 st.markdown(
     """
     <style>
@@ -79,15 +80,19 @@ st.markdown(
       :root{
         --text:         var(--text-color, #0f172a);            /* slate-900 */
         --muted:        var(--secondary-text-color, #475569);  /* slate-600 */
-        --border-outer: #cbd5e1;  /* slate-300: card outlines */
-        --border-inner: #dbe3ef;  /* soft tiles */
+        --border-outer: #9fb2c9;  /* stronger edge for cards (slate-400ish) */
+        --border-inner: #cbd5e1;  /* inner tiles */
         --border-soft:  #e2e8f0;  /* separators */
         --bg-card:      #ffffff;  /* cards */
-        --bg-subtle:    #f8fafc;  /* tiles */
+        --bg-subtle:    #f7fafc;  /* tiles */
         --ring:         #3b82f6;  /* focus ring */
       }
 
-      /* Streamlit dark theme attribute (and OS fallback) */
+      /* Give light mode a slightly tinted app background so white cards stand out */
+      html:not([data-theme="dark"]) .stApp,
+      body:not([data-theme="dark"]) .stApp { background:#f6f8fc; }
+
+      /* Streamlit dark theme (and OS fallback) */
       html[data-theme="dark"], body[data-theme="dark"]{
         --text: rgba(255,255,255,.92);
         --muted: rgba(255,255,255,.72);
@@ -117,20 +122,20 @@ st.markdown(
 
       .metric-card {
         background: var(--bg-card);
-        border: 1.75px solid var(--border-outer);
         border-radius: 14px;
         padding: 16px;
-        box-shadow:
-          0 1px 0 rgba(2,6,23,0.04),
-          0 1px 2px rgba(2,6,23,0.06);
         color: var(--text);
+        /* Make edges visible in light mode */
+        box-shadow:
+          0 0 0 1.5px var(--border-outer),
+          0 8px 14px rgba(15,23,42,0.05);
       }
       .metric-card h4 { margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
 
       .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
       .metric-box {
         background: var(--bg-subtle);
-        border:1.5px solid var(--border-inner);
+        border:1.6px solid var(--border-inner);
         border-radius:12px;
         padding:12px;
         text-align:center;
@@ -143,15 +148,15 @@ st.markdown(
 
       /* ---------- Review cards ---------- */
       .review-card {
-        border:1.75px solid var(--border-outer);
         background:var(--bg-card);
         border-radius:12px;
         padding:16px;
         margin: 10px 0 14px;
-        box-shadow:
-          0 1px 0 rgba(2,6,23,0.04),
-          0 1px 2px rgba(2,6,23,0.06);
         color: var(--text);
+        /* Same visibility treatment as metric cards */
+        box-shadow:
+          0 0 0 1.5px var(--border-outer),
+          0 8px 14px rgba(15,23,42,0.05);
       }
       .review-card p { margin:.25rem 0; line-height:1.5; }
 
@@ -161,58 +166,42 @@ st.markdown(
         display:inline-flex; align-items:center; gap:.4ch;
         padding:6px 12px;
         border-radius:10px;
-        font-weight:600; font-size:.94rem;
-        line-height:1.1;
-        border:1.5px solid var(--border-inner);
+        font-weight:600; font-size:.94rem; line-height:1.1;
+        border:1.6px solid var(--border-inner);
         background: var(--bg-subtle);
         color: var(--text);
         box-shadow: inset 0 -1px 0 rgba(2,6,23,0.03);
       }
-      /* Positive / Negative accents (light & dark tuned) */
-      .badge.pos {
-        border-color: #86e4bd;            /* mint-300 */
-        background: #e8fbf2;              /* mint-50 */
-        color: #065f46;                    /* emerald-900 */
-      }
-      .badge.neg {
-        border-color: #f8b4b4;            /* rose-300 */
-        background: #fff1f2;              /* rose-50 */
-        color: #7f1d1d;                    /* rose-900 */
-      }
-      html[data-theme="dark"] .badge,
-      body[data-theme="dark"] .badge {
+      .badge.pos { border-color:#7ed9b3; background:#e9fbf3; color:#0b4f3e; }
+      .badge.neg { border-color:#f6b4b4; background:#fff1f2; color:#7f1d1d; }
+
+      html[data-theme="dark"] .badge, body[data-theme="dark"] .badge {
         border-color: var(--border-inner);
         background: var(--bg-subtle);
         color: var(--text);
       }
-      html[data-theme="dark"] .badge.pos,
-      body[data-theme="dark"] .badge.pos {
-        border-color: rgba(52,211,153,.45);
-        background: rgba(16,185,129,.10);
-        color: #a7f3d0;
+      html[data-theme="dark"] .badge.pos, body[data-theme="dark"] .badge.pos {
+        border-color: rgba(52,211,153,.45); background: rgba(16,185,129,.10); color:#a7f3d0;
       }
-      html[data-theme="dark"] .badge.neg,
-      body[data-theme="dark"] .badge.neg {
-        border-color: rgba(252,165,165,.45);
-        background: rgba(248,113,113,.12);
-        color: #fecaca;
+      html[data-theme="dark"] .badge.neg, body[data-theme="dark"] .badge.neg {
+        border-color: rgba(252,165,165,.45); background: rgba(248,113,113,.12); color:#fecaca;
       }
 
       /* ---------- Chat bubbles ---------- */
-      .chat-q { background:var(--bg-subtle); border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; color:var(--text); }
-      .chat-a { background:#fff8eb; border:1.5px solid #f2e3be; border-radius:14px; padding:12px 12px; color:#5b4206; }
+      .chat-q { background:var(--bg-subtle); border:1.6px solid var(--border-inner); border-radius:14px; padding:10px 12px; color:var(--text); }
+      .chat-a { background:#fff8eb; border:1.6px solid #f2e3be; border-radius:14px; padding:12px 12px; color:#5b4206; }
       html[data-theme="dark"] .chat-a, body[data-theme="dark"] .chat-a {
         background:var(--bg-card) !important; border-color:var(--border-outer) !important; color:var(--text) !important;
       }
 
-      /* ---------- Hero ---------- */
+      /* ---------- Hero (slightly more contrast in light) ---------- */
       .hero-wrap {
         position: relative; overflow: hidden; border-radius: 14px;
-        border: 1.75px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
-        background: linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f7f7f7 55%,#f7f7f7 100%);
+        margin: .25rem 0 1rem 0; height: 150px;
         box-shadow:
-          0 1px 0 rgba(2,6,23,0.04),
-          0 1px 2px rgba(2,6,23,0.06);
+          0 0 0 1.5px var(--border-outer),
+          0 8px 14px rgba(15,23,42,0.05);
+        background: linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f2f6ff 55%,#f2f6ff 100%);
       }
       #hero-canvas { position:absolute; left:0; top:0; width:55%; height:100%; }
       .hero-inner { position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; }
@@ -222,10 +211,9 @@ st.markdown(
       .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; color:var(--text); }
       .sn-logo g { fill: currentColor !important; }
 
+      /* Dark hero gradient preserved */
       @media (prefers-color-scheme: dark){
-        .hero-wrap{
-          background: linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
-        }
+        .hero-wrap{ background: linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%); }
       }
       html[data-theme="dark"] .hero-wrap, body[data-theme="dark"] .hero-wrap{
         background: linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
@@ -235,71 +223,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- Hero ----------
-def render_hero():
-    sharkninja_svg = """
-    <svg class="sn-logo" viewBox="0 0 520 90" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="SharkNinja">
-      <g fill="currentColor">
-        <text x="0" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="800" font-size="52">Shark</text>
-        <rect x="225" y="12" width="4" height="66" rx="2" fill="currentColor"/>
-        <text x="245" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="900" font-size="52">NINJA</text>
-      </g>
-    </svg>
-    """.strip()
-
-    st_html(
-        f"""
-        <div class="hero-wrap" id="top-hero">
-          <canvas id="hero-canvas"></canvas>
-          <div class="hero-inner">
-            <div>
-              <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
-              <div class="hero-sub">Insights, trends, and ratings — fast.</div>
-            </div>
-            <div class="hero-right">{sharkninja_svg}</div>
-          </div>
-        </div>
-        <script>
-        (function(){{
-          const c = document.getElementById('hero-canvas');
-          const ctx = c.getContext('2d', {{alpha:true}});
-          const DPR = window.devicePixelRatio || 1;
-          let w=0,h=0;
-          function resize(){{
-            const r = c.getBoundingClientRect();
-            w = Math.max(300, r.width|0);
-            h = Math.max(120, r.height|0);
-            c.width = w * DPR; c.height = h * DPR;
-            ctx.setTransform(DPR,0,0,DPR,0,0);
-          }}
-          window.addEventListener('resize', resize, {{passive:true}});
-          resize();
-
-          let N = 140;
-          let stars = Array.from({{length:N}}, () => ({{
-            x: Math.random()*w, y: Math.random()*h,
-            r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
-          }}));
-          function tick(){{
-            ctx.clearRect(0,0,w,h);
-            for(const s of stars){{
-              ctx.beginPath();
-              ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
-              ctx.fillStyle = 'rgba(255,200,50,.9)';
-              ctx.fill();
-              s.x += 0.12*s.s; if(s.x > w) s.x = 0;
-            }}
-            requestAnimationFrame(tick);
-          }}
-          tick();
-        }})();
-        </script>
-        """,
-        height=160,
-    )
-
-
-render_hero()
 
 # ---------- Utilities ----------
 def clean_text(x: str, keep_na: bool = False) -> str:
