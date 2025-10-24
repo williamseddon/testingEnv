@@ -57,13 +57,13 @@ st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 # ---------- Global CSS (dark/light safe) ----------
 
 # ---------- Global CSS (accessible light + dark) ----------
+# ---------- Global CSS (accessible light + dark + rating colors) ----------
 st.markdown(
     """
     <style>
       :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
       *,::before,::after { box-sizing: border-box; }
 
-      /* Slim scrollbars where supported */
       @supports (scrollbar-color: transparent transparent){
         * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
       }
@@ -74,20 +74,27 @@ st.markdown(
         --text:         #0f172a;   /* slate-900 */
         --muted:        #475569;   /* slate-600 */
         --muted-2:      #64748b;   /* slate-500 */
-        --border-strong:#91a6bf;   /* > slate-400 for visible edges */
+        --border-strong:#90a7c1;   /* visible edges */
         --border:       #cbd5e1;   /* slate-300 */
         --border-soft:  #e2e8f0;   /* slate-200 */
-        --bg-app:       #f6f8fc;   /* off-white app BG */
-        --bg-card:      #ffffff;   /* cards */
-        --bg-tile:      #f8fafc;   /* subtle tiles */
-        --ring:         #3b82f6;   /* focus */
-      }
+        --bg-app:       #f6f8fc;   /* off-white */
+        --bg-card:      #ffffff;
+        --bg-tile:      #f8fafc;
+        --ring:         #3b82f6;
+        --ok:           #16a34a;   /* green-600 */
+        --bad:          #dc2626;   /* red-600  */
 
-      /* Use a tinted background so white cards stand out in light mode */
+        /* Hero height tuned to avoid iframe clipping without JS */
+        --hero-h: 160px;
+      }
+      @media (max-width: 1200px){ :root{ --hero-h: 150px; } }
+      @media (max-width: 768px){  :root{ --hero-h: 140px; } }
+
+      /* Make white cards pop in light mode */
       html:not([data-theme="dark"]) .stApp,
       body:not([data-theme="dark"]) .stApp { background: var(--bg-app); }
 
-      /* Dark tokens */
+      /* Dark tokens (only when Streamlit sets data-theme) */
       html[data-theme="dark"], body[data-theme="dark"]{
         --text:         rgba(255,255,255,.92);
         --muted:        rgba(255,255,255,.72);
@@ -99,9 +106,13 @@ st.markdown(
         --bg-card:      rgba(255,255,255,.06);
         --bg-tile:      rgba(255,255,255,.04);
         --ring:         #60a5fa;
+        --ok:           #34d399;  /* green-400 */
+        --bad:          #f87171;  /* red-400  */
       }
-      @media (prefers-color-scheme: light){
-        :root{
+
+      /* OS dark fallback ONLY if Streamlit didn't set data-theme */
+      @media (prefers-color-scheme: dark){
+        html:not([data-theme]), body:not([data-theme]){
           --text:         rgba(255,255,255,.92);
           --muted:        rgba(255,255,255,.72);
           --muted-2:      rgba(255,255,255,.64);
@@ -112,6 +123,8 @@ st.markdown(
           --bg-card:      rgba(255,255,255,.06);
           --bg-tile:      rgba(255,255,255,.04);
           --ring:         #60a5fa;
+          --ok:           #34d399;
+          --bad:          #f87171;
         }
       }
 
@@ -122,56 +135,36 @@ st.markdown(
       section[data-testid="stSidebar"] .stSelectbox label,
       section[data-testid="stSidebar"] .stMultiSelect label { font-size:.95rem; }
       section[data-testid="stSidebar"] .stExpander { border-radius:10px; }
-
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
-
-      /* ---------- Generic card helpers ---------- */
-      .card-edge {
-        background:var(--bg-card);
-        border-radius:14px;
-        box-shadow:
-          0 0 0 1.5px var(--border-strong),
-          0 8px 14px rgba(15,23,42,0.06);
-        color:var(--text);
-      }
 
       /* ---------- Metric cards ---------- */
       .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
       @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
 
-      .metric-card { padding:16px; }
-      .metric-card { composes: card-edge; } /* hint only; ignored by browsers */
-
-      /* inline 'composes' equivalent */
       .metric-card{
         background:var(--bg-card);
         border-radius:14px;
+        padding:16px;
         box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
         color:var(--text);
       }
+      .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
 
-      .metric-card h4{
-        margin:.2rem 0 .7rem 0;
-        font-size:1.05rem;
-        color:var(--text);                  /* dark in light mode */
-      }
-      .metric-row { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-
+      .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
       .metric-box{
         background:var(--bg-tile);
         border:1.6px solid var(--border);
         border-radius:12px;
-        padding:12px;
-        text-align:center;
-        color:var(--text);
+        padding:12px; text-align:center; color:var(--text);
       }
       .metric-label{ color:var(--muted); font-size:.85rem; }
-      .metric-kpi{
-        font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px;
-        color:var(--text);                  /* dark in light mode */
-      }
+      .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
 
-      /* Streamlit st.metric widgets (your two KPIs under the grid) */
+      /* Average rating coloring */
+      .metric-kpi.rating.kpi-pos{ color:var(--ok) !important; }
+      .metric-kpi.rating.kpi-neg{ color:var(--bad) !important; }
+
+      /* Streamlit st.metric widgets (if you still use them) */
       [data-testid="stMetricValue"]{ color:var(--text) !important; font-weight:800; letter-spacing:-0.01em; }
       [data-testid="stMetricLabel"]{ color:var(--muted) !important; }
       [data-testid="stMetricDelta"] span{ color:var(--muted-2) !important; }
@@ -181,9 +174,7 @@ st.markdown(
       /* ---------- Review cards ---------- */
       .review-card{
         background:var(--bg-card);
-        border-radius:12px;
-        padding:16px;
-        margin:10px 0 14px;
+        border-radius:12px; padding:16px; margin:10px 0 14px;
         box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
         color:var(--text);
       }
@@ -193,21 +184,16 @@ st.markdown(
       .badges{ display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
       .badge{
         display:inline-flex; align-items:center; gap:.4ch;
-        padding:6px 12px;
-        border-radius:10px;
+        padding:6px 12px; border-radius:10px;
         font-weight:600; font-size:.94rem; line-height:1.1;
         border:1.6px solid var(--border);
-        background:var(--bg-tile);
-        color:var(--text);
+        background:var(--bg-tile); color:var(--text);
         box-shadow:inset 0 -1px 0 rgba(2,6,23,0.03);
       }
       .badge.pos{ border-color:#7ed9b3; background:#e9fbf3; color:#0b4f3e; }
       .badge.neg{ border-color:#f6b4b4; background:#fff1f2; color:#7f1d1d; }
-
       html[data-theme="dark"] .badge, body[data-theme="dark"] .badge{
-        border-color:var(--border);
-        background:var(--bg-tile);
-        color:var(--text);
+        border-color:var(--border); background:var(--bg-tile); color:var(--text);
       }
       html[data-theme="dark"] .badge.pos, body[data-theme="dark"] .badge.pos{
         border-color:rgba(52,211,153,.45); background:rgba(16,185,129,.10); color:#a7f3d0;
@@ -217,26 +203,25 @@ st.markdown(
       }
 
       /* ---------- Chat bubbles ---------- */
-      .chat-q{
-        background:var(--bg-tile);
-        border:1.6px solid var(--border);
-        border-radius:14px; padding:10px 12px; color:var(--text);
-      }
-      .chat-a{
-        background:#fff8eb; border:1.6px solid #f2e3be;
-        border-radius:14px; padding:12px 12px; color:#5b4206;
-      }
+      .chat-q{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:14px; padding:10px 12px; color:var(--text); }
+      .chat-a{ background:#fff8eb; border:1.6px solid #f2e3be; border-radius:14px; padding:12px 12px; color:#5b4206; }
       html[data-theme="dark"] .chat-a, body[data-theme="dark"] .chat-a{
         background:var(--bg-card)!important; border-color:var(--border-strong)!important; color:var(--text)!important;
       }
 
-      /* ---------- Hero ---------- */
+      /* ---------- Hero (responsive; not cut off) ---------- */
       .hero-wrap{
-        position:relative; overflow:hidden; border-radius:14px; height:150px; margin:.25rem 0 1rem 0;
+        position:relative; overflow:hidden; border-radius:14px;
+        height:var(--hero-h); min-height:var(--hero-h);
+        margin:.25rem 0 1rem 0;
         box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
         background:linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f2f6ff 55%,#f2f6ff 100%);
       }
-      #hero-canvas{ position:absolute; left:0; top:0; width:55%; height:100%; }
+      #hero-canvas{
+        position:absolute; left:0; top:0;
+        width:55%; height:100%;
+        display:block; /* prevents baseline clipping */
+      }
       .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; }
       .hero-title{ font-size:clamp(22px,3.3vw,42px); font-weight:800; margin:0; color:var(--text); }
       .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); }
@@ -244,8 +229,11 @@ st.markdown(
       .sn-logo{ width:170px; height:auto; }
       .sn-logo g{ fill:currentColor!important; }
 
+      /* Dark hero gradient preserved */
       @media (prefers-color-scheme: dark){
-        .hero-wrap{ background:linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%); }
+        html:not([data-theme]) .hero-wrap{
+          background:linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
+        }
       }
       html[data-theme="dark"] .hero-wrap, body[data-theme="dark"] .hero-wrap{
         background:linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
@@ -254,11 +242,7 @@ st.markdown(
       /* ---------- Links & focus ---------- */
       a{ color:#2563eb; }
       a:hover{ text-decoration:underline; }
-      :focus-visible{
-        outline:2px solid var(--ring);
-        outline-offset:2px;
-        border-radius:10px;
-      }
+      :focus-visible{ outline:2px solid var(--ring); outline-offset:2px; border-radius:10px; }
     </style>
     """,
     unsafe_allow_html=True,
