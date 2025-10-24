@@ -75,49 +75,54 @@ st.markdown(
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-      /* -------- Theme tokens (light defaults) -------- */
+      /* ---------- Theme tokens (light defaults) ---------- */
       :root{
-        --text:         var(--text-color, #111827);
-        --muted:        var(--secondary-text-color, #6b7280);
-        --border-outer: #D5DDEB;    /* emphasized outline */
-        --border-inner: #E3E8F3;    /* inner tiles */
-        --border-soft:  #EDF1F8;    /* separators */
-        --bg-card:      #FFFFFF;
-        --bg-subtle:    #F9FAFC;
+        --text:         var(--text-color, #0f172a);            /* slate-900 */
+        --muted:        var(--secondary-text-color, #475569);  /* slate-600 */
+        --border-outer: #cbd5e1;  /* slate-300: card outlines */
+        --border-inner: #dbe3ef;  /* soft tiles */
+        --border-soft:  #e2e8f0;  /* separators */
+        --bg-card:      #ffffff;  /* cards */
+        --bg-subtle:    #f8fafc;  /* tiles */
+        --ring:         #3b82f6;  /* focus ring */
       }
-      /* Streamlit dark theme (newer builds set data-theme on html; older on body) */
+
+      /* Streamlit dark theme attribute (and OS fallback) */
       html[data-theme="dark"], body[data-theme="dark"]{
         --text: rgba(255,255,255,.92);
         --muted: rgba(255,255,255,.72);
         --border-outer: rgba(255,255,255,.18);
-        --border-inner: rgba(255,255,255,.12);
-        --border-soft:  rgba(255,255,255,.08);
+        --border-inner: rgba(255,255,255,.14);
+        --border-soft:  rgba(255,255,255,.10);
         --bg-card: rgba(255,255,255,.06);
         --bg-subtle: rgba(255,255,255,.04);
+        --ring: #60a5fa;
       }
-      /* OS preference fallback */
       @media (prefers-color-scheme: dark){
         :root{
           --text: rgba(255,255,255,.92);
           --muted: rgba(255,255,255,.72);
           --border-outer: rgba(255,255,255,.18);
-          --border-inner: rgba(255,255,255,.12);
-          --border-soft:  rgba(255,255,255,.08);
+          --border-inner: rgba(255,255,255,.14);
+          --border-soft:  rgba(255,255,255,.10);
           --bg-card: rgba(255,255,255,.06);
           --bg-subtle: rgba(255,255,255,.04);
+          --ring: #60a5fa;
         }
       }
 
-      /* -------- Metric cards -------- */
+      /* ---------- Metric cards ---------- */
       .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:17px; }
       @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
 
       .metric-card {
         background: var(--bg-card);
-        border: 2px solid var(--border-outer);
+        border: 1.75px solid var(--border-outer);
         border-radius: 14px;
         padding: 16px;
-        box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+        box-shadow:
+          0 1px 0 rgba(2,6,23,0.04),
+          0 1px 2px rgba(2,6,23,0.06);
         color: var(--text);
       }
       .metric-card h4 { margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
@@ -132,44 +137,82 @@ st.markdown(
         color: var(--text);
       }
       .metric-label { color:var(--muted); font-size:.85rem; }
-      .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; color:var(--text); }
+      .metric-kpi { font-weight:800; font-size: 1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
 
       .section-divider { height:1px; background:var(--border-soft); margin:24px 0 14px; }
 
-      /* -------- Review cards -------- */
+      /* ---------- Review cards ---------- */
       .review-card {
-        border:2px solid var(--border-outer);
+        border:1.75px solid var(--border-outer);
         background:var(--bg-card);
         border-radius:12px;
         padding:16px;
         margin: 10px 0 14px;
-        box-shadow:0 1px 2px rgba(16,24,40,0.04);
+        box-shadow:
+          0 1px 0 rgba(2,6,23,0.04),
+          0 1px 2px rgba(2,6,23,0.06);
         color: var(--text);
       }
-      .review-card p { margin:.25rem 0; line-height:1.45; }
+      .review-card p { margin:.25rem 0; line-height:1.5; }
 
-      .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-      .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
-      .badge.pos { background:#E7F8EE; color:#065F46; border:1px solid #CDEFE1; }
-      .badge.neg { background:#FDECEC; color:#7F1D1D; border:1px solid #F7D1D1; }
-      /* Dark-friendly badge tweak for contrast */
-      html[data-theme="dark"] .badge.pos, body[data-theme="dark"] .badge.pos { background:rgba(16,185,129,.1); color:#34D399; border-color:rgba(52,211,153,.35); }
-      html[data-theme="dark"] .badge.neg, body[data-theme="dark"] .badge.neg { background:rgba(248,113,113,.12); color:#FCA5A5; border-color:rgba(252,165,165,.35); }
-
-      /* -------- Chat bubbles -------- */
-      .chat-q { background:var(--bg-subtle); border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; color:var(--text); }
-      .chat-a { background:#FFF8EB; border:1.5px solid #F2E3BE; border-radius:14px; padding:12px 12px; color:#5b4206; }
-      /* In dark, keep both bubbles on dark surfaces for readability */
-      @media (prefers-color-scheme: dark){
-        .chat-a { background:var(--bg-card) !important; border-color:var(--border-outer) !important; color:var(--text) !important; }
+      /* ---------- Chips / badges (clear borders & readable text) ---------- */
+      .badges { display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
+      .badge {
+        display:inline-flex; align-items:center; gap:.4ch;
+        padding:6px 12px;
+        border-radius:10px;
+        font-weight:600; font-size:.94rem;
+        line-height:1.1;
+        border:1.5px solid var(--border-inner);
+        background: var(--bg-subtle);
+        color: var(--text);
+        box-shadow: inset 0 -1px 0 rgba(2,6,23,0.03);
       }
-      html[data-theme="dark"] .chat-a, body[data-theme="dark"] .chat-a { background:var(--bg-card) !important; border-color:var(--border-outer) !important; color:var(--text) !important; }
+      /* Positive / Negative accents (light & dark tuned) */
+      .badge.pos {
+        border-color: #86e4bd;            /* mint-300 */
+        background: #e8fbf2;              /* mint-50 */
+        color: #065f46;                    /* emerald-900 */
+      }
+      .badge.neg {
+        border-color: #f8b4b4;            /* rose-300 */
+        background: #fff1f2;              /* rose-50 */
+        color: #7f1d1d;                    /* rose-900 */
+      }
+      html[data-theme="dark"] .badge,
+      body[data-theme="dark"] .badge {
+        border-color: var(--border-inner);
+        background: var(--bg-subtle);
+        color: var(--text);
+      }
+      html[data-theme="dark"] .badge.pos,
+      body[data-theme="dark"] .badge.pos {
+        border-color: rgba(52,211,153,.45);
+        background: rgba(16,185,129,.10);
+        color: #a7f3d0;
+      }
+      html[data-theme="dark"] .badge.neg,
+      body[data-theme="dark"] .badge.neg {
+        border-color: rgba(252,165,165,.45);
+        background: rgba(248,113,113,.12);
+        color: #fecaca;
+      }
 
-      /* -------- Hero -------- */
+      /* ---------- Chat bubbles ---------- */
+      .chat-q { background:var(--bg-subtle); border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; color:var(--text); }
+      .chat-a { background:#fff8eb; border:1.5px solid #f2e3be; border-radius:14px; padding:12px 12px; color:#5b4206; }
+      html[data-theme="dark"] .chat-a, body[data-theme="dark"] .chat-a {
+        background:var(--bg-card) !important; border-color:var(--border-outer) !important; color:var(--text) !important;
+      }
+
+      /* ---------- Hero ---------- */
       .hero-wrap {
         position: relative; overflow: hidden; border-radius: 14px;
-        border: 2px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
+        border: 1.75px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
         background: linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f7f7f7 55%,#f7f7f7 100%);
+        box-shadow:
+          0 1px 0 rgba(2,6,23,0.04),
+          0 1px 2px rgba(2,6,23,0.06);
       }
       #hero-canvas { position:absolute; left:0; top:0; width:55%; height:100%; }
       .hero-inner { position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; }
@@ -179,7 +222,6 @@ st.markdown(
       .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; color:var(--text); }
       .sn-logo g { fill: currentColor !important; }
 
-      /* Dark hero gradient */
       @media (prefers-color-scheme: dark){
         .hero-wrap{
           background: linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
@@ -255,6 +297,7 @@ def render_hero():
         """,
         height=160,
     )
+
 
 render_hero()
 
