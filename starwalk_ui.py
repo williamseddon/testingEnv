@@ -54,14 +54,14 @@ def model_supports_temperature(model_id: str) -> bool:
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
-# ---------- Global CSS (focus: borders & grouping) ----------
+# ---------- Global CSS (dark/light safe) ----------
 st.markdown(
     """
     <style>
       :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
       *, ::before, ::after { box-sizing: border-box; }
 
-      /* subtle scrollbars where supported */
+      /* Subtle scrollbars where supported */
       @supports (scrollbar-color: transparent transparent) {
         * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
       }
@@ -69,22 +69,46 @@ st.markdown(
       .block-container { padding-top: .75rem; padding-bottom: 1rem; }
       section[data-testid="stSidebar"] .block-container { padding-top: .5rem; }
       section[data-testid="stSidebar"] .stButton>button { width: 100%; }
-      section[data-testid="stSidebar"] .stSelectbox label, 
+      section[data-testid="stSidebar"] .stSelectbox label,
       section[data-testid="stSidebar"] .stMultiSelect label { font-size: .95rem; }
       section[data-testid="stSidebar"] .stExpander { border-radius: 10px; }
 
       mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-      /* Border palette */
-      :root {
+      /* -------- Theme tokens (light defaults) -------- */
+      :root{
+        --text:         var(--text-color, #111827);
+        --muted:        var(--secondary-text-color, #6b7280);
         --border-outer: #D5DDEB;    /* emphasized outline */
         --border-inner: #E3E8F3;    /* inner tiles */
         --border-soft:  #EDF1F8;    /* separators */
         --bg-card:      #FFFFFF;
         --bg-subtle:    #F9FAFC;
       }
+      /* Streamlit dark theme (newer builds set data-theme on html; older on body) */
+      html[data-theme="dark"], body[data-theme="dark"]{
+        --text: rgba(255,255,255,.92);
+        --muted: rgba(255,255,255,.72);
+        --border-outer: rgba(255,255,255,.18);
+        --border-inner: rgba(255,255,255,.12);
+        --border-soft:  rgba(255,255,255,.08);
+        --bg-card: rgba(255,255,255,.06);
+        --bg-subtle: rgba(255,255,255,.04);
+      }
+      /* OS preference fallback */
+      @media (prefers-color-scheme: dark){
+        :root{
+          --text: rgba(255,255,255,.92);
+          --muted: rgba(255,255,255,.72);
+          --border-outer: rgba(255,255,255,.18);
+          --border-inner: rgba(255,255,255,.12);
+          --border-soft:  rgba(255,255,255,.08);
+          --bg-card: rgba(255,255,255,.06);
+          --bg-subtle: rgba(255,255,255,.04);
+        }
+      }
 
-      /* Metrics cards */
+      /* -------- Metric cards -------- */
       .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:17px; }
       @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
 
@@ -94,8 +118,9 @@ st.markdown(
         border-radius: 14px;
         padding: 16px;
         box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+        color: var(--text);
       }
-      .metric-card h4 { margin:.2rem 0 .7rem 0; font-size:1.05rem; color:#111827; }
+      .metric-card h4 { margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
 
       .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
       .metric-box {
@@ -104,13 +129,14 @@ st.markdown(
         border-radius:12px;
         padding:12px;
         text-align:center;
+        color: var(--text);
       }
-      .metric-label { color:#6b7280; font-size:.85rem; }
-      .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; }
+      .metric-label { color:var(--muted); font-size:.85rem; }
+      .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; color:var(--text); }
 
       .section-divider { height:1px; background:var(--border-soft); margin:24px 0 14px; }
 
-      /* Review cards (📝 All Reviews) */
+      /* -------- Review cards -------- */
       .review-card {
         border:2px solid var(--border-outer);
         background:var(--bg-card);
@@ -118,6 +144,7 @@ st.markdown(
         padding:16px;
         margin: 10px 0 14px;
         box-shadow:0 1px 2px rgba(16,24,40,0.04);
+        color: var(--text);
       }
       .review-card p { margin:.25rem 0; line-height:1.45; }
 
@@ -125,12 +152,20 @@ st.markdown(
       .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
       .badge.pos { background:#E7F8EE; color:#065F46; border:1px solid #CDEFE1; }
       .badge.neg { background:#FDECEC; color:#7F1D1D; border:1px solid #F7D1D1; }
+      /* Dark-friendly badge tweak for contrast */
+      html[data-theme="dark"] .badge.pos, body[data-theme="dark"] .badge.pos { background:rgba(16,185,129,.1); color:#34D399; border-color:rgba(52,211,153,.35); }
+      html[data-theme="dark"] .badge.neg, body[data-theme="dark"] .badge.neg { background:rgba(248,113,113,.12); color:#FCA5A5; border-color:rgba(252,165,165,.35); }
 
-      /* Chat bubbles (single latest pair only, not stored) */
-      .chat-q { background:#F5F7FB; border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; }
-      .chat-a { background:#FFF8EB; border:1.5px solid #F2E3BE; border-radius:14px; padding:12px 12px; }
+      /* -------- Chat bubbles -------- */
+      .chat-q { background:var(--bg-subtle); border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; color:var(--text); }
+      .chat-a { background:#FFF8EB; border:1.5px solid #F2E3BE; border-radius:14px; padding:12px 12px; color:#5b4206; }
+      /* In dark, keep both bubbles on dark surfaces for readability */
+      @media (prefers-color-scheme: dark){
+        .chat-a { background:var(--bg-card) !important; border-color:var(--border-outer) !important; color:var(--text) !important; }
+      }
+      html[data-theme="dark"] .chat-a, body[data-theme="dark"] .chat-a { background:var(--bg-card) !important; border-color:var(--border-outer) !important; color:var(--text) !important; }
 
-      /* Hero */
+      /* -------- Hero -------- */
       .hero-wrap {
         position: relative; overflow: hidden; border-radius: 14px;
         border: 2px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
@@ -138,21 +173,22 @@ st.markdown(
       }
       #hero-canvas { position:absolute; left:0; top:0; width:55%; height:100%; }
       .hero-inner { position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; }
-      .hero-title { font-size: clamp(22px, 3.3vw, 42px); font-weight: 800; margin:0; }
-      .hero-sub { margin: 4px 0 0 0; color:#667085; font-size: clamp(12px, 1.1vw, 16px); }
+      .hero-title { font-size: clamp(22px, 3.3vw, 42px); font-weight: 800; margin:0; color:var(--text); }
+      .hero-sub { margin: 4px 0 0 0; color:var(--muted); font-size: clamp(12px, 1.1vw, 16px); }
       .sn-logo { width: 170px; height:auto; }
-      .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; }
+      .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; color:var(--text); }
+      .sn-logo g { fill: currentColor !important; }
 
-      /* Dark scheme polish */
-      @media (prefers-color-scheme: light){
-        .metric-card, .metric-box, .review-card, .chat-q, .chat-a, .hero-wrap {
-          background: rgba(255,255,255,0.06) !important;
-          border-color: rgba(255,255,255,0.18) !important;
+      /* Dark hero gradient */
+      @media (prefers-color-scheme: dark){
+        .hero-wrap{
+          background: linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
         }
-        .metric-label { color: rgba(255,255,255,0.75); }
+      }
+      html[data-theme="dark"] .hero-wrap, body[data-theme="dark"] .hero-wrap{
+        background: linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
       }
     </style>
-    
     """,
     unsafe_allow_html=True,
 )
@@ -161,9 +197,9 @@ st.markdown(
 def render_hero():
     sharkninja_svg = """
     <svg class="sn-logo" viewBox="0 0 520 90" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="SharkNinja">
-      <g fill="#111">
+      <g fill="currentColor">
         <text x="0" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="800" font-size="52">Shark</text>
-        <rect x="225" y="12" width="4" height="66" rx="2" fill="#222"/>
+        <rect x="225" y="12" width="4" height="66" rx="2" fill="currentColor"/>
         <text x="245" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="900" font-size="52">NINJA</text>
       </g>
     </svg>
