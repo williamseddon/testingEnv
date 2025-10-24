@@ -54,198 +54,176 @@ def model_supports_temperature(model_id: str) -> bool:
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
-# ---------- Global CSS (dark/light safe) ----------
-<style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
-  *,::before,::after { box-sizing: border-box; }
+# ---------- Global CSS (focus: borders & grouping) ----------
+st.markdown(
+    """
+    <style>
+      :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
+      *, ::before, ::after { box-sizing: border-box; }
 
-  @supports (scrollbar-color: transparent transparent){
-    * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
-  }
+      /* subtle scrollbars where supported */
+      @supports (scrollbar-color: transparent transparent) {
+        * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+      }
 
-  /* ---------- Theme tokens ---------- */
-  /* Light defaults */
-  :root{
-    --text:         #0f172a;   /* slate-900 */
-    --muted:        #475569;   /* slate-600 */
-    --muted-2:      #64748b;   /* slate-500 */
-    --border-strong:#90a7c1;   /* visible edges */
-    --border:       #cbd5e1;   /* slate-300 */
-    --border-soft:  #e2e8f0;   /* slate-200 */
-    --bg-app:       #f6f8fc;   /* off-white */
-    --bg-card:      #ffffff;
-    --bg-tile:      #f8fafc;
-    --ring:         #3b82f6;
-    --ok:           #16a34a;   /* green-600 */
-    --bad:          #dc2626;   /* red-600  */
+      .block-container { padding-top: .75rem; padding-bottom: 1rem; }
+      section[data-testid="stSidebar"] .block-container { padding-top: .5rem; }
+      section[data-testid="stSidebar"] .stButton>button { width: 100%; }
+      section[data-testid="stSidebar"] .stSelectbox label, 
+      section[data-testid="stSidebar"] .stMultiSelect label { font-size: .95rem; }
+      section[data-testid="stSidebar"] .stExpander { border-radius: 10px; }
 
-    /* Hero height tuned to avoid iframe clipping without JS */
-    --hero-h: 160px;
-  }
-  @media (max-width: 1200px){ :root{ --hero-h: 150px; } }
-  @media (max-width: 768px){  :root{ --hero-h: 140px; } }
+      mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-  /* Apply app background in BOTH themes */
-  html:not([data-theme="dark"]) .stApp,
-  body:not([data-theme="dark"]) .stApp { background: var(--bg-app); }
-  html[data-theme="dark"] .stApp,
-  body[data-theme="dark"] .stApp { background: var(--bg-app); }
+      /* Border palette */
+      :root {
+        --border-outer: #D5DDEB;    /* emphasized outline */
+        --border-inner: #E3E8F3;    /* inner tiles */
+        --border-soft:  #EDF1F8;    /* separators */
+        --bg-card:      #FFFFFF;
+        --bg-subtle:    #F9FAFC;
+      }
 
-  /* Dark tokens (when Streamlit sets data-theme) */
-  html[data-theme="dark"], body[data-theme="dark"]{
-    --text:         rgba(255,255,255,.92);
-    --muted:        rgba(255,255,255,.72);
-    --muted-2:      rgba(255,255,255,.64);
-    --border-strong:rgba(255,255,255,.22);
-    --border:       rgba(255,255,255,.16);
-    --border-soft:  rgba(255,255,255,.10);
-    --bg-app:       #0b0e14;
-    --bg-card:      rgba(255,255,255,.06);
-    --bg-tile:      rgba(255,255,255,.04);
-    --ring:         #60a5fa;
-    --ok:           #34d399;  /* green-400 */
-    --bad:          #f87171;  /* red-400  */
-  }
+      /* Metrics cards */
+      .metrics-grid { display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:17px; }
+      @media (max-width: 1100px){ .metrics-grid { grid-template-columns: 1fr; } }
 
-  /* OS dark fallback ONLY if Streamlit didn't set data-theme */
-  @media (prefers-color-scheme: dark){
-    html:not([data-theme]), body:not([data-theme]){
-      --text:         rgba(255,255,255,.92);
-      --muted:        rgba(255,255,255,.72);
-      --muted-2:      rgba(255,255,255,.64);
-      --border-strong:rgba(255,255,255,.22);
-      --border:       rgba(255,255,255,.16);
-      --border-soft:  rgba(255,255,255,.10);
-      --bg-app:       #0b0e14;
-      --bg-card:      rgba(255,255,255,.06);
-      --bg-tile:      rgba(255,255,255,.04);
-      --ring:         #60a5fa;
-      --ok:           #34d399;
-      --bad:          #f87171;
-    }
-  }
+      .metric-card {
+        background: var(--bg-card);
+        border: 2px solid var(--border-outer);
+        border-radius: 14px;
+        padding: 16px;
+        box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+      }
+      .metric-card h4 { margin:.2rem 0 .7rem 0; font-size:1.05rem; color:#111827; }
 
-  /* ---------- Layout polish ---------- */
-  .block-container { padding-top: 1.25rem; padding-bottom: 1rem; }
-  .block-container > :first-child { margin-top: 0 !important; } /* prevents “top cut off” look */
-  section[data-testid="stSidebar"] .block-container { padding-top:.5rem; }
-  section[data-testid="stSidebar"] .stButton>button { width:100%; }
-  section[data-testid="stSidebar"] .stSelectbox label,
-  section[data-testid="stSidebar"] .stMultiSelect label { font-size:.95rem; }
-  section[data-testid="stSidebar"] .stExpander { border-radius:10px; }
-  [data-testid="stFileUploader"] label { line-height:1.2; display:inline-block; }
-  mark { background:#fff2a8; padding:0 .2em; border-radius:3px; }
-  h1, h2, h3, h4, h5, h6 { scroll-margin-top: 96px; }
+      .metric-row { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
+      .metric-box {
+        background: var(--bg-subtle);
+        border:1.5px solid var(--border-inner);
+        border-radius:12px;
+        padding:12px;
+        text-align:center;
+      }
+      .metric-label { color:#6b7280; font-size:.85rem; }
+      .metric-kpi { font-weight:800; font-size: 1.8rem; margin-top:2px; }
 
-  /* ---------- Metric cards ---------- */
-  .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
-  @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
+      .section-divider { height:1px; background:var(--border-soft); margin:24px 0 14px; }
 
-  .metric-card{
-    background:var(--bg-card);
-    border-radius:14px;
-    padding:16px;
-    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
-    color:var(--text);
-  }
-  .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
+      /* Review cards (📝 All Reviews) */
+      .review-card {
+        border:2px solid var(--border-outer);
+        background:var(--bg-card);
+        border-radius:12px;
+        padding:16px;
+        margin: 10px 0 14px;
+        box-shadow:0 1px 2px rgba(16,24,40,0.04);
+      }
+      .review-card p { margin:.25rem 0; line-height:1.45; }
 
-  .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-  .metric-box{
-    background:var(--bg-tile);
-    border:1.6px solid var(--border);
-    border-radius:12px;
-    padding:12px; text-align:center; color:var(--text);
-  }
-  .metric-label{ color:var(--muted); font-size:.85rem; }
-  .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
+      .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+      .badge { display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
+      .badge.pos { background:#E7F8EE; color:#065F46; border:1px solid #CDEFE1; }
+      .badge.neg { background:#FDECEC; color:#7F1D1D; border:1px solid #F7D1D1; }
 
-  /* Optional rating coloring hooks */
-  .metric-kpi.rating.kpi-pos{ color:var(--ok) !important; }
-  .metric-kpi.rating.kpi-neg{ color:var(--bad) !important; }
+      /* Chat bubbles (single latest pair only, not stored) */
+      .chat-q { background:#F5F7FB; border:1.5px solid var(--border-inner); border-radius:14px; padding:10px 12px; }
+      .chat-a { background:#FFF8EB; border:1.5px solid #F2E3BE; border-radius:14px; padding:12px 12px; }
 
-  /* Streamlit st.metric widgets */
-  [data-testid="stMetricValue"]{ color:var(--text) !important; font-weight:800; letter-spacing:-0.01em; }
-  [data-testid="stMetricLabel"]{ color:var(--muted) !important; }
-  [data-testid="stMetricDelta"] span{ color:var(--muted-2) !important; }
+      /* Callouts */
+      .callout{border-left:4px solid;border-radius:10px;padding:10px 12px;margin:10px 0}
+      .callout.warn{background:#FFF7ED;border-color:#F97316;color:#7C2D12}
 
-  .section-divider{ height:1px; background:var(--border-soft); margin:24px 0 14px; }
+      /* Hero */
+      .hero-wrap {
+        position: relative; overflow: hidden; border-radius: 14px;
+        border: 2px solid var(--border-outer); height: 150px; margin: .25rem 0 1rem 0;
+        background: linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f7f7f7 55%,#f7f7f7 100%);
+      }
+      #hero-canvas { position:absolute; left:0; top:0; width:55%; height:100%; }
+      .hero-inner { position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; }
+      .hero-title { font-size: clamp(22px, 3.3vw, 42px); font-weight: 800; margin:0; }
+      .hero-sub { margin: 4px 0 0 0; color:#667085; font-size: clamp(12px, 1.1vw, 16px); }
+      .sn-logo { width: 170px; height:auto; }
+      .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; }
 
-  /* ---------- Review cards ---------- */
-  .review-card{
-    background:var(--bg-card);
-    border-radius:12px; padding:16px; margin:10px 0 14px;
-    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
-    color:var(--text);
-  }
-  .review-card p{ margin:.25rem 0; line-height:1.5; }
+      /* Dark scheme polish (apply only when user prefers dark) */
+      @media (prefers-color-scheme: dark){
+        .metric-card, .metric-box, .review-card, .chat-q, .chat-a, .hero-wrap {
+          background: rgba(255,255,255,0.06) !important;
+          border-color: rgba(255,255,255,0.18) !important;
+        }
+        .metric-label { color: rgba(255,255,255,0.75); }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-  /* ---------- Chips / badges ---------- */
-  .badges{ display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
-  .badge{
-    display:inline-flex; align-items:center; gap:.4ch;
-    padding:6px 12px; border-radius:10px;
-    font-weight:600; font-size:.94rem; line-height:1.1;
-    border:1.6px solid var(--border);
-    background:var(--bg-tile); color:var(--text);
-    box-shadow:inset 0 -1px 0 rgba(2,6,23,0.03);
-  }
-  .badge.pos{ border-color:#7ed9b3; background:#e9fbf3; color:#0b4f3e; }
-  .badge.neg{ border-color:#f6b4b4; background:#fff1f2; color:#7f1d1d; }
+# ---------- Hero ----------
+def render_hero():
+    sharkninja_svg = """
+    <svg class="sn-logo" viewBox="0 0 520 90" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="SharkNinja">
+      <g fill="#111">
+        <text x="0" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="800" font-size="52">Shark</text>
+        <rect x="225" y="12" width="4" height="66" rx="2" fill="#222"/>
+        <text x="245" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="900" font-size="52">NINJA</text>
+      </g>
+    </svg>
+    """.strip()
 
-  html[data-theme="dark"] .badge, body[data-theme="dark"] .badge{
-    border-color:var(--border); background:var(--bg-tile); color:var(--text);
-  }
-  html[data-theme="dark"] .badge.pos, body[data-theme="dark"] .badge.pos{
-    border-color:rgba(52,211,153,.45); background:rgba(16,185,129,.10); color:#a7f3d0;
-  }
-  html[data-theme="dark"] .badge.neg, body[data-theme="dark"] .badge.neg{
-    border-color:rgba(252,165,165,.45); background:rgba(248,113,113,.12); color:#fecaca;
-  }
+    st_html(
+        f"""
+        <div class="hero-wrap" id="top-hero">
+          <canvas id="hero-canvas"></canvas>
+          <div class="hero-inner">
+            <div>
+              <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
+              <div class="hero-sub">Insights, trends, and ratings — fast.</div>
+            </div>
+            <div class="hero-right">{sharkninja_svg}</div>
+          </div>
+        </div>
+        <script>
+        (function(){{
+          const c = document.getElementById('hero-canvas');
+          const ctx = c.getContext('2d', {{alpha:true}});
+          const DPR = window.devicePixelRatio || 1;
+          let w=0,h=0;
+          function resize(){{
+            const r = c.getBoundingClientRect();
+            w = Math.max(300, r.width|0);
+            h = Math.max(120, r.height|0);
+            c.width = w * DPR; c.height = h * DPR;
+            ctx.setTransform(DPR,0,0,DPR,0,0);
+          }}
+          window.addEventListener('resize', resize, {{passive:true}});
+          resize();
 
-  /* ---------- Chat bubbles ---------- */
-  .chat-q{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:14px; padding:10px 12px; color:var(--text); }
-  .chat-a{ background:#fff8eb; border:1.6px solid #f2e3be; border-radius:14px; padding:12px 12px; color:#5b4206; }
-  html[data-theme="dark"] .chat-a, body[data-theme="dark"] .chat-a{
-    background:var(--bg-card)!important; border-color:var(--border-strong)!important; color:var(--text)!important;
-  }
+          let N = 140;
+          let stars = Array.from({{length:N}}, () => ({{
+            x: Math.random()*w, y: Math.random()*h,
+            r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
+          }}));
+          function tick(){{
+            ctx.clearRect(0,0,w,h);
+            for(const s of stars){{
+              ctx.beginPath();
+              ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+              ctx.fillStyle = 'rgba(255,200,50,.9)';
+              ctx.fill();
+              s.x += 0.12*s.s; if(s.x > w) s.x = 0;
+            }}
+            requestAnimationFrame(tick);
+          }}
+          tick();
+        }})();
+        </script>
+        """,
+        height=160,
+    )
 
-  /* ---------- Hero (responsive; not cut off) ---------- */
-  .hero-wrap{
-    position:relative; overflow:hidden; border-radius:14px;
-    height:var(--hero-h); min-height:var(--hero-h);
-    margin:.25rem 0 1rem 0;
-    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
-    background:linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f2f6ff 55%,#f2f6ff 100%);
-  }
-  #hero-canvas{
-    position:absolute; left:0; top:0;
-    width:55%; height:100%;
-    display:block; /* prevents baseline clipping */
-  }
-  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; }
-  .hero-title{ font-size:clamp(22px,3.3vw,42px); font-weight:800; margin:0; color:var(--text); }
-  .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); }
-  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:40%; color:var(--text); }
-  .sn-logo{ width:170px; height:auto; }
-  .sn-logo g{ fill:currentColor!important; }
-
-  /* Dark hero gradient preserved */
-  @media (prefers-color-scheme: dark){
-    html:not([data-theme]) .hero-wrap{
-      background:linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
-    }
-  }
-  html[data-theme="dark"] .hero-wrap, body[data-theme="dark"] .hero-wrap{
-    background:linear-gradient(90deg,#0f1115 0%,#0f1115 55%,#12151c 55%,#12151c 100%);
-  }
-
-  /* ---------- Links & focus ---------- */
-  a{ color:#2563eb; }
-  a:hover{ text-decoration:underline; }
-  :focus-visible{ outline:2px solid var(--ring); outline-offset:2px; border-radius:10px; }
-</style>
-
+render_hero()
 
 # ---------- Utilities ----------
 def clean_text(x: str, keep_na: bool = False) -> str:
@@ -265,6 +243,10 @@ def clean_text(x: str, keep_na: bool = False) -> str:
     if s.upper() in {"<NA>","NA","N/A","NULL","NONE"}:
         return pd.NA if keep_na else ""
     return s
+
+def esc(x) -> str:
+    """HTML-escape any dynamic value used inside unsafe_allow_html blocks."""
+    return _html.escape("" if pd.isna(x) else str(x))
 
 def apply_filter(df: pd.DataFrame, column_name: str, label: str, key: str | None = None):
     options = ["ALL"]
@@ -308,7 +290,7 @@ def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: li
         mask = filtered_df[cols].isin([item]).any(axis=1)
         count = int(mask.sum())
         if count == 0: continue
-        avg_star = filtered_df.loc[mask, "Star Rating"].mean()
+        avg_star = filtered_df.loc[mask, "Star Rating"].mean() if "Star Rating" in filtered_df.columns else np.nan
         pct = (count / total_rows * 100) if total_rows else 0
         results.append({"Item": item_str.title(),
                         "Avg Star": round(avg_star,1) if pd.notna(avg_star) else None,
@@ -326,6 +308,87 @@ def highlight_html(text: str, keyword: str | None) -> str:
         except re.error:
             pass
     return safe
+
+# ---------- Chart helpers ----------
+def seeded_share_chart(df: pd.DataFrame):
+    if "Star Rating" not in df.columns:
+        return None
+    sr = pd.to_numeric(df["Star Rating"], errors="coerce")
+    ok = df[sr.notna()].copy()
+    ok["Star Rating"] = sr[sr.notna()].astype(int).clip(1,5)
+    if "Seeded" in ok.columns:
+        ok["Group"] = np.where(ok["Seeded"].astype("string").str.upper().eq("YES"), "Seeded", "Organic")
+    else:
+        ok["Group"] = "All"
+    order = [1,2,3,4,5]
+    counts = ok.groupby(["Group","Star Rating"]).size().unstack(fill_value=0).reindex(columns=order, fill_value=0)
+    if counts.empty:
+        return None
+    pct = counts.div(counts.sum(axis=1), axis=0)*100
+
+    fig = go.Figure()
+    for star in order:
+        fig.add_trace(go.Bar(
+            x=pct.index, y=pct[star], name=f"{star}★",
+            text=[f"{v:.1f}%" for v in pct[star]],
+            textposition="inside"
+        ))
+    fig.update_layout(
+        barmode="stack", title="<b>Share of Ratings by Group</b>",
+        yaxis=dict(title="% of reviews", range=[0,100], tickformat=".0f"),
+        xaxis=dict(title=""),
+        plot_bgcolor="white", template="plotly_white",
+        margin=dict(l=40, r=40, t=45, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
+
+def trend_chart(df: pd.DataFrame, freq: str = "W"):
+    if "Review Date" not in df.columns or "Star Rating" not in df.columns:
+        return None
+    d = df.copy()
+    d["RD"] = pd.to_datetime(d["Review Date"], errors="coerce")
+    d["SR"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+    d = d[d["RD"].notna() & d["SR"].notna()]
+    if d.empty:
+        return None
+    g = d.groupby(pd.Grouper(key="RD", freq=freq)).agg(avg_star=("SR","mean"), n=("SR","size"))
+    if g.empty:
+        return None
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=g.index, y=g["avg_star"], mode="lines+markers", name="Avg ★"))
+    fig.add_trace(go.Bar(x=g.index, y=g["n"], name="Review count", opacity=0.35, yaxis="y2"))
+
+    fig.update_layout(
+        title=f"<b>Trend: Avg ★ and Volume ({freq})</b>",
+        xaxis=dict(title="Date"),
+        yaxis=dict(title="Avg ★", range=[0.8,5.1]),
+        yaxis2=dict(title="Count", overlaying="y", side="right", showgrid=False),
+        plot_bgcolor="white", template="plotly_white",
+        margin=dict(l=40, r=40, t=45, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
+
+def symptom_heatmap(df: pd.DataFrame, cols: list[str], top: int = 12):
+    base = analyze_delighters_detractors(df, cols)
+    if base.empty: return None
+    top_items = base.head(top)["Item"].tolist()
+    heat_df = base[base["Item"].isin(top_items)][["Item","Avg Star","Mentions"]].set_index("Item")
+    if heat_df.empty: return None
+    z = heat_df["Avg Star"].astype(float).values.reshape(-1,1)
+    fig = go.Figure(data=go.Heatmap(
+        z=z, x=["Avg ★"], y=heat_df.index.tolist(),
+        colorbar=dict(title="Avg ★"), zmin=1, zmax=5
+    ))
+    fig.update_layout(
+        title="<b>Top Symptoms (Detractors): Avg ★ Heatmap</b>",
+        xaxis=dict(showgrid=False), yaxis=dict(autorange="reversed"),
+        plot_bgcolor="white", template="plotly_white",
+        margin=dict(l=100, r=40, t=45, b=40),
+    )
+    return fig
 
 # LLM helpers ---------------------------------------------------
 @st.cache_resource(show_spinner=False)
@@ -403,7 +466,11 @@ if not uploaded_file:
 # ---------- Load & clean ----------
 try:
     st.markdown("---")
-    df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
+    except ValueError:
+        # Fallback to first sheet if the named sheet doesn't exist
+        df = pd.read_excel(uploaded_file)
 
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
         if col in df.columns:
@@ -415,7 +482,6 @@ try:
     for c in all_symptom_cols:
         df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
 
-    # ✅ fixed stray quote here
     if "Verbatim" in df.columns:
         df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
     if "Review Date" in df.columns:
@@ -431,14 +497,14 @@ with st.sidebar.expander("🗓️ Timeframe", expanded=False):
     timeframe = st.selectbox("Select Timeframe",
                              options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
                              key="tf")
-    today = datetime.today()
+    today = datetime.today().date()
     start_date, end_date = None, None
     if timeframe == "Custom Range":
         start_date, end_date = st.date_input(
             label="Date Range",
-            value=(datetime.today() - timedelta(days=30), datetime.today()),
-            min_value=datetime(2000, 1, 1),
-            max_value=datetime.today(),
+            value=(today - timedelta(days=30), today),
+            min_value=datetime(2000, 1, 1).date(),
+            max_value=today,
             label_visibility="collapsed"
         )
     elif timeframe == "Last Week":  start_date, end_date = today - timedelta(days=7), today
@@ -521,7 +587,7 @@ if st.sidebar.button("🧹 Clear all filters"):
 st.sidebar.write("")
 st.sidebar.markdown("---")
 
-# LLM settings (no archive, no nav buttons)
+# ---------- LLM settings ----------
 with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     _model_choices = [
         ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -548,60 +614,176 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     if not temp_supported:
         st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
 
-# ---- Feedback modal (button lives in sidebar) ----
-def send_feedback_via_email(subject: str, body: str) -> bool:
-    try:
-        host = st.secrets.get("SMTP_HOST")
-        port = int(st.secrets.get("SMTP_PORT", 587))
-        user = st.secrets.get("SMTP_USER")
-        pwd  = st.secrets.get("SMTP_PASS")
-        sender = st.secrets.get("SMTP_FROM", user or "")
-        to = st.secrets.get("SMTP_TO", "wseddon@sharkninja.com")
-        if not (host and port and sender and to):
-            return False
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = to
-        msg.set_content(body)
-        with smtplib.SMTP(host, port) as s:
-            s.starttls()
-            if user and pwd: s.login(user, pwd)
-            s.send_message(msg)
-        return True
-    except Exception:
-        return False
+# ---------- Ask your data (LLM) — moved up, with disclaimer ----------
+anchor("askdata-anchor")
+st.markdown("## 🤖 Ask your data")
+st.markdown(
+    '<div class="callout warn">⚠️ AI can make mistakes. Numbers are computed from the filtered data via tools, '
+    'but always double-check important conclusions.</div>',
+    unsafe_allow_html=True
+)
 
-_DIALOG_AVAILABLE = hasattr(st, "dialog")
-if _DIALOG_AVAILABLE:
-    @st.dialog("💬 Submit Feedback", width="large")
-    def open_feedback_dialog():
-        st.caption("Tell us what to improve. We care about making this tool user-centric.")
-        with st.form("feedback_modal_form", clear_on_submit=True):
-            name = st.text_input("Your name (optional)", key="fb_modal_name")
-            email = st.text_input("Your email (optional)", key="fb_modal_email")
-            message = st.text_area("Feedback / feature request", height=160, key="fb_modal_msg")
-            send_modal = st.form_submit_button("Submit feedback")
-        if send_modal:
-            if not message.strip():
-                st.warning("Please enter some feedback before submitting.")
-                st.stop()
-            body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
-            ok = send_feedback_via_email("Star Walk — Feedback", body)
-            if ok: st.success("Thanks! Your feedback was sent.")
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+if not _HAS_OPENAI:
+    st.info("To enable this panel, add `openai` to your requirements and redeploy. Then set `OPENAI_API_KEY`.")
+elif not api_key:
+    st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
+else:
+    verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
+    index = build_vector_index(verb_series.tolist(), api_key)
+
+    # Ask form; no state is kept after this run
+    with st.form("ask_ai_form", clear_on_submit=True):
+        q = st.text_area("Ask a question", value="", height=80)
+        send = st.form_submit_button("Send")
+
+    if send and q.strip():
+        q = q.strip()
+        # retrieval
+        retrieved = vector_search(q, index, api_key, top_k=8) if index else []
+        quotes = []
+        for txt, sim in retrieved[:5]:
+            s = (txt or "").strip()
+            if len(s) > 0:
+                if len(s) > 320: s = s[:317] + "…"
+                quotes.append(f"• “{s}”")
+        quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
+
+        # ------ Safe helpers for pandas.query ------
+        def _safe_query(qs: str) -> bool:
+            if not qs or len(qs) > 200: return False
+            bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`"]
+            if any(t in qs.lower() for t in bad): return False
+            return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
+
+        # tools
+        def pandas_count(query: str) -> dict:
+            try:
+                if not _safe_query(query): return {"error":"unsafe query"}
+                res = filtered.query(query)  # default engine (numexpr where possible)
+                return {"count": int(len(res))}
+            except Exception as e:
+                return {"error": str(e)}
+
+        def pandas_mean(column: str, query: str | None = None) -> dict:
+            try:
+                if column not in filtered.columns: return {"error": f"Unknown column {column}"}
+                d = filtered if not query else (filtered.query(query) if _safe_query(query) else None)
+                if d is None: return {"error":"unsafe query"}
+                return {"mean": float(pd.to_numeric(d[column], errors='coerce').mean())}
+            except Exception as e:
+                return {"error": str(e)}
+
+        def symptom_stats(symptom: str) -> dict:
+            cols = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in filtered.columns]
+            if not cols: return {"count":0,"avg_star":None}
+            mask = filtered[cols].isin([symptom]).any(axis=1)
+            d = filtered[mask]
+            return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) and "Star Rating" in d.columns else None}
+
+        def keyword_stats(term: str) -> dict:
+            if "Verbatim" not in filtered.columns: return {"count": 0, "pct": 0.0}
+            ser = filtered["Verbatim"].astype("string").fillna("")
+            cnt = int(ser.str.contains(term, case=False, na=False).sum())
+            pct = (cnt / max(1,len(filtered))) * 100.0
+            return {"count": cnt, "pct": pct}
+
+        def get_metrics_snapshot():
+            try:
+                return {
+                    "total_reviews": int(len(filtered)),
+                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
+                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
+                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered.columns else {},
+                }
+            except Exception as e:
+                return {"error": str(e)}
+
+        # local fallback
+        def _local_answer_fallback() -> str:
+            try:
+                parts = []
+                total = int(len(filtered))
+                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total and "Star Rating" in filtered.columns else 0.0
+                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total and "Star Rating" in filtered.columns else 0.0
+                parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
+
+                detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
+                deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
+                def fmt(df):
+                    if df.empty: return "None"
+                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
+                parts.append("**Top detractors:** " + fmt(detr))
+                parts.append("**Top delighters:** " + fmt(deli))
+                return "\n\n".join(parts)
+            except Exception as e:
+                return f"(Fallback summary error: {e})"
+
+        # compose single-turn request
+        selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
+        llm_temp = float(st.session_state.get("llm_temp", 0.2))
+        tools = [
+            {"type":"function","function":{
+                "name":"pandas_count","description":"Count rows matching a pandas query over the CURRENT filtered dataset.",
+                "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+            {"type":"function","function":{
+                "name":"pandas_mean","description":"Mean of a numeric column (optional pandas query).",
+                "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}}},
+            {"type":"function","function":{
+                "name":"symptom_stats","description":"Mentions + avg star for a symptom across Symptom 1–20.",
+                "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}}},
+            {"type":"function","function":{
+                "name":"keyword_stats","description":"Count + % of reviews with term in Verbatim.",
+                "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}}},
+            {"type":"function","function":{
+                "name":"get_metrics_snapshot","description":"Return current page metrics.",
+                "parameters":{"type":"object","properties":{}}}},
+        ]
+        sys_ctx = (
+            "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
+            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
+            "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
+        )
+
+        try:
+            client = OpenAI(api_key=api_key)
+            req = {"model": selected_model,
+                   "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
+                   "tools": tools}
+            if model_supports_temperature(selected_model): req["temperature"] = llm_temp
+            with st.spinner("Thinking..."):
+                first = client.chat.completions.create(**req)
+            msg = first.choices[0].message
+            tool_msgs = []
+            if msg.tool_calls:
+                for call in msg.tool_calls:
+                    name = call.function.name
+                    args = json.loads(call.function.arguments or "{}")
+                    out = {"error":"unknown tool"}
+                    if name == "pandas_count": out = pandas_count(args.get("query",""))
+                    if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                    if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
+                    if name == "keyword_stats": out = keyword_stats(args.get("term",""))
+                    if name == "get_metrics_snapshot": out = get_metrics_snapshot()
+                    tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
+            if tool_msgs:
+                follow = {"model": selected_model,
+                          "messages":[
+                              {"role":"system","content":sys_ctx},
+                              {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
+                              *tool_msgs
+                          ]}
+                if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
+                res2 = client.chat.completions.create(**follow)
+                final_text = res2.choices[0].message.content
             else:
-                st.link_button(
-                    "Open email to wseddon@sharkninja.com",
-                    url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={_html.escape(message)}"
-                )
-            st.stop()
+                final_text = msg.content
+        except Exception:
+            final_text = _local_answer_fallback()
 
-# Sidebar button: open modal if available, otherwise scroll to on-page form
-if st.sidebar.button("Submit Feedback"):
-    if _DIALOG_AVAILABLE:
-        open_feedback_dialog()
-    else:
-        scroll_to("feedback-anchor")
+        # show the single Q/A (not stored)
+        st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -615,13 +797,21 @@ def pct_12(series: pd.Series) -> float:
 
 def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
     cnt = len(sub)
-    avg = float(sub["Star Rating"].mean()) if cnt else 0.0
-    pct = pct_12(sub["Star Rating"]) if cnt else 0.0
+    if cnt == 0 or "Star Rating" not in sub.columns:
+        return 0, 0.0, 0.0
+    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
+    pct = pct_12(sub["Star Rating"])
     return cnt, avg, pct
 
+# Robust Seeded split (handles missing column)
+if "Seeded" in filtered.columns:
+    seed_mask = filtered["Seeded"].astype("string").str.upper().eq("YES")
+else:
+    seed_mask = pd.Series(False, index=filtered.index)
+
 all_cnt, all_avg, all_low = section_stats(filtered)
-org = filtered[filtered.get("Seeded","").astype("string").str.upper() != "YES"]
-seed = filtered[filtered.get("Seeded","").astype("string").str.upper() == "YES"]
+org = filtered[~seed_mask]
+seed = filtered[seed_mask]
 org_cnt, org_avg, org_low = section_stats(org)
 seed_cnt, seed_avg, seed_low = section_stats(seed)
 
@@ -657,14 +847,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Distribution chart
-star_counts = filtered["Star Rating"].value_counts().sort_index()
+# Distribution chart (guard for missing column)
+if "Star Rating" in filtered.columns:
+    star_counts = pd.to_numeric(filtered["Star Rating"], errors="coerce").dropna().value_counts().sort_index()
+else:
+    star_counts = pd.Series([], dtype="int")
 total_reviews = len(filtered)
 percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
 star_labels = [f"{int(star)} stars" for star in star_counts.index]
-
-mc1, mc2 = st.columns(2)
-
 
 fig_bar_horizontal = go.Figure(go.Bar(
     x=star_counts.values, y=star_labels, orientation="h",
@@ -683,6 +873,23 @@ fig_bar_horizontal.update_layout(
     margin=dict(l=40, r=40, t=45, b=40)
 )
 st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+
+# New charts
+fig_share = seeded_share_chart(filtered)
+if fig_share:
+    st.plotly_chart(fig_share, use_container_width=True)
+
+c_tr1, c_tr2 = st.columns([1,1])
+with c_tr1:
+    fig_trend_w = trend_chart(filtered, "W")
+    if fig_trend_w: st.plotly_chart(fig_trend_w, use_container_width=True)
+with c_tr2:
+    fig_trend_m = trend_chart(filtered, "M")
+    if fig_trend_m: st.plotly_chart(fig_trend_m, use_container_width=True)
+
+fig_hm = symptom_heatmap(filtered, existing_detractor_columns, top=12)
+if fig_hm:
+    st.plotly_chart(fig_hm, use_container_width=True)
 
 st.markdown("---")
 
@@ -778,9 +985,9 @@ else:
         st.markdown(
             f"""
             <div class="review-card">
-                <p><strong>Source:</strong> {row.get('Source', '')} | <strong>Model:</strong> {row.get('Model (SKU)', '')}</p>
-                <p><strong>Country:</strong> {row.get('Country', '')} | <strong>Date:</strong> {date_str}</p>
-                <p><strong>Rating:</strong> {'⭐' * star_int} ({row.get('Star Rating', '')}/5)</p>
+                <p><strong>Source:</strong> {esc(row.get('Source'))} | <strong>Model:</strong> {esc(row.get('Model (SKU)'))}</p>
+                <p><strong>Country:</strong> {esc(row.get('Country'))} | <strong>Date:</strong> {esc(date_str)}</p>
+                <p><strong>Rating:</strong> {'⭐' * star_int} ({esc(row.get('Star Rating'))}/5)</p>
                 <p><strong>Review:</strong> {display_review_html}</p>
                 <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
                 <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
@@ -813,169 +1020,34 @@ with p5:
 
 st.markdown("---")
 
-# ---------- Ask your data (LLM) — ONLY current response, not stored ----------
-anchor("askdata-anchor")
-st.markdown("## 🤖 Ask your data")
-st.caption("Ask one question about the **currently filtered** reviews. The response shows below and is not saved.")
-
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-if not _HAS_OPENAI:
-    st.info("To enable this panel, add `openai` to your requirements and redeploy. Then set `OPENAI_API_KEY`.")
-elif not api_key:
-    st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
-else:
-    verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-    index = build_vector_index(verb_series.tolist(), api_key)
-
-    # Ask form; no state is kept after this run
-    with st.form("ask_ai_form", clear_on_submit=True):
-        q = st.text_area("Ask a question", value="", height=80)
-        send = st.form_submit_button("Send")
-
-    if send and q.strip():
-        q = q.strip()
-        # retrieval
-        retrieved = vector_search(q, index, api_key, top_k=8) if index else []
-        quotes = []
-        for txt, sim in retrieved[:5]:
-            s = (txt or "").strip()
-            if len(s) > 0:
-                if len(s) > 320: s = s[:317] + "…"
-                quotes.append(f"• “{s}”")
-        quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
-
-        # tools
-        def pandas_count(query: str) -> dict:
-            try:
-                if ";" in query or "__" in query: return {"error":"disallowed pattern"}
-                res = filtered.query(query, engine="python")
-                return {"count": int(len(res))}
-            except Exception as e:
-                return {"error": str(e)}
-
-        def pandas_mean(column: str, query: str | None = None) -> dict:
-            try:
-                if column not in filtered.columns: return {"error": f"Unknown column {column}"}
-                d = filtered if not query else filtered.query(query, engine="python")
-                return {"mean": float(pd.to_numeric(d[column], errors='coerce').mean())}
-            except Exception as e:
-                return {"error": str(e)}
-
-        def symptom_stats(symptom: str) -> dict:
-            cols = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in filtered.columns]
-            if not cols: return {"count":0,"avg_star":None}
-            mask = filtered[cols].isin([symptom]).any(axis=1)
-            d = filtered[mask]
-            return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) else None}
-
-        def keyword_stats(term: str) -> dict:
-            if "Verbatim" not in filtered.columns: return {"count": 0, "pct": 0.0}
-            ser = filtered["Verbatim"].astype("string").fillna("")
-            cnt = int(ser.str.contains(term, case=False, na=False).sum())
-            pct = (cnt / max(1,len(filtered))) * 100.0
-            return {"count": cnt, "pct": pct}
-
-        def get_metrics_snapshot():
-            try:
-                return {
-                    "total_reviews": int(len(filtered)),
-                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) else 0.0,
-                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) else 0.0,
-                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered else {},
-                }
-            except Exception as e:
-                return {"error": str(e)}
-
-        # local fallback
-        def _local_answer_fallback() -> str:
-            try:
-                parts = []
-                total = int(len(filtered))
-                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total else 0.0
-                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total else 0.0
-                parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
-
-                detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
-                deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
-                def fmt(df):
-                    if df.empty: return "None"
-                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
-                parts.append("**Top detractors:** " + fmt(detr))
-                parts.append("**Top delighters:** " + fmt(deli))
-                return "\\n\\n".join(parts)
-            except Exception as e:
-                return f"(Fallback summary error: {e})"
-
-        # compose single-turn request
-        selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
-        llm_temp = float(st.session_state.get("llm_temp", 0.2))
-        tools = [
-            {"type":"function","function":{
-                "name":"pandas_count","description":"Count rows matching a pandas query over the CURRENT filtered dataset.",
-                "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-            {"type":"function","function":{
-                "name":"pandas_mean","description":"Mean of a numeric column (optional pandas query).",
-                "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}}},
-            {"type":"function","function":{
-                "name":"symptom_stats","description":"Mentions + avg star for a symptom across Symptom 1–20.",
-                "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}}},
-            {"type":"function","function":{
-                "name":"keyword_stats","description":"Count + % of reviews with term in Verbatim.",
-                "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}}},
-            {"type":"function","function":{
-                "name":"get_metrics_snapshot","description":"Return current page metrics.",
-                "parameters":{"type":"object","properties":{}}}},
-        ]
-        sys_ctx = (
-            "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\\n"
-            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\\n\\n"
-            "RETRIEVED_SNIPPETS:\\n" + (quotes_text or "(none)") + f"\\n\\nROW_COUNT={len(filtered)}"
-        )
-
-        try:
-            client = OpenAI(api_key=api_key)
-            req = {"model": selected_model,
-                   "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
-                   "tools": tools}
-            if model_supports_temperature(selected_model): req["temperature"] = llm_temp
-            with st.spinner("Thinking..."):
-                first = client.chat.completions.create(**req)
-            msg = first.choices[0].message
-            tool_msgs = []
-            if msg.tool_calls:
-                for call in msg.tool_calls:
-                    name = call.function.name
-                    args = json.loads(call.function.arguments or "{}")
-                    out = {"error":"unknown tool"}
-                    if name == "pandas_count": out = pandas_count(args.get("query",""))
-                    if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                    if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
-                    if name == "keyword_stats": out = keyword_stats(args.get("term",""))
-                    if name == "get_metrics_snapshot": out = get_metrics_snapshot()
-                    tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
-            if tool_msgs:
-                follow = {"model": selected_model,
-                          "messages":[{"role":"system","content":sys_ctx},
-                                      {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                                      *tool_msgs]}
-                if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
-                res2 = client.chat.completions.create(**follow)
-                final_text = res2.choices[0].message.content
-            else:
-                final_text = msg.content
-        except Exception:
-            final_text = _local_answer_fallback()
-
-        # show the single Q/A (not stored)
-        st.markdown(f"<div class='chat-q'><b>User:</b> {q}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-
-st.markdown("---")
-
 # ---------- Feedback (anchor fallback) ----------
 anchor("feedback-anchor")
 st.markdown("## 💬 Submit Feedback")
 st.caption("Tell us what to improve. We care about making this tool user-centric.")
+
+def send_feedback_via_email(subject: str, body: str) -> bool:
+    try:
+        host = st.secrets.get("SMTP_HOST")
+        port = int(st.secrets.get("SMTP_PORT", 587))
+        user = st.secrets.get("SMTP_USER")
+        pwd  = st.secrets.get("SMTP_PASS")
+        sender = st.secrets.get("SMTP_FROM", user or "")
+        to = st.secrets.get("SMTP_TO", "wseddon@sharkninja.com")
+        if not (host and port and sender and to):
+            return False
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to
+        msg.set_content(body)
+        with smtplib.SMTP(host, port) as s:
+            s.starttls()
+            if user and pwd: s.login(user, pwd)
+            s.send_message(msg)
+        return True
+    except Exception:
+        return False
+
 with st.form("feedback_form", clear_on_submit=True):
     name = st.text_input("Your name (optional)")
     email = st.text_input("Your email (optional)")
@@ -985,7 +1057,7 @@ if submitted:
     if not message.strip():
         st.warning("Please enter some feedback before submitting.")
     else:
-        body = f"Name: {name or '-'}\\nEmail: {email or '-'}\\n\\nFeedback:\\n{message}"
+        body = f"Name: {name or '-'}\nEmail: {email or '-'}\n\nFeedback:\n{message}"
         ok = send_feedback_via_email("Star Walk — Feedback", body)
         if ok: st.success("Thanks! Your feedback was sent.")
         else:
