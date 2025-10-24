@@ -682,8 +682,7 @@ percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews el
 star_labels = [f"{int(star)} stars" for star in star_counts.index]
 
 mc1, mc2 = st.columns(2)
-with mc1: st.metric("Total Reviews", f"{total_reviews:,}")
-with mc2: st.metric("Avg Star Rating", f"{all_avg:.1f}", delta_color="inverse")
+
 
 fig_bar_horizontal = go.Figure(go.Bar(
     x=star_counts.values, y=star_labels, orientation="h",
