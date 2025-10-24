@@ -111,7 +111,7 @@ st.markdown(
       }
 
       /* OS dark fallback ONLY if Streamlit didn't set data-theme */
-      @media (prefers-color-scheme: dark){
+      @media (prefers-color-scheme: light){
         html:not([data-theme]), body:not([data-theme]){
           --text:         rgba(255,255,255,.92);
           --muted:        rgba(255,255,255,.72);
