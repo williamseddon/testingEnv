@@ -100,7 +100,7 @@ st.markdown(
         --bg-tile:      rgba(255,255,255,.04);
         --ring:         #60a5fa;
       }
-      @media (prefers-color-scheme: dark){
+      @media (prefers-color-scheme: light){
         :root{
           --text:         rgba(255,255,255,.92);
           --muted:        rgba(255,255,255,.72);
