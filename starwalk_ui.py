@@ -1,34 +1,18 @@
-# =========================
-# Star Walk Analysis Dashboard — Symptomization Beta
+# ---------- Star Walk — Upload + Symptomize UI (complete) ----------
 # Streamlit 1.38+
-# =========================
 
-# ---------- Imports ----------
 import io
 import os
 import re
-import math
-import time
 import json
-import textwrap
-from typing import List, Dict, Tuple
+import difflib
+from typing import List, Tuple
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
 from streamlit.components.v1 import html as st_html
-import html as _html  # for safe escaping in markdown/HTML
 
-# Optional: text fixer
-try:
-    from ftfy import fix_text as _ftfy_fix
-    _HAS_FTFY = True
-except Exception:
-    _HAS_FTFY = False
-    _ftfy_fix = None
-
-# Optional: OpenAI
+# Optional: use OpenAI if available
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
@@ -36,13 +20,17 @@ except Exception:
     _HAS_OPENAI = False
     OpenAI = None  # type: ignore
 
-# Excel formatting-preserving writer
-from openpyxl import load_workbook
+# Optional: preserve workbook formatting
+try:
+    from openpyxl import load_workbook
+    _HAS_OPENPYXL = True
+except Exception:
+    _HAS_OPENPYXL = False
 
-# ---------- Page Config ----------
+# ---------------- Page + Theme ----------------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
-# ---------- Force Light Mode ----------
+# Force light mode
 st_html("""
 <script>
 (function () {
@@ -62,18 +50,18 @@ st_html("""
 </script>
 """, height=0)
 
-# ---------- Global CSS ----------
-GLOBAL_CSS = """
+# ---------------- Global CSS ----------------
+st.markdown("""
 <style>
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
   @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
+
   :root{
     --text:#0f172a; --muted:#475569; --muted-2:#64748b;
     --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
     --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
     --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-    --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
   html, body, .stApp {
     background: var(--bg-app);
@@ -81,623 +69,393 @@ GLOBAL_CSS = """
     color: var(--text);
   }
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
-  mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
+  .card{
+    background:var(--bg-card); border-radius:14px; padding:16px;
+    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
+  }
+  .muted{ color:var(--muted); }
+  .pill{ display:inline-block; padding:4px 10px; border-radius:999px; background:var(--bg-tile); border:1px solid var(--border); font-weight:600; }
+  .ok{ color:#065F46; }
+  .warn{ color:#7C2D12; }
   .hero-wrap{
-    position:relative; overflow:hidden; border-radius:14px; min-height:150px; margin:.25rem 0 1rem 0;
+    position:relative; overflow:hidden; border-radius:14px; min-height:116px; margin:.25rem 0 1rem 0;
     box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
     background:linear-gradient(90deg, var(--bg-card) 0% 55%, transparent 55% 100%);
   }
-  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; color:var(--text); }
-  .hero-title{ font-size:clamp(22px,3.3vw,42px); font-weight:800; margin:0; font-family:inherit; }
-  .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); font-family:inherit; }
-  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:40%; }
-  .sn-logo{ height:48px; width:auto; display:block; }
-  .callout{border-left:4px solid;border-radius:10px;padding:10px 12px;margin:10px 0}
-  .callout.warn{background:#FFF7ED;border-color:#F97316;color:#7C2D12}
-  .review-card{
-    background:var(--bg-card);
-    border-radius:12px; padding:16px; margin:16px 0 24px;
-    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
-  }
-  .badge{
-    display:inline-flex; align-items:center; gap:.4ch;
-    padding:6px 12px; border-radius:10px; font-weight:600; font-size:.94rem;
-    border:1.6px solid var(--border); background:var(--bg-tile);
-  }
+  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:10px 18px; }
+  .hero-title{ font-size:clamp(22px,3.2vw,38px); font-weight:800; margin:0; }
+  .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); }
+  .sn-logo{ height:46px; width:auto; display:block; opacity:.9; }
 </style>
-"""
-st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# ---------- Helpers ----------
-NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
 
-def model_supports_temperature(model_id: str) -> bool:
-    return model_id not in NO_TEMP_MODELS and not str(model_id).startswith("gpt-5")
+# ---------------- Small helpers ----------------
+def _is_empty_cell(v) -> bool:
+    if pd.isna(v): return True
+    s = str(v).strip()
+    return s == "" or s.upper() in {"NA", "N/A", "NULL", "NONE", "-", "--"}
 
-def clean_text(x: str, keep_na: bool = False) -> str:
-    if pd.isna(x): return pd.NA if keep_na else ""
-    s = str(x)
-    if _HAS_FTFY:
-        try: s = _ftfy_fix(s)
-        except Exception: pass
-    if any(ch in s for ch in ("Ã","Â","â","ï","€","™")):
-        try:
-            repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-            if repaired.strip(): s = repaired
-        except Exception: pass
-    rep = {"â€™":"'", "â€˜":"‘", "â€œ":"“", "â€\x9d":"”", "â€“":"–", "â€”":"—", "Â":""}
-    for bad, good in rep.items(): s = s.replace(bad, good)
-    s = s.strip()
-    if s.upper() in {"<NA>","NA","N/A","NULL","NONE"}:
-        return pd.NA if keep_na else ""
-    return s
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
-def find_symptom_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    names = df.columns.tolist()
-    sym_cols = [c for c in names if re.fullmatch(r"Symptom\s+([1-9]|1[0-9]|20)", str(c).strip(), re.I)]
-    if len(sym_cols) >= 20:
-        sym_cols_sorted = sorted(sym_cols, key=lambda c: int(re.findall(r"\d+", c)[0]))
-        return sym_cols_sorted[:10], sym_cols_sorted[10:20]
-    idx = list(range(10, 30))  # K..AD
-    cols = [names[i] for i in idx if i < len(names)]
-    return cols[:10], cols[10:20]
+def _escape_md(s: str) -> str:
+    # minimal safe markdown escape for inline text
+    return re.sub(r'([_*`>])', r'\\\1', s)
 
-def read_symptom_library(xls_bytes: bytes) -> Tuple[List[str], List[str]]:
-    try:
-        xls = pd.ExcelFile(io.BytesIO(xls_bytes))
-        if "Symptoms" not in xls.sheet_names:
-            return [], []
-        sheet = pd.read_excel(xls, sheet_name="Symptoms")
-        cols = [c for c in sheet.columns if str(c).strip()]
-        dl, dt = [], []
-        if any("delight" in str(c).lower() for c in cols):
-            for c in cols:
-                if "delight" in str(c).lower():
-                    dl = [clean_text(v) for v in sheet[c].dropna().astype(str).tolist() if clean_text(v)]
-                if "detract" in str(c).lower():
-                    dt = [clean_text(v) for v in sheet[c].dropna().astype(str).tolist() if clean_text(v)]
-        else:
-            if len(cols) >= 2:
-                dl = [clean_text(v) for v in sheet[cols[0]].dropna().astype(str).tolist() if clean_text(v)]
-                dt = [clean_text(v) for v in sheet[cols[1]].dropna().astype(str).tolist() if clean_text(v)]
-        def _uniq(seq):
-            seen=set(); out=[]
-            for s in seq:
-                t=s.strip()
-                if t and t.lower() not in seen:
-                    seen.add(t.lower()); out.append(t)
-            return out
-        return _uniq(dl), _uniq(dt)
-    except Exception:
-        return [], []
 
-CONFLICT_GROUPS = [
-    {"canonical": "Learning curve",
-     "aliases": ["Initial difficulty", "Setup confusion", "First-use confusion"]},
-    {"canonical": "Price/value",
-     "aliases": ["Price mismatch", "Too expensive", "Cost"]},
-    {"canonical": "Effectiveness - Frizz Free",
-     "aliases": ["Not effective - frizz fighting", "Anti-frizz performance"]},
-]
-
-def _apply_conflict_dedupe(items: List[Tuple[str, float]], sim_cut: float = 0.90) -> List[Tuple[str, float]]:
-    canon = {}
-    for g in CONFLICT_GROUPS:
-        base = g["canonical"].lower()
-        for a in [g["canonical"], *g.get("aliases", [])]:
-            canon[a.lower()] = base
-    grouped = {}
-    for label, score in items:
-        key = canon.get(label.lower(), label.lower())
-        if key not in grouped or score > grouped[key][1]:
-            grouped[key] = (label, score)
-    labels = [v[0] for v in grouped.values()]
-    scores = [v[1] for v in grouped.values()]
-    def jacc(a: str, b: str) -> float:
-        sa, sb = set(a.lower().split()), set(b.lower().split())
-        return 0.0 if not sa or not sb else len(sa & sb) / len(sa | sb)
-    kept: List[Tuple[str, float]] = []
-    for li, si in zip(labels, scores):
-        if any(jacc(li, lj) >= 0.80 for lj, _ in kept):
-            continue
-        kept.append((li, si))
-    return kept
-
-def _norm(s): return re.sub(r"\s+", " ", str(s or "")).strip()
-
-# ---------- LLM Extraction ----------
-def llm_extract_symptoms(cli, model, review_text: str,
-                         allowed_delighters: List[str], allowed_detractors: List[str],
-                         max_each: int, require_evidence: bool, conserv_thresh: float):
-    if not cli:
-        return {"delighters": [], "detractors": [], "new_candidates": {"delighters": [], "detractors": []}}
-    sys = (
-        "You are SharkNinja's review tagger. Select symptoms ONLY from the provided lists.\n"
-        "If evidence is weak or ambiguous, ABSTAIN. Never guess.\n"
-        "Return at most the requested number per section. Provide a short exact quote for each selection.\n"
-        "If something clear is NOT in the lists, place it in new_candidates (do not include it in main lists).\n"
-        "Avoid near-duplicates; prefer canonical phrasing (e.g., 'Learning curve' over 'Initial difficulty').\n"
-        "Include numeric confidence 0.0–1.0 for each item."
-    )
-    user = {
-        "review": review_text,
-        "allowed": {"delighters": allowed_delighters, "detractors": allowed_detractors},
-        "max_each": max_each,
-        "require_quote": require_evidence,
-        "confidence_floor": conserv_thresh,
-        "format": {
-            "delighters": [{"symptom": "string", "quote": "string", "confidence": 0.0}],
-            "detractors": [{"symptom": "string", "quote": "string", "confidence": 0.0}],
-            "new_candidates": {"delighters": ["string"], "detractors": ["string"]}
-        }
-    }
-    req = {
-        "model": model,
-        "messages": [{"role": "system", "content": sys},
-                     {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
-        "response_format": {"type": "json_object"},
-    }
-    if model_supports_temperature(model):
-        req["temperature"] = 0.2  # safe-ish for non-GPT-5 models
-    try:
-        out = cli.chat.completions.create(**req)
-        return json.loads(out.choices[0].message.content or "{}")
-    except Exception:
-        return {"delighters": [], "detractors": [], "new_candidates": {"delighters": [], "detractors": []}}
-
-def _filter_side(items_json: List[Dict], side_key: str, review_text: str,
-                 stars: float, conservative: float, require_evidence: bool,
-                 block_duplicates: bool, max_each: int) -> List[Tuple[str, float, str]]:
-    out: List[Tuple[str, float, str]] = []
-    txt_lower = review_text.lower()
-    for it in items_json or []:
-        label = _norm(it.get("symptom"))
-        quote = _norm(it.get("quote"))
-        conf = float(it.get("confidence") or 0.0)
-        if not label:
-            continue
-        if require_evidence and (not quote or quote.lower() not in txt_lower):
-            continue
-        if not math.isnan(stars):
-            if side_key == "delighters" and stars <= 2:
-                conf -= 0.08
-            if side_key == "detractors" and stars >= 4:
-                conf -= 0.08
-        if conf >= conservative:
-            out.append((label, conf, quote))
-    if block_duplicates:
-        pared = _apply_conflict_dedupe([(l, c) for (l, c, _) in out])
-        keep = {l for (l, _) in pared}
-        out = [t for t in out if t[0] in keep]
-    out.sort(key=lambda x: x[1], reverse=True)
-    return out[:max_each]
-
-# ---------- Sidebar ----------
-st.sidebar.header("📁 Upload Star Walk File")
-uploaded_file = st.sidebar.file_uploader("Choose Excel (.xlsx)", type=["xlsx"])
-
-st.sidebar.subheader("⚙️ Processing")
-batch_size = st.sidebar.slider("Reviews to process per request", 1, 20, 10, help="Process a subset each time.")
-
-st.sidebar.subheader("🎯 Accuracy Controls")
-conservative = st.sidebar.slider("Conservativeness (higher = fewer, surer picks)", 0.50, 0.95, 0.80, 0.01)
-require_evidence = st.sidebar.checkbox("Require explicit quote in text", value=True)
-block_duplicates = st.sidebar.checkbox("Block near-duplicate symptoms", value=True)
-max_per_side = st.sidebar.slider("Max per side (Delighters / Detractors)", 1, 10, 6)
-
-st.sidebar.subheader("🤖 Model")
-_model_choices = [
-    ("Fast & economical – 4o-mini", "gpt-4o-mini"),
-    ("Balanced – 4o", "gpt-4o"),
-    ("Advanced – 4.1", "gpt-4.1"),
-    ("Most advanced – GPT-5", "gpt-5"),
-    ("GPT-5 (Chat latest)", "gpt-5-chat-latest"),
-]
-_default_model = st.session_state.get("llm_model", "gpt-4o-mini")
-_default_idx = next((i for i, (_, mid) in enumerate(_model_choices) if mid == _default_model), 0)
-label_choice = st.sidebar.selectbox("Model", options=[l for (l, _) in _model_choices], index=_default_idx)
-selected_model = dict(_model_choices)[label_choice]
-st.session_state["llm_model"] = selected_model
-
-if model_supports_temperature(selected_model):
-    st.sidebar.caption("Temperature set internally to 0.2 for consistency.")
-else:
-    st.sidebar.caption("This model ignores temperature (fixes unsupported 'temperature' error).")
-
-# ---------- Body: Guard on upload ----------
-if not uploaded_file:
-    st.info("Upload your Excel file to begin.")
-    st.stop()
-
-# Read workbook bytes (we keep it to preserve formatting later)
-xls_bytes = uploaded_file.getvalue()
-df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=None)
-
-# Choose primary sheet
-sheet_name = "Star Walk scrubbed verbatims" if "Star Walk scrubbed verbatims" in df else list(df.keys())[0]
-data = df[sheet_name].copy()
-
-# Clean basic fields
-for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-    if col in data.columns: data[col] = data[col].astype("string").str.upper()
-if "Star Rating" in data.columns:
-    data["Star Rating"] = pd.to_numeric(data["Star Rating"], errors="coerce")
-if "Verbatim" in data.columns:
-    data["Verbatim"] = data["Verbatim"].astype("string").map(clean_text)
-
-# Symptom columns
-det_cols, del_cols = find_symptom_columns(data)
-all_symptom_cols = det_cols + del_cols
-
-def row_is_missing_symptoms(row) -> bool:
-    subset = row[all_symptom_cols] if set(all_symptom_cols).issubset(row.index) else pd.Series(dtype=object)
-    if subset.empty: return False
-    return subset.replace("", np.nan).isna().all()
-
-missing_mask = data.apply(row_is_missing_symptoms, axis=1) if all_symptom_cols else pd.Series(False, index=data.index)
-missing_indices = data.index[missing_mask].tolist()
-missing_count = int(missing_mask.sum())
-
-# Read library from "Symptoms" sheet
-lib_delighters, lib_detractors = read_symptom_library(xls_bytes)
-
-# ---------- Hero + Summary ----------
-logo_html = (
-    '<img class="sn-logo" '
-    'src="https://upload.wikimedia.org/wikipedia/commons/e/ea/SharkNinja_logo.svg" '
-    'alt="SharkNinja logo" />'
-)
-st_html(f"""
+# ---------------- Header ----------------
+st.markdown("""
 <div class="hero-wrap">
   <div class="hero-inner">
     <div>
-      <h1 class="hero-title">Star Walk Analysis Dashboard</h1>
-      <div class="hero-sub">Insights, trends, and ratings — fast.</div>
+      <div class="hero-title">Star Walk — Symptomize Reviews</div>
+      <div class="hero-sub">Upload your workbook, detect reviews without symptoms, and let AI suggest precise delighters & detractors.</div>
     </div>
-    <div class="hero-right">{logo_html}</div>
+    <div><img class="sn-logo" src="https://upload.wikimedia.org/wikipedia/commons/e/ea/SharkNinja_logo.svg" alt="SharkNinja"></div>
   </div>
 </div>
-""", height=160)
+""", unsafe_allow_html=True)
 
-# Snapshot cards
-def pct_12(series: pd.Series) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    return float((s <= 2).mean() * 100) if not s.empty else 0.0
 
-def section_stats(sub: pd.DataFrame) -> Tuple[int, float, float]:
-    cnt = len(sub)
-    if cnt == 0 or "Star Rating" not in sub.columns: return 0, 0.0, 0.0
-    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
-    pct = pct_12(sub["Star Rating"])
-    return cnt, avg, pct
+# ---------------- Sidebar: Upload ----------------
+st.sidebar.header("📁 Upload Star Walk File")
+uploaded = st.sidebar.file_uploader("Choose Excel File", type=["xlsx"], accept_multiple_files=False)
 
-all_cnt, all_avg, all_low = section_stats(data)
+# Keep original bytes (so we can write back with formatting)
+if uploaded and "uploaded_bytes" not in st.session_state:
+    uploaded.seek(0)
+    st.session_state["uploaded_bytes"] = uploaded.read()
+    uploaded.seek(0)
 
-st.markdown("### ⭐ Star Rating Metrics")
-def card_html(title, count, avg, pct):
-    return textwrap.dedent(f"""
-    <div class="review-card" style="display:flex;justify-content:space-between;align-items:center">
-      <div><b>{title}</b><br/><span class="badge">Count: {count:,}</span></div>
-      <div><span class="badge">Avg ★ {avg:.1f}</span> <span class="badge">% 1–2★ {pct:.1f}%</span></div>
-    </div>
-    """)
-st.markdown(card_html("All Reviews", all_cnt, all_avg, all_low), unsafe_allow_html=True)
+if not uploaded:
+    st.info("Upload a `.xlsx` workbook to begin.")
+    st.stop()
 
-# IQR of max chars per review
-st.markdown("#### 🧪 Review Length IQR")
-if "Verbatim" in data.columns and not data["Verbatim"].dropna().empty:
-    lens = data["Verbatim"].fillna("").astype(str).map(len)
-    q1, q3 = np.percentile(lens, [25, 75])
-    iqr = q3 - q1
-    st.write(f"IQR (characters): **{int(iqr)}** — Q1: {int(q1)}, Q3: {int(q3)}. Max: {int(lens.max())}")
-else:
-    st.write("No review text found to compute IQR.")
-
-# ---------- “Missing Symptoms” banner ----------
-st.markdown("---")
-st.markdown(f"### 🧩 {missing_count} reviews missing symptoms")
-st.caption("Only **Symptom 1–10 = Detractors** and **Symptom 11–20 = Delighters** will be filled (≤10 each side).")
-
-# ---------- Session state ----------
-if "symp_suggestions" not in st.session_state:
-    st.session_state.symp_suggestions = {}  # ridx -> payload
-if "ema_secs_per_review" not in st.session_state:
-    st.session_state.ema_secs_per_review = 1.2
-if "processed_rows" not in st.session_state:
-    st.session_state.processed_rows = set()
-
-# ---------- Controls row ----------
-c1, c2, c3, _ = st.columns([1,1,1,3])
-with c1:
-    do_process = st.button(f"✨ Symptomize next {min(batch_size, max(0, missing_count - len(st.session_state.processed_rows)))} review(s)", use_container_width=True)
-with c2:
-    clear_suggestions = st.button("🧹 Clear pending suggestions", use_container_width=True)
-with c3:
-    apply_now = st.button("✅ Apply approved to sheet", use_container_width=True)
-
-# ---------- Processing batch ----------
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-cli = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
-
-if clear_suggestions:
-    st.session_state.symp_suggestions = {}
-    st.session_state.processed_rows = set()
-    st.success("Cleared pending suggestions.")
-
-if do_process:
-    if not cli:
-        st.warning("OpenAI not configured. Set `OPENAI_API_KEY` to enable symptomization.")
-    else:
-        todo = [i for i in missing_indices if i not in st.session_state.processed_rows][:batch_size]
-        if not todo:
-            st.info("No more missing-symptom reviews to process in this batch.")
-        else:
-            status = st.empty()
-            prog = st.progress(0.0)
-            t0 = time.time()
-            for k, ridx in enumerate(todo, start=1):
-                row = data.loc[ridx]
-                txt = clean_text(row.get("Verbatim", ""))
-                stars = float(row.get("Star Rating")) if pd.notna(row.get("Star Rating")) else float("nan")
-                t_start = time.time()
-
-                result = llm_extract_symptoms(
-                    cli, selected_model, txt,
-                    lib_delighters, lib_detractors,
-                    max_each=max_per_side,
-                    require_evidence=require_evidence,
-                    conserv_thresh=conservative
-                )
-                dels = _filter_side(result.get("delighters"), "delighters", txt, stars,
-                                    conservative, require_evidence, block_duplicates, max_per_side)
-                dets = _filter_side(result.get("detractors"), "detractors", txt, stars,
-                                    conservative, require_evidence, block_duplicates, max_per_side)
-
-                st.session_state.symp_suggestions[ridx] = {
-                    "del": dels, "det": dets,
-                    "new_del": list(dict.fromkeys([_norm(x) for x in (result.get("new_candidates", {}).get("delighters") or []) if _norm(x)])),
-                    "new_det": list(dict.fromkeys([_norm(x) for x in (result.get("new_candidates", {}).get("detractors") or []) if _norm(x)])),
-                    "text": txt,
-                    "stars": stars,
-                }
-                st.session_state.processed_rows.add(ridx)
-
-                # timing + ETA
-                dt = max(0.05, time.time() - t_start)
-                alpha = 0.35
-                st.session_state.ema_secs_per_review = (1 - alpha) * st.session_state.ema_secs_per_review + alpha * dt
-                remaining = len(todo) - k
-                eta = remaining * st.session_state.ema_secs_per_review
-                status.write(f"Processed {k}/{len(todo)} • ~{eta:.1f}s remaining")
-                prog.progress(k / len(todo))
-
-            status.write("Batch complete.")
-            prog.progress(1.0)
-            st.success(f"Processed {len(todo)} review(s).")
-
-# ---------- Approval UI ----------
-def _safe_html_block(text: str) -> str:
-    # Escape and keep line breaks
-    return _html.escape(text or "").replace("\n", "<br>")
-
-if st.session_state.symp_suggestions:
-    st.markdown("## 🔎 Review & Approve Suggestions")
-    for ridx, pack in st.session_state.symp_suggestions.items():
-        txt = pack.get("text", "")
-        stars = pack.get("stars", float("nan"))
-        dels = pack.get("del", [])
-        dets = pack.get("det", [])
-        new_del = pack.get("new_del", [])
-        new_det = pack.get("new_det", [])
-
-        with st.expander(f"Review #{ridx} • Stars: {stars if not math.isnan(stars) else '–'} • {len(dels)} delighters / {len(dets)} detractors", expanded=False):
-            st.markdown("**Full review:**", help="Quoted evidence must appear in the review to be accepted (if that setting is enabled).")
-            st.markdown(
-                f"<div class='review-card' style='background:var(--bg-tile);'>{_safe_html_block(txt)}</div>",
-                unsafe_allow_html=True
-            )
-
-            a1, a2 = st.columns(2)
-            with a1:
-                st.markdown("**Delighters (checked = approve)**")
-                keep_del = []
-                for lab, conf, quote in dels:
-                    if st.checkbox(f"{lab} — {conf:.2f}", key=f"del_{ridx}_{lab}", value=True,
-                                   help=f'Evidence: "{quote}"'):
-                        keep_del.append(lab)
-            with a2:
-                st.markdown("**Detractors (checked = approve)**")
-                keep_det = []
-                for lab, conf, quote in dets:
-                    if st.checkbox(f"{lab} — {conf:.2f}", key=f"det_{ridx}_{lab}", value=True,
-                                   help=f'Evidence: "{quote}"'):
-                        keep_det.append(lab)
-
-            if new_del or new_det:
-                st.markdown("---")
-                st.markdown("**New candidate symptoms detected (not in library):**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if new_del:
-                        st.caption("Proposed Delighters")
-                        for s in new_del:
-                            st.checkbox(f"Approve: {s}", key=f"newdel_{ridx}_{s}", value=False)
-                with c2:
-                    if new_det:
-                        st.caption("Proposed Detractors")
-                        for s in new_det:
-                            st.checkbox(f"Approve: {s}", key=f"newdet_{ridx}_{s}", value=False)
-
-# ---------- Apply selections to DataFrame & Excel ----------
-def write_symptoms_to_df(df_in: pd.DataFrame, ridx: int, detractors: List[str], delighters: List[str],
-                         det_cols: List[str], del_cols: List[str]):
-    for i in range(10):
-        col = det_cols[i] if i < len(det_cols) else None
-        if col: df_in.at[ridx, col] = detractors[i] if i < len(detractors) else ""
-    for j in range(10):
-        col = del_cols[j] if j < len(del_cols) else None
-        if col: df_in.at[ridx, col] = delighters[j] if j < len(delighters) else ""
-
-def apply_to_library(xls_path: str, approve_map: Dict[str, List[str]]):
+# ---------------- Load DataFrame ----------------
+# Prefer sheet "Star Walk scrubbed verbatims", fallback to first
+try:
     try:
-        wb = load_workbook(xls_path)
-        if "Symptoms" not in wb.sheetnames:
-            return
-        ws = wb["Symptoms"]
-        headers = [str(c.value).strip().lower() if c.value else "" for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        try:
-            del_idx = headers.index(next(h for h in headers if "delight" in h))
-        except StopIteration:
-            del_idx = 0
-        try:
-            det_idx = headers.index(next(h for h in headers if "detract" in h))
-        except StopIteration:
-            det_idx = 1
-        max_row = ws.max_row
-        existing_del = set()
-        existing_det = set()
-        for r in range(2, max_row + 1):
-            v1 = ws.cell(row=r, column=del_idx+1).value
-            v2 = ws.cell(row=r, column=det_idx+1).value
-            if v1: existing_del.add(str(v1).strip().lower())
-            if v2: existing_det.add(str(v2).strip().lower())
-        add_del = [s for s in approve_map.get("delighters", []) if s.lower() not in existing_del]
-        add_det = [s for s in approve_map.get("detractors", []) if s.lower() not in existing_det]
-        row_ptr = max_row + 1
-        for s in add_del:
-            ws.cell(row=row_ptr, column=del_idx+1, value=s); row_ptr += 1
-        row_ptr = max_row + 1
-        for s in add_det:
-            ws.cell(row=row_ptr, column=det_idx+1, value=s); row_ptr += 1
-        wb.save(xls_path)
+        df = pd.read_excel(uploaded, sheet_name="Star Walk scrubbed verbatims")
+    except ValueError:
+        df = pd.read_excel(uploaded)
+except Exception as e:
+    st.error(f"Could not read the Excel file: {e}")
+    st.stop()
+
+# Robust Symptom column detection
+explicit_cols = [f"Symptom {i}" for i in range(1, 21)]
+SYMPTOM_COLS = [c for c in explicit_cols if c in df.columns]
+if not SYMPTOM_COLS and len(df.columns) >= 30:
+    # Fallback to K–AD (0-based col index 10..29 inclusive)
+    SYMPTOM_COLS = df.columns[10:30].tolist()
+
+if not SYMPTOM_COLS:
+    st.error("Couldn't locate Symptom 1–20 columns. Please ensure the sheet has those columns or that columns K–AD are the symptoms.")
+    st.stop()
+
+# Detect rows with ALL symptom cells empty
+mask_empty = df[SYMPTOM_COLS].applymap(_is_empty_cell).all(axis=1)
+missing_idx = df.index[mask_empty].tolist()
+missing_count = len(missing_idx)
+
+# Show upload success + quick metrics
+with st.container():
+    st.success("File uploaded successfully.")
+    # IQR of review lengths (for QA visibility)
+    text_series = df.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str)
+    lengths = text_series.str.len()
+    if not lengths.empty:
+        q1 = lengths.quantile(0.25)
+        q3 = lengths.quantile(0.75)
+        iqr = q3 - q1
+        st.caption(f"Review length IQR (chars): Q1={int(q1)}, Q3={int(q3)}, IQR={int(iqr)}.")
+
+
+# ---------------- Load Allowed Symptoms from "Symptoms" sheet ----------------
+def load_symptom_lists_from_workbook(raw_bytes: bytes) -> Tuple[List[str], List[str]]:
+    try:
+        xls = pd.ExcelFile(io.BytesIO(raw_bytes))
+        target = None
+        for name in xls.sheet_names:
+            if name.strip().lower() in {"symptoms", "symptom", "symptom sheet", "symptom tab"}:
+                target = name
+                break
+        if not target:
+            return [], []
+        s = pd.read_excel(xls, target)
+        cols = {c.lower().strip(): c for c in s.columns}
+        dels = s[cols.get("delighters")] if "delighters" in cols else s.get("Delighters")
+        dets = s[cols.get("detractors")] if "detractors" in cols else s.get("Detractors")
+        del_list = [str(x).strip() for x in (dels or pd.Series(dtype=str)).dropna().tolist() if str(x).strip()]
+        det_list = [str(x).strip() for x in (dets or pd.Series(dtype=str)).dropna().tolist() if str(x).strip()]
+        return del_list, det_list
     except Exception:
-        pass
+        return [], []
 
-def build_colmap_from_sheet(xls_bytes: bytes, sheetname: str) -> Dict[str, int]:
-    wb = load_workbook(io.BytesIO(xls_bytes), read_only=False)
-    if sheetname not in wb.sheetnames: sheetname = wb.sheetnames[0]
-    ws = wb[sheetname]
-    header_row = next(ws.iter_rows(min_row=1, max_row=1))
-    mapping = {}
-    for idx, cell in enumerate(header_row, start=1):
-        label = str(cell.value).strip() if cell.value else ""
-        if label: mapping[label] = idx
-    return mapping
+ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS = load_symptom_lists_from_workbook(
+    st.session_state.get("uploaded_bytes", b"")
+)
+ALLOWED_DELIGHTERS_SET = set(ALLOWED_DELIGHTERS)
+ALLOWED_DETRACTORS_SET = set(ALLOWED_DETRACTORS)
 
-def save_preserving_format(xls_bytes: bytes, out_path: str, df_updated: pd.DataFrame,
-                           sheetname: str, rows_to_update: List[int],
-                           col_map: Dict[str, int], det_cols: List[str], del_cols: List[str]):
-    wb = load_workbook(io.BytesIO(xls_bytes))
-    if sheetname not in wb.sheetnames:
-        sheetname = wb.sheetnames[0]
-    ws = wb[sheetname]
+# ---------------- Controls (top bar) ----------------
+top = st.container()
+with top:
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
 
-    # Map df positional index -> worksheet row (header row is 1, first data row is 2)
-    pos_map = {pos: 2 + pos for pos in range(len(df_updated))}
-    # For each ridx, get its position in the current df.index
-    for ridx in rows_to_update:
+    with c1:
+        st.markdown(f"**{missing_count}** reviews have all **Symptom 1–20** empty.")
+    with c2:
+        batch_n = st.slider("How many to process this run", 1, 20, min(10, max(1, missing_count)) if missing_count else 10)
+    with c3:
+        model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
+    with c4:
+        # rough request/time estimate
+        reqs = min(batch_n, missing_count)
+        # very conservative throughput estimate (per-review seconds) by model
+        spd = 1.2 if model_choice in {"gpt-4o-mini", "gpt-4o"} else (1.6 if model_choice == "gpt-4.1" else 2.2)
+        secs = int(round(reqs * spd))
+        st.caption(f"Est. requests: {reqs} • Rough time: ~{secs}s (single batch).")
+
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+if missing_count and not _HAS_OPENAI:
+    st.warning("Install `openai` and set `OPENAI_API_KEY` to enable AI labeling.")
+if missing_count and _HAS_OPENAI and not api_key:
+    st.warning("Set `OPENAI_API_KEY` (env or secrets) to enable AI labeling.")
+
+# ---------------- Session state for suggestions/selection ----------------
+st.session_state.setdefault("symptom_suggestions", [])    # list of dicts
+st.session_state.setdefault("sug_selected", set())        # set of indices in suggestions list
+
+# ---------------- LLM picker ----------------
+def _dedupe_keep_top(items: List[Tuple[str, float]], top_n: int = 10, min_conf: float = 0.58) -> List[str]:
+    """Drop near-duplicates (SequenceMatcher>0.9) and low-confidence."""
+    items = [(n, c) for (n, c) in items if c >= min_conf]
+    kept: List[Tuple[str, float]] = []
+    for n, c in sorted(items, key=lambda x: -x[1]):
+        n_norm = _normalize_name(n)
+        if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.90 for k, _ in kept):
+            kept.append((n, c))
+        if len(kept) >= top_n:
+            break
+    return [n for n, _ in kept]
+
+def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]) -> Tuple[List[str], List[str]]:
+    if not review or (not allowed_del and not allowed_det):
+        return [], []
+
+    sys = (
+        "You label one review. Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.\n"
+        "Return JSON: {\"delighters\":[{\"name\":\"...\",\"confidence\":0-1},...],"
+        "\"detractors\":[{\"name\":\"...\",\"confidence\":0-1},...]}\n"
+        "Rules: (1) If not clearly present, omit. (2) Prefer precision over recall. "
+        "(3) Avoid near-duplicates (e.g., choose 'Learning curve' OR 'Initial difficulty', not both). "
+        "(4) If none, return empty arrays."
+    )
+    user = {
+        "review": review[:4000],
+        "stars": float(stars) if pd.notna(stars) else None,
+        "allowed_delighters": allowed_del[:60],
+        "allowed_detractors": allowed_det[:60]
+    }
+
+    # Try OpenAI; if it fails, fall back to simple keyword match
+    if _HAS_OPENAI and api_key:
         try:
-            pos = int(np.where(df_updated.index == ridx)[0][0])
-        except Exception:
-            continue
-        ws_row = pos_map.get(pos)
-        if ws_row is None:
-            continue
-        # Detractors 1..10
-        for i in range(10):
-            colname = det_cols[i] if i < len(det_cols) else None
-            if colname and colname in col_map:
-                val = df_updated.at[ridx, colname]
-                ws.cell(row=ws_row, column=col_map[colname], value=(val if val != "" else None))
-        # Delighters 11..20
-        for j in range(10):
-            colname = del_cols[j] if j < len(del_cols) else None
-            if colname and colname in col_map:
-                val = df_updated.at[ridx, colname]
-                ws.cell(row=ws_row, column=col_map[colname], value=(val if val != "" else None))
-
-    wb.save(out_path)
-
-if apply_now and st.session_state.symp_suggestions:
-    updated_rows = []
-    approved_new_del = []
-    approved_new_det = []
-    for ridx, pack in st.session_state.symp_suggestions.items():
-        keep_del, keep_det = [], []
-        for lab, conf, quote in pack.get("del", []):
-            if st.session_state.get(f"del_{ridx}_{lab}", False):
-                keep_del.append(lab)
-        for lab, conf, quote in pack.get("det", []):
-            if st.session_state.get(f"det_{ridx}_{lab}", False):
-                keep_det.append(lab)
-        write_symptoms_to_df(data, ridx, detractors=keep_det[:10], delighters=keep_del[:10],
-                             det_cols=det_cols, del_cols=del_cols)
-        if keep_del or keep_det:
-            updated_rows.append(ridx)
-        for s in pack.get("new_del", []):
-            if st.session_state.get(f"newdel_{ridx}_{s}", False):
-                approved_new_del.append(s)
-        for s in pack.get("new_det", []):
-            if st.session_state.get(f"newdet_{ridx}_{s}", False):
-                approved_new_det.append(s)
-
-    if not updated_rows and not (approved_new_del or approved_new_det):
-        st.info("No changes selected.")
-    else:
-        out_path = "/mnt/data/StarWalk_symptomized.xlsx"
-        colmap = build_colmap_from_sheet(xls_bytes, sheet_name)
-        try:
-            save_preserving_format(
-                xls_bytes, out_path, data, sheet_name, updated_rows, colmap, det_cols, del_cols
+            client = OpenAI(api_key=api_key)
+            req = dict(
+                model=model_choice,
+                messages=[{"role":"system","content":sys},
+                          {"role":"user","content":json.dumps(user)}],
+                response_format={"type":"json_object"}
             )
-            if approved_new_del or approved_new_det:
-                apply_to_library(
-                    out_path,
-                    {"delighters": list(dict.fromkeys(approved_new_del)),
-                     "detractors": list(dict.fromkeys(approved_new_det))}
-                )
-            st.success("Updates applied. You can download the updated workbook below.")
-            with open(out_path, "rb") as f:
-                st.download_button("⬇️ Download updated Excel", f, file_name="StarWalk_symptomized.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.error(f"Failed to write Excel with preserved formatting: {e}")
-            csv_bytes = data.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("⬇️ Download updated data (CSV fallback)", csv_bytes,
-                               file_name="StarWalk_symptomized.csv", mime="text/csv")
+            # Skip temperature for GPT-5 to avoid 400 unsupported_value
+            if not str(model_choice).startswith("gpt-5"):
+                req["temperature"] = 0.2
 
-# ---------- Simple distribution chart ----------
-st.markdown("---")
-st.markdown("### 📊 Star Rating Distribution")
-if "Star Rating" in data.columns:
-    star_counts = pd.to_numeric(data["Star Rating"], errors="coerce").dropna().value_counts().sort_index()
-else:
-    star_counts = pd.Series([], dtype="int")
-total_reviews = len(data)
-percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
-star_labels = [f"{int(star)} stars" for star in star_counts.index]
-fig_bar_horizontal = go.Figure(go.Bar(
-    x=star_counts.values, y=star_labels, orientation="h",
-    text=[f"{value} reviews ({percentages.get(idx, 0)}%)"
-          for idx, value in zip(star_counts.index, star_counts.values)],
-    textposition="auto",
-    marker=dict(color=["#EF4444", "#F59E0B", "#EAB308", "#10B981", "#22C55E"]),
-    hoverinfo="y+x+text"
-))
-fig_bar_horizontal.update_layout(
-    title="<b>Star Rating Distribution</b>",
-    xaxis=dict(title="Number of Reviews", showgrid=False),
-    yaxis=dict(title="Star Ratings", showgrid=False),
-    plot_bgcolor="white",
-    template="plotly_white",
-    margin=dict(l=40, r=40, t=45, b=40)
-)
-st.plotly_chart(fig_bar_horizontal, use_container_width=True)
+            out = client.chat.completions.create(**req)
+            content = out.choices[0].message.content or "{}"
+            data = json.loads(content)
+            dels_raw = data.get("delighters", []) or []
+            dets_raw = data.get("detractors", []) or []
+            dels = [(d.get("name","").strip(), float(d.get("confidence", 0))) for d in dels_raw if d.get("name")]
+            dets = [(d.get("name","").strip(), float(d.get("confidence", 0))) for d in dets_raw if d.get("name")]
 
-# ---------- Footer callout ----------
-st.markdown(
-    '<div class="callout warn">⚠️ AI can make mistakes. This tool abstains when evidence is weak and requires quotes (if enabled). Please review suggestions before applying.</div>',
-    unsafe_allow_html=True
-)
+            # Keep only items that exist in the allowed lists
+            dels = [(n, c) if n in ALLOWED_DELIGHTERS_SET else (n, 0.0) for n, c in dels]
+            dets = [(n, c) if n in ALLOWED_DETRACTORS_SET else (n, 0.0) for n, c in dets]
+
+            return _dedupe_keep_top(dels, 10), _dedupe_keep_top(dets, 10)
+        except Exception:
+            pass
+
+    # Fallback: conservative keyword overlap
+    text = " " + review.lower() + " "
+    def pick_from_allowed(allowed: List[str]) -> List[str]:
+        scored = []
+        for a in allowed:
+            a_norm = _normalize_name(a)
+            if not a_norm:
+                continue
+            toks = [t for t in a_norm.split() if len(t) > 2]
+            if not toks:
+                continue
+            score = sum(1 for t in toks if f" {t} " in text) / len(toks)
+            if score >= 0.75:  # conservative
+                scored.append((a, 0.60 + 0.4*score))
+        return _dedupe_keep_top(scored, 10)
+
+    return pick_from_allowed(allowed_del), pick_from_allowed(allowed_det)
+
+# ---------------- Symptomize action ----------------
+run_col = st.container()
+with run_col:
+    left, right = st.columns([1,4])
+    with left:
+        can_run = missing_count > 0 and (not _HAS_OPENAI or api_key is not None)
+        run = st.button(f"✨ Symptomize next {min(batch_n, missing_count)} review(s)", disabled=not can_run)
+    with right:
+        if missing_count == 0:
+            st.info("No empty-symptom reviews detected.")
+        elif not _HAS_OPENAI or not api_key:
+            st.info("Add OpenAI to your environment and set `OPENAI_API_KEY` to enable AI labeling.")
+
+# Process batch and store suggestions
+if run and missing_idx:
+    todo = missing_idx[:batch_n]
+    progress = st.progress(0)
+    status = st.empty()
+    for i, idx in enumerate(todo, start=1):
+        row = df.loc[idx]
+        review_txt = str(row.get("Verbatim", "") or "").strip()
+        stars = row.get("Star Rating", None)
+
+        dels, dets = _llm_pick(review_txt, stars, ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS)
+        st.session_state["symptom_suggestions"].append({
+            "row_index": int(idx),
+            "stars": float(stars) if pd.notna(stars) else None,
+            "review": review_txt,
+            "delighters": dels,
+            "detractors": dets
+        })
+        progress.progress(i / len(todo))
+        status.info(f"Processed {i}/{len(todo)}")
+    status.success("Done!")
+    st.rerun()
 
 
+# ---------------- Review & Approve UI ----------------
+sugs = st.session_state.get("symptom_suggestions", [])
+if sugs:
+    st.markdown("## 🔍 Review & Approve Suggestions")
+
+    with st.expander("Bulk actions", expanded=True):
+        cba1, cba2, cba3, cba4 = st.columns([1,1,2,3])
+        with cba1:
+            if st.button("Select all"):
+                st.session_state["sug_selected"] = set(range(len(sugs)))
+        with cba2:
+            if st.button("Clear selection"):
+                st.session_state["sug_selected"] = set()
+        with cba3:
+            if st.button("Keep only non-empty"):
+                st.session_state["sug_selected"] = {i for i, s in enumerate(sugs) if s["delighters"] or s["detractors"]}
+        with cba4:
+            max_apply = st.slider("Max rows to apply this click", 1, len(sugs), min(20, len(sugs)))
+
+    for i, s in enumerate(sugs):
+        lab = f"Review #{i} • Stars: {s.get('stars','-')} • {len(s['delighters'])} delighters / {len(s['detractors'])} detractors"
+        with st.expander(lab, expanded=(i == 0)):
+            # Selection checkbox
+            checked = i in st.session_state["sug_selected"]
+            if st.checkbox("Select for apply", value=checked, key=f"sel_{i}"):
+                st.session_state["sug_selected"].add(i)
+            else:
+                st.session_state["sug_selected"].discard(i)
+
+            # Full review (escaped)
+            review_block = _escape_md(s["review"]) if s["review"] else "*(empty)*"
+            st.markdown(f"**Full review:**\n\n> {review_block}")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("**Detractors (≤10)**")
+                st.code("; ".join(s["detractors"]) if s["detractors"] else "–")
+            with c2:
+                st.write("**Delighters (≤10)**")
+                st.code("; ".join(s["delighters"]) if s["delighters"] else "–")
+
+    if st.button("✅ Apply selected to DataFrame"):
+        picked = [i for i in st.session_state["sug_selected"]]
+        if not picked:
+            st.warning("Nothing selected.")
+        else:
+            picked = picked[:max_apply]
+            for i in picked:
+                s = sugs[i]
+                ri = s["row_index"]
+                # Write detractors to Symptom 1..10; delighters to 11..20
+                for j, name in enumerate(s["detractors"][:10], start=1):
+                    col = f"Symptom {j}"
+                    if col in df.columns:
+                        df.at[ri, col] = name
+                for j, name in enumerate(s["delighters"][:10], start=11):
+                    col = f"Symptom {j}"
+                    if col in df.columns:
+                        df.at[ri, col] = name
+            st.success(f"Applied {len(picked)} rows.")
+            # Clear selection for applied rows
+            for i in picked:
+                st.session_state["sug_selected"].discard(i)
+
+# ---------------- Download updated workbook (preserve formatting if possible) ----------------
+def offer_downloads():
+    st.markdown("### ⬇️ Download Updated Workbook")
+    base_btn_label = "Download updated workbook (.xlsx)"
+    if "uploaded_bytes" not in st.session_state:
+        st.info("Upload a workbook first.")
+        return
+
+    raw = st.session_state["uploaded_bytes"]
+
+    # Try to write back only Symptom columns using openpyxl (preserve styles)
+    if _HAS_OPENPYXL:
+        try:
+            bio = io.BytesIO(raw)
+            wb = load_workbook(bio)
+            data_sheet = "Star Walk scrubbed verbatims"
+            if data_sheet not in wb.sheetnames:
+                data_sheet = wb.sheetnames[0]
+            ws = wb[data_sheet]
+
+            # Header map
+            headers = {ws.cell(row=1, column=ci).value: ci for ci in range(1, ws.max_column + 1)}
+            def col_idx(name): return headers.get(name)
+
+            # Write back only the Symptom columns; assume data starts row 2
+            for df_row_idx, row in df.reset_index(drop=True).iterrows():
+                excel_row = 2 + df_row_idx
+                for c in SYMPTOM_COLS:
+                    ci = col_idx(c)
+                    if ci:
+                        ws.cell(row=excel_row, column=ci).value = row.get(c, None)
+
+            out = io.BytesIO()
+            wb.save(out)
+            st.download_button(base_btn_label, data=out.getvalue(),
+                               file_name="StarWalk_updated.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            return
+        except Exception:
+            pass
+
+    # Fallback (plain export; formatting not preserved)
+    out2 = io.BytesIO()
+    with pd.ExcelWriter(out2, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name="Star Walk scrubbed verbatims")
+    st.download_button(base_btn_label + " (no formatting)", data=out2.getvalue(),
+                       file_name="StarWalk_updated_basic.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+offer_downloads()
