@@ -148,7 +148,7 @@ st.markdown(
       .hero-right { display:flex; align-items:center; justify-content:flex-end; width:40%; }
 
       /* Dark scheme polish (apply only when user prefers dark) */
-      @media (prefers-color-scheme: dark){
+      @media (prefers-color-scheme: light){
         .metric-card, .metric-box, .review-card, .chat-q, .chat-a, .hero-wrap {
           background: rgba(255,255,255,0.06) !important;
           border-color: rgba(255,255,255,0.18) !important;
