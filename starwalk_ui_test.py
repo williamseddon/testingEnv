@@ -124,6 +124,17 @@ GLOBAL_CSS = """
   .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
   .review-card p{ margin:.25rem 0; line-height:1.5; }
 
+    /* ---- Review Cards ---- */
+  .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
+  .review-card p{ margin:.25rem 0; line-height:1.5; }
+
+  /* ---- Symptom badges (green = delighters, red = detractors) ---- */
+  .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+  .badge{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.85rem; border:1.5px solid transparent; }
+  .badge.pos{ background:#ecfdf5; border-color:#86efac; color:#065f46; }  /* green */
+  .badge.neg{ background:#fef2f2; border-color:#fca5a5; color:#7f1d1d; }  /* red */
+
+
   /* ---- Hero ---- */
   .hero-wrap{
     position:relative; overflow:hidden; border-radius:14px; min-height:150px; margin:.25rem 0 1rem 0;
