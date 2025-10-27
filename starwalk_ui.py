@@ -233,16 +233,14 @@ def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]
         return [], [], [], []
 
     sys = (
-        "You label one user review. Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
-"
-        "Return JSON: {\"delighters\":[{\"name\":\"...\",\"confidence\":0-1},...],"
-        "\"detractors\":[{\"name\":\"...\",\"confidence\":0-1},...]}
-"
+        "You label one user review. Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.\n"
+        'Return JSON: {"delighters":[{"name":"...","confidence":0-1},...],' 
+        '"detractors":[{"name":"...","confidence":0-1},...]}\n'
         "Rules: (1) If not clearly present, OMIT. (2) Prefer precision over recall. (3) Avoid near-duplicates."
     )
     user = {
         "review": review[:4000],
-        "stars": float(stars) if pd.notna(stars) else None,
+        "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
         "allowed_delighters": allowed_del[:80],
         "allowed_detractors": allowed_det[:80]
     }
@@ -252,12 +250,15 @@ def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]
     if _HAS_OPENAI and api_key:
         try:
             client = OpenAI(api_key=api_key)
-            req = dict(
-                model=model_choice,
-                messages=[{"role":"system","content":sys}, {"role":"user","content":json.dumps(user)}],
-                response_format={"type":"json_object"}
-            )
-            # GPT-5 rejects non-default temperature; omit in that case
+            req = {
+                "model": model_choice,
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": json.dumps(user)}
+                ],
+                "response_format": {"type": "json_object"}
+            }
+            # GPT-5 rejects non-default temperature; omit for that family
             if not str(model_choice).startswith("gpt-5"):
                 req["temperature"] = 0.2
             out = client.chat.completions.create(**req)
@@ -265,30 +266,41 @@ def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]
             data = json.loads(content)
             dels_raw = data.get("delighters", []) or []
             dets_raw = data.get("detractors", []) or []
-            dels_pairs = [(d.get("name",""), float(d.get("confidence",0))) for d in dels_raw if d.get("name")]
-            dets_pairs = [(d.get("name",""), float(d.get("confidence",0))) for d in dets_raw if d.get("name")]
-            # Partition into allowed vs novel; apply stricter threshold
-            for n,c in dels_pairs:
-                if n in ALLOWED_DELIGHTERS_SET: dels.append((n,c))
-                else: novel_dels.append((n,c))
-            for n,c in dets_pairs:
-                if n in ALLOWED_DETRACTORS_SET: dets.append((n,c))
-                else: novel_dets.append((n,c))
-            return _dedupe_keep_top(dels,10,min_conf), _dedupe_keep_top(dets,10,min_conf), _dedupe_keep_top(novel_dels,5,max(0.70,min_conf)), _dedupe_keep_top(novel_dets,5,max(0.70,min_conf))
+            dels_pairs = [(d.get("name", ""), float(d.get("confidence", 0))) for d in dels_raw if d.get("name")]
+            dets_pairs = [(d.get("name", ""), float(d.get("confidence", 0))) for d in dets_raw if d.get("name")]
+            for n, c in dels_pairs:
+                if n in ALLOWED_DELIGHTERS_SET:
+                    dels.append((n, c))
+                else:
+                    novel_dels.append((n, c))
+            for n, c in dets_pairs:
+                if n in ALLOWED_DETRACTORS_SET:
+                    dets.append((n, c))
+                else:
+                    novel_dets.append((n, c))
+            return (
+                _dedupe_keep_top(dels, 10, min_conf),
+                _dedupe_keep_top(dets, 10, min_conf),
+                _dedupe_keep_top(novel_dels, 5, max(0.70, min_conf)),
+                _dedupe_keep_top(novel_dets, 5, max(0.70, min_conf))
+            )
         except Exception:
             pass
 
-    # conservative keyword fallback
-    text = " "+review.lower()+" "
+    # Conservative keyword fallback (no-API)
+    text = " " + review.lower() + " "
     def pick_from_allowed(allowed: List[str]) -> List[str]:
         scored = []
         for a in allowed:
             a_norm = _normalize_name(a)
-            toks = [t for t in a_norm.split() if len(t)>2]
-            if not toks: continue
+            toks = [t for t in a_norm.split() if len(t) > 2]
+            if not toks:
+                continue
             score = sum(1 for t in toks if f" {t} " in text) / len(toks)
-            if score >= min_conf: scored.append((a, 0.60+0.4*score))
-        return _dedupe_keep_top(scored,10,min_conf)
+            if score >= min_conf:
+                scored.append((a, 0.60 + 0.4 * score))
+        return _dedupe_keep_top(scored, 10, min_conf)
+
     return pick_from_allowed(allowed_del), pick_from_allowed(allowed_det), [], []
 
 # ---------------- Run Symptomize ----------------
@@ -479,3 +491,4 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+
