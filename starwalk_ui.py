@@ -216,10 +216,9 @@ def _normalize_name(name: str) -> str:
 
 def _escape_md(s: str) -> str:
     # Escape Markdown special chars by prefixing a single backslash
-    # Avoid backreference syntax to keep this source safe for code-generation tools
     return re.sub(r'([_*`>])', lambda m: '\\' + m.group(1), s)
 
-# Conservative dedupe + cut to Ne + cut to N
+# Conservative dedupe + cut to N
 
 def _dedupe_keep_top(items: List[Tuple[str, float]], top_n: int = 10, min_conf: float = 0.60) -> List[str]:
     items = [(n, c) for (n, c) in items if c >= min_conf]
@@ -255,23 +254,17 @@ def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]
     if not review or (not allowed_del and not allowed_det):
         return [], [], [], []
 
-    sys = """You are labeling a single user review.
-Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
-Return JSON exactly like: {"delighters":[{"name":"...","confidence":0-1}], "detractors":[{"name":"...","confidence":0-1}]}
-Rules:
-1) If not clearly present, OMIT it.
-2) Prefer precision over recall; avoid stretch matches.
-3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
-4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
-""" If not clearly present, OMIT it.
-"
-        "2) Prefer precision over recall; avoid stretch matches.
-"
-        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
-"
-        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
-"
+    sys_prompt = (
+        "You are labeling a single user review.\n"
+        "Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.\n"
+        'Return JSON exactly like: {"delighters":[{"name":"...","confidence":0.0}], "detractors":[{"name":"...","confidence":0.0}]}\n'
+        "Rules:\n"
+        "1) If not clearly present, OMIT it.\n"
+        "2) Prefer precision over recall; avoid stretch matches.\n"
+        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').\n"
+        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.\n"
     )
+
     user = {
         "review": review[:4000],
         "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
@@ -287,7 +280,7 @@ Rules:
             req = {
                 "model": model_choice,
                 "messages": [
-                    {"role": "system", "content": sys},
+                    {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": json.dumps(user)}
                 ],
                 "response_format": {"type": "json_object"}
@@ -527,6 +520,7 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+
 
 
 
