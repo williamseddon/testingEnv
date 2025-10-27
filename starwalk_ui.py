@@ -142,35 +142,170 @@ q1 = verb_series.str.len().quantile(0.25) if not verb_series.empty else 0
 q3 = verb_series.str.len().quantile(0.75) if not verb_series.empty else 0
 IQR = (q3 - q1) if (q3 or q1) else 0
 
-# ---------------- Load symptom dictionary from "Symptoms" sheet if present ----------------
+# ---------------- Load symptom dictionary from "Symptoms" sheet (robust + user overrides) ----------------
+import io as _io
 
-def load_symptom_lists(raw_bytes: bytes) -> Tuple[list, list]:
+# Helpers to robustly find sheets/columns
+def _norm(s: str) -> str:
+    if s is None: return ""
+    return re.sub(r"[^a-z]+", "", str(s).lower()).strip()
+
+def _looks_like_symptom_sheet(name: str) -> bool:
+    return "symptom" in _norm(name)
+
+def _col_score(colname: str, want: str) -> int:
+    n = _norm(colname)
+    if not n: return 0
+    synonyms = {
+        "delighters": ["delight","delighters","pros","positive","positives","likes","good"],
+        "detractors": ["detract","detractors","cons","negative","negatives","dislikes","bad","issues"],
+    }
+    return max((1 for token in synonyms[want] if token in n), default=0)
+
+def _extract_from_df(df_sheet: pd.DataFrame):
+    """Try multiple layouts and return (delighters, detractors, debug)."""
+    debug = {"strategy": None, "columns": list(df_sheet.columns)}
+    # Strategy 1: fuzzy headers
+    best_del = None; best_det = None
+    for c in df_sheet.columns:
+        if _col_score(str(c), "delighters"): best_del = c if best_del is None else best_del
+        if _col_score(str(c), "detractors"): best_det = c if best_det is None else best_det
+    if best_del is not None or best_det is not None:
+        dels_ser = df_sheet.get(best_del, pd.Series(dtype=str)) if best_del is not None else pd.Series(dtype=str)
+        dets_ser = df_sheet.get(best_det, pd.Series(dtype=str)) if best_det is not None else pd.Series(dtype=str)
+        dels = [str(x).strip() for x in dels_ser.dropna().tolist() if str(x).strip()]
+        dets = [str(x).strip() for x in dets_ser.dropna().tolist() if str(x).strip()]
+        if dels or dets:
+            debug.update({"strategy":"fuzzy-headers","best_del_col":best_del,"best_det_col":best_det})
+            return dels, dets, debug
+    # Strategy 2: Type/Category + Item
+    type_col = None; item_col = None
+    for c in df_sheet.columns:
+        if _norm(c) in {"type","category","class","label"}: type_col = c
+        if _norm(c) in {"item","symptom","name","term","entry","value"}: item_col = c
+    if type_col is not None and item_col is not None:
+        t = df_sheet[type_col].astype(str).str.strip().str.lower()
+        i = df_sheet[item_col].astype(str).str.strip()
+        dels = i[t.str.contains("delight|pro|positive", na=False)]
+        dets = i[t.str.contains("detract|con|negative", na=False)]
+        dels = [x for x in dels.dropna().tolist() if x]
+        dets = [x for x in dets.dropna().tolist() if x]
+        if dels or dets:
+            debug.update({"strategy":"type+item","type_col":type_col,"item_col":item_col})
+            return dels, dets, debug
+    # Strategy 3: first two non-empty columns
+    non_empty_cols = []
+    for c in df_sheet.columns:
+        vals = [str(x).strip() for x in df_sheet[c].dropna().tolist() if str(x).strip()]
+        if vals:
+            non_empty_cols.append((c, vals))
+        if len(non_empty_cols) >= 2: break
+    if non_empty_cols:
+        dels = non_empty_cols[0][1]
+        dets = non_empty_cols[1][1] if len(non_empty_cols) > 1 else []
+        debug.update({"strategy":"first-two-nonempty","picked_cols":[c for c,_ in non_empty_cols[:2]]})
+        return dels, dets, debug
+    return [], [], {"strategy":"none","columns":list(df_sheet.columns)}
+
+def autodetect_symptom_sheet(xls: pd.ExcelFile) -> str | None:
+    names = xls.sheet_names
+    cands = [n for n in names if _looks_like_symptom_sheet(n)]
+    if cands:
+        return min(cands, key=lambda n: len(_norm(n)))
+    return names[0] if names else None
+
+def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, user_del_col: str | None = None, user_det_col: str | None = None):
+    meta = {"sheet": None, "strategy": None, "columns": [], "note": ""}
+    if not raw_bytes:
+        meta["note"] = "No raw bytes provided"
+        return [], [], meta
     try:
-        xls = pd.ExcelFile(io.BytesIO(raw_bytes))
-        target = None
-        for n in xls.sheet_names:
-            if n.strip().lower() in {"symptoms","symptom","symptom sheet","symptom tab"}:
-                target = n; break
-        if not target:
-            return [], []
-        s = pd.read_excel(xls, target)
-        cols = {c.lower().strip(): c for c in s.columns}
-        dels = s[cols.get("delighters")] if "delighters" in cols else s.get("Delighters")
-        dets = s[cols.get("detractors")] if "detractors" in cols else s.get("Detractors")
-        del_list = [str(x).strip() for x in (dels or pd.Series(dtype=str)).dropna().tolist() if str(x).strip()]
-        det_list = [str(x).strip() for x in (dets or pd.Series(dtype=str)).dropna().tolist() if str(x).strip()]
-        return del_list, det_list
-    except Exception:
-        return [], []
+        xls = pd.ExcelFile(_io.BytesIO(raw_bytes))
+    except Exception as e:
+        meta["note"] = f"Could not open Excel: {e}"
+        return [], [], meta
+    sheet = user_sheet or autodetect_symptom_sheet(xls)
+    if not sheet:
+        meta["note"] = "No sheets found"
+        return [], [], meta
+    meta["sheet"] = sheet
+    try:
+        s = pd.read_excel(xls, sheet_name=sheet)
+    except Exception as e:
+        meta["note"] = f"Could not read sheet '{sheet}': {e}"
+        return [], [], meta
+    if user_del_col or user_det_col:
+        dels = s.get(user_del_col, pd.Series(dtype=str)) if user_del_col in s.columns else pd.Series(dtype=str)
+        dets = s.get(user_det_col, pd.Series(dtype=str)) if user_det_col in s.columns else pd.Series(dtype=str)
+        dels = [str(x).strip() for x in dels.dropna().tolist() if str(x).strip()]
+        dets = [str(x).strip() for x in dets.dropna().tolist() if str(x).strip()]
+        meta.update({"strategy":"manual-columns","columns":list(s.columns)})
+        return dels, dets, meta
+    dels, dets, info = _extract_from_df(s)
+    meta.update(info)
+    return dels, dets, meta
 
-ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS = load_symptom_lists(st.session_state.get("uploaded_bytes", b""))
+# ---- Symptoms sheet picker (UI) ----
+st.sidebar.markdown("### 🧾 Symptoms Source")
+raw_bytes = st.session_state.get("uploaded_bytes", b"")
+
+sheet_names = []
+try:
+    _xls_tmp = pd.ExcelFile(_io.BytesIO(raw_bytes))
+    sheet_names = _xls_tmp.sheet_names
+except Exception:
+    pass
+
+auto_sheet = autodetect_symptom_sheet(_xls_tmp) if sheet_names else None
+chosen_sheet = st.sidebar.selectbox(
+    "Choose the sheet that contains Delighters/Detractors",
+    options=sheet_names if sheet_names else ["(no sheets detected)"],
+    index=(sheet_names.index(auto_sheet) if (sheet_names and auto_sheet in sheet_names) else 0)
+)
+
+# Preview columns for manual selection
+symp_cols_preview = []
+if sheet_names:
+    try:
+        _df_symp_prev = pd.read_excel(_io.BytesIO(raw_bytes), sheet_name=chosen_sheet)
+        symp_cols_preview = list(_df_symp_prev.columns)
+    except Exception:
+        _df_symp_prev = pd.DataFrame()
+        symp_cols_preview = []
+
+manual_cols = False
+picked_del_col = None
+picked_det_col = None
+
+if symp_cols_preview:
+    st.sidebar.caption("Detected columns:")
+    st.sidebar.write(", ".join(map(str, symp_cols_preview)))
+    manual_cols = st.sidebar.checkbox("Manually choose Delighters/Detractors columns", value=False)
+    if manual_cols:
+        picked_del_col = st.sidebar.selectbox("Delighters column", options=["(none)"] + symp_cols_preview, index=0)
+        picked_det_col = st.sidebar.selectbox("Detractors column", options=["(none)"] + symp_cols_preview, index=0)
+        if picked_del_col == "(none)": picked_del_col = None
+        if picked_det_col == "(none)": picked_det_col = None
+
+ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS, SYM_META = load_symptom_lists_robust(
+    raw_bytes, user_sheet=chosen_sheet if sheet_names else None, user_del_col=picked_del_col, user_det_col=picked_det_col
+)
+ALLOWED_DELIGHTERS = [x for x in ALLOWED_DELIGHTERS if x]
+ALLOWED_DETRACTORS = [x for x in ALLOWED_DETRACTORS if x]
 ALLOWED_DELIGHTERS_SET = set(ALLOWED_DELIGHTERS)
 ALLOWED_DETRACTORS_SET = set(ALLOWED_DETRACTORS)
 
-if not ALLOWED_DELIGHTERS and not ALLOWED_DETRACTORS:
-    st.warning("Couldn't find a 'Symptoms' sheet with Delighters/Detractors. AI will only use conservative keyword fallback.")
+if ALLOWED_DELIGHTERS or ALLOWED_DETRACTORS:
+    st.sidebar.success(
+        f"Loaded {len(ALLOWED_DELIGHTERS)} delighters, {len(ALLOWED_DETRACTORS)} detractors (sheet: '{SYM_META.get('sheet','?')}', mode: {SYM_META.get('strategy','?')})."
+    )
+else:
+    st.sidebar.warning(
+        f"Didn't find clear Delighters/Detractors lists in '{SYM_META.get('sheet','?')}'. Using conservative keyword fallback. Adjust options above if needed."
+    )
 
 # ---------------- Top KPIs & Actions ----------------
+
 st.markdown("### Status")
 colA, colB, colC, colD = st.columns([2,2,2,3])
 with colA:
@@ -521,5 +656,6 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+
 
 
