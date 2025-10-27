@@ -215,7 +215,7 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
 def _escape_md(s: str) -> str:
-    return re.sub(r'([_*`>])', r'\\\\\\\\\\\\\\\', s)
+    return re.sub(r'([_`>])', r'\\\\\\\\\\\\\\\', s)
 
 # Conservative dedupe + cut to N
 
