@@ -1,4 +1,4 @@
-# ---------- Star Walk — Upload + Symptomize (Enhanced UX & Accuracy) ----------
+# ---------- Star Walk — Upload + Symptomize (Enhanced UX, Accuracy & Approvals) ----------
 # Streamlit 1.38+
 
 import io
@@ -75,6 +75,8 @@ GLOBAL_CSS = """
   .muted{ color:var(--muted); }
   .kpi{ display:flex; gap:14px; flex-wrap:wrap }
   .pill{ padding:8px 12px; border-radius:999px; border:1.5px solid var(--border); background:var(--bg-tile); font-weight:700 }
+  .review-quote { white-space:pre-wrap; background:var(--bg-tile); border:1.5px solid var(--border); border-radius:12px; padding:8px 10px; }
+  mark { background:#fff2a8; padding:0 .15em; border-radius:3px; }
 </style>
 """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
@@ -140,7 +142,7 @@ q1 = verb_series.str.len().quantile(0.25) if not verb_series.empty else 0
 q3 = verb_series.str.len().quantile(0.75) if not verb_series.empty else 0
 IQR = (q3 - q1) if (q3 or q1) else 0
 
-# Load symptom dictionary from "Symptoms" sheet if present
+# ---------------- Load symptom dictionary from "Symptoms" sheet if present ----------------
 
 def load_symptom_lists(raw_bytes: bytes) -> Tuple[list, list]:
     try:
@@ -165,6 +167,9 @@ ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS = load_symptom_lists(st.session_state.get
 ALLOWED_DELIGHTERS_SET = set(ALLOWED_DELIGHTERS)
 ALLOWED_DETRACTORS_SET = set(ALLOWED_DETRACTORS)
 
+if not ALLOWED_DELIGHTERS and not ALLOWED_DETRACTORS:
+    st.warning("Couldn't find a 'Symptoms' sheet with Delighters/Detractors. AI will only use conservative keyword fallback.")
+
 # ---------------- Top KPIs & Actions ----------------
 st.markdown("### Status")
 colA, colB, colC, colD = st.columns([2,2,2,3])
@@ -183,11 +188,11 @@ with left:
 with mid:
     model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
 with right:
-    strictness = st.slider("Strictness (higher = fewer, more precise)", 0.55, 0.90, 0.70, 0.01)
+    strictness = st.slider("Strictness (higher = fewer, more precise)", 0.55, 0.90, 0.72, 0.01, help="Confidence threshold; also reduces near-duplicate choices.")
 
-# ETA (heuristic)
+# ETA (heuristic) — scaled by interquartile text length
 rows = min(batch_n, missing_count)
-speed_base = 1.2 if model_choice in {"gpt-4o-mini","gpt-4o"} else (1.6 if model_choice=="gpt-4.1" else 2.2)
+speed_base = 1.1 if model_choice in {"gpt-4o-mini","gpt-4o"} else (1.5 if model_choice=="gpt-4.1" else 2.0)
 length_factor = max(0.75, min(1.35, ((q1+q3)/800.0) if (q1+q3)>0 else 1.0))
 eta_secs = int(round(rows * speed_base * length_factor))
 st.caption(f"Will attempt {rows} rows • Rough ETA: ~{eta_secs}s")
@@ -210,7 +215,7 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
 def _escape_md(s: str) -> str:
-    return re.sub(r'([_*`>])', r'\\\1', s)
+    return re.sub(r'([_*`>])', r'\\\\\\\\\\\\\\\', s)
 
 # Conservative dedupe + cut to N
 
@@ -225,6 +230,22 @@ def _dedupe_keep_top(items: List[Tuple[str, float]], top_n: int = 10, min_conf: 
         if len(kept) >= top_n: break
     return [n for n, _ in kept]
 
+# Highlight allowed terms in review for quick verification
+
+def _highlight_terms(text: str, allowed: List[str]) -> str:
+    safe = _escape_md(text)
+    # Simple HTML mark on raw string in a separate block below (not markdown)
+    html = re.escape(text)
+    out = text
+    for t in sorted(set(allowed), key=len, reverse=True):
+        if not t.strip():
+            continue
+        try:
+            out = re.sub(rf"(\\b{re.escape(t)}\\b)", r"<mark>\</mark>", out, flags=re.IGNORECASE)
+        except re.error:
+            pass
+    return out
+
 # Model call (JSON-only)
 
 def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str], min_conf: float):
@@ -233,10 +254,14 @@ def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]
         return [], [], [], []
 
     sys = (
-        "You label one user review. Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.\n"
-        'Return JSON: {"delighters":[{"name":"...","confidence":0-1},...],' 
-        '"detractors":[{"name":"...","confidence":0-1},...]}\n'
-        "Rules: (1) If not clearly present, OMIT. (2) Prefer precision over recall. (3) Avoid near-duplicates."
+        "You are labeling a single user review.\n"
+        "Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.\n"
+        'Return JSON exactly like: {"delighters":[{"name":"...","confidence":0-1}], "detractors":[{"name":"...","confidence":0-1}]}\n'
+        "Rules:\n"
+        "1) If not clearly present, OMIT it.\n"
+        "2) Prefer precision over recall; avoid stretch matches.\n"
+        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').\n"
+        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.\n"
     )
     user = {
         "review": review[:4000],
@@ -362,11 +387,13 @@ if sugs:
             else:
                 st.session_state["sug_selected"].discard(i)
 
-            # Full review
-            review_block = _escape_md(s["review"]) if s["review"] else "*(empty)*"
-            st.markdown(f"**Full review:**
-
-> {review_block}")
+            # Full review with highlights of allowed terms
+            if s["review"]:
+                highlighted = _highlight_terms(s["review"], ALLOWED_DELIGHTERS + ALLOWED_DETRACTORS)
+                st.markdown("**Full review:**")
+                st.markdown(f"<div class='review-quote'>{highlighted}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown("**Full review:** (empty)")
 
             c1,c2 = st.columns(2)
             with c1:
@@ -491,4 +518,5 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+
 
