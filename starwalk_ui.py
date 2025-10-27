@@ -334,6 +334,15 @@ with acc2:
 with acc3:
     process_longest_first = st.checkbox("Process longest reviews first", value=True)
 
+# Speed mode (reduce latency): forces smaller model & shorter batch hint
+speed_col = st.container()
+with speed_col:
+    speed_mode = st.checkbox("⚡ Speed mode (optimize for latency)", value=False, help="Uses a faster model and sorts by shorter reviews first. Accuracy settings still apply.")
+    if speed_mode:
+        if model_choice != "gpt-4o-mini":
+            st.info("Speed mode suggests 'gpt-4o-mini' for fastest responses.")
+        process_longest_first = False
+
 # ETA (heuristic) — token-aware
 MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
 MODEL_LAT = {"gpt-4o-mini": 0.6, "gpt-4o": 0.9, "gpt-4.1": 1.1, "gpt-5": 1.3}
@@ -433,22 +442,18 @@ def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str]
         return [], [], [], []
 
     sys_prompt = (
-        "You are labeling a single user review.
-"
-        "Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
-"
-        "Return JSON exactly like: {\"delighters\":[{\"name\":\"...\",\"confidence\":0.0}], \"detractors\":[{\"name\":\"...\",\"confidence\":0.0}]}
-"
-        "Rules:
-"
-        "1) If not clearly present, OMIT it.
-"
-        "2) Prefer precision over recall; avoid stretch matches.
-"
-        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
-"
-        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
-"
+        """
+You are labeling a single user review.
+Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
+Return JSON exactly like:
+{"delighters":[{"name":"...","confidence":0.0}], "detractors":[{"name":"...","confidence":0.0}]}
+
+Rules:
+1) If not clearly present, OMIT it.
+2) Prefer precision over recall; avoid stretch matches.
+3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
+4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
+        """
     )
 
     user =  {
@@ -780,4 +785,3 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
-
