@@ -217,7 +217,7 @@ def _normalize_name(name: str) -> str:
 def _escape_md(s: str) -> str:
     # Escape Markdown special chars by prefixing a single backslash
     # e.g., _ -> \_, * -> \*, ` -> \`, > -> \>
-    return re.sub(r'([_*`>])', r'\\', s)', r'\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\', s)
+    return re.sub(r'([_*`>])', r'\\', s)', r'\\', s)
 
 # Conservative dedupe + cut to N
 
