@@ -749,24 +749,6 @@ fig_bar_horizontal.update_layout(
 )
 st.plotly_chart(fig_bar_horizontal, use_container_width=True)
 
-# New charts
-fig_share = seeded_share_chart(filtered)
-if fig_share:
-    st.plotly_chart(fig_share, use_container_width=True)
-
-c_tr1, c_tr2 = st.columns([1,1])
-with c_tr1:
-    fig_trend_w = trend_chart(filtered, "W")
-    if fig_trend_w: st.plotly_chart(fig_trend_w, use_container_width=True)
-with c_tr2:
-    fig_trend_m = trend_chart(filtered, "M")
-    if fig_trend_m: st.plotly_chart(fig_trend_m, use_container_width=True)
-
-fig_hm = symptom_heatmap(filtered, existing_detractor_columns, top=12)
-if fig_hm:
-    st.plotly_chart(fig_hm, use_container_width=True)
-
-st.markdown("---")
 
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
