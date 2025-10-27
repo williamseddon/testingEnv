@@ -16,8 +16,6 @@ import warnings
 import smtplib
 from email.message import EmailMessage
 from streamlit.components.v1 import html as st_html  # for custom HTML blocks
-from pathlib import Path
-import base64, mimetypes
 
 warnings.filterwarnings(
     "ignore",
@@ -98,30 +96,11 @@ st.markdown(
 # ---------- Hero with SharkNinja logo ----------
 
 def _load_sn_logo_html() -> str:
-    """Return an <img> tag for the SharkNinja logo.
-    Priority: secrets/env URL -> local assets -> fallback SVG wordmark.
-    Set LOGO_URL in .streamlit/secrets.toml or env for a hosted asset.
-    """
-    url = st.secrets.get("LOGO_URL", os.getenv("LOGO_URL"))
-    if url:
-        return f'<img class="sn-logo" src="{_html.escape(url)}" alt="SharkNinja logo" />'
-    for rel in [
-        "assets/sharkninja.svg", "assets/sharkninja-logo.svg",
-        "assets/sharkninja.png", "assets/sharkninja-logo.png",
-    ]:
-        p = Path(rel)
-        if p.exists():
-            mime = mimetypes.guess_type(p.name)[0] or ("image/svg+xml" if p.suffix==".svg" else "image/png")
-            b64 = base64.b64encode(p.read_bytes()).decode()
-            return f'<img class="sn-logo" src="data:{mime};base64,{b64}" alt="SharkNinja logo" />'
-    # Fallback simple wordmark (non-official)
+    """Return an <img> tag for the SharkNinja logo (official asset)."""
     return (
-        "<svg class='sn-logo' viewBox='0 0 520 90' xmlns='http://www.w3.org/2000/svg' aria-label='SharkNinja'>"
-        "<g fill='currentColor'>"
-        "<text x='0' y='62' font-family='Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial' font-weight='800' font-size='52'>Shark</text>"
-        "<rect x='225' y='12' width='4' height='66' rx='2'/>"
-        "<text x='245' y='62' font-family='Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial' font-weight='900' font-size='52'>NINJA</text>"
-        "</g></svg>"
+        '<img class="sn-logo" '
+        'src="https://upload.wikimedia.org/wikipedia/commons/e/ea/SharkNinja_logo.svg" '
+        'alt="SharkNinja logo" />'
     )
 
 
