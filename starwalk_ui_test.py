@@ -88,6 +88,10 @@ st.markdown(
       .badge.pos{ border-color:#7ed9b3; background:#e9fbf3; color:#0b4f3e; }
       .badge.neg{ border-color:#f6b4b4; background:#fff1f2; color:#7f1d1d; }
           .sn-logo{height:48px;width:auto;display:block}
+          /* Typography override */
+      html, body, .stApp { font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif; }
+      .hero-title, .hero-sub { font-family: inherit; }
+      .sn-logo{height:48px;width:auto;display:block}
     </style>
     """,
     unsafe_allow_html=True,
@@ -112,7 +116,7 @@ def render_hero():
         <div class="hero-wrap" id="top-hero"
              style="position:relative;overflow:hidden;border-radius:14px;min-height:150px;margin:.25rem 0 1rem 0;
                     box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
-                    background:linear-gradient(90deg,#ffffff 0%,#ffffff 55%,#f2f6ff 55%,#f2f6ff 100%);">
+                    background:linear-gradient(90deg, var(--bg-card) 0% 55%, transparent 55% 100%);">
           <canvas id="hero-canvas" style="position:absolute;left:0;top:0;width:55%;height:100%;"></canvas>
           <div class="hero-inner" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:space-between;padding:0 18px;color:var(--text);">
             <div>
@@ -158,6 +162,8 @@ def render_hero():
 
 # Render hero at the top
 render_hero()
+
+
 
 
 
