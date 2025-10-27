@@ -106,8 +106,9 @@ def _load_sn_logo_html() -> str:
 
 def render_hero():
     logo_html = _load_sn_logo_html()
-    st_html(
-        f"""
+    # Use a plain triple-quoted string so JS/CSS braces aren't treated as f-string expressions.
+    # Then inject the logo via a unique token replacement to avoid escaping hundreds of braces.
+    HERO_HTML = """
         <div class="hero-wrap" id="top-hero"
              style="position:relative;overflow:hidden;border-radius:14px;min-height:150px;margin:.25rem 0 1rem 0;
                     box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
@@ -118,7 +119,7 @@ def render_hero():
               <h1 class="hero-title" style="font-size:clamp(22px,3.3vw,42px);font-weight:800;margin:0;">Star Walk Analysis Dashboard</h1>
               <div class="hero-sub" style="margin:4px 0 0 0;color:var(--muted);font-size:clamp(12px,1.1vw,16px);">Insights, trends, and ratings — fast.</div>
             </div>
-            <div class="hero-right" style="display:flex;align-items:center;justify-content:flex-end;width:40%;">{logo_html}</div>
+            <div class="hero-right" style="display:flex;align-items:center;justify-content:flex-end;width:40%;">__LOGO__</div>
           </div>
         </div>
         <script>
@@ -151,12 +152,14 @@ def render_hero():
           tick();
         })();
         </script>
-        """,
-        height=160,
-    )
+    """.replace("__LOGO__", logo_html)
+
+    st_html(HERO_HTML, height=160)
 
 # Render hero at the top
 render_hero()
+
+
 
 # ---------- Utilities ----------
 def clean_text(x: str, keep_na: bool = False) -> str:
