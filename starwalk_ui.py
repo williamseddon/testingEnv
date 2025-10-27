@@ -1,186 +1,101 @@
-import streamlit as st
-import pandas as pd
-import openai
-import os
-import numpy as np
+# ---------- Page config ----------
+st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
-# Set page title and layout
-st.set_page_config(page_title="Star Walk Analysis Dashboard", layout="wide")
+# ---------- Force Light Mode ----------
+st_html("""
+<script>
+(function () {
+  function setLight() {
+    try {
+      document.documentElement.setAttribute('data-theme','light');
+      document.body && document.body.setAttribute('data-theme','light');
+      window.localStorage.setItem('theme','light');
+    } catch (e) {}
+  }
+  setLight();
+  new MutationObserver(setLight).observe(
+    document.documentElement,
+    { attributes: true, attributeFilter: ['data-theme'] }
+  );
+})();
+</script>
+""", height=0)
 
-# Inject global CSS for Helvetica font and force light mode
-st.markdown("""
-    <style>
-    html, body, [class*="css"] {
-        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif !important;
-    }
-    html {
-        color-scheme: light !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+# ---------- Global CSS ----------
+GLOBAL_CSS = """
+<style>
+  /* =====================
+     Global CSS — Light-first
+     ===================== */
+  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
+  *, ::before, ::after { box-sizing: border-box; }
+  @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
 
-# Title of the app
-st.title("Star Walk Analysis Dashboard")
+  /* ---- Design tokens (light) ---- */
+  :root{
+    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
+    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
+    --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
+    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
+    --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
+  }
 
-# Load data (only once, using session state to avoid reloading on every run)
-if 'data_loaded' not in st.session_state:
-    try:
-        # Read the Excel file and required sheets
-        main_df = pd.read_excel("Shark HD600 Valentino Starwalk (NEW).xlsx", sheet_name="Star Walk scrubbed verbatims")
-        symptoms_df = pd.read_excel("Shark HD600 Valentino Starwalk (NEW).xlsx", sheet_name="Symptoms")
-    except Exception as e:
-        st.error(f"Error loading Excel file: {e}")
-        st.stop()
-    # Compile official symptoms list from 'Symptoms' sheet (both Detractors and Delighters)
-    official_symptoms = []
-    if 'Detractors' in symptoms_df.columns:
-        official_symptoms += [str(x).strip() for x in symptoms_df['Detractors'].dropna().tolist()]
-    if 'Delighters' in symptoms_df.columns:
-        official_symptoms += [str(x).strip() for x in symptoms_df['Delighters'].dropna().tolist()]
-    # Remove duplicates while preserving order
-    seen = set()
-    official_symptoms_unique = []
-    for sym in official_symptoms:
-        if sym and sym not in seen:
-            seen.add(sym)
-            official_symptoms_unique.append(sym)
-    # Store dataframes and list in session state
-    st.session_state['main_df'] = main_df
-    st.session_state['official_symptoms'] = official_symptoms_unique
-    st.session_state['data_loaded'] = True
+  /* ---- Dark tokens (kept for safety; app forced light) ---- */
+  html[data-theme="dark"], body[data-theme="dark"]{
+    --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
+    --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
+    --bg-app:#0b0e14; --bg-card:rgba(255,255,255,.06); --bg-tile:rgba(255,255,255,.04);
+    --ring:#60a5fa; --ok:#34d399; --bad:#f87171;
+  }
+
+  html, body, .stApp {
+    background: var(--bg-app);
+    font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
+    color: var(--text);
+  }
+  .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
+  section[data-testid="stSidebar"] .block-container { padding-top:.6rem; }
+  mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
+
+  /* ---- Metric Cards ---- */
+  .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
+  @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
+  .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
+  .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
+  .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  .metric-box{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:12px; padding:12px; text-align:center; color:var(--text); }
+  .metric-label{ color:var(--muted); font-size:.85rem; }
+  .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
+
+  /* ---- Review Cards ---- */
+  .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
+  .review-card p{ margin:.25rem 0; line-height:1.5; }
+
+  /* ---- Hero ---- */
+  .hero-wrap{
+    position:relative; overflow:hidden; border-radius:14px; min-height:150px; margin:.25rem 0 1rem 0;
+    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
+    background:linear-gradient(90deg, var(--bg-card) 0% 55%, transparent 55% 100%);
+  }
+  #hero-canvas{ position:absolute; left:0; top:0; width:55%; height:100%; display:block; }
+  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; color:var(--text); }
+  .hero-title{ font-size:clamp(22px,3.3vw,42px); font-weight:800; margin:0; font-family:inherit; }
+  .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); font-family:inherit; }
+  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:40%; }
+  .sn-logo{ height:48px; width:auto; display:block; }
+
+  [data-testid="stPlotlyChart"]{ margin-top:18px !important; margin-bottom:30px !important; }
+</style>
+"""
+
+st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+
+# ---------- File Uploader ----------
+st.sidebar.header("Upload Star Walk File")
+uploaded_file = st.sidebar.file_uploader("Upload Excel file", type=["xlsx"], help="Upload the Star Walk formatted Excel file.")
+
+if uploaded_file is not None:
+    st.success("File uploaded successfully.")
+    # Load and process will happen later in the flow
 else:
-    main_df = st.session_state['main_df']
-    official_symptoms_unique = st.session_state['official_symptoms']
-
-# Identify reviews where all 20 symptom columns are blank or NaN
-symptom_cols = [f"Symptom {i}" for i in range(1, 21)]
-missing_mask = main_df[symptom_cols].isna().all(axis=1)
-missing_indices = main_df.index[missing_mask].tolist()
-missing_count = len(missing_indices)
-
-# Display the count of reviews without symptoms
-st.write(f"{missing_count} reviews without symptoms detected.")
-
-if missing_count > 0:
-    # Obtain OpenAI API key (from environment or user input)
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        openai_api_key = st.text_input("Enter OpenAI API Key", type="password")
-    # Button to trigger AI symptom extraction
-    if st.button("Auto-symptomize missing reviews with OpenAI"):
-        if not openai_api_key:
-            st.error("Please provide an OpenAI API key to continue.")
-        else:
-            openai.api_key = openai_api_key
-            suggestions = {}
-            with st.spinner("Analyzing reviews for symptoms..."):
-                for idx in missing_indices:
-                    review_text = str(main_df.at[idx, 'Verbatim'])
-                    # Construct prompt with the official symptoms list
-                    symptom_list_str = "; ".join(official_symptoms_unique)
-                    prompt = (
-                        "You are an AI assistant that extracts product feedback symptoms from reviews.\n"
-                        "We have an official list of known symptoms (issues or highlights) for the product. The list of official symptoms is:\n"
-                        f"{symptom_list_str}\n\n"
-                        "Based on the following review, identify up to 10 symptoms from the official list that are relevant. "
-                        "If the review mentions any issue or benefit that is not in the official list, include it as well marked as 'new'.\n"
-                        f"Review:\n\"{review_text}\"\n\n"
-                        "Provide the symptoms as a comma-separated list."
-                    )
-                    try:
-                        response = openai.ChatCompletion.create(
-                            model="gpt-3.5-turbo",
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0
-                        )
-                        content = response["choices"][0]["message"]["content"].strip()
-                    except Exception as e:
-                        content = ""
-                        st.error(f"OpenAI API call failed for a review: {e}")
-                    # Parse the AI response to extract symptoms
-                    extracted = []
-                    if content:
-                        # Replace newlines with commas for uniform splitting
-                        text = content.replace("\n", ", ")
-                        parts = [p.strip() for p in text.split(",") if p.strip()]
-                        for term in parts:
-                            # Clean up each term (remove bullets/numbers and "(new)" marker)
-                            cleaned = term.lstrip("-*•0123456789. ").strip()
-                            if cleaned.lower().endswith("(new)"):
-                                cleaned = cleaned[:cleaned.lower().rfind("(new)")].strip()
-                            if cleaned:
-                                # Match to official list (case-insensitive) to preserve official wording
-                                match = next((off for off in official_symptoms_unique if off.lower() == cleaned.lower()), None)
-                                extracted.append(match if match else cleaned)
-                    # Deduplicate extracted terms (case-insensitive) while preserving order
-                    seen_terms = set()
-                    final_terms = []
-                    for term in extracted:
-                        t_low = term.lower()
-                        if t_low not in seen_terms:
-                            seen_terms.add(t_low)
-                            final_terms.append(term)
-                    suggestions[idx] = final_terms
-            # Store suggestions in session state for display
-            st.session_state['suggestions'] = suggestions
-            st.success("AI-generated symptom suggestions are ready below. Please review and adjust if necessary.")
-    
-    # If suggestions have been generated, display each review with its suggested symptoms
-    if 'suggestions' in st.session_state:
-        suggestions = st.session_state['suggestions']
-        for idx in missing_indices:
-            review_text = str(main_df.at[idx, 'Verbatim'])
-            suggested_terms = suggestions.get(idx, [])
-            # Prepare options for multiselect: all official symptoms plus any new suggestions
-            options = list(official_symptoms_unique)
-            options.sort(key=lambda x: x.lower())  # sort alphabetically for convenience
-            default_selection = []
-            for term in suggested_terms:
-                # Check if term is an official symptom (case-insensitive match)
-                if term.lower() in (off.lower() for off in official_symptoms_unique):
-                    # Use official term with correct casing
-                    match_off = next((off for off in official_symptoms_unique if off.lower() == term.lower()), term)
-                    default_selection.append(match_off)
-                else:
-                    # Term is not in official list (new) – mark it and include in options
-                    new_label = f"{term} (new)"
-                    if new_label not in options:
-                        options.append(new_label)
-                    default_selection.append(new_label)
-            # Display the review text
-            st.write(f"**Review (ID {idx})**:")
-            st.markdown(f"> {review_text}")
-            # Display multiselect for the symptoms, pre-populated with suggestions
-            st.multiselect(
-                "Symptoms:", options=options, default=default_selection,
-                key=f"symptoms_select_{idx}"
-            )
-        # Button to apply updates to the DataFrame
-        if st.button("Update Data with new symptoms"):
-            updated_count = 0
-            for idx in missing_indices:
-                selected = st.session_state.get(f"symptoms_select_{idx}", [])
-                # Build final list of symptoms from the selection (remove " (new)" tags)
-                final_list = []
-                for term in selected:
-                    term = str(term).strip()
-                    if term.lower().endswith("(new)"):
-                        term = term[:term.lower().rfind("(new)")].strip()
-                    final_list.append(term)
-                # Pad the list with NaN up to 20 columns
-                final_list_padded = final_list[:20] + [np.nan] * (20 - len(final_list))
-                # Update the DataFrame row with the final symptoms
-                main_df.loc[idx, symptom_cols] = final_list_padded
-                updated_count += 1
-            # Save updated DataFrame back to session state
-            st.session_state['main_df'] = main_df
-            # Clear suggestions from session state (optional, to reset the UI)
-            if 'suggestions' in st.session_state:
-                del st.session_state['suggestions']
-            # Show summary message
-            st.success(f"Updated {updated_count} reviews with new symptoms.")
-else:
-    # If no reviews are missing symptoms
-    st.info("All reviews already have symptoms. No action needed.")
-
-
+    st.warning("Please upload a Star Walk Excel file to proceed.")
