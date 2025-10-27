@@ -80,6 +80,15 @@ GLOBAL_CSS = """
 </style>
 """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+# Extra CSS enhancements for chips
+st.markdown("""
+<style>
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
+  .chip{padding:6px 10px;border-radius:999px;border:1.5px solid var(--border);background:var(--bg-tile);font-weight:700;font-size:.9rem}
+  .chip.pos{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
+  .chip.neg{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
+</style>
+""", unsafe_allow_html=True)
 
 # ---------------- Header ----------------
 st.markdown(
@@ -324,6 +333,22 @@ with mid:
     model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
 with right:
     strictness = st.slider("Strictness (higher = fewer, more precise)", 0.55, 0.95, 0.75, 0.01, help="Confidence + evidence threshold; also reduces near-duplicates.")
+
+# Allowed lists viewer
+with st.expander("📚 View allowed symptom palettes (from 'Symptoms' sheet)", expanded=False):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**Allowed Detractors** ({len(ALLOWED_DETRACTORS)}):")
+        if ALLOWED_DETRACTORS:
+            st.markdown("<div class='chips'>" + "".join([f"<span class='chip neg'>{x}</span>" for x in ALLOWED_DETRACTORS]) + "</div>", unsafe_allow_html=True)
+        else:
+            st.caption("None detected")
+    with c2:
+        st.markdown(f"**Allowed Delighters** ({len(ALLOWED_DELIGHTERS)}):")
+        if ALLOWED_DELIGHTERS:
+            st.markdown("<div class='chips'>" + "".join([f"<span class='chip pos'>{x}</span>" for x in ALLOWED_DELIGHTERS]) + "</div>", unsafe_allow_html=True)
+        else:
+            st.caption("None detected")
 
 # Additional accuracy knobs
 acc1, acc2, acc3 = st.columns([2,2,3])
@@ -579,32 +604,54 @@ sugs = st.session_state.get("symptom_suggestions", [])
 if sugs:
     st.markdown("## 🔍 Review & Approve Suggestions")
 
-    # Bulk actions
+    # Fast bulk actions using direct session updates (no per-checkbox loops)
     with st.expander("Bulk actions", expanded=True):
-        c1,c2,c3,c4 = st.columns([1,1,2,3])
+        c1,c2,c3,c4,c5 = st.columns([1,1,1,2,3])
+        if "sug_selected" not in st.session_state:
+            st.session_state["sug_selected"] = set()
+        total = len(sugs)
         with c1:
-            if st.button("Select all"):
-                st.session_state["sug_selected"] = set(range(len(sugs)))
+            if st.button("Select all (fast)"):
+                st.session_state["sug_selected"] = set(range(total))
+                # also tick any checkbox state keys so the UI shows them checked
+                for i in range(total):
+                    st.session_state[f"sel_{i}"] = True
         with c2:
-            if st.button("Clear selection"):
+            if st.button("Clear all"):
                 st.session_state["sug_selected"] = set()
+                for i in range(total):
+                    st.session_state[f"sel_{i}"] = False
         with c3:
-            if st.button("Keep only non-empty"):
-                st.session_state["sug_selected"] = {i for i,s in enumerate(sugs) if s["delighters"] or s["detractors"]}
+            if st.button("Invert"):
+                newset = set()
+                for i in range(total):
+                    cur = st.session_state.get(f"sel_{i}", i in st.session_state["sug_selected"])  # current visual value
+                    cur = not cur
+                    st.session_state[f"sel_{i}"] = cur
+                    if cur:
+                        newset.add(i)
+                st.session_state["sug_selected"] = newset
         with c4:
-            max_apply = st.slider("Max rows to apply now", 1, len(sugs), min(20, len(sugs)))
+            if st.button("Only with suggestions"):
+                keep = {i for i,s in enumerate(sugs) if s["delighters"] or s["detractors"]}
+                st.session_state["sug_selected"] = keep
+                for i in range(total):
+                    st.session_state[f"sel_{i}"] = (i in keep)
+        with c5:
+            max_apply = st.slider("Max rows to apply now", 1, total, min(20, total))
 
     for i, s in enumerate(sugs):
         label = f"Review #{i} • Stars: {s.get('stars','-')} • {len(s['delighters'])} delighters / {len(s['detractors'])} detractors"
         with st.expander(label, expanded=(i==0)):
-            # Select
-            checked = i in st.session_state["sug_selected"]
-            if st.checkbox("Select for apply", value=checked, key=f"sel_{i}"):
+            # Selection checkbox bound to session key
+            default_checked = st.session_state.get(f"sel_{i}", i in st.session_state["sug_selected"])
+            checked = st.checkbox("Select for apply", value=default_checked, key=f"sel_{i}")
+            if checked:
                 st.session_state["sug_selected"].add(i)
             else:
                 st.session_state["sug_selected"].discard(i)
 
-            # Full review with highlights of allowed terms
+            # Full review with highlights
             if s["review"]:
                 highlighted = _highlight_terms(s["review"], ALLOWED_DELIGHTERS + ALLOWED_DETRACTORS)
                 st.markdown("**Full review:**")
@@ -612,13 +659,22 @@ if sugs:
             else:
                 st.markdown("**Full review:** (empty)")
 
+            # Pretty chips for suggestions
             c1,c2 = st.columns(2)
             with c1:
                 st.write("**Detractors (≤10)**")
-                st.code("; ".join(s["detractors"]) if s["detractors"] else "–")
+                if s["detractors"]:
+                    html = "<div class='chips'>" + "".join([f"<span class='chip neg'>{x}</span>" for x in s["detractors"]]) + "</div>"
+                    st.markdown(html, unsafe_allow_html=True)
+                else:
+                    st.code("–")
             with c2:
                 st.write("**Delighters (≤10)**")
-                st.code("; ".join(s["delighters"]) if s["delighters"] else "–")
+                if s["delighters"]:
+                    html = "<div class='chips'>" + "".join([f"<span class='chip pos'>{x}</span>" for x in s["delighters"]]) + "</div>"
+                    st.markdown(html, unsafe_allow_html=True)
+                else:
+                    st.code("–")
 
             # Novel candidates with approval toggles
             if s["novel_detractors"] or s["novel_delighters"]:
@@ -669,6 +725,7 @@ if sugs:
             st.success(f"Applied {len(picked)} row(s) to DataFrame.")
 
 # ---------------- Novel Symptoms Review Center ----------------
+
 # Aggregate proposals across all suggestions for a single review hub
 pending_novel_del = {}
 pending_novel_det = {}
@@ -785,4 +842,5 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+
 
