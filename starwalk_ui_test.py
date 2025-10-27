@@ -86,16 +86,7 @@ st.markdown(
       .badge{ display:inline-flex; align-items:center; gap:.4ch; padding:6px 12px; border-radius:10px; font-weight:600; font-size:.94rem; border:1.6px solid var(--border); background:var(--bg-tile); color:var(--text); }
       .badge.pos{ border-color:#7ed9b3; background:#e9fbf3; color:#0b4f3e; }
       .badge.neg{ border-color:#f6b4b4; background:#fff1f2; color:#7f1d1d; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-# (code truncated for brevity — complete script remains same logic as provided, with charts moved below reviews)
-
-# ---------- Global CSS (focus: borders & grouping) ----------
-st.markdown(
-    """
     <style>
       :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
       *, ::before, ::after { box-sizing: border-box; }
