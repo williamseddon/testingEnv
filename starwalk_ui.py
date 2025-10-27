@@ -2,6 +2,7 @@
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
 # ---------- Force Light Mode ----------
+from streamlit.components.v1 import html as st_html
 st_html("""
 <script>
 (function () {
@@ -24,14 +25,10 @@ st_html("""
 # ---------- Global CSS ----------
 GLOBAL_CSS = """
 <style>
-  /* =====================
-     Global CSS — Light-first
-     ===================== */
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
   @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
 
-  /* ---- Design tokens (light) ---- */
   :root{
     --text:#0f172a; --muted:#475569; --muted-2:#64748b;
     --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
@@ -40,7 +37,6 @@ GLOBAL_CSS = """
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  /* ---- Dark tokens (kept for safety; app forced light) ---- */
   html[data-theme="dark"], body[data-theme="dark"]{
     --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
     --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
@@ -57,7 +53,6 @@ GLOBAL_CSS = """
   section[data-testid="stSidebar"] .block-container { padding-top:.6rem; }
   mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-  /* ---- Metric Cards ---- */
   .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
   @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
   .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
@@ -67,11 +62,9 @@ GLOBAL_CSS = """
   .metric-label{ color:var(--muted); font-size:.85rem; }
   .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
 
-  /* ---- Review Cards ---- */
   .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
   .review-card p{ margin:.25rem 0; line-height:1.5; }
 
-  /* ---- Hero ---- */
   .hero-wrap{
     position:relative; overflow:hidden; border-radius:14px; min-height:150px; margin:.25rem 0 1rem 0;
     box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
@@ -90,12 +83,13 @@ GLOBAL_CSS = """
 
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
-# ---------- File Uploader ----------
+# ---------- Sidebar File Upload ----------
 st.sidebar.header("Upload Star Walk File")
-uploaded_file = st.sidebar.file_uploader("Upload Excel file", type=["xlsx"], help="Upload the Star Walk formatted Excel file.")
+uploaded_file = st.sidebar.file_uploader("Choose Excel File", type=["xlsx"])
 
 if uploaded_file is not None:
-    st.success("File uploaded successfully.")
-    # Load and process will happen later in the flow
+    st.success("File uploaded successfully. Ready to proceed with analysis.")
+    # Continue processing the uploaded_file within the main app logic
 else:
-    st.warning("Please upload a Star Walk Excel file to proceed.")
+    st.warning("Please upload a Star Walk Excel file to begin.")
+
