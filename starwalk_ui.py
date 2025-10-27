@@ -315,7 +315,7 @@ with colB:
 with colC:
     st.markdown(f"<div class='pill'>✂ IQR chars: <b>{int(IQR)}</b></div>", unsafe_allow_html=True)
 with colD:
-    st.caption("Estimates scale by model + text length; they are indicative only.")
+    st.caption("Estimates scale by model, token budget and text length; indicative only.")
 
 left, mid, right = st.columns([2,2,3])
 with left:
@@ -323,13 +323,25 @@ with left:
 with mid:
     model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
 with right:
-    strictness = st.slider("Strictness (higher = fewer, more precise)", 0.55, 0.90, 0.72, 0.01, help="Confidence threshold; also reduces near-duplicate choices.")
+    strictness = st.slider("Strictness (higher = fewer, more precise)", 0.55, 0.95, 0.75, 0.01, help="Confidence + evidence threshold; also reduces near-duplicates.")
 
-# ETA (heuristic) — scaled by interquartile text length
+# Additional accuracy knobs
+acc1, acc2, acc3 = st.columns([2,2,3])
+with acc1:
+    require_evidence = st.checkbox("Require textual evidence", value=True, help="Rejects a pick unless at least N key tokens from the symptom appear in the review text.")
+with acc2:
+    evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1 if strictness>=0.8 else 0)
+with acc3:
+    process_longest_first = st.checkbox("Process longest reviews first", value=True)
+
+# ETA (heuristic) — token-aware
+MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
+MODEL_LAT = {"gpt-4o-mini": 0.6, "gpt-4o": 0.9, "gpt-4.1": 1.1, "gpt-5": 1.3}
 rows = min(batch_n, missing_count)
-speed_base = 1.1 if model_choice in {"gpt-4o-mini","gpt-4o"} else (1.5 if model_choice=="gpt-4.1" else 2.0)
-length_factor = max(0.75, min(1.35, ((q1+q3)/800.0) if (q1+q3)>0 else 1.0))
-eta_secs = int(round(rows * speed_base * length_factor))
+chars_est = max(200, int((q1+q3)/2)) if (q1 or q3) else 400
+tok_est = int(chars_est/4)
+rt = rows * (MODEL_LAT.get(model_choice,1.0) + tok_est/max(8, MODEL_TPS.get(model_choice,12)))
+eta_secs = int(round(rt))
 st.caption(f"Will attempt {rows} rows • Rough ETA: ~{eta_secs}s")
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
@@ -339,6 +351,7 @@ if missing_count and _HAS_OPENAI and not api_key:
     st.warning("Set `OPENAI_API_KEY` (env or secrets) to enable AI labeling.")
 
 # ---------------- Session State ----------------
+
 st.session_state.setdefault("symptom_suggestions", [])
 st.session_state.setdefault("sug_selected", set())
 st.session_state.setdefault("approved_new_delighters", set())
@@ -349,60 +362,100 @@ st.session_state.setdefault("approved_new_detractors", set())
 def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
-def _escape_md(s: str) -> str:
-    """Escape a subset of Markdown so reviews render predictably in Streamlit."""
-    if s is None:
-        return ""
-    return re.sub(r'([\`*_{}\[\]()#+\-.!>])', r'\\1', str(s))
+# Canonical aliases to avoid near-duplicate picks (extendable)
+ALIAS_CANON = {
+    "initial difficulty": "Learning curve",
+    "hard to learn": "Learning curve",
+    "setup difficulty": "Learning curve",
+    "noisy startup": "Startup noise",
+    "too loud": "Loud",
+}
 
-# Conservative dedupe + cut to N
+def canonicalize(name: str) -> str:
+    nn = (name or "").strip()
+    base = _normalize_name(nn)
+    for k, v in ALIAS_CANON.items():
+        if _normalize_name(k) == base:
+            return v
+    return nn
 
-def _dedupe_keep_top(items: List[Tuple[str, float]], top_n: int = 10, min_conf: float = 0.60) -> List[str]:
-    items = [(n, c) for (n, c) in items if c >= min_conf]
-    kept: List[Tuple[str, float]] = []
-    for n, c in sorted(items, key=lambda x: -x[1]):
+# Evidence scoring: count token hits from symptom within the review
+_def_word = re.compile(r"[a-z0-9]{3,}")
+
+def _evidence_score(symptom: str, text: str) -> tuple[int, list[str]]:
+    if not symptom or not text:
+        return 0, []
+    toks = [t for t in _normalize_name(symptom).split() if _def_word.match(t)]
+    hits = []
+    for t in toks:
+        try:
+            if re.search(rf"\b{re.escape(t)}\b", text, flags=re.IGNORECASE):
+                hits.append(t)
+        except re.error:
+            pass
+    return len(hits), hits
+
+# Conservative dedupe + cut to N with canonicalization and similarity guard
+
+def _dedupe_keep_top(items: list[tuple[str, float]], top_n: int = 10, min_conf: float = 0.60) -> list[str]:
+    # canonicalize and filter by confidence
+    canon_pairs: list[tuple[str, float]] = []
+    for (n, c) in items:
+        if c >= min_conf and n:
+            canon_pairs.append((canonicalize(n), c))
+    kept: list[tuple[str, float]] = []
+    for n, c in sorted(canon_pairs, key=lambda x: -x[1]):
         n_norm = _normalize_name(n)
-        # avoid near-duplicates (e.g., "initial difficulty" vs "learning curve")
-        if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.90 for k, _ in kept):
+        if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.88 for k, _ in kept):
             kept.append((n, c))
-        if len(kept) >= top_n: break
+        if len(kept) >= top_n:
+            break
     return [n for n, _ in kept]
 
-# Highlight allowed terms in review for quick verification
+# Highlight allowed terms in review for quick verification (true word boundaries)
 
-def _highlight_terms(text: str, allowed: List[str]) -> str:
+def _highlight_terms(text: str, allowed: list[str]) -> str:
     out = text
     for t in sorted(set(allowed), key=len, reverse=True):
         if not t.strip():
             continue
         try:
-            out = re.sub(rf"({re.escape(t)})", r"<mark>\1</mark>", out, flags=re.IGNORECASE)
+            out = re.sub(rf"(\b{re.escape(t)}\b)", r"<mark>\1</mark>", out, flags=re.IGNORECASE)
         except re.error:
             pass
     return out
 
-# Model call (JSON-only)
+# Model call (JSON-only) with evidence guardrails
 
-def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str], min_conf: float):
+def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float, evidence_hits_required: int = 1):
     """Return (allowed_delighters, allowed_detractors, novel_delighters, novel_detractors)."""
     if not review or (not allowed_del and not allowed_det):
         return [], [], [], []
 
-    sys_prompt = """You are labeling a single user review.
-Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
-Return JSON exactly like: {"delighters":[{"name":"...","confidence":0.0}], "detractors":[{"name":"...","confidence":0.0}]}
-Rules:
-1) If not clearly present, OMIT it.
-2) Prefer precision over recall; avoid stretch matches.
-3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
-4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
-"""
+    sys_prompt = (
+        "You are labeling a single user review.
+"
+        "Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
+"
+        "Return JSON exactly like: {\"delighters\":[{\"name\":\"...\",\"confidence\":0.0}], \"detractors\":[{\"name\":\"...\",\"confidence\":0.0}]}
+"
+        "Rules:
+"
+        "1) If not clearly present, OMIT it.
+"
+        "2) Prefer precision over recall; avoid stretch matches.
+"
+        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
+"
+        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
+"
+    )
 
     user =  {
         "review": review[:4000],
         "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
-        "allowed_delighters": allowed_del[:80],
-        "allowed_detractors": allowed_det[:80]
+        "allowed_delighters": allowed_del[:120],
+        "allowed_detractors": allowed_det[:120]
     }
 
     dels, dets, novel_dels, novel_dets = [], [], [], []
@@ -426,18 +479,18 @@ Rules:
             data = json.loads(content)
             dels_raw = data.get("delighters", []) or []
             dets_raw = data.get("detractors", []) or []
-            dels_pairs = [(d.get("name", ""), float(d.get("confidence", 0))) for d in dels_raw if d.get("name")]
-            dets_pairs = [(d.get("name", ""), float(d.get("confidence", 0))) for d in dets_raw if d.get("name")]
+            dels_pairs = [(canonicalize(d.get("name", "")), float(d.get("confidence", 0))) for d in dels_raw if d.get("name")]
+            dets_pairs = [(canonicalize(d.get("name", "")), float(d.get("confidence", 0))) for d in dets_raw if d.get("name")]
+            # Evidence filter (guardrail)
+            text = review or ""
+            dels_pairs = [p for p in dels_pairs if _evidence_score(p[0], text)[0] >= evidence_hits_required]
+            dets_pairs = [p for p in dets_pairs if _evidence_score(p[0], text)[0] >= evidence_hits_required]
             for n, c in dels_pairs:
-                if n in ALLOWED_DELIGHTERS_SET:
-                    dels.append((n, c))
-                else:
-                    novel_dels.append((n, c))
+                if n in ALLOWED_DELIGHTERS_SET: dels.append((n, c))
+                else: novel_dels.append((n, c))
             for n, c in dets_pairs:
-                if n in ALLOWED_DETRACTORS_SET:
-                    dets.append((n, c))
-                else:
-                    novel_dets.append((n, c))
+                if n in ALLOWED_DETRACTORS_SET: dets.append((n, c))
+                else: novel_dets.append((n, c))
             return (
                 _dedupe_keep_top(dels, 10, min_conf),
                 _dedupe_keep_top(dets, 10, min_conf),
@@ -449,21 +502,23 @@ Rules:
 
     # Conservative keyword fallback (no-API)
     text = " " + review.lower() + " "
-    def pick_from_allowed(allowed: List[str]) -> List[str]:
+    def pick_from_allowed(allowed: list[str]) -> list[str]:
         scored = []
         for a in allowed:
-            a_norm = _normalize_name(a)
-            toks = [t for t in a_norm.split() if len(t) > 2]
+            a_can = canonicalize(a)
+            toks = [t for t in _normalize_name(a_can).split() if len(t) > 2]
             if not toks:
                 continue
-            score = sum(1 for t in toks if f" {t} " in text) / len(toks)
-            if score >= min_conf:
-                scored.append((a, 0.60 + 0.4 * score))
+            hits = [t for t in toks if f" {t} " in text]
+            score = len(hits) / len(toks)
+            if len(hits) >= evidence_hits_required and score >= min_conf:
+                scored.append((a_can, 0.60 + 0.4 * score))
         return _dedupe_keep_top(scored, 10, min_conf)
 
     return pick_from_allowed(allowed_del), pick_from_allowed(allowed_det), [], []
 
 # ---------------- Run Symptomize ----------------
+
 can_run = missing_count > 0 and ((not _HAS_OPENAI) or (api_key is not None))
 
 col_runA, col_runB, col_runC = st.columns([2,2,3])
@@ -725,3 +780,4 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+
