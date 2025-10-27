@@ -15,7 +15,9 @@ import textwrap
 import warnings
 import smtplib
 from email.message import EmailMessage
-from streamlit.components.v1 import html as st_html  # ✅ needed for render_hero()
+from streamlit.components.v1 import html as st_html  # for custom HTML blocks
+from pathlib import Path
+import base64, mimetypes
 
 warnings.filterwarnings(
     "ignore",
@@ -47,6 +49,7 @@ except Exception:
     _HAS_FAISS = False
 
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
+
 def model_supports_temperature(model_id: str) -> bool:
     return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
 
@@ -58,83 +61,72 @@ st.markdown(
     """
     <style>
       :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
-      *, ::before, ::after { box-sizing: border-box; }
-      @supports (scrollbar-color: transparent transparent) {
-        * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
-      }
-
-      /* Theme tokens */
+      *,::before,::after { box-sizing: border-box; }
+      @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
       :root{
-        --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-        --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
-        --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-        --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-
-        /* Extras used by cards below */
-        --border-outer:#D5DDEB; --border-inner:#E3E8F3; --bg-subtle:#F9FAFC;
+        --text:#0f172a; --muted:#475569; --muted-2:#64748b; --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0; --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc; --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
       }
       html[data-theme="dark"], body[data-theme="dark"]{
-        --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
-        --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
-        --bg-app:#0b0e14; --bg-card:rgba(255,255,255,.06); --bg-tile:rgba(255,255,255,.04);
-        --ring:#60a5fa; --ok:#34d399; --bad:#f87171;
+        --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64); --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10); --bg-app:#0b0e14; --bg-card:rgba(255,255,255,.06); --bg-tile:rgba(255,255,255,.04); --ring:#60a5fa; --ok:#34d399; --bad:#f87171;
       }
-
       .block-container { padding-top:.75rem; padding-bottom:1rem; }
       section[data-testid="stSidebar"] .block-container { padding-top:.5rem; }
       section[data-testid="stSidebar"] .stButton>button { width:100%; }
-      section[data-testid="stSidebar"] .stSelectbox label,
-      section[data-testid="stSidebar"] .stMultiSelect label { font-size:.95rem; }
+      section[data-testid="stSidebar"] .stSelectbox label,section[data-testid="stSidebar"] .stMultiSelect label{ font-size:.95rem; }
       section[data-testid="stSidebar"] .stExpander { border-radius:10px; }
       mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
-
-      /* Metrics cards */
-      .metrics-grid { display:grid; grid-template-columns:repeat(3, minmax(260px,1fr)); gap:17px; }
+      .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
       @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
-
-      .metric-card{
-        background:var(--bg-card); border-radius:14px; padding:16px;
-        box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text);
-      }
+      .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
       .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
-
       .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-      .metric-box{
-        background:var(--bg-tile); border:1.6px solid var(--border);
-        border-radius:12px; padding:12px; text-align:center; color:var(--text);
-      }
+      .metric-box{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:12px; padding:12px; text-align:center; color:var(--text); }
       .metric-label{ color:var(--muted); font-size:.85rem; }
       .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
-
-      /* Review cards */
-      .review-card{
-        background:var(--bg-card); border-radius:12px; padding:16px; margin:10px 0 14px;
-        box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text);
-      }
+      .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:10px 0 14px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
       .review-card p{ margin:.25rem 0; line-height:1.5; }
-
-      /* Chips / badges */
-      .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-      .badge{ display:inline-block; padding:6px 10px; border-radius:8px; font-weight:600; font-size:.95rem; }
-      .badge.pos{ background:#E7F8EE; color:#065F46; border:1px solid #CDEFE1; }
-      .badge.neg{ background:#FDECEC; color:#7F1D1D; border:1px solid #F7D1D1; }
+      .badges{ display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
+      .badge{ display:inline-flex; align-items:center; gap:.4ch; padding:6px 12px; border-radius:10px; font-weight:600; font-size:.94rem; border:1.6px solid var(--border); background:var(--bg-tile); color:var(--text); }
+      .badge.pos{ border-color:#7ed9b3; background:#e9fbf3; color:#0b4f3e; }
+      .badge.neg{ border-color:#f6b4b4; background:#fff1f2; color:#7f1d1d; }
+          .sn-logo{height:48px;width:auto;display:block}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ---------- Hero ----------
-def render_hero():
-    sharkninja_svg = """
-    <svg class="sn-logo" viewBox="0 0 520 90" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="SharkNinja">
-      <g fill="currentColor">
-        <text x="0" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="800" font-size="52">Shark</text>
-        <rect x="225" y="12" width="4" height="66" rx="2" />
-        <text x="245" y="62" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-weight="900" font-size="52">NINJA</text>
-      </g>
-    </svg>
-    """.strip()
+# ---------- Hero with SharkNinja logo ----------
 
+def _load_sn_logo_html() -> str:
+    """Return an <img> tag for the SharkNinja logo.
+    Priority: secrets/env URL -> local assets -> fallback SVG wordmark.
+    Set LOGO_URL in .streamlit/secrets.toml or env for a hosted asset.
+    """
+    url = st.secrets.get("LOGO_URL", os.getenv("LOGO_URL"))
+    if url:
+        return f'<img class="sn-logo" src="{_html.escape(url)}" alt="SharkNinja logo" />'
+    for rel in [
+        "assets/sharkninja.svg", "assets/sharkninja-logo.svg",
+        "assets/sharkninja.png", "assets/sharkninja-logo.png",
+    ]:
+        p = Path(rel)
+        if p.exists():
+            mime = mimetypes.guess_type(p.name)[0] or ("image/svg+xml" if p.suffix==".svg" else "image/png")
+            b64 = base64.b64encode(p.read_bytes()).decode()
+            return f'<img class="sn-logo" src="data:{mime};base64,{b64}" alt="SharkNinja logo" />'
+    # Fallback simple wordmark (non-official)
+    return (
+        "<svg class='sn-logo' viewBox='0 0 520 90' xmlns='http://www.w3.org/2000/svg' aria-label='SharkNinja'>"
+        "<g fill='currentColor'>"
+        "<text x='0' y='62' font-family='Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial' font-weight='800' font-size='52'>Shark</text>"
+        "<rect x='225' y='12' width='4' height='66' rx='2'/>"
+        "<text x='245' y='62' font-family='Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial' font-weight='900' font-size='52'>NINJA</text>"
+        "</g></svg>"
+    )
+
+
+def render_hero():
+    logo_html = _load_sn_logo_html()
     st_html(
         f"""
         <div class="hero-wrap" id="top-hero"
@@ -147,50 +139,45 @@ def render_hero():
               <h1 class="hero-title" style="font-size:clamp(22px,3.3vw,42px);font-weight:800;margin:0;">Star Walk Analysis Dashboard</h1>
               <div class="hero-sub" style="margin:4px 0 0 0;color:var(--muted);font-size:clamp(12px,1.1vw,16px);">Insights, trends, and ratings — fast.</div>
             </div>
-            <div class="hero-right" style="display:flex;align-items:center;justify-content:flex-end;width:40%;">{sharkninja_svg}</div>
+            <div class="hero-right" style="display:flex;align-items:center;justify-content:flex-end;width:40%;">{logo_html}</div>
           </div>
         </div>
         <script>
-        (function(){{
+        (function(){
           const c = document.getElementById('hero-canvas');
-          const ctx = c.getContext('2d', {{alpha:true}});
+          if(!c) return;
+          const ctx = c.getContext('2d', {alpha:true});
           const DPR = window.devicePixelRatio || 1;
           let w=0,h=0;
-          function resize(){{
+          function resize(){
             const r = c.getBoundingClientRect();
             w = Math.max(300, r.width|0);
             h = Math.max(120, r.height|0);
             c.width = w * DPR; c.height = h * DPR;
             ctx.setTransform(DPR,0,0,DPR,0,0);
-          }}
-          window.addEventListener('resize', resize, {{passive:true}});
+          }
+          window.addEventListener('resize', resize, {passive:true});
           resize();
-
           let N = 140;
-          let stars = Array.from({{length:N}}, () => ({{
-            x: Math.random()*w, y: Math.random()*h,
-            r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9
-          }}));
-          function tick(){{
+          let stars = Array.from({length:N}, () => ({x: Math.random()*w, y: Math.random()*h, r: 0.6 + Math.random()*1.4, s: 0.3 + Math.random()*0.9}));
+          function tick(){
             ctx.clearRect(0,0,w,h);
-            for(const s of stars){{
-              ctx.beginPath();
-              ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
-              ctx.fillStyle = 'rgba(255,200,50,.9)';
-              ctx.fill();
+            for(const s of stars){
+              ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+              ctx.fillStyle = 'rgba(255,200,50,.9)'; ctx.fill();
               s.x += 0.12*s.s; if(s.x > w) s.x = 0;
-            }}
+            }
             requestAnimationFrame(tick);
-          }}
+          }
           tick();
-        }})();
+        })();
         </script>
         """,
         height=160,
     )
 
+# Render hero at the top
 render_hero()
-
 
 # ---------- Utilities ----------
 def clean_text(x: str, keep_na: bool = False) -> str:
