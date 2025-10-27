@@ -1,8 +1,11 @@
+# ---------- Imports ----------
+import streamlit as st
+from streamlit.components.v1 import html as st_html
+
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
 # ---------- Force Light Mode ----------
-from streamlit.components.v1 import html as st_html
 st_html("""
 <script>
 (function () {
@@ -80,7 +83,6 @@ GLOBAL_CSS = """
   [data-testid="stPlotlyChart"]{ margin-top:18px !important; margin-bottom:30px !important; }
 </style>
 """
-
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 # ---------- Sidebar File Upload ----------
@@ -89,7 +91,6 @@ uploaded_file = st.sidebar.file_uploader("Choose Excel File", type=["xlsx"])
 
 if uploaded_file is not None:
     st.success("File uploaded successfully. Ready to proceed with analysis.")
-    # Continue processing the uploaded_file within the main app logic
 else:
     st.warning("Please upload a Star Walk Excel file to begin.")
 
