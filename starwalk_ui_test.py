@@ -92,6 +92,23 @@ st.markdown(
       html, body, .stApp { font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif; }
       .hero-title, .hero-sub { font-family: inherit; }
       .sn-logo{height:48px;width:auto;display:block}
+          /* Typography override */
+      html, body, .stApp { font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif; }
+      .hero-title, .hero-sub { font-family: inherit; }
+      .sn-logo{height:48px;width:auto;display:block}
+
+      /* ---------- Spacing helpers & chart spacing ---------- */
+      :root{ --gap-sm:12px; --gap-md:20px; --gap-lg:32px; }
+      .block-gap-sm{ height:var(--gap-sm); }
+      .block-gap-md{ height:var(--gap-md); }
+      .block-gap-lg{ height:var(--gap-lg); }
+      .section{ margin:28px 0 18px; }
+      .review-card{ margin:14px 0 22px; }
+      /* Give Plotly charts breathing room */
+      [data-testid="stPlotlyChart"]{ margin-top:16px !important; margin-bottom:28px !important; }
+      /* Headings spacing */
+      h2, .stMarkdown h2{ margin-top:24px; margin-bottom:14px; }
+      h3, .stMarkdown h3{ margin-top:22px; margin-bottom:12px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -162,10 +179,6 @@ def render_hero():
 
 # Render hero at the top
 render_hero()
-
-
-
-
 
 # ---------- Utilities ----------
 def clean_text(x: str, keep_na: bool = False) -> str:
