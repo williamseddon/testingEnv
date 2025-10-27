@@ -353,7 +353,7 @@ def _escape_md(s: str) -> str:
     """Escape a subset of Markdown so reviews render predictably in Streamlit."""
     if s is None:
         return ""
-    return re.sub(r'([\`*_{}\[\]()#+\-.!>])', r'\\\1', str(s))
+    return re.sub(r'([\`*_{}\[\]()#+\-.!>])', r'\\1', str(s))
 
 # Conservative dedupe + cut to N
 
@@ -371,15 +371,12 @@ def _dedupe_keep_top(items: List[Tuple[str, float]], top_n: int = 10, min_conf: 
 # Highlight allowed terms in review for quick verification
 
 def _highlight_terms(text: str, allowed: List[str]) -> str:
-    safe = _escape_md(text)
-    # Simple HTML mark on raw string in a separate block below (not markdown)
-    html = re.escape(text)
     out = text
     for t in sorted(set(allowed), key=len, reverse=True):
         if not t.strip():
             continue
         try:
-            out = re.sub(rf"(\b{re.escape(t)}\b)", r"<mark>\1</mark>", out, flags=re.IGNORECASE)
+            out = re.sub(rf"({re.escape(t)})", r"<mark>\1</mark>", out, flags=re.IGNORECASE)
         except re.error:
             pass
     return out
@@ -468,17 +465,39 @@ Rules:
 
 # ---------------- Run Symptomize ----------------
 can_run = missing_count > 0 and ((not _HAS_OPENAI) or (api_key is not None))
-run = st.button(f"✨ Symptomize next {min(batch_n, missing_count)} review(s)", disabled=not can_run)
 
-if run and missing_idx:
-    todo = missing_idx[:batch_n]
+col_runA, col_runB, col_runC = st.columns([2,2,3])
+with col_runA:
+    run = st.button(
+        f"✨ Symptomize next {min(batch_n, missing_count)} review(s)",
+        disabled=not can_run,
+        help="Runs on the next batch of reviews missing symptoms."
+    )
+with col_runB:
+    enable_all = st.checkbox("Enable ALL (bulk)")
+    run_all = st.button(
+        f"⚡ Symptomize ALL {missing_count} missing",
+        disabled=(not can_run) or missing_count==0 or (not enable_all),
+        help="Processes every review that has empty Symptom 1–20. Uses many API calls."
+    )
+with col_runC:
+    st.caption("Tip: Use batch mode first to review accuracy, then run ALL.")
+
+if (run or run_all) and missing_idx:
+    todo = missing_idx if run_all else missing_idx[:batch_n]
     progress = st.progress(0)
     status = st.empty()
     for i, idx in enumerate(todo, start=1):
         row = df.loc[idx]
         review_txt = str(row.get("Verbatim", "") or "").strip()
         stars = row.get("Star Rating", None)
-        dels, dets, novel_dels, novel_dets = _llm_pick(review_txt, stars, ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS, strictness)
+        dels, dets, novel_dels, novel_dets = _llm_pick(
+            review_txt,
+            stars,
+            ALLOWED_DELIGHTERS,
+            ALLOWED_DETRACTORS,
+            strictness
+        )
         st.session_state["symptom_suggestions"].append({
             "row_index": int(idx),
             "stars": float(stars) if pd.notna(stars) else None,
@@ -492,7 +511,7 @@ if run and missing_idx:
         })
         progress.progress(i/len(todo))
         status.info(f"Processed {i}/{len(todo)}")
-    status.success("Done!")
+    status.success("Finished generating suggestions! Review below, then Apply to write into the sheet.")
     st.rerun()
 
 # ---------------- Review & Approve ----------------
@@ -589,6 +608,56 @@ if sugs:
                     st.session_state["approved_new_detractors"].add(n)
             st.success(f"Applied {len(picked)} row(s) to DataFrame.")
 
+# ---------------- Novel Symptoms Review Center ----------------
+# Aggregate proposals across all suggestions for a single review hub
+pending_novel_del = {}
+pending_novel_det = {}
+for _s in st.session_state.get("symptom_suggestions", []):
+    for name in _s.get("novel_delighters", []):
+        if name: pending_novel_del[name] = pending_novel_del.get(name, 0) + 1
+    for name in _s.get("novel_detractors", []):
+        if name: pending_novel_det[name] = pending_novel_det.get(name, 0) + 1
+
+_total_novel = len(pending_novel_del) + len(pending_novel_det)
+if _total_novel:
+    with st.expander(f"🧪 Review New Symptoms ({_total_novel} pending)", expanded=True):
+        tabs = st.tabs(["Novel Detractors", "Novel Delighters"])
+
+        def _review_table(pending_dict, kind):
+            if not pending_dict:
+                st.caption("No proposals.")
+                return
+            add_all = st.checkbox(f"Approve all {kind}", key=f"approve_all_{kind}")
+            for i, (name, count) in enumerate(sorted(pending_dict.items(), key=lambda x: (-x[1], x[0]))):
+                cols = st.columns([0.07, 0.58, 0.20, 0.15])
+                with cols[0]:
+                    approve = st.checkbox("", value=add_all, key=f"nov_{kind}_{i}_approve")
+                with cols[1]:
+                    new_name = st.text_input("Name", value=name, key=f"nov_{kind}_{i}_name", label_visibility="collapsed")
+                with cols[2]:
+                    st.write(f"Seen in **{count}** rows")
+                with cols[3]:
+                    st.caption(kind[:-1].capitalize())
+                if approve:
+                    if kind=="detractors":
+                        st.session_state["approved_new_detractors"].add(new_name.strip())
+                    else:
+                        st.session_state["approved_new_delighters"].add(new_name.strip())
+
+        with tabs[0]:
+            _review_table(pending_novel_det, "detractors")
+        with tabs[1]:
+            _review_table(pending_novel_del, "delighters")
+
+        if st.button("Apply approvals now (update allowed lists)"):
+            for n in list(st.session_state["approved_new_detractors"]):
+                if n and n not in ALLOWED_DETRACTORS_SET:
+                    ALLOWED_DETRACTORS.append(n); ALLOWED_DETRACTORS_SET.add(n)
+            for n in list(st.session_state["approved_new_delighters"]):
+                if n and n not in ALLOWED_DELIGHTERS_SET:
+                    ALLOWED_DELIGHTERS.append(n); ALLOWED_DELIGHTERS_SET.add(n)
+            st.success("Allowed lists updated for this session.")
+
 # ---------------- Download Updated Workbook ----------------
 
 def offer_downloads():
@@ -656,7 +725,3 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
-
-
-
-
