@@ -216,7 +216,7 @@ def _normalize_name(name: str) -> str:
 
 def _escape_md(s: str) -> str:
     # Escape Markdown special chars by prefixing a single backslash
-    return re.sub(r'([_*`>])', lambda m: '\\' + m.group(1), s)
+    return re.sub(r'([_*`>])', lambda m: '\' + m.group(1), s)
 
 # Conservative dedupe + cut to N
 
@@ -255,14 +255,22 @@ def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str]
         return [], [], [], []
 
     sys_prompt = (
-        "You are labeling a single user review.\n"
-        "Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.\n"
-        'Return JSON exactly like: {"delighters":[{"name":"...","confidence":0.0}], "detractors":[{"name":"...","confidence":0.0}]}\n'
-        "Rules:\n"
-        "1) If not clearly present, OMIT it.\n"
-        "2) Prefer precision over recall; avoid stretch matches.\n"
-        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').\n"
-        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.\n"
+        "You are labeling a single user review.
+"
+        "Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
+"
+        'Return JSON exactly like: {"delighters":[{"name":"...","confidence":0.0}], "detractors":[{"name":"...","confidence":0.0}]}
+'
+        "Rules:
+"
+        "1) If not clearly present, OMIT it.
+"
+        "2) Prefer precision over recall; avoid stretch matches.
+"
+        "3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
+"
+        "4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
+"
     )
 
     user = {
@@ -520,8 +528,3 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
-
-
-
-
-
