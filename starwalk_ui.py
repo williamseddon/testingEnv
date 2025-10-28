@@ -1,6 +1,3 @@
-# Write the enhanced Streamlit app to a file for download
-code = r'''# ---------- Star Walk — Upload + Symptomize (Enhanced UX, 14" UI & Real-time + Speed) ----------
-# Streamlit 1.38+
 
 import io
 import os
