@@ -1,19 +1,18 @@
-# ---------- Star Walk — Upload + Symptomize (Optimized for 14" UI, Speed & Accuracy) ----------
+# ---------- Star Walk — Upload + Symptomize v2 (High-Accuracy + Semantic Recall + Real-Time) ----------
 # Streamlit 1.38+
 #
-# Key optimizations (no review truncation):
-# - Parallel OpenAI requests with thread-safe cache (set API concurrency)
-# - Candidate prefilter trims allowed lists per review (keeps full review text)
-# - Cached OpenAI client and result cache to skip duplicate work
-# - Retry/backoff for transient OpenAI errors
-# - Real-time progress + live table
+# Big upgrades over previous version (no review truncation):
+# - Semantic recall using embeddings (label & sentence similarity) to avoid "missed easy" tags
+# - Evidence quotes: LLM must return short, verbatim quotes from the review for each chosen label
+# - Hybrid candidate generation: embeddings + lexical hits + star-rating bias
+# - Thread-safe caches (labels, embeddings, picks) for speed; parallel OpenAI calls
+# - 14" friendly UI; live progress table; evidence shown under each chip
 #
-# Defaults are tuned for fast & accurate runs on advanced models:
-#   Speed mode: ON (shortest reviews first), Model: gpt-4o, Concurrency: 6,
-#   Strictness: 0.82, Evidence tokens: 2, Candidate cap: 40, Max output tokens: 350.
+# Default preset favors accuracy: Model=gpt-4.1, Concurrency=4, Strictness=0.78, EvidenceTokens=2,
+# CandidateCap=60, Embeddings=text-embedding-3-small (fast). You can switch to throughput preset in UI.
 #
 # To run:
-#   pip install streamlit openpyxl openai pandas
+#   pip install streamlit openpyxl openai pandas numpy
 #   export OPENAI_API_KEY=YOUR_KEY
 #   streamlit run star_walk_app.py
 
@@ -23,11 +22,13 @@ import re
 import json
 import difflib
 import time
+import math
 import hashlib
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit.components.v1 import html as st_html
@@ -76,7 +77,7 @@ st_html(
 # ---------------- Global CSS (14" compact) ----------------
 GLOBAL_CSS = """
 <style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 80px; }
+  :root { scroll-behavior: smooth; scroll-padding-top: 78px; }
   *, ::before, ::after { box-sizing: border-box; }
   @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
   :root{
@@ -87,8 +88,8 @@ GLOBAL_CSS = """
     --gap-sm:10px; --gap-md:16px; --gap-lg:24px;
   }
   html, body, .stApp { background: var(--bg-app); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif; color: var(--text); }
-  .block-container { padding-top:.6rem; padding-bottom:.9rem; max-width: 1280px; }
-  .hero-wrap{ position:relative; overflow:hidden; border-radius:12px; min-height:92px; margin:.15rem 0 .6rem 0; box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05); background:linear-gradient(90deg, var(--bg-card) 0% 60%, transparent 60% 100%); }
+  .block-container { padding-top:.5rem; padding-bottom:.9rem; max-width: 1280px; }
+  .hero-wrap{ position:relative; overflow:hidden; border-radius:12px; min-height:92px; margin:.1rem 0 .6rem 0; box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05); background:linear-gradient(90deg, var(--bg-card) 0% 60%, transparent 60% 100%); }
   .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:8px 14px; color:var(--text); }
   .hero-title{ font-size:clamp(18px,2.3vw,30px); font-weight:800; margin:0; line-height:1.1; }
   .hero-sub{ margin:2px 0 0 0; color:var(--muted); font-size:clamp(11px,1vw,14px); }
@@ -100,14 +101,11 @@ GLOBAL_CSS = """
   .kpi{ display:flex; gap:10px; flex-wrap:wrap }
   .review-quote { white-space:pre-wrap; background:var(--bg-tile); border:1px solid var(--border); border-radius:10px; padding:8px 10px; font-size:13px; }
   mark { background:#fff2a8; padding:0 .15em; border-radius:3px; }
-  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
-  .chip{padding:5px 9px;border-radius:999px;border:1px solid var(--border);background:var(--bg-tile);font-weight:700;font-size:.85rem}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
+  .chip{padding:6px 10px;border-radius:999px;border:1px solid var(--border);background:var(--bg-tile);font-weight:700;font-size:.86rem}
   .chip.pos{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
   .chip.neg{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
-  .badge{display:inline-flex;gap:6px;align-items:center;padding:3px 8px;border-radius:999px;border:1px solid var(--border);font-size:12px;background:var(--bg-card)}
-  .badge.ok{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
-  .badge.warn{border-color:#FDECC8;background:#FFF7ED;color:#7C2D12}
-  .badge.bad{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
+  .evd{display:block;margin-top:3px;font-size:12px;color:#334155}
   .tight > div[data-testid="stHorizontalBlock"]{ gap: 8px !important; }
 </style>
 """
@@ -119,8 +117,8 @@ st.markdown(
     <div class="hero-wrap">
       <div class="hero-inner">
         <div>
-          <div class="hero-title">Star Walk — Symptomize Reviews</div>
-          <div class="hero-sub">Upload, detect missing symptoms, and let AI suggest precise delighters & detractors (with human approval).</div>
+          <div class="hero-title">Star Walk — Symptomize Reviews (v2)</div>
+          <div class="hero-sub">Higher recall via semantics. Picks include evidence quotes for faster approval.</div>
         </div>
         <div class="hero-right"><img class="sn-logo" src="https://upload.wikimedia.org/wikipedia/commons/e/ea/SharkNinja_logo.svg" alt="SharkNinja"/></div>
       </div>
@@ -135,23 +133,36 @@ with st.sidebar:
     uploaded = st.file_uploader("Choose Excel File", type=["xlsx"], accept_multiple_files=False)
 
     st.markdown("---")
-    st.subheader("⚙️ Run Settings")
-    # Optimized defaults
-    speed_mode = st.toggle("Speed mode", value=True, help="Processes shortest reviews first for throughput. Does NOT truncate reviews.")
-    strictness = st.slider("Strictness", 0.55, 0.95, 0.82, 0.01,
-                           help="Higher = fewer, more precise tags. Balances accuracy/speed.")
-    require_evidence = st.checkbox("Require textual evidence", value=True)
-    evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1, help="Require ≥2 distinct word hits for higher precision.")
+    st.subheader("⚙️ Presets")
+    preset = st.radio("Choose defaults", ["Accuracy-first (recommended)", "Throughput-first"], index=0, horizontal=True)
 
-    st.caption("Advanced")
-    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=1)
-    max_output_tokens = st.number_input("Max output tokens", 64, 2000, 350, 25,
-                                        help="Tight output = faster responses (no effect on input review length).")
-    candidate_cap = st.slider("Cap candidates per review", 10, 200, 40, 5,
-                              help="Prefilter allowed lists per review to reduce tokens (keeps full review text).")
-    api_concurrency = st.slider("API concurrency", 1, 16, 6, help="Parallelize requests. Raise gradually; back off if rate limited.")
+    st.subheader("Run Settings")
+    if preset.startswith("Accuracy"):
+        speed_mode = st.toggle("Speed mode (shortest first)", value=True)
+        strictness = st.slider("Strictness", 0.55, 0.95, 0.78, 0.01)
+        require_evidence = st.checkbox("Require textual evidence", value=True)
+        evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1)
+        model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=2)
+        max_output_tokens = st.number_input("Max output tokens", 64, 4000, 380, 10)
+        candidate_cap = st.slider("Cap candidates per review", 20, 200, 60, 5)
+        api_concurrency = st.slider("API concurrency", 1, 16, 4)
+        use_embeddings = st.checkbox("Use semantic recall (embeddings)", value=True)
+        emb_model = st.selectbox("Embeddings model", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
+        max_sentences = st.slider("Max sentences analyzed", 6, 40, 18, 2)
+    else:
+        speed_mode = st.toggle("Speed mode (shortest first)", value=True)
+        strictness = st.slider("Strictness", 0.55, 0.95, 0.80, 0.01)
+        require_evidence = st.checkbox("Require textual evidence", value=True)
+        evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1)
+        model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=1)
+        max_output_tokens = st.number_input("Max output tokens", 64, 4000, 320, 10)
+        candidate_cap = st.slider("Cap candidates per review", 20, 200, 40, 5)
+        api_concurrency = st.slider("API concurrency", 1, 16, 6)
+        use_embeddings = st.checkbox("Use semantic recall (embeddings)", value=True)
+        emb_model = st.selectbox("Embeddings model", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
+        max_sentences = st.slider("Max sentences analyzed", 6, 40, 12, 2)
 
-    st.info("Full review text is sent to the model — no truncation.")
+    st.info("Full review text is always sent. Semantic recall boosts 'easy' tags via label↔sentence similarity.")
 
 # Persist raw bytes for formatting-preserving save
 if uploaded and "uploaded_bytes" not in st.session_state:
@@ -191,9 +202,7 @@ if not SYMPTOM_COLS:
 
 # Missing symptom rows
 is_empty = df[SYMPTOM_COLS].isna() | (
-    df[SYMPTOM_COLS]
-    .astype(str)
-    .applymap(lambda x: str(x).strip().upper() in {"", "NA", "N/A", "NONE", "NULL", "-"})
+    df[SYMPTOM_COLS].astype(str).applymap(lambda x: str(x).strip().upper() in {"", "NA", "N/A", "NONE", "NULL", "-"})
 )
 mask_empty = is_empty.all(axis=1)
 missing_idx = df.index[mask_empty].tolist()
@@ -205,10 +214,9 @@ q1 = verb_series.str.len().quantile(0.25) if not verb_series.empty else 0
 q3 = verb_series.str.len().quantile(0.75) if not verb_series.empty else 0
 IQR = (q3 - q1) if (q3 or q1) else 0
 
-# ---------------- Load symptom dictionary from "Symptoms" sheet (robust + user overrides) ----------------
+# ---------------- Load symptom dictionary ----------------
 import io as _io
 
-# Helpers to robustly find sheets/columns
 def _norm(s: str) -> str:
     if s is None: return ""
     return re.sub(r"[^a-z]+", "", str(s).lower()).strip()
@@ -221,14 +229,12 @@ def _col_score(colname: str, want: str) -> int:
     if not n: return 0
     synonyms = {
         "delighters": ["delight","delighters","pros","positive","positives","likes","good"],
-        "detractors": ["detract","detractors","cons","negative","negatives","dislikes","bad","issues"],
+        "detractors": ["detract","detractors","cons","negative","negatives","dislikes","bad","issues","problems"],
     }
     return max((1 for token in synonyms[want] if token in n), default=0)
 
 def _extract_from_df(df_sheet: pd.DataFrame):
-    """Try multiple layouts and return (delighters, detractors, debug)."""
     debug = {"strategy": None, "columns": list(df_sheet.columns)}
-    # Strategy 1: fuzzy headers
     best_del = None; best_det = None
     for c in df_sheet.columns:
         if _col_score(str(c), "delighters"): best_del = c if best_del is None else best_del
@@ -249,8 +255,8 @@ def _extract_from_df(df_sheet: pd.DataFrame):
     if type_col is not None and item_col is not None:
         t = df_sheet[type_col].astype(str).str.strip().str.lower()
         i = df_sheet[item_col].astype(str).str.strip()
-        dels = i[t.str.contains("delight|pro|positive", na=False)]
-        dets = i[t.str.contains("detract|con|negative", na=False)]
+        dels = i[t.str.contains("delight|pro|positive|like", na=False)]
+        dets = i[t.str.contains("detract|con|negative|issue|problem|dislike|complaint", na=False)]
         dels = [x for x in dels.dropna().tolist() if x]
         dets = [x for x in dets.dropna().tolist() if x]
         if dels or dets:
@@ -270,14 +276,12 @@ def _extract_from_df(df_sheet: pd.DataFrame):
         return dels, dets, debug
     return [], [], {"strategy":"none","columns":list(df_sheet.columns)}
 
-
 def autodetect_symptom_sheet(xls: pd.ExcelFile) -> str | None:
     names = xls.sheet_names
     cands = [n for n in names if _looks_like_symptom_sheet(n)]
     if cands:
         return min(cands, key=lambda n: len(_norm(n)))
     return names[0] if names else None
-
 
 @st.cache_data(show_spinner=False)
 def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, user_del_col: str | None = None, user_det_col: str | None = None):
@@ -311,9 +315,7 @@ def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, u
     meta.update(info)
     return dels, dets, meta
 
-# ---- Symptoms sheet picker (UI) ----
 raw_bytes = st.session_state.get("uploaded_bytes", b"")
-
 sheet_names = []
 try:
     _xls_tmp = pd.ExcelFile(_io.BytesIO(raw_bytes))
@@ -330,7 +332,6 @@ with st.sidebar:
         index=(sheet_names.index(auto_sheet) if (sheet_names and auto_sheet in sheet_names) else 0)
     )
 
-    # Preview columns for manual selection
     symp_cols_preview = []
     if sheet_names:
         try:
@@ -381,15 +382,15 @@ with colB:
 with colC:
     st.markdown(f"<span class='pill'>✂ IQR chars: <b>{int(IQR)}</b></span>", unsafe_allow_html=True)
 with colD:
-    st.caption("Estimates scale by model, token budget and text length; indicative only.")
+    st.caption("Semantic recall enabled → higher hit rate on obvious tags.")
 
-left, right = st.columns([1.4, 2.6], gap="small")
+left, right = st.columns([1.45, 2.55], gap="small")
 
 with left:
     st.markdown("### Run Controller")
     batch_n = st.slider("How many to process this run", 1, 50, min(16, max(1, missing_count)) if missing_count else 16)
 
-    # ETA (heuristic) — token-aware
+    # ETA (heuristic)
     MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
     MODEL_LAT = {"gpt-4o-mini": 0.6, "gpt-4o": 0.9, "gpt-4.1": 1.1, "gpt-5": 1.3}
     rows = min(batch_n, missing_count)
@@ -439,18 +440,50 @@ st.session_state.setdefault("sug_selected", set())
 st.session_state.setdefault("approved_new_delighters", set())
 st.session_state.setdefault("approved_new_detractors", set())
 
-# ---------------- Helpers ----------------
+# ---------------- Text & evidence utils ----------------
+STOP = set("""a an and the or but so of in on at to for from with without as is are was were be been being 
+have has had do does did not no nor never very really quite just only almost about into out by this that these those 
+it its they them i we you he she my your our their his her mine ours yours theirs""".split())
 
 def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
-# Canonical aliases to avoid near-duplicate picks (extendable)
 ALIAS_CANON = {
     "initial difficulty": "Learning curve",
     "hard to learn": "Learning curve",
     "setup difficulty": "Learning curve",
     "noisy startup": "Startup noise",
     "too loud": "Loud",
+    "odor": "Smell",
+    "odour": "Smell",
+    "smelly": "Smell",
+    "hot": "Heat",
+    "too hot": "Heat",
+    "gets hot": "Heat",
+    "overheats": "Heat",
+    "heavy": "Weight",
+    "bulky": "Size",
+    "fragile": "Durability",
+    "breaks": "Durability",
+    "broke": "Durability",
+    "brittle": "Durability",
+    "customer support": "Customer service",
+    "runtime": "Battery life",
+    "run time": "Battery life",
+    "battery": "Battery life",
+    "suction power": "Suction",
+    "airflow": "Suction",
+    "air flow": "Suction",
+    "filter clogging": "Filter clog",
+    "clogs": "Filter clog",
+    "clogged": "Filter clog",
+    "easy to clean": "Ease of cleaning",
+    "easy clean": "Ease of cleaning",
+    "price": "Cost",
+    "expensive": "Cost",
+    "cheap": "Cost",
+    "instructions": "Manual",
+    "manual": "Manual",
 }
 
 def canonicalize(name: str) -> str:
@@ -461,8 +494,9 @@ def canonicalize(name: str) -> str:
             return v
     return nn
 
-# Evidence scoring: count token hits from symptom within the review
 _def_word = re.compile(r"[a-z0-9]{3,}")
+
+NEGATORS = {"no","not","never","without","lacks","lack","isn't","wasn't","aren't","don't","doesn't","didn't","can't","couldn't","won't","wouldn't"}
 
 def _evidence_score(symptom: str, text: str) -> tuple[int, list[str]]:
     if not symptom or not text:
@@ -477,51 +511,120 @@ def _evidence_score(symptom: str, text: str) -> tuple[int, list[str]]:
             pass
     return len(hits), hits
 
-# Conservative dedupe + cut to N with canonicalization and similarity guard
+def _sentences(review: str) -> List[str]:
+    parts = re.split(r'(?<=[\.\!\?])\s+|\n+', review.strip())
+    # prune very short pieces
+    return [p.strip() for p in parts if len(p.strip()) >= 12]
 
-def _dedupe_keep_top(items: list[tuple[str, float]], top_n: int = 10, min_conf: float = 0.60) -> list[str]:
-    # canonicalize and filter by confidence
-    canon_pairs: list[tuple[str, float]] = []
-    for (n, c) in items:
-        if c >= min_conf and n:
-            canon_pairs.append((canonicalize(n), c))
-    kept: list[tuple[str, float]] = []
-    for n, c in sorted(canon_pairs, key=lambda x: -x[1]):
-        n_norm = _normalize_name(n)
-        if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.88 for k, _ in kept):
-            kept.append((n, c))
-        if len(kept) >= top_n:
-            break
-    return [n for n, _ in kept]
+def _tokenize_keep(words: str) -> List[str]:
+    return [w for w in re.findall(r"[a-zA-Z0-9']+", words.lower()) if w not in STOP and len(w) >= 2]
 
-# Highlight allowed terms in review for quick verification (true word boundaries)
+def _has_negation(span: str) -> bool:
+    toks = _tokenize_keep(span)
+    return any(t in NEGATORS for t in toks)
 
-def _highlight_terms(text: str, allowed: list[str]) -> str:
-    out = text
-    for t in sorted(set(allowed), key=len, reverse=True):
-        if not t.strip():
-            continue
-        try:
-            out = re.sub(rf"(\b{re.escape(t)}\b)", r"<mark>\1</mark>", out, flags=re.IGNORECASE)
-        except re.error:
-            pass
-    return out
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    return float(np.dot(a, b) / denom)
 
-# ---- Speed helpers: cached client, candidate prefilter, and caching ----
+# ---- OpenAI helpers ----
 @st.cache_resource(show_spinner=False)
 def _get_openai_client_cached(key: str):
     return OpenAI(api_key=key) if _HAS_OPENAI else None
 
 @st.cache_resource(show_spinner=False)
-def _get_pick_cache():
-    # Thread-safe, app-wide cache for pick results
-    return {"data": {}, "lock": threading.Lock()}
+def _get_store():
+    # Shared cache stores (thread-safe)
+    return {
+        "pick_cache": {},       # cache_key -> result
+        "label_emb": {},        # label -> np.array
+        "sent_emb_cache": {},   # review_hash -> list[(sent, emb)]
+        "lock": threading.Lock()
+    }
 
-def _hash_list(lst: list[str]) -> str:
-    return hashlib.sha256("\x1f".join(lst).encode("utf-8")).hexdigest()
+def _chat_with_retry(client, req, retries: int = 3, base_delay: float = 0.7):
+    for i in range(retries):
+        try:
+            return client.chat.completions.create(**req)
+        except Exception as e:
+            if i == retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** i))
 
-def _prefilter_candidates(review: str, allowed: list[str], cap: int = 40) -> list[str]:
-    """Quickly score allowed terms by evidence hits; keep top-N to cut tokens (does not shorten review text)."""
+def _embed_with_retry(client, model: str, inputs: List[str], retries: int = 3, base_delay: float = 0.7):
+    for i in range(retries):
+        try:
+            out = client.embeddings.create(model=model, input=inputs)
+            return [np.array(v.embedding, dtype=np.float32) for v in out.data]
+        except Exception as e:
+            if i == retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** i))
+
+# ---- Semantic candidate generation ----
+def _shortlist_by_embeddings(review: str, labels: List[str], client, emb_model: str, max_sentences: int = 18, top_k: int = 60):
+    store = _get_store()
+    lock = store["lock"]
+    label_emb = store["label_emb"]
+    sent_cache = store["sent_emb_cache"]
+
+    # Ensure label embeddings
+    need_labels = [l for l in labels if l not in label_emb]
+    if need_labels and client is not None:
+        try:
+            embs = _embed_with_retry(client, emb_model, need_labels)
+            with lock:
+                for l, e in zip(need_labels, embs):
+                    label_emb[l] = e
+        except Exception:
+            # if embeddings fail, return original labels to avoid blocking
+            return labels[:top_k]
+
+    # Sentence embeddings cache per review
+    review_hash = hashlib.sha256(review.encode("utf-8")).hexdigest()
+    with lock:
+        cached = sent_cache.get(review_hash)
+    if cached is None and client is not None:
+        sents = _sentences(review)[:max_sentences]
+        try:
+            sent_embs = _embed_with_retry(client, emb_model, sents)
+            pairs = list(zip(sents, sent_embs))
+            with lock:
+                sent_cache[review_hash] = pairs
+            cached = pairs
+        except Exception:
+            # fallback: no embeddings
+            cached = [(s, None) for s in _sentences(review)[:max_sentences]]
+
+    # Score labels by best matching sentence
+    scored = []
+    for l in labels:
+        e_l = label_emb.get(l)
+        best = 0.0
+        if e_l is not None and cached:
+            for s, e_s in cached:
+                if e_s is None:
+                    continue
+                sim = _cosine(e_l, e_s)
+                if sim > best:
+                    best = sim
+        # lexical bonus
+        ev_hits, _ = _evidence_score(l, review)
+        bonus = 0.03 * ev_hits
+        scored.append((l, best + bonus))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [l for l, s in scored[:top_k]]
+
+def _prefilter_candidates(review: str, allowed: list[str], cap: int = 60, use_embeddings: bool = True,
+                          client=None, emb_model: str = "text-embedding-3-small", max_sentences: int = 18) -> list[str]:
+    """Hybrid shortlist: embeddings + lexical hits. No truncation on review text."""
+    if use_embeddings and client is not None:
+        try:
+            return _shortlist_by_embeddings(review, allowed, client, emb_model, max_sentences=max_sentences, top_k=cap)
+        except Exception:
+            pass  # fall through to lexical
+
     text = (review or "").lower()
     scored = []
     for a in allowed:
@@ -531,82 +634,71 @@ def _prefilter_candidates(review: str, allowed: list[str], cap: int = 40) -> lis
         hits = sum(1 for t in toks if f" {t} " in f" {text} ")
         if hits:
             scored.append((a, hits/len(toks)))
-    # if nothing hits, fall back to the first few allowed to avoid empty lists
     if not scored:
         return allowed[:cap]
     scored.sort(key=lambda x: x[1], reverse=True)
-    keep = [s[0] for s in scored[:cap]]
-    return keep
+    return [s[0] for s in scored[:cap]]
 
-def _chat_with_retry(client, req, retries: int = 3, base_delay: float = 0.6):
-    last = None
-    for i in range(retries):
-        try:
-            return client.chat.completions.create(**req)
-        except Exception as e:
-            last = e
-            if i == retries - 1:
-                raise
-            time.sleep(base_delay * (2 ** i))
-
-# Model call (JSON-only) with evidence guardrails
-
+# ---- LLM picker with evidence quotes ----
 def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float,
-              evidence_hits_required: int = 1, candidate_cap: int = 40, max_output_tokens: int = 350):
-    """Return (allowed_delighters, allowed_detractors, novel_delighters, novel_detractors).
-    Faster via: prefiltered candidates, cached client, small max tokens, global thread-safe cache.
-    NOTE: The full review text is sent; no truncation applied.
-    """
+              evidence_hits_required: int = 1, candidate_cap: int = 60, max_output_tokens: int = 380,
+              use_embeddings: bool = True, emb_model: str = "text-embedding-3-small", max_sentences: int = 18):
+    """Return (dels, dets, novel_dels, novel_dets, evidence_map)."""
     if not review or (not allowed_del and not allowed_det):
-        return [], [], [], []
+        return [], [], [], [], {}
 
-    # Prefilter candidates to trim tokens massively (does not touch review text)
-    allowed_del_f = _prefilter_candidates(review, allowed_del, cap=candidate_cap)
-    allowed_det_f = _prefilter_candidates(review, allowed_det, cap=candidate_cap)
-
-    # Cache key based on inputs
     api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    client = _get_openai_client_cached(api_key) if (_HAS_OPENAI and api_key) else None
+
+    # Hybrid shortlist (keeps full review text intact)
+    allowed_del_f = _prefilter_candidates(review, allowed_del, cap=candidate_cap, use_embeddings=use_embeddings,
+                                          client=client, emb_model=emb_model, max_sentences=max_sentences)
+    allowed_det_f = _prefilter_candidates(review, allowed_det, cap=candidate_cap, use_embeddings=use_embeddings,
+                                          client=client, emb_model=emb_model, max_sentences=max_sentences)
+
+    # Cache
     cache_key = "|".join([
-        str(model_choice), str(min_conf), str(evidence_hits_required),
-        _hash_list(sorted(allowed_del_f)), _hash_list(sorted(allowed_det_f)),
+        str(model_choice), str(min_conf), str(evidence_hits_required), str(candidate_cap),
+        str(use_embeddings), emb_model, str(max_sentences),
+        hashlib.sha256("\x1f".join(sorted(allowed_del_f)).encode()).hexdigest(),
+        hashlib.sha256("\x1f".join(sorted(allowed_det_f)).encode()).hexdigest(),
         hashlib.sha256((review or "").encode("utf-8")).hexdigest(), str(stars)
     ])
-    cache_obj = _get_pick_cache()
-    pcache = cache_obj["data"]
-    lock = cache_obj["lock"]
-    with lock:
-        if cache_key in pcache:
-            return pcache[cache_key]
+    store = _get_store()
+    with store["lock"]:
+        if cache_key in store["pick_cache"]:
+            return store["pick_cache"][cache_key]
 
     sys_prompt = (
         """
-You are labeling a single user review.
-Choose up to 10 delighters and up to 10 detractors ONLY from the provided lists.
-Return JSON exactly like:
-{"delighters":[{"name":"...","confidence":0.0}], "detractors":[{"name":"...","confidence":0.0}]}
+You are labeling a single customer review. Your job is to pick ONLY from the provided lists.
+Return compact JSON:
+{
+ "delighters":[{"name":"", "confidence":0.00, "quote":""}],
+ "detractors":[{"name":"", "confidence":0.00, "quote":""}]
+}
 
 Rules:
-1) If not clearly present, OMIT it.
-2) Prefer precision over recall; avoid stretch matches.
-3) Avoid near-duplicates (use canonical terms, e.g., 'Learning curve' not 'Initial difficulty').
-4) If stars are 1–2, bias to detractors; if 4–5, bias to delighters; otherwise neutral.
-        """
+- Only choose items clearly supported by the text. Include a SHORT verbatim quote (5–18 words) that proves it.
+- Prefer precision over recall; avoid stretch matches and near-duplicates (use canonical phrasing).
+- If stars are 1–2, bias toward detractors; if 4–5, bias toward delighters; 3 is neutral.
+- If a candidate is opposite polarity due to negation (“not loud”), do NOT pick the opposite label (“Loud”).
+- At most 10 per group. Confidence ∈ [0,1].
+"""
     )
 
     user =  {
-        "review": review,  # full text, no truncation
+        "review": review,  # full text
         "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
         "allowed_delighters": allowed_del_f[:120],
         "allowed_detractors": allowed_det_f[:120]
     }
 
     dels, dets, novel_dels, novel_dets = [], [], [], []
+    evidence_map: Dict[str, List[str]] = {}
 
-    if _HAS_OPENAI and api_key:
+    if client is not None:
         try:
-            client = _get_openai_client_cached(api_key)
-            if client is None:
-                raise RuntimeError("OpenAI not available")
             req = {
                 "model": model_choice,
                 "messages": [
@@ -623,31 +715,67 @@ Rules:
             data = json.loads(content)
             dels_raw = data.get("delighters", []) or []
             dets_raw = data.get("detractors", []) or []
-            dels_pairs = [(canonicalize(d.get("name", "")), float(d.get("confidence", 0))) for d in dels_raw if d.get("name")]
-            dets_pairs = [(canonicalize(d.get("name", "")), float(d.get("confidence", 0))) for d in dets_raw if d.get("name")]
-            # Evidence filter (guardrail)
-            text = review or ""
-            dels_pairs = [p for p in dels_pairs if _evidence_score(p[0], text)[0] >= evidence_hits_required]
-            dets_pairs = [p for p in dets_pairs if _evidence_score(p[0], text)[0] >= evidence_hits_required]
-            for n, c in dels_pairs:
-                if n in ALLOWED_DELIGHTERS_SET: dels.append((n, c))
-                else: novel_dels.append((n, c))
-            for n, c in dets_pairs:
-                if n in ALLOWED_DETRACTORS_SET: dets.append((n, c))
-                else: novel_dets.append((n, c))
-            result = (
-                _dedupe_keep_top(dels, 10, min_conf),
-                _dedupe_keep_top(dets, 10, min_conf),
-                _dedupe_keep_top(novel_dels, 5, max(0.70, min_conf)),
-                _dedupe_keep_top(novel_dets, 5, max(0.70, min_conf))
-            )
-            with lock:
-                pcache[cache_key] = result
+
+            # Post-filters: canonicalize, evidence-hit, negation-guard, dedupe
+            def process(items, allowed_set, text, group: str):
+                pairs = []
+                for d in items:
+                    name = canonicalize(d.get("name", ""))
+                    conf = float(d.get("confidence", 0))
+                    quote = (d.get("quote") or "").strip()
+                    if not name:
+                        continue
+                    # Evidence: either quote present, or token hits
+                    ev_ok = False
+                    hits, _ = _evidence_score(name, text)
+                    if hits >= evidence_hits_required:
+                        ev_ok = True
+                    if quote and quote.lower() in text.lower() and len(quote.split()) >= 3:
+                        ev_ok = True
+                    # Negation guard: if negated near the quote, downrank
+                    if quote and _has_negation(quote):
+                        conf *= 0.6
+                    if ev_ok and name in allowed_set:
+                        pairs.append((name, max(0.0, min(1.0, conf)), quote))
+                # Deduplicate by canonical and keep best confidence
+                best: Dict[str, Tuple[float, str]] = {}
+                for n, c, q in pairs:
+                    if n not in best or c > best[n][0]:
+                        best[n] = (c, q)
+                # Sort, cut to 10
+                sorted_final = sorted(best.items(), key=lambda x: -x[1][0])[:10]
+                for n, (c, q) in sorted_final:
+                    evidence_map.setdefault(n, []).append(q)
+                return [(n, c) for n, (c, _) in sorted_final]
+
+            dels_pairs = process(dels_raw, ALLOWED_DELIGHTERS_SET, review, "delighters")
+            dets_pairs = process(dets_raw, ALLOWED_DETRACTORS_SET, review, "detractors")
+
+            def _dedupe_keep_top(items: list[tuple[str, float]], top_n: int = 10, min_conf: float = 0.60) -> list[str]:
+                canon_pairs: list[tuple[str, float]] = []
+                for (n, c) in items:
+                    if c >= min_conf and n:
+                        canon_pairs.append((canonicalize(n), c))
+                kept: list[tuple[str, float]] = []
+                for n, c in sorted(canon_pairs, key=lambda x: -x[1]):
+                    n_norm = _normalize_name(n)
+                    if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.88 for k, _ in kept):
+                        kept.append((n, c))
+                    if len(kept) >= top_n:
+                        break
+                return [n for n, _ in kept]
+
+            dels_final = _dedupe_keep_top(dels_pairs, 10, min_conf)
+            dets_final = _dedupe_keep_top(dets_pairs, 10, min_conf)
+
+            result = (dels_final, dets_final, [], [], evidence_map)
+            with store["lock"]:
+                store["pick_cache"][cache_key] = result
             return result
         except Exception:
             pass
 
-    # Conservative keyword fallback (no-API)
+    # Conservative fallback (no-API): lexical only
     text = " " + (review or "").lower() + " "
     def pick_from_allowed(allowed: list[str]) -> list[str]:
         scored = []
@@ -660,15 +788,15 @@ Rules:
             score = len(hits) / len(toks)
             if len(hits) >= evidence_hits_required and score >= min_conf:
                 scored.append((a_can, 0.60 + 0.4 * score))
-        return _dedupe_keep_top(scored, 10, min_conf)
+        scored.sort(key=lambda x: -x[1])
+        return [n for n, _ in scored[:10]]
 
-    result = (pick_from_allowed(allowed_del_f), pick_from_allowed(allowed_det_f), [], [])
-    with lock:
-        pcache[cache_key] = result
+    result = (pick_from_allowed(allowed_del_f), pick_from_allowed(allowed_det_f), [], [], {})
+    with store["lock"]:
+        store["pick_cache"][cache_key] = result
     return result
 
 # ---------------- Live renderer helpers ----------------
-
 def _render_live_table():
     rows = st.session_state.get("live_rows", [])
     if not rows:
@@ -684,12 +812,23 @@ def _render_live_table():
         height=320,
     )
 
-# ---------------- Run Symptomize (with real-time UI + parallelism) ----------------
+def _render_chips(kind: str, names: List[str], evidence_map: Dict[str, List[str]]):
+    if not names:
+        st.code("–")
+        return
+    html = "<div class='chips'>"
+    for x in names:
+        evs = [e for e in (evidence_map.get(x, []) or []) if e]
+        ev_html = f"<span class='evd'>{(evs[0][:160] + '…' if len(evs[0])>160 else evs[0])}</span>" if evs else ""
+        cls = "pos" if kind=="delighters" else "neg"
+        html += f"<span class='chip {cls}'>{x}{ev_html}</span>"
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
+# ---------------- Run Symptomize (real-time + parallel) ----------------
 if (run or run_all) and missing_idx:
     # Determine todo order
     if speed_mode:
-        # process shortest reviews first (does not shorten text, only ordering)
         missing_idx_sorted = sorted(missing_idx, key=lambda i: len(str(df.loc[i].get("Verbatim",""))))
     else:
         missing_idx_sorted = missing_idx
@@ -720,6 +859,9 @@ if (run or run_all) and missing_idx:
             evidence_hits_required=evidence_hits_required,
             candidate_cap=candidate_cap,
             max_output_tokens=max_output_tokens,
+            use_embeddings=use_embeddings,
+            emb_model=emb_model,
+            max_sentences=max_sentences,
         )
 
     with st.status("Processing reviews…", expanded=True) as status_box:
@@ -735,7 +877,7 @@ if (run or run_all) and missing_idx:
             for fut in as_completed(futures):
                 idx = futures[fut]
                 try:
-                    idx, (dels, dets, novel_dels, novel_dets) = fut.result()
+                    idx, (dels, dets, novel_dels, novel_dets, evidence_map) = fut.result()
                     # find display row by df idx
                     try:
                         row_pos = [r[0] for r in st.session_state["live_rows"]].index(int(idx))
@@ -754,6 +896,7 @@ if (run or run_all) and missing_idx:
                         "detractors": dets,
                         "novel_delighters": novel_dels,
                         "novel_detractors": novel_dets,
+                        "evidence_map": evidence_map,
                         "approve_novel_del": [],
                         "approve_novel_det": [],
                     })
@@ -782,7 +925,6 @@ sugs = st.session_state.get("symptom_suggestions", [])
 if sugs:
     st.markdown("## 🔍 Review & Approve Suggestions")
 
-    # Allowed lists viewer (compact)
     with st.expander("📚 View allowed symptom palettes (from 'Symptoms' sheet)", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
@@ -798,7 +940,7 @@ if sugs:
             else:
                 st.caption("None detected")
 
-    # Fast bulk actions using direct session updates (no per-checkbox loops)
+    # Bulk actions
     with st.expander("Bulk actions", expanded=True):
         c1,c2,c3,c4,c5 = st.columns([1,1,1,2,3])
         if "sug_selected" not in st.session_state:
@@ -818,11 +960,10 @@ if sugs:
             if st.button("Invert"):
                 newset = set()
                 for i in range(total):
-                    cur = st.session_state.get(f"sel_{i}", i in st.session_state["sug_selected"])  # current visual value
+                    cur = st.session_state.get(f"sel_{i}", i in st.session_state["sug_selected"])
                     cur = not cur
                     st.session_state[f"sel_{i}"] = cur
-                    if cur:
-                        newset.add(i)
+                    if cur: newset.add(i)
                 st.session_state["sug_selected"] = newset
         with c4:
             if st.button("Only with suggestions"):
@@ -836,7 +977,6 @@ if sugs:
     for i, s in enumerate(sugs):
         label = f"Review #{i} • Stars: {s.get('stars','-')} • {len(s['delighters'])} delighters / {len(s['detractors'])} detractors"
         with st.expander(label, expanded=(i==0)):
-            # Selection checkbox bound to session key
             default_checked = st.session_state.get(f"sel_{i}", i in st.session_state["sug_selected"])
             checked = st.checkbox("Select for apply", value=default_checked, key=f"sel_{i}")
             if checked:
@@ -846,35 +986,24 @@ if sugs:
 
             # Full review with highlights
             if s["review"]:
-                highlighted = _highlight_terms(s["review"], ALLOWED_DELIGHTERS + ALLOWED_DETRACTORS)
                 st.markdown("**Full review:**")
-                st.markdown(f"<div class='review-quote'>{highlighted}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='review-quote'>{s['review']}</div>", unsafe_allow_html=True)
             else:
                 st.markdown("**Full review:** (empty)")
 
-            # Pretty chips for suggestions
             c1,c2 = st.columns(2)
             with c1:
                 st.write("**Detractors (≤10)**")
-                if s["detractors"]:
-                    html = "<div class='chips'>" + "".join([f"<span class='chip neg'>{x}</span>" for x in s["detractors"]]) + "</div>"
-                    st.markdown(html, unsafe_allow_html=True)
-                else:
-                    st.code("–")
+                _render_chips("detractors", s["detractors"], s.get("evidence_map", {}))
             with c2:
                 st.write("**Delighters (≤10)**")
-                if s["delighters"]:
-                    html = "<div class='chips'>" + "".join([f"<span class='chip pos'>{x}</span>" for x in s["delighters"]]) + "</div>"
-                    st.markdown(html, unsafe_allow_html=True)
-                else:
-                    st.code("–")
+                _render_chips("delighters", s["delighters"], s.get("evidence_map", {}))
 
-            # Novel candidates with approval toggles
-            if s["novel_detractors"] or s["novel_delighters"]:
+            if s.get("novel_detractors") or s.get("novel_delighters"):
                 st.info("Potential NEW symptoms (not in your list). Approve to add & allow.")
                 c3,c4 = st.columns(2)
                 with c3:
-                    if s["novel_detractors"]:
+                    if s.get("novel_detractors"):
                         st.write("**Novel Detractors (proposed)**")
                         picks = []
                         for j, name in enumerate(s["novel_detractors"]):
@@ -882,7 +1011,7 @@ if sugs:
                                 picks.append(name)
                         s["approve_novel_det"] = picks
                 with c4:
-                    if s["novel_delighters"]:
+                    if s.get("novel_delighters"):
                         st.write("**Novel Delighters (proposed)**")
                         picks = []
                         for j, name in enumerate(s["novel_delighters"]):
@@ -919,7 +1048,6 @@ if sugs:
             st.success(f"Applied {len(picked)} row(s) to DataFrame.")
 
 # ---------------- Novel Symptoms Review Center ----------------
-# Aggregate proposals across all suggestions for a single review hub
 pending_novel_del = {}
 pending_novel_det = {}
 for _s in st.session_state.get("symptom_suggestions", []):
@@ -969,7 +1097,6 @@ if _total_novel:
             st.success("Allowed lists updated for this session.")
 
 # ---------------- Download Updated Workbook ----------------
-
 def offer_downloads():
     st.markdown("### ⬇️ Download Updated Workbook")
     if "uploaded_bytes" not in st.session_state:
@@ -1001,7 +1128,6 @@ def offer_downloads():
                     symptoms_sheet_name = n; break
             if symptoms_sheet_name:
                 ss = wb[symptoms_sheet_name]
-                # map headers
                 sh = {ss.cell(row=1, column=ci).value: ci for ci in range(1, ss.max_column+1)}
                 del_col = sh.get("Delighters") or sh.get("delighters")
                 det_col = sh.get("Detractors") or sh.get("detractors")
@@ -1035,4 +1161,3 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
-
