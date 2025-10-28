@@ -109,7 +109,7 @@ def _detect_negated_quote(quote: str, full_text: str) -> bool:
     return any(t in NEGATORS for t in toks)
 
 # ---------------- Prompting ----------------
-PROMPT_INSTRUCTIONS = """You are Shark Glossi Review Analyzer, an AI assistant designed to evaluate and process customer reviews for the Shark Glossi (similar to SmoothStyle) hot tool.
+PROMPT_INSTRUCTIONS = """You are SharkNinja product review classifying expeer and my AI assistant designed to evaluate and process customer reviews for the any Shark, Ninja or competative product. This feedback is used to help us learn how we can improve our products and will be reviewed by a quality engineer focused on CSAT, safety and reliability.
 
 Your job is to extract and clearly list all delighters and detractors from the review, using only the predefined items in the provided lists. Use semantics: synonyms and paraphrases may map to the closest item from the list, but DO NOT invent new items or use labels not present in the lists.
 
