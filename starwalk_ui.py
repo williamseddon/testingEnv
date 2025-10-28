@@ -1,6 +1,4 @@
-Always show details
-# Write the fully updated & optimized Streamlit app to a new file for download
-code = r'''# ---------- Star Walk — Upload + Symptomize (Optimized for 14" UI, Speed & Accuracy) ----------
+# ---------- Star Walk — Upload + Symptomize (Optimized for 14" UI, Speed & Accuracy) ----------
 # Streamlit 1.38+
 #
 # Key optimizations (no review truncation):
@@ -464,7 +462,7 @@ def canonicalize(name: str) -> str:
     return nn
 
 # Evidence scoring: count token hits from symptom within the review
-_def_word = re.compile(r"[a-z0-9]{3,}")
+_def_word = re.compile(r"[a-z0-9]{3,}"]
 
 def _evidence_score(symptom: str, text: str) -> tuple[int, list[str]]:
     if not symptom or not text:
@@ -1037,29 +1035,4 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
-'''
-path = "/mnt/data/star_walk_app.py"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
 
-# Also provide a zip for convenience
-import zipfile
-zip_path = "/mnt/data/star_walk_app.zip"
-with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    z.write(path, arcname="star_walk_app.py")
-
-# Print a tiny confirmation
-import os, json, hashlib
-def sha256(p):
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-print(json.dumps({
-    "py_path": path,
-    "py_sha256": sha256(path),
-    "zip_path": zip_path,
-    "zip_sha256": sha256(zip_path),
-}, indent=2))
