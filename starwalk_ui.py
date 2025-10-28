@@ -1,4 +1,4 @@
-Please finish this: # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # Star Walk — Symptomize Reviews (v3)
 # High-Recall + Semantic Recall + Variant-Aware Evidence + Ensemble Rerank
 # Streamlit 1.38+
