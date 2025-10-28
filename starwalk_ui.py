@@ -1,5 +1,23 @@
-# ---------- Star Walk — Upload + Symptomize (Enhanced UX, 14" UI & Real‑time + Speed) ----------
+Always show details
+# Write the fully updated & optimized Streamlit app to a new file for download
+code = r'''# ---------- Star Walk — Upload + Symptomize (Optimized for 14" UI, Speed & Accuracy) ----------
 # Streamlit 1.38+
+#
+# Key optimizations (no review truncation):
+# - Parallel OpenAI requests with thread-safe cache (set API concurrency)
+# - Candidate prefilter trims allowed lists per review (keeps full review text)
+# - Cached OpenAI client and result cache to skip duplicate work
+# - Retry/backoff for transient OpenAI errors
+# - Real-time progress + live table
+#
+# Defaults are tuned for fast & accurate runs on advanced models:
+#   Speed mode: ON (shortest reviews first), Model: gpt-4o, Concurrency: 6,
+#   Strictness: 0.82, Evidence tokens: 2, Candidate cap: 40, Max output tokens: 350.
+#
+# To run:
+#   pip install streamlit openpyxl openai pandas
+#   export OPENAI_API_KEY=YOUR_KEY
+#   streamlit run star_walk_app.py
 
 import io
 import os
@@ -10,6 +28,7 @@ import time
 import hashlib
 from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import pandas as pd
 import streamlit as st
@@ -119,21 +138,22 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚙️ Run Settings")
-    speed_mode = st.toggle("Speed mode", value=False, help="Uses faster model & shorter reviews first (does not shorten text).")
-    strictness = st.slider("Strictness", 0.55, 0.95, 0.75, 0.01,
-                           help="Confidence + evidence threshold; also reduces near-duplicates.")
+    # Optimized defaults
+    speed_mode = st.toggle("Speed mode", value=True, help="Processes shortest reviews first for throughput. Does NOT truncate reviews.")
+    strictness = st.slider("Strictness", 0.55, 0.95, 0.82, 0.01,
+                           help="Higher = fewer, more precise tags. Balances accuracy/speed.")
     require_evidence = st.checkbox("Require textual evidence", value=True)
-    evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1 if strictness>=0.8 else 0)
+    evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1, help="Require ≥2 distinct word hits for higher precision.")
 
     st.caption("Advanced")
-    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
-    max_output_tokens = st.number_input("Max output tokens", 64, 2000, 400, 32,
-                                        help="Limits LLM output to keep latency low.")
-    candidate_cap = st.slider("Cap candidates per review", 10, 120, 40, 5,
-                              help="Prefilter allowed lists per review to reduce tokens. This does NOT shorten the review text.")
-    api_concurrency = st.slider("API concurrency", 1, 8, 4, help="Parallelize requests (watch rate limits).")
+    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=1)
+    max_output_tokens = st.number_input("Max output tokens", 64, 2000, 350, 25,
+                                        help="Tight output = faster responses (no effect on input review length).")
+    candidate_cap = st.slider("Cap candidates per review", 10, 200, 40, 5,
+                              help="Prefilter allowed lists per review to reduce tokens (keeps full review text).")
+    api_concurrency = st.slider("API concurrency", 1, 16, 6, help="Parallelize requests. Raise gradually; back off if rate limited.")
 
-    st.info("Reviews are sent in full — no truncation applied.")
+    st.info("Full review text is sent to the model — no truncation.")
 
 # Persist raw bytes for formatting-preserving save
 if uploaded and "uploaded_bytes" not in st.session_state:
@@ -369,7 +389,7 @@ left, right = st.columns([1.4, 2.6], gap="small")
 
 with left:
     st.markdown("### Run Controller")
-    batch_n = st.slider("How many to process this run", 1, 30, min(12, max(1, missing_count)) if missing_count else 12)
+    batch_n = st.slider("How many to process this run", 1, 50, min(16, max(1, missing_count)) if missing_count else 16)
 
     # ETA (heuristic) — token-aware
     MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
@@ -411,18 +431,15 @@ with left:
 with right:
     st.markdown("### Live Processing")
     if "live_rows" not in st.session_state:
-        st.session_state["live_rows"] = []  # list of dict rows for the live table
+        st.session_state["live_rows"] = []  # list of rows for the live table
     live_table_ph = st.empty()
-    live_detail_ph = st.empty()
     live_progress = st.progress(0)
 
 # ---------------- Session State (non-UI) ----------------
-
 st.session_state.setdefault("symptom_suggestions", [])
 st.session_state.setdefault("sug_selected", set())
 st.session_state.setdefault("approved_new_delighters", set())
 st.session_state.setdefault("approved_new_detractors", set())
-st.session_state.setdefault("pick_cache", {})
 
 # ---------------- Helpers ----------------
 
@@ -495,10 +512,15 @@ def _highlight_terms(text: str, allowed: list[str]) -> str:
 # ---- Speed helpers: cached client, candidate prefilter, and caching ----
 @st.cache_resource(show_spinner=False)
 def _get_openai_client_cached(key: str):
-    return OpenAI(api_key=key)
+    return OpenAI(api_key=key) if _HAS_OPENAI else None
+
+@st.cache_resource(show_spinner=False)
+def _get_pick_cache():
+    # Thread-safe, app-wide cache for pick results
+    return {"data": {}, "lock": threading.Lock()}
 
 def _hash_list(lst: list[str]) -> str:
-    return hashlib.sha1("\x1f".join(lst).encode("utf-8")).hexdigest()
+    return hashlib.sha256("\x1f".join(lst).encode("utf-8")).hexdigest()
 
 def _prefilter_candidates(review: str, allowed: list[str], cap: int = 40) -> list[str]:
     """Quickly score allowed terms by evidence hits; keep top-N to cut tokens (does not shorten review text)."""
@@ -518,12 +540,23 @@ def _prefilter_candidates(review: str, allowed: list[str], cap: int = 40) -> lis
     keep = [s[0] for s in scored[:cap]]
     return keep
 
+def _chat_with_retry(client, req, retries: int = 3, base_delay: float = 0.6):
+    last = None
+    for i in range(retries):
+        try:
+            return client.chat.completions.create(**req)
+        except Exception as e:
+            last = e
+            if i == retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** i))
+
 # Model call (JSON-only) with evidence guardrails
 
 def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float,
-              evidence_hits_required: int = 1, candidate_cap: int = 40, max_output_tokens: int = 400):
+              evidence_hits_required: int = 1, candidate_cap: int = 40, max_output_tokens: int = 350):
     """Return (allowed_delighters, allowed_detractors, novel_delighters, novel_detractors).
-    Faster via: prefiltered candidates, cached client, small max tokens, local cache.
+    Faster via: prefiltered candidates, cached client, small max tokens, global thread-safe cache.
     NOTE: The full review text is sent; no truncation applied.
     """
     if not review or (not allowed_del and not allowed_det):
@@ -538,11 +571,14 @@ def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str]
     cache_key = "|".join([
         str(model_choice), str(min_conf), str(evidence_hits_required),
         _hash_list(sorted(allowed_del_f)), _hash_list(sorted(allowed_det_f)),
-        hashlib.sha1((review or "").encode("utf-8")).hexdigest(), str(stars)
+        hashlib.sha256((review or "").encode("utf-8")).hexdigest(), str(stars)
     ])
-    pcache = st.session_state.get("pick_cache", {})
-    if cache_key in pcache:
-        return pcache[cache_key]
+    cache_obj = _get_pick_cache()
+    pcache = cache_obj["data"]
+    lock = cache_obj["lock"]
+    with lock:
+        if cache_key in pcache:
+            return pcache[cache_key]
 
     sys_prompt = (
         """
@@ -560,7 +596,7 @@ Rules:
     )
 
     user =  {
-        "review": review,  # <-- full text, no truncation
+        "review": review,  # full text, no truncation
         "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
         "allowed_delighters": allowed_del_f[:120],
         "allowed_detractors": allowed_det_f[:120]
@@ -571,6 +607,8 @@ Rules:
     if _HAS_OPENAI and api_key:
         try:
             client = _get_openai_client_cached(api_key)
+            if client is None:
+                raise RuntimeError("OpenAI not available")
             req = {
                 "model": model_choice,
                 "messages": [
@@ -582,7 +620,7 @@ Rules:
             }
             if not str(model_choice).startswith("gpt-5"):
                 req["temperature"] = 0.0
-            out = client.chat.completions.create(**req)
+            out = _chat_with_retry(client, req)
             content = out.choices[0].message.content or "{}"
             data = json.loads(content)
             dels_raw = data.get("delighters", []) or []
@@ -605,7 +643,8 @@ Rules:
                 _dedupe_keep_top(novel_dels, 5, max(0.70, min_conf)),
                 _dedupe_keep_top(novel_dets, 5, max(0.70, min_conf))
             )
-            st.session_state["pick_cache"][cache_key] = result
+            with lock:
+                pcache[cache_key] = result
             return result
         except Exception:
             pass
@@ -626,7 +665,8 @@ Rules:
         return _dedupe_keep_top(scored, 10, min_conf)
 
     result = (pick_from_allowed(allowed_del_f), pick_from_allowed(allowed_det_f), [], [])
-    st.session_state["pick_cache"][cache_key] = result
+    with lock:
+        pcache[cache_key] = result
     return result
 
 # ---------------- Live renderer helpers ----------------
@@ -686,6 +726,7 @@ if (run or run_all) and missing_idx:
 
     with st.status("Processing reviews…", expanded=True) as status_box:
         completed = 0
+        errors = 0
         live_progress.progress(0)
         if st.session_state["live_rows"]:
             st.session_state["live_rows"][0][-1] = "processing"
@@ -694,37 +735,46 @@ if (run or run_all) and missing_idx:
         with ThreadPoolExecutor(max_workers=api_concurrency) as ex:
             futures = {ex.submit(_process_one, idx): idx for idx in todo}
             for fut in as_completed(futures):
-                idx, (dels, dets, novel_dels, novel_dets) = fut.result()
-                # find display row by df idx
+                idx = futures[fut]
                 try:
-                    row_pos = [r[0] for r in st.session_state["live_rows"]].index(int(idx))
-                except ValueError:
-                    row_pos = None
-                if row_pos is not None:
-                    st.session_state["live_rows"][row_pos][3] = len(dets)
-                    st.session_state["live_rows"][row_pos][4] = len(dels)
-                    st.session_state["live_rows"][row_pos][-1] = "done"
-
-                # Save suggestion bundle
-                st.session_state["symptom_suggestions"].append({
-                    "row_index": int(idx),
-                    "stars": float(df.loc[idx].get("Star Rating")) if pd.notna(df.loc[idx].get("Star Rating")) else None,
-                    "review": str(df.loc[idx].get("Verbatim", "") or "").strip(),
-                    "delighters": dels,
-                    "detractors": dets,
-                    "novel_delighters": novel_dels,
-                    "novel_detractors": novel_dets,
-                    "approve_novel_del": [],
-                    "approve_novel_det": [],
-                })
-                completed += 1
-                live_progress.progress(completed/len(todo))
-                status_box.write(f"Completed {completed}/{len(todo)} — df idx {idx}: det {len(dets)} / del {len(dels)}")
-                try:
-                    st.toast(f"df idx {idx}: det {len(dets)} / del {len(dels)}")
-                except Exception:
-                    pass
-                _render_live_table()
+                    idx, (dels, dets, novel_dels, novel_dets) = fut.result()
+                    # find display row by df idx
+                    try:
+                        row_pos = [r[0] for r in st.session_state["live_rows"]].index(int(idx))
+                    except ValueError:
+                        row_pos = None
+                    if row_pos is not None:
+                        st.session_state["live_rows"][row_pos][3] = len(dets)
+                        st.session_state["live_rows"][row_pos][4] = len(dels)
+                        st.session_state["live_rows"][row_pos][-1] = "done"
+                    # Save suggestion bundle
+                    st.session_state["symptom_suggestions"].append({
+                        "row_index": int(idx),
+                        "stars": float(df.loc[idx].get("Star Rating")) if pd.notna(df.loc[idx].get("Star Rating")) else None,
+                        "review": str(df.loc[idx].get("Verbatim", "") or "").strip(),
+                        "delighters": dels,
+                        "detractors": dets,
+                        "novel_delighters": novel_dels,
+                        "novel_detractors": novel_dets,
+                        "approve_novel_del": [],
+                        "approve_novel_det": [],
+                    })
+                except Exception as e:
+                    errors += 1
+                    try:
+                        row_pos = [r[0] for r in st.session_state["live_rows"]].index(int(idx))
+                        st.session_state["live_rows"][row_pos][-1] = "error"
+                    except Exception:
+                        pass
+                    status_box.write(f"⚠️ Error on df idx {idx}: {type(e).__name__}")
+                finally:
+                    completed += 1
+                    live_progress.progress(completed/len(todo))
+                    try:
+                        st.toast(f"Done {completed}/{len(todo)} (errors: {errors})")
+                    except Exception:
+                        pass
+                    _render_live_table()
 
         status_box.update(label="Finished generating suggestions! Review below, then Apply to write into the sheet.", state="complete")
     st.rerun()
@@ -987,7 +1037,29 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+'''
+path = "/mnt/data/star_walk_app.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
 
+# Also provide a zip for convenience
+import zipfile
+zip_path = "/mnt/data/star_walk_app.zip"
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    z.write(path, arcname="star_walk_app.py")
 
+# Print a tiny confirmation
+import os, json, hashlib
+def sha256(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-
+print(json.dumps({
+    "py_path": path,
+    "py_sha256": sha256(path),
+    "zip_path": zip_path,
+    "zip_sha256": sha256(zip_path),
+}, indent=2))
