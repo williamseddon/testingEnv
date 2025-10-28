@@ -462,7 +462,7 @@ def canonicalize(name: str) -> str:
     return nn
 
 # Evidence scoring: count token hits from symptom within the review
-_def_word = re.compile(r"[a-z0-9]{3,}"]
+_def_word = re.compile(r"[a-z0-9]{3,}")
 
 def _evidence_score(symptom: str, text: str) -> tuple[int, list[str]]:
     if not symptom or not text:
