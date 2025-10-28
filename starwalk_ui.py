@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# Star Walk — Symptomize Reviews (v5.1)
+# Star Walk — Symptomize Reviews (v5.2)
 # One-review-per-call • strict JSON • timeouts • manual sheet/column selection
+# POSITONAL WRITE RULE: Detractors -> K..T (cols 11..20) • Delighters -> U..AD (cols 21..30)
 #
 # To run:
 #   pip install streamlit openpyxl openai pandas
 #   export OPENAI_API_KEY=YOUR_KEY
-#   streamlit run star_walk_app_v5_1.py
+#   streamlit run star_walk_app_v5_2.py
 
 import io
 import os
@@ -35,7 +36,7 @@ except Exception:
 
 
 # ---------------- Page Config ----------------
-st.set_page_config(layout="wide", page_title="Star Walk — Symptomize (v5.1)")
+st.set_page_config(layout="wide", page_title="Star Walk — Symptomize (v5.2)")
 
 # ---------------- Force Light Mode ----------------
 st_html(
@@ -233,8 +234,18 @@ def _call_openai_for_review(client, model: str, system_prompt: str, user_prompt:
 # ---------------- Excel write helpers ----------------
 SYMPTOM_COLS = [f"Symptom {i}" for i in range(1, 21)]
 
-def _write_symptoms_into_workbook_bytes(raw_bytes: bytes, review_sheet: str,
-                                        df: pd.DataFrame, results: Dict[int, Dict[str, Any]]) -> bytes:
+def _write_symptoms_into_workbook_bytes(raw_bytes: bytes,
+                                        review_sheet: str,
+                                        df: pd.DataFrame,
+                                        results: Dict[int, Dict[str, Any]],
+                                        prefer_positional: bool = True) -> bytes:
+    """
+    Writes (POSITIVE CONTROLLED BY POSITION):
+      - Detractors -> columns K..T (11..20)
+      - Delighters -> columns U..AD (21..30)
+    If header names are weird or out of order, positional mapping still wins.
+    """
+    # Fallback if openpyxl unavailable (keeps header-based writing only)
     if not _HAS_OPENPYXL:
         out = io.BytesIO()
         for idx, res in results.items():
@@ -258,27 +269,55 @@ def _write_symptoms_into_workbook_bytes(raw_bytes: bytes, review_sheet: str,
         review_sheet = wb.sheetnames[0]
     ws = wb[review_sheet]
 
+    # Build header map (for safety/clearing), but we will prioritize positions.
     headers = {ws.cell(row=1, column=ci).value: ci for ci in range(1, ws.max_column + 1)}
-    last_col = ws.max_column
-    for name in SYMPTOM_COLS:
-        if name not in headers or headers[name] is None:
-            last_col += 1
-            ws.cell(row=1, column=last_col).value = name
-            headers[name] = last_col
 
+    # Resolve the 20 symptom columns by position:
+    # 1) Try to find 20 "Symptom" headers and sort by column index
+    # 2) Otherwise fall back to fixed K..AD (11..30)
+    def _resolve_symptom_positions():
+        pos_by_name = []
+        for ci in range(1, ws.max_column + 1):
+            val = ws.cell(row=1, column=ci).value
+            if isinstance(val, str) and val.strip():
+                if re.search(r"\bsymptom\b", val, flags=re.IGNORECASE):
+                    pos_by_name.append(ci)
+        pos_by_name = sorted(pos_by_name)
+        if len(pos_by_name) >= 20:
+            pos_by_name = pos_by_name[:20]  # keep left-to-right
+            return pos_by_name[:10], pos_by_name[10:]
+        # fallback: fixed K..AD
+        detr_cols = list(range(11, 21))   # K..T
+        del_cols  = list(range(21, 31))   # U..AD
+        return detr_cols, del_cols
+
+    detr_positions, del_positions = _resolve_symptom_positions()
+
+    # If preferring positional mapping, clear K..AD globally first
+    if prefer_positional:
+        for excel_row in range(2, ws.max_row + 1):
+            for ci in range(11, 31):  # K..AD
+                ws.cell(row=excel_row, column=ci).value = None
+
+    # Write each processed row
     for df_row_idx, res in results.items():
         excel_row = 2 + df_row_idx
-        for i in range(1, 21):
-            ci = headers.get(f"Symptom {i}")
-            if ci: ws.cell(row=excel_row, column=ci).value = None
+
+        # defensive clear for this row's K..AD
+        for ci in range(11, 31):
+            ws.cell(row=excel_row, column=ci).value = None
+
+        # Detractors -> K..T
         dets = [x["name"] for x in res.get("detractors", [])][:10]
-        for j, name in enumerate(dets, start=1):
-            ci = headers.get(f"Symptom {j}")
-            if ci: ws.cell(row=excel_row, column=ci).value = name
+        for j, name in enumerate(dets):
+            if j < len(detr_positions):
+                ws.cell(row=excel_row, column=detr_positions[j]).value = name
+
+        # Delighters -> U..AD
         dels = [x["name"] for x in res.get("delighters", [])][:10]
-        for j, name in enumerate(dels, start=11):
-            ci = headers.get(f"Symptom {j}")
-            if ci: ws.cell(row=excel_row, column=ci).value = name
+        for j, name in enumerate(dels):
+            if j < len(del_positions):
+                ws.cell(row=excel_row, column=del_positions[j]).value = name
 
     out = io.BytesIO()
     wb.save(out)
@@ -333,6 +372,8 @@ with st.sidebar:
     api_concurrency = st.slider("API concurrency", 1, 8, 3)
     max_output_tokens = st.number_input("LLM max tokens", 128, 2000, 700, 10)
 
+    st.caption("Positional write rule is enforced: K–T = detractors, U–AD = delighters.")
+
     st.markdown("---")
     if st.button("🩺 Health check"):
         api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
@@ -375,7 +416,8 @@ st.markdown("## 1) Configure Sources")
 
 # Symptoms sheet + columns
 with st.expander("Symptoms configuration (Delighters/Detractors)", expanded=True):
-    symp_sheet = st.selectbox("Symptoms sheet", options=all_sheets, index=(all_sheets.index("Symptoms") if "Symptoms" in all_sheets else 0))
+    symp_default = "Symptoms" if "Symptoms" in all_sheets else all_sheets[0]
+    symp_sheet = st.selectbox("Symptoms sheet", options=all_sheets, index=all_sheets.index(symp_default))
     df_symp = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=symp_sheet)
     st.caption("Detected columns:")
     st.write(", ".join(map(str, df_symp.columns)))
@@ -434,14 +476,15 @@ with st.expander("🔎 Prompt Preview (first review)", expanded=False):
     st.code(user_preview[:2000] + ("..." if len(user_preview) > 2000 else ""))
 
 # ---------------- KPIs ----------------
-SYMPTOM_COLS = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in df_reviews.columns]
-if not SYMPTOM_COLS:
+# Ensure Symptom 1..20 exist in df (for missing-row detection only; writer uses position)
+SYMPTOM_COLS_DF = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in df_reviews.columns]
+if not SYMPTOM_COLS_DF:
     for c in [f"Symptom {i}" for i in range(1,21)]:
         df_reviews[c] = None
-    SYMPTOM_COLS = [f"Symptom {i}" for i in range(1,21)]
+    SYMPTOM_COLS_DF = [f"Symptom {i}" for i in range(1,21)]
 
-is_empty = df_reviews[SYMPTOM_COLS].isna() | (
-    df_reviews[SYMPTOM_COLS].astype(str).applymap(lambda x: str(x).strip().upper() in {"", "NA", "N/A", "NONE", "NULL", "-"})
+is_empty = df_reviews[SYMPTOM_COLS_DF].isna() | (
+    df_reviews[SYMPTOM_COLS_DF].astype(str).applymap(lambda x: str(x).strip().upper() in {"", "NA", "N/A", "NONE", "NULL", "-"})
 )
 mask_empty = is_empty.all(axis=1)
 missing_idx = df_reviews.index[mask_empty].tolist()
@@ -456,8 +499,6 @@ with colC:
     st.markdown(f"<span class='pill'>📚 Lists loaded: <b>{len(delighters)}</b> delighters • <b>{len(detractors)}</b> detractors</span>", unsafe_allow_html=True)
 
 # ---------------- Session State ----------------
-st.session_state.setdefault("symptom_suggestions", [])
-st.session_state.setdefault("sug_selected", set())
 st.session_state.setdefault("updated_bytes", None)
 
 # ---------------- Single-row test (debug-first) ----------------
@@ -540,10 +581,12 @@ if (run or run_all) and missing_idx:
                         completed += 1
         status_box.update(label="Batch finished", state="complete")
 
-    # Write outputs back to workbook bytes
+    # Write outputs back to workbook bytes (POSitional mapping enforced)
     try:
         # write symptoms into the review sheet
-        updated_bytes = _write_symptoms_into_workbook_bytes(raw_bytes, review_sheet, df_reviews.copy(), results_by_idx)
+        updated_bytes = _write_symptoms_into_workbook_bytes(
+            raw_bytes, review_sheet, df_reviews.copy(), results_by_idx, prefer_positional=True
+        )
         # write the detailed tagging sheet
         updated_bytes = _write_review_tagging_sheet(updated_bytes, tagging_rows)
         st.session_state["updated_bytes"] = updated_bytes
@@ -562,5 +605,6 @@ if st.session_state.get("updated_bytes"):
     )
 else:
     st.caption("Run a test or batch to enable download.")
+
 
 
