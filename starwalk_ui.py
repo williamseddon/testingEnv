@@ -1,25 +1,23 @@
 # -*- coding: utf-8 -*-
-# Star Walk — Symptomize Reviews (v3)
-# High-Recall + Semantic Recall + Variant-Aware Evidence + Ensemble Rerank
-# Streamlit 1.38+
+# Star Walk — Symptomize Reviews (v4, model-first)
+# High-precision LLM extraction with self-consistency + evidence & negation validation
 #
 # To run:
 #   pip install streamlit openpyxl openai pandas numpy
 #   export OPENAI_API_KEY=YOUR_KEY
-#   streamlit run star_walk_app_v3.py
+#   streamlit run star_walk_app_v4.py
 
 import io
 import os
 import re
 import json
-import difflib
 import time
 import math
 import hashlib
-from typing import List, Tuple, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import itertools
+from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
 import numpy as np
@@ -27,7 +25,7 @@ import pandas as pd
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 
-# Optional OpenAI
+# -------- Optional OpenAI ----------
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
@@ -35,7 +33,7 @@ except Exception:
     _HAS_OPENAI = False
     OpenAI = None  # type: ignore
 
-# Optional: preserve workbook formatting
+# -------- Optional: preserve workbook formatting ----------
 try:
     from openpyxl import load_workbook
     _HAS_OPENPYXL = True
@@ -43,7 +41,7 @@ except Exception:
     _HAS_OPENPYXL = False
 
 # ---------------- Page Config ----------------
-st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
+st.set_page_config(layout="wide", page_title="Star Walk — Symptomize (v4)")
 
 # ---------------- Force Light Mode ----------------
 st_html(
@@ -59,8 +57,7 @@ st_html(
   }
   setLight();
   new MutationObserver(setLight).observe(
-    document.documentElement,
-    { attributes: true, attributeFilter: ['data-theme'] }
+    document.documentElement,{ attributes:true, attributeFilter:['data-theme'] }
   );
 })();
 </script>
@@ -68,39 +65,36 @@ st_html(
     height=0,
 )
 
-# ---------------- Global CSS (14" compact) ----------------
+# ---------------- Global CSS (compact) ----------------
 GLOBAL_CSS = """
 <style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 78px; }
-  *, ::before, ::after { box-sizing: border-box; }
-  @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
+  :root { scroll-behavior:smooth; scroll-padding-top:78px }
+  *, ::before, ::after { box-sizing:border-box }
   :root{
-    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-    --border-strong:#94a3b8; --border:#cbd5e1; --border-soft:#e2e8f0;
+    --text:#0f172a; --muted:#475569; --border:#cbd5e1; --border-strong:#94a3b8;
     --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626; --warn:#b45309;
-    --gap-sm:10px; --gap-md:16px; --gap-lg:24px;
   }
-  html, body, .stApp { background: var(--bg-app); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif; color: var(--text); }
-  .block-container { padding-top:.5rem; padding-bottom:.9rem; max-width: 1280px; }
-  .hero-wrap{ position:relative; overflow:hidden; border-radius:12px; min-height:92px; margin:.1rem 0 .6rem 0; box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05); background:linear-gradient(90deg, var(--bg-card) 0% 60%, transparent 60% 100%); }
-  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:8px 14px; color:var(--text); }
-  .hero-title{ font-size:clamp(18px,2.3vw,30px); font-weight:800; margin:0; line-height:1.1; }
-  .hero-sub{ margin:2px 0 0 0; color:var(--muted); font-size:clamp(11px,1vw,14px); }
-  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:36%; }
-  .sn-logo{ height:36px; width:auto; display:block; opacity:.92; }
-  .card{ background:var(--bg-card); border-radius:12px; padding:12px; box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05); }
-  .muted{ color:var(--muted); }
-  .pill{ padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:var(--bg-tile); font-weight:700; font-size:12px; }
-  .kpi{ display:flex; gap:10px; flex-wrap:wrap }
-  .review-quote { white-space:pre-wrap; background:var(--bg-tile); border:1px solid var(--border); border-radius:10px; padding:8px 10px; font-size:13px; }
-  mark { background:#fff2a8; padding:0 .15em; border-radius:3px; }
+  html, body, .stApp { background:var(--bg-app); color:var(--text); font-family:ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif; }
+  .block-container { padding-top:.5rem; padding-bottom:.9rem; max-width:1280px }
+  .hero-wrap{ position:relative; border-radius:12px; min-height:92px; margin:.1rem 0 .6rem 0;
+    box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05);
+    background:linear-gradient(90deg, var(--bg-card) 0% 60%, transparent 60% 100%);
+  }
+  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:8px 14px }
+  .hero-title{ font-size:clamp(18px,2.3vw,30px); font-weight:800; margin:0; line-height:1.1 }
+  .hero-sub{ margin:2px 0 0 0; color:#64748b; font-size:clamp(11px,1vw,14px) }
+  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:36% }
+  .sn-logo{ height:36px; width:auto; display:block; opacity:.92 }
+  .card{ background:var(--bg-card); border-radius:12px; padding:12px;
+    box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05)
+  }
+  .pill{ padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:var(--bg-tile); font-weight:700; font-size:12px }
+  .review-quote { white-space:pre-wrap; background:var(--bg-tile); border:1px solid var(--border); border-radius:10px; padding:8px 10px; font-size:13px }
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
   .chip{padding:6px 10px;border-radius:999px;border:1px solid var(--border);background:var(--bg-tile);font-weight:700;font-size:.86rem}
   .chip.pos{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
   .chip.neg{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
   .evd{display:block;margin-top:3px;font-size:12px;color:#334155}
-  .tight > div[data-testid="stHorizontalBlock"]{ gap: 8px !important; }
 </style>
 """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
@@ -111,8 +105,8 @@ st.markdown(
     <div class="hero-wrap">
       <div class="hero-inner">
         <div>
-          <div class="hero-title">Star Walk — Symptomize Reviews (v3)</div>
-          <div class="hero-sub">Variant-aware semantics with evidence quotes. Fewer missed easy tags.</div>
+          <div class="hero-title">Star Walk — Symptomize Reviews (v4)</div>
+          <div class="hero-sub">Model-first extraction with self-consistency + validation. No hard-coded symptom rules.</div>
         </div>
         <div class="hero-right"><img class="sn-logo" src="https://upload.wikimedia.org/wikipedia/commons/e/ea/SharkNinja_logo.svg" alt="SharkNinja"/></div>
       </div>
@@ -127,41 +121,18 @@ with st.sidebar:
     uploaded = st.file_uploader("Choose Excel File", type=["xlsx"], accept_multiple_files=False)
 
     st.markdown("---")
-    st.subheader("⚙️ Presets")
-    preset = st.radio("Choose defaults", ["Accuracy-first (recommended)", "Throughput-first"], index=0, horizontal=True)
+    st.subheader("⚙️ Run Settings (simplified)")
+    model_choice = st.selectbox("Model", ["gpt-5", "gpt-4.1", "gpt-4o", "gpt-4o-mini"], index=0)
+    n_samples = st.slider("Self-consistency samples", 1, 5, 3, 1,
+                          help="Number of independent extractions to vote/merge.")
+    api_concurrency = st.slider("API concurrency", 1, 16, 6)
+    max_output_tokens = st.number_input("LLM max tokens", 128, 4000, 420, 10)
+    use_embeddings = st.checkbox("Use semantic shortlist (embeddings)", value=True,
+                                 help="Boosts recall; not rule-based.")
+    emb_model = st.selectbox("Embeddings model", ["text-embedding-3-large", "text-embedding-3-small"], index=0)
+    max_sentences = st.slider("Max sentences analyzed", 6, 40, 22, 2)
 
-    st.subheader("Run Settings")
-    if preset.startswith("Accuracy"):
-        speed_mode = st.toggle("Speed mode (shortest first)", value=True)
-        strictness = st.slider("Strictness", 0.55, 0.95, 0.78, 0.01)
-        require_evidence = st.checkbox("Require textual evidence", value=True)
-        evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1)
-        model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=2)
-        max_output_tokens = st.number_input("Max output tokens", 64, 4000, 380, 10)
-        candidate_cap = st.slider("Cap candidates per review", 20, 200, 80, 5)
-        api_concurrency = st.slider("API concurrency", 1, 16, 4)
-        use_embeddings = st.checkbox("Use semantic recall (embeddings)", value=True)
-        emb_model = st.selectbox("Embeddings model", ["text-embedding-3-small", "text-embedding-3-large"], index=1)
-        max_sentences = st.slider("Max sentences analyzed", 6, 40, 18, 2)
-    else:
-        speed_mode = st.toggle("Speed mode (shortest first)", value=True)
-        strictness = st.slider("Strictness", 0.55, 0.95, 0.80, 0.01)
-        require_evidence = st.checkbox("Require textual evidence", value=True)
-        evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1)
-        model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=1)
-        max_output_tokens = st.number_input("Max output tokens", 64, 4000, 320, 10)
-        candidate_cap = st.slider("Cap candidates per review", 20, 200, 60, 5)
-        api_concurrency = st.slider("API concurrency", 1, 16, 6)
-        use_embeddings = st.checkbox("Use semantic recall (embeddings)", value=True)
-        emb_model = st.selectbox("Embeddings model", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
-        max_sentences = st.slider("Max sentences analyzed", 6, 40, 12, 2)
-
-    # New toggles (apply for both presets)
-    variant_boost = st.checkbox("Use auto-generated synonyms/variants", value=True)
-    auto_relax = st.checkbox("Auto-relax if nothing found", value=True)
-    ensemble_check = st.checkbox("Ensemble rerank (lexical+embed+LLM)", value=True)
-
-    st.info("Full review text is always sent. Semantic recall boosts easy tags via label-to-sentence similarity and variant matching.")
+    st.info("No strictness knobs or keyword gates. The model extracts; we validate and rank by evidence.")
 
 # Persist raw bytes for formatting-preserving save
 if uploaded and "uploaded_bytes" not in st.session_state:
@@ -218,72 +189,21 @@ import io as _io
 
 def _norm(s: str) -> str:
     if s is None: return ""
-    return re.sub(r"[^a-z]+", "", str(s).lower()).strip()
+    return re.sub(r"\s+", " ", str(s)).strip()
 
 def _looks_like_symptom_sheet(name: str) -> bool:
-    return "symptom" in _norm(name)
-
-def _col_score(colname: str, want: str) -> int:
-    n = _norm(colname)
-    if not n: return 0
-    synonyms = {
-        "delighters": ["delight","delighters","pros","positive","positives","likes","good"],
-        "detractors": ["detract","detractors","cons","negative","negatives","dislikes","bad","issues","problems"],
-    }
-    return max((1 for token in synonyms[want] if token in n), default=0)
-
-def _extract_from_df(df_sheet: pd.DataFrame):
-    debug = {"strategy": None, "columns": list(df_sheet.columns)}
-    best_del = None; best_det = None
-    for c in df_sheet.columns:
-        if _col_score(str(c), "delighters"): best_del = c if best_del is None else best_del
-        if _col_score(str(c), "detractors"): best_det = c if best_det is None else best_det
-    if best_del is not None or best_det is not None:
-        dels_ser = df_sheet.get(best_del, pd.Series(dtype=str)) if best_del is not None else pd.Series(dtype=str)
-        dets_ser = df_sheet.get(best_det, pd.Series(dtype=str)) if best_det is not None else pd.Series(dtype=str)
-        dels = [str(x).strip() for x in dels_ser.dropna().tolist() if str(x).strip()]
-        dets = [str(x).strip() for x in dets_ser.dropna().tolist() if str(x).strip()]
-        if dels or dets:
-            debug.update({"strategy":"fuzzy-headers","best_del_col":best_del,"best_det_col":best_det})
-            return dels, dets, debug
-    # Strategy 2: Type/Category + Item
-    type_col = None; item_col = None
-    for c in df_sheet.columns:
-        if _norm(c) in {"type","category","class","label"}: type_col = c
-        if _norm(c) in {"item","symptom","name","term","entry","value"}: item_col = c
-    if type_col is not None and item_col is not None:
-        t = df_sheet[type_col].astype(str).str.strip().str.lower()
-        i = df_sheet[item_col].astype(str).str.strip()
-        dels = i[t.str.contains("delight|pro|positive|like", na=False)]
-        dets = i[t.str.contains("detract|con|negative|issue|problem|dislike|complaint", na=False)]
-        dels = [x for x in dels.dropna().tolist() if x]
-        dets = [x for x in dets.dropna().tolist() if x]
-        if dels or dets:
-            debug.update({"strategy":"type+item","type_col":type_col,"item_col":item_col})
-            return dels, dets, debug
-    # Strategy 3: first two non-empty columns
-    non_empty_cols = []
-    for c in df_sheet.columns:
-        vals = [str(x).strip() for x in df_sheet[c].dropna().tolist() if str(x).strip()]
-        if vals:
-            non_empty_cols.append((c, vals))
-        if len(non_empty_cols) >= 2: break
-    if non_empty_cols:
-        dels = non_empty_cols[0][1]
-        dets = non_empty_cols[1][1] if len(non_empty_cols) > 1 else []
-        debug.update({"strategy":"first-two-nonempty","picked_cols":[c for c,_ in non_empty_cols[:2]]})
-        return dels, dets, debug
-    return [], [], {"strategy":"none","columns":list(df_sheet.columns)}
+    n = re.sub(r"[^a-z]+","",name.lower())
+    return "symptom" in n or "palette" in n or "taxonomy" in n
 
 def autodetect_symptom_sheet(xls: pd.ExcelFile) -> str | None:
     names = xls.sheet_names
     cands = [n for n in names if _looks_like_symptom_sheet(n)]
-    if cands:
-        return min(cands, key=lambda n: len(_norm(n)))
+    if cands: return min(cands, key=len)
     return names[0] if names else None
 
 @st.cache_data(show_spinner=False)
-def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, user_del_col: str | None = None, user_det_col: str | None = None):
+def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None,
+                              user_del_col: str | None = None, user_det_col: str | None = None):
     meta = {"sheet": None, "strategy": None, "columns": [], "note": ""}
     if not raw_bytes:
         meta["note"] = "No raw bytes provided"
@@ -303,6 +223,21 @@ def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, u
     except Exception as e:
         meta["note"] = f"Could not read sheet '{sheet}': {e}"
         return [], [], meta
+
+    # Guess columns by fuzzy titles
+    def _col_score(colname: str, want: str) -> int:
+        n = re.sub(r"[^a-z]+","",colname.lower())
+        synonyms = {
+            "delighters": ["delight","delighters","pros","positive","positives","likes","good"],
+            "detractors": ["detract","detractors","cons","negative","negatives","dislikes","bad","issues","problems"],
+        }
+        return max((1 for token in synonyms[want] if token in n), default=0)
+
+    best_del = None; best_det = None
+    for c in s.columns:
+        if _col_score(str(c), "delighters"): best_del = c if best_del is None else best_del
+        if _col_score(str(c), "detractors"): best_det = c if best_det is None else best_det
+
     if user_del_col or user_det_col:
         dels = s.get(user_del_col, pd.Series(dtype=str)) if user_del_col in s.columns else pd.Series(dtype=str)
         dets = s.get(user_det_col, pd.Series(dtype=str)) if user_det_col in s.columns else pd.Series(dtype=str)
@@ -310,9 +245,29 @@ def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, u
         dets = [str(x).strip() for x in dets.dropna().tolist() if str(x).strip()]
         meta.update({"strategy":"manual-columns","columns":list(s.columns)})
         return dels, dets, meta
-    dels, dets, info = _extract_from_df(s)
-    meta.update(info)
-    return dels, dets, meta
+
+    if best_del is not None or best_det is not None:
+        dels_ser = s.get(best_del, pd.Series(dtype=str)) if best_del is not None else pd.Series(dtype=str)
+        dets_ser = s.get(best_det, pd.Series(dtype=str)) if best_det is not None else pd.Series(dtype=str)
+        dels = [str(x).strip() for x in dels_ser.dropna().tolist() if str(x).strip()]
+        dets = [str(x).strip() for x in dets_ser.dropna().tolist() if str(x).strip()]
+        meta.update({"strategy":"fuzzy-headers","columns":list(s.columns)})
+        return dels, dets, meta
+
+    # Fallback: first two non-empty columns
+    non_empty_cols = []
+    for c in s.columns:
+        vals = [str(x).strip() for x in s[c].dropna().tolist() if str(x).strip()]
+        if vals:
+            non_empty_cols.append((c, vals))
+        if len(non_empty_cols) >= 2: break
+    if non_empty_cols:
+        dels = non_empty_cols[0][1]
+        dets = non_empty_cols[1][1] if len(non_empty_cols) > 1 else []
+        meta.update({"strategy":"first-two-nonempty","columns":[c for c,_ in non_empty_cols[:2]]})
+        return dels, dets, meta
+
+    return [], [], {"strategy":"none","columns":list(s.columns)}
 
 raw_bytes = st.session_state.get("uploaded_bytes", b"")
 sheet_names = []
@@ -321,7 +276,6 @@ try:
     sheet_names = _xls_tmp.sheet_names
 except Exception:
     pass
-
 auto_sheet = autodetect_symptom_sheet(_xls_tmp) if sheet_names else None
 
 with st.sidebar:
@@ -330,7 +284,6 @@ with st.sidebar:
         options=sheet_names if sheet_names else ["(no sheets detected)"],
         index=(sheet_names.index(auto_sheet) if (sheet_names and auto_sheet in sheet_names) else 0)
     )
-
     symp_cols_preview = []
     if sheet_names:
         try:
@@ -340,22 +293,8 @@ with st.sidebar:
             _df_symp_prev = pd.DataFrame()
             symp_cols_preview = []
 
-    manual_cols = False
-    picked_del_col = None
-    picked_det_col = None
-
-    if symp_cols_preview:
-        st.caption("Detected columns:")
-        st.write(", ".join(map(str, symp_cols_preview)))
-        manual_cols = st.checkbox("Manually choose Delighters/Detractors columns", value=False)
-        if manual_cols:
-            picked_del_col = st.selectbox("Delighters column", options=["(none)"] + symp_cols_preview, index=0)
-            picked_det_col = st.selectbox("Detractors column", options=["(none)"] + symp_cols_preview, index=0)
-            if picked_del_col == "(none)": picked_del_col = None
-            if picked_det_col == "(none)": picked_det_col = None
-
 ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS, SYM_META = load_symptom_lists_robust(
-    raw_bytes, user_sheet=chosen_sheet if sheet_names else None, user_del_col=picked_del_col, user_det_col=picked_det_col
+    raw_bytes, user_sheet=chosen_sheet if sheet_names else None
 )
 ALLOWED_DELIGHTERS = [x for x in ALLOWED_DELIGHTERS if x]
 ALLOWED_DETRACTORS = [x for x in ALLOWED_DETRACTORS if x]
@@ -369,7 +308,7 @@ with st.sidebar:
         )
     else:
         st.warning(
-            f"Didn't find clear Delighters/Detractors lists in '{SYM_META.get('sheet','?')}'. Using conservative keyword fallback. Adjust options above if needed."
+            f"Didn't find clear Delighters/Detractors lists in '{SYM_META.get('sheet','?')}'. Provide a palette sheet."
         )
 
 # ========================== TOP KPIs ==========================
@@ -381,7 +320,7 @@ with colB:
 with colC:
     st.markdown(f"<span class='pill'>✂ IQR chars: <b>{int(IQR)}</b></span>", unsafe_allow_html=True)
 with colD:
-    st.caption("Variant-aware semantic recall enabled.")
+    st.caption("Model-first extraction. No keyword thresholds.")
 
 left, right = st.columns([1.45, 2.55], gap="small")
 
@@ -390,12 +329,11 @@ with left:
     batch_n = st.slider("How many to process this run", 1, 50, min(16, max(1, missing_count)) if missing_count else 16)
 
     # ETA (heuristic)
-    MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
     MODEL_LAT = {"gpt-4o-mini": 0.6, "gpt-4o": 0.9, "gpt-4.1": 1.1, "gpt-5": 1.3}
     rows = min(batch_n, missing_count)
     chars_est = max(200, int((q1+q3)/2)) if (q1 or q3) else 400
     tok_est = int(chars_est/4)
-    rt = rows * (MODEL_LAT.get(model_choice,1.0) + tok_est/max(8, MODEL_TPS.get(model_choice,12)))
+    rt = rows * (MODEL_LAT.get(model_choice,1.0) + tok_est/24)
     eta_secs = int(round(rt))
     st.caption(f"Will attempt {rows} rows • Rough ETA: ~{eta_secs}s")
 
@@ -424,7 +362,7 @@ with left:
             help="Processes every review that has empty Symptom 1–20. Uses many API calls.",
             use_container_width=True,
         )
-    st.caption("Tip: Use batch mode first to review accuracy, then run ALL.")
+    st.caption("Tip: Batch first; then run ALL if the output looks right.")
 
 with right:
     st.markdown("### Live Processing")
@@ -436,527 +374,307 @@ with right:
 # ---------------- Session State (non-UI) ----------------
 st.session_state.setdefault("symptom_suggestions", [])
 st.session_state.setdefault("sug_selected", set())
-st.session_state.setdefault("approved_new_delighters", set())
-st.session_state.setdefault("approved_new_detractors", set())
 
 # ---------------- Text & evidence utils ----------------
 STOP = set("""a an and the or but so of in on at to for from with without as is are was were be been being 
 have has had do does did not no nor never very really quite just only almost about into out by this that these those 
 it its they them i we you he she my your our their his her mine ours yours theirs""".split())
-
-_DEF_WORD = re.compile(r"[a-z0-9]{3,}")
-
-# Expanded negation & downplayers
 NEGATORS = {
     "no","not","never","without","lacks","lack","isn't","wasn't","aren't","don't",
     "doesn't","didn't","can't","couldn't","won't","wouldn't","hardly","barely","rarely",
-    "scarcely","little","few"
+    "scarcely","little","few","free","free-of"
 }
-
-# Canonical mapping (existing + extended paraphrases)
-ALIAS_CANON = {
-    "initial difficulty": "Learning curve",
-    "hard to learn": "Learning curve",
-    "setup difficulty": "Learning curve",
-    "noisy startup": "Startup noise",
-    "too loud": "Loud",
-    "odor": "Smell",
-    "odour": "Smell",
-    "smelly": "Smell",
-    "hot": "Heat",
-    "too hot": "Heat",
-    "gets hot": "Heat",
-    "overheats": "Heat",
-    "heavy": "Weight",
-    "bulky": "Size",
-    "fragile": "Durability",
-    "breaks": "Durability",
-    "broke": "Durability",
-    "brittle": "Durability",
-    "customer support": "Customer service",
-    "runtime": "Battery life",
-    "run time": "Battery life",
-    "battery": "Battery life",
-    "suction power": "Suction",
-    "airflow": "Suction",
-    "air flow": "Suction",
-    "filter clogging": "Filter clog",
-    "clogs": "Filter clog",
-    "clogged": "Filter clog",
-    "easy to clean": "Ease of cleaning",
-    "easy clean": "Ease of cleaning",
-    "price": "Cost",
-    "expensive": "Cost",
-    "cheap": "Cost",
-    "instructions": "Manual",
-    "manual": "Manual",
-    # New common paraphrases
-    "gets warm": "Heat",
-    "burns": "Heat",
-    "burnt": "Heat",
-    "hot to touch": "Heat",
-    "not loud": "Quiet",
-    "humming": "Noise",
-    "whistling": "Noise",
-    "rattling": "Noise",
-    "vibration": "Vibration",
-    "vibrates": "Vibration",
-    "hair tangles": "Tangles",
-    "tangles": "Tangles",
-    "snags": "Tangles",
-    "snagging": "Tangles",
-    "loose": "Fit",
-    "wobbly": "Fit",
-    "flimsy": "Durability",
-    "cheap plastic": "Durability",
-    "battery dies": "Battery life",
-    "doesn't hold charge": "Battery life",
-    "holds charge": "Battery life",
-    "short charge": "Battery life",
-    "charging slow": "Charge speed",
-    "charge slow": "Charge speed",
-    "instructions unclear": "Manual",
-    "confusing manual": "Manual",
-    "hard to clean": "Ease of cleaning",
-    "easy clean up": "Ease of cleaning",
-    "dust clogs": "Filter clog",
-    "blocked filter": "Filter clog",
-    "low suction": "Suction",
-    "weak suction": "Suction",
-    "strong suction": "Suction",
-    "too expensive": "Cost",
-    "great value": "Cost",
-    "value": "Cost",
-    "fast shipping": "Shipping",
-    "late delivery": "Shipping",
-    "late": "Shipping",
-    "arrived damaged": "Shipping damage",
-}
-
-# Synonym/variant seeds per concept
-SYN_SEEDS = {
-    "Heat": ["hot","warm","warms up","overheat","burns","burnt","toasty","heat"],
-    "Loud": ["loud","noisy","noise","loudness","too loud","very loud","blaring"],
-    "Noise": ["noise","hum","whine","whistle","rattle","buzz","clatter"],
-    "Vibration": ["vibrate","vibration","vibrates","shakes","rumbles"],
-    "Smell": ["odor","odour","smell","stink","stinks","smelly","scent"],
-    "Durability": ["breaks","broke","broken","flimsy","thin","cheap plastic","fragile","crack"],
-    "Battery life": ["battery","charge lasts","holds charge","dies fast","short battery","runtime"],
-    "Charge speed": ["charges slowly","slow charge","charging slow","takes long to charge"],
-    "Suction": ["suction","airflow","air flow","pull","weak suction","strong suction","power"],
-    "Filter clog": ["clog","clogged","block","blocked filter","dust clog","hair clog"],
-    "Ease of cleaning": ["easy to clean","easy clean","hard to clean","cleanup","clean up"],
-    "Cost": ["price","expensive","overpriced","cheap","value"],
-    "Manual": ["instructions","manual","guide","how to","unclear manual"],
-    "Learning curve": ["hard to learn","confusing","setup difficulty","learning curve"],
-    "Customer service": ["customer support","service","support"],
-    "Shipping": ["shipping","delivery","late","arrived late","fast shipping"],
-    "Shipping damage": ["arrived damaged","damaged box","dented","scratched"]
-}
-
-# Small helpers
+_DEF_WORD = re.compile(r"[a-z0-9]{3,}")
 
 def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+"," ", (name or "").lower()).strip()
 
-# Variant generation
-_DEF_PLURALS = [("y","ies"),("","s")]
-
-def _mk_variants(phrase: str) -> list[str]:
-    phrase = (phrase or "").strip()
-    out = {phrase}
-    base = _normalize_name(phrase)
-    out.add(base)
-    out.add(base.replace("-"," "))
-    out.add(base.replace(" ", ""))
-    toks = base.split()
-    if toks:
-        last = toks[-1]
-        for a,b in _DEF_PLURALS:
-            if last.endswith(a):
-                toks2 = toks[:-1] + [last[:len(last)-len(a)] + b]
-                out.add(" ".join(toks2))
-    if toks:
-        stem = toks[-1]
-        toks_ing = toks[:-1] + [stem + "ing"]
-        toks_ed  = toks[:-1] + [stem + "ed"]
-        out.add(" ".join(toks_ing)); out.add(" ".join(toks_ed))
-    return sorted({o.strip() for o in out if o.strip()})
-
-@st.cache_resource(show_spinner=False)
-def _build_label_variant_index(labels: list[str]) -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {}
-    for L in labels:
-        canon = canonicalize(L)
-        seeds = [canon]
-        for k,v in ALIAS_CANON.items():
-            if v.lower() == canon.lower():
-                seeds.append(k)
-        for k,v in SYN_SEEDS.items():
-            if k.lower() == canon.lower():
-                seeds.extend(v)
-        variants = list(itertools.chain.from_iterable(_mk_variants(s) for s in set(seeds)))
-        variants = [v for v in dict.fromkeys(variants) if 2 <= len(v.split()) <= 6 or len(v) >= 4]
-        out[canon] = variants[:40]
-    return out
-
-def canonicalize(name: str) -> str:
-    nn = (name or "").strip()
-    base = _normalize_name(nn)
-    for k, v in ALIAS_CANON.items():
-        if _normalize_name(k) == base:
-            return v
-    return nn
-
 def _tokenize_keep(words: str) -> list[str]:
     return [w for w in re.findall(r"[a-zA-Z0-9']+", (words or "").lower()) if w not in STOP and len(w) >= 2]
 
-def _evidence_score(label: str, text: str, label_variants: dict[str,list[str]]|None=None) -> tuple[int, list[str]]:
-    if not label or not text:
-        return 0, []
-    canon = canonicalize(label)
-    variants = (label_variants or {}).get(canon, []) or [canon]
-    text_norm = _normalize_name(text)
-    hits: list[str] = []
-    for v in variants:
-        v_norm = _normalize_name(v)
-        if re.search(rf"\b{re.escape(v_norm)}\b", text_norm):
-            hits.append(v)
-            continue
-        if 5 <= len(v_norm) <= 20:
-            ratio = difflib.SequenceMatcher(None, v_norm, text_norm).find_longest_match(0,len(v_norm),0,len(text_norm)).size / max(1,len(v_norm))
-            if ratio >= 0.85:
-                hits.append(v)
-    return len(hits), hits[:3]
-
-def _has_negation(span: str) -> bool:
-    toks = _tokenize_keep(span)
-    return any(t in NEGATORS for t in toks)
-
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
-
-# ---- Sentence splitter (kept from v2) ----
 def _sentences(review: str) -> List[str]:
     parts = re.split(r'(?<=[\.!\?])\s+|\n+', (review or "").strip())
     return [p.strip() for p in parts if len(p.strip()) >= 12]
+
+def _quote_matches_text(quote: str, text: str, thresh: float = 0.62) -> bool:
+    if not quote: return False
+    q = _tokenize_keep(quote)
+    t = _tokenize_keep(text)
+    if not q or not t: return False
+    overlap = len(set(q) & set(t)) / max(1, len(set(q)))
+    # also accept exact substring
+    return (overlap >= thresh) or (_normalize_name(quote) in _normalize_name(text))
+
+def _context_has_negation(text_norm: str, start: int, window_chars: int = 120) -> bool:
+    left_ctx = text_norm[max(0, start - window_chars): start]
+    toks = _tokenize_keep(left_ctx)[-6:]
+    return any(t in NEGATORS for t in toks)
+
+def _find_quote_positions(text: str, snippet: str) -> Tuple[int,int]:
+    tn = _normalize_name(text)
+    qn = _normalize_name(snippet)
+    i = tn.find(qn)
+    if i < 0: return -1, -1
+    return i, i+len(qn)
+
+def _evidence_quality(quote: str, text: str) -> Tuple[int,int,bool]:
+    """
+    Returns (pos_hits, neg_hits, ok)
+    We look for the quote in text (exact or normalized), then check local negation.
+    """
+    if not quote: return 0, 0, False
+    if not _quote_matches_text(quote, text): return 0, 0, False
+    tn = _normalize_name(text)
+    start, end = _find_quote_positions(text, quote)
+    if start < 0:
+        # fallback: approximate position by scanning first occurrence of any token
+        toks = _tokenize_keep(quote)
+        pos = -1
+        for t in toks:
+            j = tn.find(_normalize_name(t))
+            if j >= 0: pos = j; break
+        start = pos
+    if start < 0: return 1, 0, True  # treat as positive if we can't place it
+    neg = 1 if _context_has_negation(tn, start) else 0
+    return 1 if neg == 0 else 0, neg, (neg == 0)
 
 # ---- OpenAI helpers ----
 @st.cache_resource(show_spinner=False)
 def _get_openai_client_cached(key: str):
     return OpenAI(api_key=key) if (_HAS_OPENAI and key) else None
 
-@st.cache_resource(show_spinner=False)
-def _get_store():
-    return {
-        "pick_cache": {},
-        "label_emb": {},
-        "sent_emb_cache": {},
-        "lock": threading.Lock()
-    }
-
-def _chat_with_retry(client, req, retries: int = 3, base_delay: float = 0.7):
+def _chat_json(client, req, retries: int = 3, base_delay: float = 0.7):
+    last_err = None
     for i in range(retries):
         try:
-            return client.chat.completions.create(**req)
-        except Exception:
-            if i == retries - 1:
-                raise
+            out = client.chat.completions.create(**req)
+            content = out.choices[0].message.content or "{}"
+            return json.loads(content)
+        except Exception as e:
+            last_err = e
+            if i == retries - 1: break
             time.sleep(base_delay * (2 ** i))
+    raise last_err or RuntimeError("LLM call failed")
+
+# ---- Embeddings (shortlist, not rule-based) ----
+@st.cache_resource(show_spinner=False)
+def _get_store():
+    return {"label_emb": {}, "sent_emb_cache": {}, "lock": threading.Lock()}
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    return float(np.dot(a, b) / denom)
 
 def _embed_with_retry(client, model: str, inputs: List[str], retries: int = 3, base_delay: float = 0.7):
+    last_err = None
     for i in range(retries):
         try:
             out = client.embeddings.create(model=model, input=inputs)
             return [np.array(v.embedding, dtype=np.float32) for v in out.data]
-        except Exception:
-            if i == retries - 1:
-                raise
+        except Exception as e:
+            last_err = e
+            if i == retries - 1: break
             time.sleep(base_delay * (2 ** i))
+    raise last_err or RuntimeError("Embedding call failed")
 
-# ---- Semantic candidate generation (variant-aware) ----
-def _shortlist_by_embeddings(review: str, labels: list[str], client, emb_model: str,
-                              max_sentences: int = 18, top_k: int = 60,
-                              label_variants: dict[str,list[str]]|None=None) -> list[str]:
-    store = _get_store()
-    lock = store["lock"]
+def _shortlist_labels_by_similarity(review: str, labels: list[str], client, emb_model: str,
+                                    max_sentences: int = 22, top_k: int = 120) -> list[str]:
+    store = _get_store(); lock = store["lock"]
     label_emb = store.setdefault("label_emb", {})
     sent_cache = store.setdefault("sent_emb_cache", {})
 
-    lv = label_variants or _build_label_variant_index(labels)
+    # label embeddings
+    need = [L for L in labels if L not in label_emb]
+    if need and client is not None:
+        embs = _embed_with_retry(client, emb_model, need)
+        with lock:
+            for L, e in zip(need, embs):
+                label_emb[L] = e
 
-    need_variants: list[str] = []
-    for L in labels:
-        for v in lv.get(canonicalize(L), [L]):
-            if v not in label_emb:
-                need_variants.append(v)
-    if need_variants and client is not None:
-        try:
-            embs = _embed_with_retry(client, emb_model, need_variants)
-            with lock:
-                for v, e in zip(need_variants, embs):
-                    label_emb[v] = e
-        except Exception:
-            return labels[:top_k]
-
+    # sentence embeddings
     review_hash = hashlib.sha256((review or "").encode("utf-8")).hexdigest()
     with lock:
         cached = sent_cache.get(review_hash)
     if cached is None and client is not None:
         sents = _sentences(review)[:max_sentences]
-        try:
-            sent_embs = _embed_with_retry(client, emb_model, sents)
-            pairs = list(zip(sents, sent_embs))
-            with lock:
-                sent_cache[review_hash] = pairs
-            cached = pairs
-        except Exception:
-            cached = [(s, None) for s in _sentences(review)[:max_sentences]]
+        sent_embs = _embed_with_retry(client, emb_model, sents)
+        pairs = list(zip(sents, sent_embs))
+        with lock:
+            sent_cache[review_hash] = pairs
+        cached = pairs
 
     scored: list[tuple[str,float]] = []
     for L in labels:
         best = 0.0
-        for v in lv.get(canonicalize(L), [L]):
-            e_v = label_emb.get(v)
-            if e_v is None or not cached:
-                continue
-            for s, e_s in cached:
-                if e_s is None:
-                    continue
-                sim = _cosine(e_v, e_s)
-                if sim > best:
-                    best = sim
-        ev_hits, _ = _evidence_score(L, review, lv)
-        bonus = 0.04 * ev_hits
-        scored.append((L, best + bonus))
-
+        e_v = label_emb.get(L)
+        if e_v is None or not cached:
+            continue
+        for s, e_s in cached:
+            sim = _cosine(e_v, e_s)
+            if sim > best: best = sim
+        scored.append((L, best))
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [l for l, _ in scored[:top_k]]
+    return [l for l,_ in scored[:top_k]] or labels[:top_k]
 
-
-def _prefilter_candidates(review: str, allowed: list[str], cap: int = 60, use_embeddings: bool = True,
-                          client=None, emb_model: str = "text-embedding-3-small",
-                          max_sentences: int = 18, variant_boost: bool = True,
-                          label_variants: dict[str,list[str]]|None=None) -> list[str]:
-    lv = label_variants or (_build_label_variant_index(allowed) if variant_boost else None)
-
-    if use_embeddings and client is not None:
-        try:
-            return _shortlist_by_embeddings(review, allowed, client, emb_model,
-                                            max_sentences=max_sentences, top_k=cap,
-                                            label_variants=lv)
-        except Exception:
-            pass
-
-    text = " " + _normalize_name(review) + " "
-    scored: list[tuple[str,float]] = []
-    for L in allowed:
-        variants = (lv or {}).get(canonicalize(L), [L])
-        hits = 0; base_tok_count = 0
-        for v in variants:
-            toks = [t for t in _normalize_name(v).split() if len(t) > 2]
-            base_tok_count += len(toks)
-            if not toks:
-                continue
-            if re.search(rf"\b{re.escape(_normalize_name(v))}\b", text):
-                hits += len(toks)
-        score = (hits / max(1, base_tok_count)) if base_tok_count else 0
-        if score > 0:
-            scored.append((L, score))
-    if not scored:
-        return allowed[:cap]
-    scored.sort(key=lambda x: -x[1])
-    return [s[0] for s in scored[:cap]]
-
-# ---- LLM picker with evidence quotes (variant-aware + ensemble + auto-relax) ----
-def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float,
-              evidence_hits_required: int = 1, candidate_cap: int = 60, max_output_tokens: int = 380,
-              use_embeddings: bool = True, emb_model: str = "text-embedding-3-small", max_sentences: int = 18,
-              variant_boost: bool = True, auto_relax: bool = True, ensemble_check: bool = True):
+# ---- LLM extraction with self-consistency + validation ----
+def _llm_extract(review: str, stars, allowed_del: list[str], allowed_det: list[str],
+                 model_choice: str, max_output_tokens: int, n_samples: int,
+                 use_embeddings: bool, emb_model: str, max_sentences: int):
     if not review or (not allowed_del and not allowed_det):
-        return [], [], [], [], {}
+        return [], [], {}, {}
 
     api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
     client = _get_openai_client_cached(api_key) if (_HAS_OPENAI and api_key) else None
 
-    label_variants_del = _build_label_variant_index(allowed_del) if variant_boost and allowed_del else {}
-    label_variants_det = _build_label_variant_index(allowed_det) if variant_boost and allowed_det else {}
+    # Shortlist to reduce prompt length (not rule-based; similarity only)
+    del_list = allowed_del
+    det_list = allowed_det
+    if use_embeddings and client is not None:
+        try:
+            del_list = _shortlist_labels_by_similarity(review, allowed_del, client, emb_model,
+                                                       max_sentences=max_sentences, top_k=min(160, len(allowed_del)))
+            det_list = _shortlist_labels_by_similarity(review, allowed_det, client, emb_model,
+                                                       max_sentences=max_sentences, top_k=min(160, len(allowed_det)))
+        except Exception:
+            pass
 
-    allowed_del_f = _prefilter_candidates(review, allowed_del, cap=candidate_cap, use_embeddings=use_embeddings,
-                                          client=client, emb_model=emb_model, max_sentences=max_sentences,
-                                          variant_boost=variant_boost, label_variants=label_variants_del)
-    allowed_det_f = _prefilter_candidates(review, allowed_det, cap=candidate_cap, use_embeddings=use_embeddings,
-                                          client=client, emb_model=emb_model, max_sentences=max_sentences,
-                                          variant_boost=variant_boost, label_variants=label_variants_det)
+    sys_prompt = """
+You are a world-class review-symptom extractor.
 
-    cache_key = "|".join([
-        str(model_choice), str(min_conf), str(evidence_hits_required), str(candidate_cap),
-        str(use_embeddings), emb_model, str(max_sentences), str(variant_boost),
-        hashlib.sha256("\x1f".join(sorted(allowed_del_f)).encode()).hexdigest(),
-        hashlib.sha256("\x1f".join(sorted(allowed_det_f)).encode()).hexdigest(),
-        hashlib.sha256((review or "").encode("utf-8")).hexdigest(), str(stars)
-    ])
-    store = _get_store()
-    with store["lock"]:
-        if cache_key in store["pick_cache"]:
-            return store["pick_cache"][cache_key]
+You MUST:
+- Choose only from the provided "allowed_delighters" and "allowed_detractors".
+- Use semantics (synonyms/paraphrases are OK) to map the review to those labels.
+- Treat negation correctly ("not loud" is NOT "Loud").
+- Provide up to 10 items per group.
+- For each item, include a SHORT evidence quote (ideally exact words from the review).
+- If a verbatim excerpt is not exact, it may be a paraphrase, but mark "paraphrase": true.
 
-    sys_prompt = (
-        """
-You are labeling a single customer review. Choose ONLY from the provided lists.
-Return compact JSON:
+Output STRICT JSON:
 {
- "delighters":[{"name":"", "confidence":0.00, "quote":""}],
- "detractors":[{"name":"", "confidence":0.00, "quote":""}]
+ "delighters":[{"name":"", "confidence":0.0, "quote":"", "paraphrase":false}],
+ "detractors":[{"name":"", "confidence":0.0, "quote":"", "paraphrase":false}]
 }
-Rules:
-- Only choose items clearly supported by the text. Include a SHORT verbatim quote (5-18 words) that proves it.
-- Prefer precision over recall; avoid stretch matches and near-duplicates (use canonical phrasing).
-- If stars are 1-2, prioritize detractors; if 4-5, prioritize delighters; 3 is neutral.
-- Respect negation: if the text says "not loud", do NOT select "Loud".
-- At most 10 per group. Confidence in [0,1].
-- IMPORTANT: If the concept appears via a synonym or paraphrase (for example, "doesn't hold charge" -> Battery life), you may still pick the canonical label.
-        """
-    )
-
-    user =  {
+Confidence ∈ [0,1]. Be precise; avoid stretches.
+"""
+    user_payload = {
         "review": review,
         "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
-        "allowed_delighters": allowed_del_f[:120],
-        "allowed_detractors": allowed_det_f[:120]
+        "allowed_delighters": del_list[:200],
+        "allowed_detractors": det_list[:200]
     }
 
-    dels: list[str] = []; dets: list[str] = []
-    novel_dels: list[str] = []; novel_dets: list[str] = []
-    evidence_map: dict[str, list[str]] = {}
-
-    def _post_process(items, allowed_set, text, lv: dict[str,list[str]]):
-        pairs: list[tuple[str,float,str]] = []
-        for d in items or []:
-            name = canonicalize(d.get("name", ""))
-            conf = float(d.get("confidence", 0))
-            quote = (d.get("quote") or "").strip()
-            if not name:
-                continue
-            ev_ok = False
-            hits, _ = _evidence_score(name, text, lv)
-            if hits >= max(1, evidence_hits_required):
-                ev_ok = True
-            if quote:
-                qn = _normalize_name(quote)
-                tn = _normalize_name(text)
-                if qn and qn in tn:
-                    ev_ok = True
-            if quote and _has_negation(quote):
-                conf *= 0.6
-            if ev_ok and name in allowed_set:
-                pairs.append((name, max(0.0, min(1.0, conf)), quote))
-        best: dict[str,tuple[float,str]] = {}
-        for n,c,q in pairs:
-            if n not in best or c > best[n][0]:
-                best[n] = (c,q)
-        final = sorted(best.items(), key=lambda x: -x[1][0])[:10]
-        for n,(c,q) in final:
-            if q:
-                evidence_map.setdefault(n, []).append(q)
-        return [(n, c) for n,(c,_) in final]
-
-    def _dedupe_keep_top(items: list[tuple[str,float]], top_n: int = 10, min_conf_: float = 0.60) -> list[str]:
-        canon_pairs: list[tuple[str,float]] = []
-        for (n, c) in items:
-            if c >= min_conf_ and n:
-                canon_pairs.append((canonicalize(n), c))
-        kept: list[tuple[str,float]] = []
-        for n, c in sorted(canon_pairs, key=lambda x: -x[1]):
-            n_norm = _normalize_name(n)
-            if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.88 for k, _ in kept):
-                kept.append((n, c))
-            if len(kept) >= top_n:
-                break
-        return [n for n,_ in kept]
-
+    # --- Multiple independent extractions (self-consistency) ---
+    samples: List[Dict[str,Any]] = []
     if client is not None:
-        try:
+        for k in range(n_samples):
             req = {
                 "model": model_choice,
                 "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": json.dumps(user)}
+                    {"role":"system","content": sys_prompt},
+                    {"role":"user","content": json.dumps(user_payload)}
                 ],
-                "response_format": {"type": "json_object"},
+                "response_format": {"type":"json_object"},
                 "max_tokens": max_output_tokens,
+                # tiny randomness across samples; GPT-5 handles this well
+                "temperature": 0.2 + 0.1 * (k % 3)
             }
-            if not str(model_choice).startswith("gpt-5"):
-                req["temperature"] = 0.0
-            out = _chat_with_retry(client, req)
-            content = out.choices[0].message.content or "{}"
-            data = json.loads(content)
+            try:
+                data = _chat_json(client, req)
+                samples.append(data)
+            except Exception:
+                pass
 
-            dels_pairs = _post_process(data.get("delighters", []), set(ALLOWED_DELIGHTERS), review, label_variants_del)
-            dets_pairs = _post_process(data.get("detractors", []), set(ALLOWED_DETRACTORS), review, label_variants_det)
+    # Fallback: no API or failures
+    if not samples:
+        return [], [], {}, {}
 
-            dels_final = _dedupe_keep_top(dels_pairs, 10, min_conf)
-            dets_final = _dedupe_keep_top(dets_pairs, 10, min_conf)
+    # --- Merge votes and validate evidence ---
+    vote_del: Dict[str, list[Tuple[float, str, bool]]] = defaultdict(list)
+    vote_det: Dict[str, list[Tuple[float, str, bool]]] = defaultdict(list)
 
-            if ensemble_check:
-                def _boost(lst: list[str], lv):
-                    scored = []
-                    for n in lst:
-                        ev, _ = _evidence_score(n, review, lv)
-                        scored.append((n, ev))
-                    scored.sort(key=lambda x: -x[1])
-                    return [n for n,_ in scored]
-                dels_final = _boost(dels_final, label_variants_del)
-                dets_final = _boost(dets_final, label_variants_det)
+    for s in samples:
+        for gkey, bucket in [("delighters","delighters"), ("detractors","detractors")]:
+            for it in s.get(gkey, []) or []:
+                name = _norm(it.get("name",""))
+                if not name: continue
+                conf = float(it.get("confidence", 0))
+                quote = _norm(it.get("quote",""))
+                paraphrase = bool(it.get("paraphrase", False))
+                if gkey == "delighters":
+                    vote_del[name].append((conf, quote, paraphrase))
+                else:
+                    vote_det[name].append((conf, quote, paraphrase))
 
-            if auto_relax and (not dels_final and not dets_final):
-                req_relaxed = req.copy()
-                req_relaxed["messages"] = [
-                    {"role":"system","content": sys_prompt + "\nIf nothing is clearly present, pick plausible items ONLY with direct textual evidence."},
-                    {"role":"user","content": json.dumps(user)}
-                ]
-                out2 = _chat_with_retry(client, req_relaxed)
-                content2 = out2.choices[0].message.content or "{}"
-                data2 = json.loads(content2)
-                dels_pairs2 = _post_process(data2.get("delighters", []), set(ALLOWED_DELIGHTERS), review, label_variants_del)
-                dets_pairs2 = _post_process(
-                    data2.get("detractors", []),
-                    set(ALLOWED_DETRACTORS),
-                    review,
-                    label_variants_det
-                )
+    def aggregate(votes: Dict[str, list[Tuple[float,str,bool]]], allowed_set: set[str]) -> Tuple[List[Tuple[str,float]], Dict[str,List[str]]]:
+        results: List[Tuple[str,float]] = []
+        evmap: Dict[str,List[str]] = {}
+        for raw_name, triples in votes.items():
+            # normalize against allowed set by best fuzzy match on case/space
+            # (labels are short; simple exact-insensitive match works well)
+            matches = [a for a in allowed_set if _normalize_name(a) == _normalize_name(raw_name)]
+            if not matches:
+                # if model returns slightly different casing/spacing, keep anyway if close
+                matches = [a for a in allowed_set if _normalize_name(raw_name) in _normalize_name(a) or _normalize_name(a) in _normalize_name(raw_name)]
+            if not matches:
+                continue
+            name = matches[0]
 
-                # Use relaxed results if they produced anything; otherwise keep originals
-                dels_final = _dedupe_keep_top(dels_pairs2, 10, min_conf) or dels_final
-                dets_final = _dedupe_keep_top(dets_pairs2, 10, min_conf) or dets_final
+            votes_n = len(triples)
+            conf_mean = float(np.mean([t[0] for t in triples])) if triples else 0.0
 
-            # Final outputs from LLM path
-            dels, dets = dels_final, dets_final
+            # evidence check across all quotes; keep the best one
+            best_ev_score = -1.0
+            best_quote = ""
+            pos_total = 0; neg_total = 0
+            for _, q, _ in triples:
+                pos, neg, ok = _evidence_quality(q, review)
+                pos_total += pos; neg_total += neg
+                if ok:
+                    # score: positive hit + longer quotes (a little) + overlap boost
+                    tok_overlap = len(set(_tokenize_keep(q)) & set(_tokenize_keep(review)))
+                    score = 1.0 + 0.05 * min(tok_overlap, 12)
+                    if score > best_ev_score:
+                        best_ev_score = score
+                        best_quote = q
+            # if none of the quotes validated, try deriving one from first sample tokens
+            if best_ev_score < 0 and triples:
+                q = triples[0][1]
+                if _quote_matches_text(q, review):
+                    best_quote = q
+                    best_ev_score = 1.0
 
-        except Exception:
-            # If the LLM path fails, fall back to lexical/semantic evidence only
-            pass
+            # final confidence: blend of vote share, model conf, and evidence
+            vote_share = votes_n / max(1, n_samples)
+            ev_bonus = 0.15 if best_ev_score > 0 else 0.0
+            neg_penalty = 0.25 if neg_total >= pos_total and (pos_total > 0) else 0.0
+            final_conf = max(0.0, min(1.0, 0.45*vote_share + 0.45*conf_mean + ev_bonus - neg_penalty))
 
-    if not (client and (dels or dets)):
-        # Evidence-only fallback (no LLM or no results)
-        def pick_from(allowed: list[str], lv: dict[str, list[str]], top_n: int = 10) -> list[str]:
-            scored = []
-            for L in allowed[:candidate_cap]:
-                hits, _ = _evidence_score(L, review, lv)
-                if hits >= max(1, evidence_hits_required):
-                    scored.append((L, hits))
-            scored.sort(key=lambda x: -x[1])
-            return [n for n, _ in scored[:top_n]]
+            if final_conf >= 0.55 and best_ev_score >= 0:
+                results.append((name, final_conf))
+                if best_quote:
+                    evmap.setdefault(name, []).append(best_quote)
 
-        dels = pick_from(allowed_del_f, label_variants_del)
-        dets = pick_from(allowed_det_f, label_variants_det)
+        # sort by confidence
+        results.sort(key=lambda x: -x[1])
+        return results[:10], evmap
 
-    # Cache and return
-    with store["lock"]:
-        store["pick_cache"][cache_key] = (dels, dets, novel_dels, novel_dets, evidence_map)
-    return dels, dets, novel_dels, novel_dets, evidence_map
+    dels_pairs, dels_evmap = aggregate(vote_del, set(allowed_del))
+    dets_pairs, dets_evmap = aggregate(vote_det, set(allowed_det))
 
+    # star-aware tie-break (soft)
+    if stars and pd.notna(stars):
+        s = float(stars)
+        if s >= 4.5:
+            dels_pairs = [(n, min(1.0, c + 0.05)) for n,c in dels_pairs]
+        elif s <= 2.0:
+            dets_pairs = [(n, min(1.0, c + 0.05)) for n,c in dets_pairs]
+
+    # final lists + combined ev map
+    evmap = {}
+    evmap.update(dels_evmap); evmap.update(dets_evmap)
+    return [n for n,_ in dels_pairs], [n for n,_ in dets_pairs], evmap, {
+        "del_pairs": dels_pairs, "det_pairs": dets_pairs
+    }
 
 # ---------------- Live rendering helpers ----------------
 def _render_live_table():
@@ -974,7 +692,6 @@ def _render_live_table():
         height=320,
     )
 
-
 def _render_chips(kind: str, names: list[str], evidence_map: Dict[str, List[str]]):
     if not names:
         st.code("-")
@@ -991,13 +708,9 @@ def _render_chips(kind: str, names: list[str], evidence_map: Dict[str, List[str]
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-
 # ---------------- Run Symptomize (parallel) ----------------
 if (run or run_all) and missing_idx:
-    missing_idx_sorted = (
-        sorted(missing_idx, key=lambda i: len(str(df.loc[i].get("Verbatim", ""))))
-        if speed_mode else list(missing_idx)
-    )
+    missing_idx_sorted = list(missing_idx)
     todo = missing_idx_sorted if run_all else missing_idx_sorted[:batch_n]
 
     st.session_state["live_rows"] = [
@@ -1016,21 +729,17 @@ if (run or run_all) and missing_idx:
         row = df.loc[idx]
         review_txt = str(row.get("Verbatim", "") or "").strip()
         stars = row.get("Star Rating", None)
-        return idx, _llm_pick(
+        return idx, _llm_extract(
             review_txt,
             stars,
             ALLOWED_DELIGHTERS,
             ALLOWED_DETRACTORS,
-            strictness,
-            evidence_hits_required=evidence_hits_required,
-            candidate_cap=candidate_cap,
+            model_choice=model_choice,
             max_output_tokens=max_output_tokens,
+            n_samples=n_samples,
             use_embeddings=use_embeddings,
             emb_model=emb_model,
-            max_sentences=max_sentences,
-            variant_boost=variant_boost,
-            auto_relax=auto_relax,
-            ensemble_check=ensemble_check,
+            max_sentences=max_sentences
         )
 
     with st.status("Processing reviews...", expanded=True) as status_box:
@@ -1047,7 +756,7 @@ if (run or run_all) and missing_idx:
             for fut in as_completed(futures):
                 idx = futures[fut]
                 try:
-                    idx, (dels, dets, novel_dels, novel_dets, evidence_map) = fut.result()
+                    idx, (dels, dets, evidence_map, debug_pairs) = fut.result()
                     # Update live table
                     try:
                         row_pos = [r[0] for r in st.session_state["live_rows"]].index(int(idx))
@@ -1066,8 +775,6 @@ if (run or run_all) and missing_idx:
                         "review": str(df.loc[idx].get("Verbatim", "") or "").strip(),
                         "delighters": dels,
                         "detractors": dets,
-                        "novel_delighters": novel_dels,
-                        "novel_detractors": novel_dets,
                         "evidence_map": evidence_map,
                     })
 
@@ -1088,7 +795,6 @@ if (run or run_all) and missing_idx:
             state="complete",
         )
     st.rerun()
-
 
 # ---------------- Review & Apply ----------------
 sugs = st.session_state.get("symptom_suggestions", [])
@@ -1160,13 +866,6 @@ if sugs:
                 st.write("**Delighters (<=10)**")
                 _render_chips("delighters", s["delighters"], s.get("evidence_map", {}))
 
-            if s.get("novel_detractors") or s.get("novel_delighters"):
-                st.markdown("**Novel (not in palette) suggestions**")
-                if s.get("novel_detractors"):
-                    st.write("_Detractors:_ " + ", ".join(sorted(set(s["novel_detractors"]))))
-                if s.get("novel_delighters"):
-                    st.write("_Delighters:_ " + ", ".join(sorted(set(s["novel_delighters"]))))
-
     if st.button("Apply selected to DataFrame", use_container_width=True):
         picked = [i for i in st.session_state["sug_selected"]]
         if not picked:
@@ -1187,7 +886,6 @@ if sugs:
                     if col in df.columns:
                         df.at[ri, col] = name
             st.success(f"Applied {len(picked)} row(s) to DataFrame.")
-
 
 # ---------------- Download Updated Workbook ----------------
 def offer_downloads():
@@ -1243,5 +941,3 @@ def offer_downloads():
     )
 
 offer_downloads()
-
-
