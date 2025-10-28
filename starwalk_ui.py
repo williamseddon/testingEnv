@@ -1,164 +1,62 @@
 # star_walk_app.py
-# Full updated and optimized code with patches applied and fixes for accuracy.
-# Assumptions:
-# - Based on typical Streamlit structure for v2.
-# - Added missing imports (difflib, hashlib).
-# - Removed unused defaultdict.
-# - Fixed allowed_set in _post_process to use shortlisted sets (allowed_del_f, etc.) for precision.
-# - Added definitions for missing sidebar controls (evidence_hits_required, etc.) in both preset branches.
-# - Defined minimal stubs for undefined functions (_embed_with_retry, _chat_with_retry, _sentences, _get_openai_client_cached, _get_store).
-# - Assumed ALLOWED_DELIGHTERS and ALLOWED_DETRACTORS as lists derived from ALIAS_CANON and SYN_SEEDS.
-# - Added negation handling refinement: only penalize if negation likely inverts the sentiment (basic check).
-# - Tightened variant generation: exclude single-word variants <5 chars to reduce noise.
-# - Defined _process_one and main app flow minimally.
-# - For completeness, included a sample UI and processing loop.
-# - Optimized for accuracy: Higher bonus for lexical hits, adjusted min_score_threshold in ensemble.
+# Symptomize v3 – high-accuracy, variant-aware, evidence-quoted labelling
+# ---------------------------------------------------------------
+#   pip install streamlit openai pandas numpy tqdm
+#   export OPENAI_API_KEY=…
+#   streamlit run star_walk_app.py
+# ---------------------------------------------------------------
 
-import streamlit as st
 import os
 import re
 import json
-import pandas as pd
-import numpy as np
-from openai import OpenAI
-import threading
-import itertools
-import difflib
 import hashlib
+import itertools
+import threading
+from typing import List, Tuple, Dict
 
-# Stub for _HAS_OPENAI (assume True if API key present)
-_HAS_OPENAI = True
+import numpy as np
+import pandas as pd
+import streamlit as st
+from openai import OpenAI
 
-# Derived from patches; assume these are the full lists
-ALLOWED_DELIGHTERS = list(set(v for v in ALIAS_CANON.values() if "delight" in v.lower() or True))  # Placeholder: all unique canons
-ALLOWED_DETRACTORS = list(set(v for v in ALIAS_CANON.values() if "detract" in v.lower() or True))  # Adjust as needed
+# ----------------------------------------------------------------------
+# 1. GLOBAL CONSTANTS & CANONICAL MAPS (exactly the data you supplied)
+# ----------------------------------------------------------------------
+STOP = set(
+    """a an and the or but so of in on at to for from with without as is are was were be been being
+    have has had do does did not no nor never very really quite just only almost about into out by this that these those
+    it its they them i we you he she my your our their his her mine ours yours theirs""".split()
+)
 
-# Stub for _get_store: Thread-safe storage
-def _get_store():
-    if not hasattr(st.session_state, '_store'):
-        st.session_state._store = {
-            "lock": threading.Lock(),
-            "pick_cache": {},
-            "label_emb": {},
-            "sent_emb_cache": {}
-        }
-    return st.session_state._store
-
-# Stub for _get_openai_client_cached
-@st.cache_resource
-def _get_openai_client_cached(api_key):
-    return OpenAI(api_key=api_key)
-
-# Stub for _sentences: Simple sentence splitter
-def _sentences(text):
-    return re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s', text)
-
-# Stub for _embed_with_retry: Basic embedding with no retry logic
-def _embed_with_retry(client, model, texts):
-    response = client.embeddings.create(input=texts, model=model)
-    return [np.array(e.embedding) for e in response.data]
-
-# Stub for _chat_with_retry: Basic chat with no retry
-def _chat_with_retry(client, req):
-    return client.chat.completions.create(**req)
-
-# ---------------- Text & evidence utils ----------------
-STOP = set("""a an and the or but so of in on at to for from with without as is are was were be been being 
-have has had do does did not no nor never very really quite just only almost about into out by this that these those 
-it its they them i we you he she my your our their his her mine ours yours theirs""".split())
-
-_DEF_WORD = re.compile(r"[a-z0-9]{3,}")
-
-# Expanded negation & downplayers
 NEGATORS = {
     "no","not","never","without","lacks","lack","isn't","wasn't","aren't","don't",
     "doesn't","didn't","can't","couldn't","won't","wouldn't","hardly","barely","rarely",
     "scarcely","little","few"
 }
 
-# Canonical mapping you had + extended everyday paraphrases
-ALIAS_CANON = {
-    # Your originals
-    "initial difficulty": "Learning curve",
-    "hard to learn": "Learning curve",
-    "setup difficulty": "Learning curve",
-    "noisy startup": "Startup noise",
-    "too loud": "Loud",
-    "odor": "Smell",
-    "odour": "Smell",
-    "smelly": "Smell",
-    "hot": "Heat",
-    "too hot": "Heat",
-    "gets hot": "Heat",
-    "overheats": "Heat",
-    "heavy": "Weight",
-    "bulky": "Size",
-    "fragile": "Durability",
-    "breaks": "Durability",
-    "broke": "Durability",
-    "brittle": "Durability",
-    "customer support": "Customer service",
-    "runtime": "Battery life",
-    "run time": "Battery life",
-    "battery": "Battery life",
-    "suction power": "Suction",
-    "airflow": "Suction",
-    "air flow": "Suction",
-    "filter clogging": "Filter clog",
-    "clogs": "Filter clog",
-    "clogged": "Filter clog",
-    "easy to clean": "Ease of cleaning",
-    "easy clean": "Ease of cleaning",
-    "price": "Cost",
-    "expensive": "Cost",
-    "cheap": "Cost",
-    "instructions": "Manual",
-    "manual": "Manual",
-    # New sensible aliases that routinely cause misses
-    "gets warm": "Heat",
-    "burns": "Heat",
-    "burnt": "Heat",
-    "hot to touch": "Heat",
-    "not loud": "Quiet",
-    "humming": "Noise",
-    "whistling": "Noise",
-    "rattling": "Noise",
-    "vibration": "Vibration",
-    "vibrates": "Vibration",
-    "hair tangles": "Tangles",
-    "tangles": "Tangles",
-    "snags": "Tangles",
-    "snagging": "Tangles",
-    "loose": "Fit",
-    "wobbly": "Fit",
-    "flimsy": "Durability",
-    "cheap plastic": "Durability",
-    "battery dies": "Battery life",
-    "doesn't hold charge": "Battery life",
-    "holds charge": "Battery life",
-    "short charge": "Battery life",
-    "charging slow": "Charge speed",
-    "charge slow": "Charge speed",
-    "instructions unclear": "Manual",
-    "confusing manual": "Manual",
-    "hard to clean": "Ease of cleaning",
-    "easy clean up": "Ease of cleaning",
-    "dust clogs": "Filter clog",
-    "blocked filter": "Filter clog",
-    "low suction": "Suction",
-    "weak suction": "Suction",
-    "strong suction": "Suction",
-    "too expensive": "Cost",
-    "great value": "Cost",
-    "value": "Cost",
-    "fast shipping": "Shipping",
-    "late delivery": "Shipping",
-    "late": "Shipping",
-    "arrived damaged": "Shipping damage",
+ALIAS_CANON = {  # <raw phrase> → <canonical>
+    "initial difficulty": "Learning curve","hard to learn": "Learning curve","setup difficulty": "Learning curve",
+    "noisy startup": "Startup noise","too loud": "Loud","odor": "Smell","odour": "Smell","smelly": "Smell",
+    "hot": "Heat","too hot": "Heat","gets hot": "Heat","overheats": "Heat","heavy": "Weight","bulky": "Size",
+    "fragile": "Durability","breaks": "Durability","broke": "Durability","brittle": "Durability",
+    "customer support": "Customer service","runtime": "Battery life","run time": "Battery life","battery": "Battery life",
+    "suction power": "Suction","airflow": "Suction","air flow": "Suction","filter clogging": "Filter clog",
+    "clogs": "Filter clog","clogged": "Filter clog","easy to clean": "Ease of cleaning","easy clean": "Ease of cleaning",
+    "price": "Cost","expensive": "Cost","cheap": "Cost","instructions": "Manual","manual": "Manual",
+    # ----- new everyday paraphrases -------------------------------------------------
+    "gets warm": "Heat","burns": "Heat","burnt": "Heat","hot to touch": "Heat","not loud": "Quiet",
+    "humming": "Noise","whistling": "Noise","rattling": "Noise","vibration": "Vibration","vibrates": "Vibration",
+    "hair tangles": "Tangles","tangles": "Tangles","snags": "Tangles","snagging": "Tangles","loose": "Fit",
+    "wobbly": "Fit","flimsy": "Durability","cheap plastic": "Durability","battery dies": "Battery life",
+    "doesn't hold charge": "Battery life","holds charge": "Battery life","short charge": "Battery life",
+    "charging slow": "Charge speed","charge slow": "Charge speed","instructions unclear": "Manual",
+    "confusing manual": "Manual","hard to clean": "Ease of cleaning","easy clean up": "Ease of cleaning",
+    "dust clogs": "Filter clog","blocked filter": "Filter clog","low suction": "Suction","weak suction": "Suction",
+    "strong suction": "Suction","too expensive": "Cost","great value": "Cost","value": "Cost",
+    "fast shipping": "Shipping","late delivery": "Shipping","late": "Shipping","arrived damaged": "Shipping damage",
 }
 
-# Synonym/variant seeds per concept (used to generate lexical & embedding variants)
-SYN_SEEDS = {
+SYN_SEEDS = {  # canonical → list of seed phrases (used for variant explosion)
     "Heat": ["hot","warm","warms up","overheat","burns","burnt","toasty","heat"],
     "Loud": ["loud","noisy","noise","loudness","too loud","very loud","blaring"],
     "Noise": ["noise","hum","whine","whistle","rattle","buzz","clatter"],
@@ -178,426 +76,355 @@ SYN_SEEDS = {
     "Shipping damage": ["arrived damaged","damaged box","dented","scratched"]
 }
 
-# Small helpers
-
+# ----------------------------------------------------------------------
+# 2. HELPERS – normalisation, variant generation, evidence scoring
+# ----------------------------------------------------------------------
 def _normalize_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+"," ", (name or "").lower()).strip()
+    return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
 
-# Variant generation: pluralization, -ing/-ed, hyphen/space, and alias expansions
-_DEF_PLURALS = [("y","ies"),("","s")]
+_DEF_PLURALS = [("y","ies"), ("","s")]
 
-def _mk_variants(phrase: str) -> list[str]:
+def _mk_variants(phrase: str) -> List[str]:
     phrase = (phrase or "").strip()
     out = {phrase}
     base = _normalize_name(phrase)
     out.add(base)
-    # hyphen/space toggles
     out.add(base.replace("-"," "))
     out.add(base.replace(" ", ""))
-    # very light morphology on last token
     toks = base.split()
     if toks:
         last = toks[-1]
-        for a,b in _DEF_PLURALS:
+        for a, b in _DEF_PLURALS:
             if last.endswith(a):
-                toks2 = toks[:-1] + [last[:len(last)-len(a)] + b]
-                out.add(" ".join(toks2))
-    # -ing/-ed
-    if toks:
+                out.add(" ".join(toks[:-1] + [last[:len(last)-len(a)] + b]))
         stem = toks[-1]
-        toks_ing = toks[:-1] + [stem + "ing"]
-        toks_ed  = toks[:-1] + [stem + "ed"]
-        out.add(" ".join(toks_ing)); out.add(" ".join(toks_ed))
-    variants = sorted({o.strip() for o in out if o.strip()})
-    # Tighten: exclude single-word <5 chars
-    return [v for v in variants if len(v.split()) > 1 or len(v) >= 5]
+        out.add(" ".join(toks[:-1] + [stem + "ing"]))
+        out.add(" ".join(toks[:-1] + [stem + "ed"]))
+    # keep only reasonable length
+    return [v for v in sorted({o.strip() for o in out if o.strip()})
+            if len(v.split()) > 1 or len(v) >= 5]
 
-# Build a label→variants index once per session (thread-safe via _get_store)
 @st.cache_resource(show_spinner=False)
-def _build_label_variant_index(labels: list[str]) -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {}
+def _build_label_variant_index(labels: List[str]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
     for L in labels:
         canon = canonicalize(L)
         seeds = [canon]
-        # include any explicit aliases that map to this canon
-        for k,v in ALIAS_CANON.items():
+        for k, v in ALIAS_CANON.items():
             if v.lower() == canon.lower():
                 seeds.append(k)
-        # include concept seeds
-        for k,v in SYN_SEEDS.items():
+        for k, v in SYN_SEEDS.items():
             if k.lower() == canon.lower():
                 seeds.extend(v)
         variants = list(itertools.chain.from_iterable(_mk_variants(s) for s in set(seeds)))
-        # Dedup & keep medium length variants (noise guard)
         variants = [v for v in dict.fromkeys(variants) if 2 <= len(v.split()) <= 6 or len(v) >= 4]
-        out[canon] = variants[:40]  # cap to keep compute bounded
+        out[canon] = variants[:40]
     return out
 
-# Canonicalizer (preserved name)
-
 def canonicalize(name: str) -> str:
-    nn = (name or "").strip()
-    base = _normalize_name(nn)
+    base = _normalize_name(name or "")
     for k, v in ALIAS_CANON.items():
         if _normalize_name(k) == base:
             return v
-    return nn
+    return name.strip()
 
-# Token helpers
+def _tokenize_keep(words: str) -> List[str]:
+    return [w for w in re.findall(r"[a-zA-Z0-9']+", (words or "").lower())
+            if w not in STOP and len(w) >= 2]
 
-def _tokenize_keep(words: str) -> list[str]:
-    return [w for w in re.findall(r"[a-zA-Z0-9']+", (words or "").lower()) if w not in STOP and len(w) >= 2]
-
-# Evidence scoring now checks across label VARIANTS with fuzzy containment
-
-def _evidence_score(label: str, text: str, label_variants: dict[str,list[str]]|None=None) -> tuple[int, list[str]]:
+def _evidence_score(label: str, text: str, label_variants: Dict[str, List[str]] | None = None) -> Tuple[int, List[str]]:
     if not label or not text:
         return 0, []
     canon = canonicalize(label)
     variants = (label_variants or {}).get(canon, []) or [canon]
     text_norm = _normalize_name(text)
-    hits: list[str] = []
+    hits: List[str] = []
     for v in variants:
         v_norm = _normalize_name(v)
-        # Exact token hit
         if re.search(rf"\b{re.escape(v_norm)}\b", text_norm):
-            hits.append(v)
-            continue
-        # Soft fuzzy match for short variants (avoid overfitting)
+            hits.append(v); continue
         if 5 <= len(v_norm) <= 20:
-            ratio = difflib.SequenceMatcher(None, v_norm, text_norm).find_longest_match(0,len(v_norm),0,len(text_norm)).size / max(1,len(v_norm))
+            ratio = difflib.SequenceMatcher(None, v_norm, text_norm).find_longest_match(
+                0, len(v_norm), 0, len(text_norm)).size / max(1, len(v_norm))
             if ratio >= 0.85:
                 hits.append(v)
     return len(hits), hits[:3]
 
-# Enhanced negation detector
-
 def _has_negation(span: str) -> bool:
-    toks = _tokenize_keep(span)
-    return any(t in NEGATORS for t in toks)
-
-# Cosine identical to your version
+    return any(t in NEGATORS for t in _tokenize_keep(span))
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    denom = np.linalg.norm(a) * np.linalg.norm(b) + 1e-12
     return float(np.dot(a, b) / denom)
 
-def _shortlist_by_embeddings(review: str, labels: list[str], client, emb_model: str,
-                              max_sentences: int = 18, top_k: int = 60,
-                              label_variants: dict[str,list[str]]|None=None) -> list[str]:
-    store = _get_store()
-    lock = store["lock"]
-    label_emb = store.setdefault("label_emb", {})  # key: variant string → np.ndarray
-    sent_cache = store.setdefault("sent_emb_cache", {})
+# ----------------------------------------------------------------------
+# 3. OPENAI CLIENT & CACHING
+# ----------------------------------------------------------------------
+@st.cache_resource
+def _get_openai_client_cached(_key: str):
+    return OpenAI(api_key=_key)
 
+def _get_store():
+    if not hasattr(st.session_state, "_store"):
+        st.session_state._store = {
+            "lock": threading.Lock(),
+            "pick_cache": {},
+            "label_emb": {},
+            "sent_emb_cache": {}
+        }
+    return st.session_state._store
+
+def _sentences(text: str) -> List[str]:
+    return [s.strip() for s in re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s', text)
+            if s.strip() and len(s.strip()) >= 12]
+
+def _embed_with_retry(client, model: str, texts: List[str]):
+    resp = client.embeddings.create(model=model, input=texts)
+    return [np.array(e.embedding, dtype=np.float32) for e in resp.data]
+
+def _chat_with_retry(client, req):
+    return client.chat.completions.create(**req)
+
+# ----------------------------------------------------------------------
+# 4. SEMANTIC SHORT-LISTING (embeddings + lexical)
+# ----------------------------------------------------------------------
+def _shortlist_by_embeddings(review: str, labels: List[str], client, emb_model: str,
+                             max_sentences: int, top_k: int,
+                             label_variants: Dict[str, List[str]] | None) -> List[str]:
+    store = _get_store()
+    lock, label_emb, sent_cache = store["lock"], store.setdefault("label_emb", {}), store.setdefault("sent_emb_cache", {})
     lv = label_variants or _build_label_variant_index(labels)
 
-    # Ensure label VARIANT embeddings
-    need_variants: list[str] = []
-    for L in labels:
-        for v in lv.get(canonicalize(L), [L]):
-            if v not in label_emb:
-                need_variants.append(v)
-    if need_variants and client is not None:
-        try:
-            embs = _embed_with_retry(client, emb_model, need_variants)
-            with lock:
-                for v, e in zip(need_variants, embs):
-                    label_emb[v] = e
-        except Exception:
-            # fall back to lexical only if embeddings fail entirely
-            return labels[:top_k]
+    # embed missing label variants
+    need = [v for L in labels for v in lv.get(canonicalize(L), [L]) if v not in label_emb]
+    if need and client:
+        embs = _embed_with_retry(client, emb_model, need)
+        with lock:
+            for v, e in zip(need, embs):
+                label_emb[v] = e
 
-    # Sentence embeddings cache per review
-    review_hash = hashlib.sha256((review or "").encode("utf-8")).hexdigest()
+    # embed review sentences (cached per-review hash)
+    rev_hash = hashlib.sha256(review.encode()).hexdigest()
     with lock:
-        cached = sent_cache.get(review_hash)
-    if cached is None and client is not None:
+        cached = sent_cache.get(rev_hash)
+    if cached is None and client:
         sents = _sentences(review)[:max_sentences]
-        try:
-            sent_embs = _embed_with_retry(client, emb_model, sents)
-            pairs = list(zip(sents, sent_embs))
-            with lock:
-                sent_cache[review_hash] = pairs
-            cached = pairs
-        except Exception:
-            cached = [(s, None) for s in _sentences(review)[:max_sentences]]
+        sent_embs = _embed_with_retry(client, emb_model, sents)
+        cached = list(zip(sents, sent_embs))
+        with lock:
+            sent_cache[rev_hash] = cached
+    elif not cached:
+        cached = [(s, None) for s in _sentences(review)[:max_sentences]]
 
-    # Score each LABEL by the best VARIANT against best sentence
-    scored: list[tuple[str,float]] = []
+    # score each label
+    scored: List[Tuple[str, float]] = []
     for L in labels:
         best = 0.0
         for v in lv.get(canonicalize(L), [L]):
             e_v = label_emb.get(v)
-            if e_v is None or not cached:
-                continue
-            for s, e_s in cached:
-                if e_s is None:
-                    continue
-                sim = _cosine(e_v, e_s)
-                if sim > best:
-                    best = sim
-        # lexical bonus using variants
+            if e_v is None: continue
+            for _, e_s in cached:
+                if e_s is None: continue
+                best = max(best, _cosine(e_v, e_s))
         ev_hits, _ = _evidence_score(L, review, lv)
-        bonus = 0.05 * ev_hits  # Slightly increased for better recall
-        scored.append((L, best + bonus))
-
+        scored.append((L, best + 0.05 * ev_hits))
     scored.sort(key=lambda x: x[1], reverse=True)
     return [l for l, _ in scored[:top_k]]
 
-
-def _prefilter_candidates(review: str, allowed: list[str], cap: int = 60, use_embeddings: bool = True,
-                          client=None, emb_model: str = "text-embedding-3-small",
-                          max_sentences: int = 18, variant_boost: bool = True,
-                          label_variants: dict[str,list[str]]|None=None) -> list[str]:
-    """Hybrid shortlist: embeddings + lexical hits across label VARIANTS."""
+def _prefilter_candidates(review: str, allowed: List[str], cap: int, use_embeddings: bool,
+                          client, emb_model: str, max_sentences: int, variant_boost: bool,
+                          label_variants: Dict[str, List[str]] | None) -> List[str]:
     lv = label_variants or (_build_label_variant_index(allowed) if variant_boost else None)
-
-    if use_embeddings and client is not None:
+    if use_embeddings and client:
         try:
             return _shortlist_by_embeddings(review, allowed, client, emb_model,
-                                            max_sentences=max_sentences, top_k=cap,
-                                            label_variants=lv)
+                                            max_sentences, cap, lv)
         except Exception:
-            pass  # fall through to lexical
-
-    # Lexical only, across variants
+            pass
+    # lexical fallback
     text = " " + _normalize_name(review) + " "
-    scored: list[tuple[str,float]] = []
+    scored: List[Tuple[str, float]] = []
     for L in allowed:
-        variants = (lv or {}).get(canonicalize(L), [L])
-        hits = 0; base_tok_count = 0
-        for v in variants:
+        hits = 0; base_tok = 0
+        for v in (lv or {}).get(canonicalize(L), [L]):
             toks = [t for t in _normalize_name(v).split() if len(t) > 2]
-            base_tok_count += len(toks)
-            if not toks:
-                continue
+            base_tok += len(toks)
             if re.search(rf"\b{re.escape(_normalize_name(v))}\b", text):
                 hits += len(toks)
-        score = (hits / max(1, base_tok_count)) if base_tok_count else 0
-        if score > 0:
-            scored.append((L, score))
+        if base_tok:
+            scored.append((L, hits / base_tok))
     if not scored:
         return allowed[:cap]
     scored.sort(key=lambda x: -x[1])
     return [s[0] for s in scored[:cap]]
 
-def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float,
-              evidence_hits_required: int = 1, candidate_cap: int = 60, max_output_tokens: int = 380,
-              use_embeddings: bool = True, emb_model: str = "text-embedding-3-small", max_sentences: int = 18,
-              variant_boost: bool = True, auto_relax: bool = True, ensemble_check: bool = True):
-    """Return (dels, dets, novel_dels, novel_dets, evidence_map)."""
+# ----------------------------------------------------------------------
+# 5. LLM PICKER (core logic – no extra “reminders”)
+# ----------------------------------------------------------------------
+def _llm_pick(review: str, stars, allowed_del: List[str], allowed_det: List[str],
+              min_conf: float, evidence_hits_required: int, candidate_cap: int,
+              max_output_tokens: int, use_embeddings: bool, emb_model: str,
+              max_sentences: int, variant_boost: bool, auto_relax: bool,
+              ensemble_check: bool):
     if not review or (not allowed_del and not allowed_det):
         return [], [], [], [], {}
 
     api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-    client = _get_openai_client_cached(api_key) if (_HAS_OPENAI and api_key) else None
+    client = _get_openai_client_cached(api_key) if api_key else None
 
-    label_variants_del = _build_label_variant_index(allowed_del) if variant_boost and allowed_del else {}
-    label_variants_det = _build_label_variant_index(allowed_det) if variant_boost and allowed_det else {}
+    lv_del = _build_label_variant_index(allowed_del) if variant_boost and allowed_del else {}
+    lv_det = _build_label_variant_index(allowed_det) if variant_boost and allowed_det else {}
 
-    # Hybrid shortlist (keeps full review text intact)
-    allowed_del_f = _prefilter_candidates(review, allowed_del, cap=candidate_cap, use_embeddings=use_embeddings,
-                                          client=client, emb_model=emb_model, max_sentences=max_sentences,
-                                          variant_boost=variant_boost, label_variants=label_variants_del)
-    allowed_det_f = _prefilter_candidates(review, allowed_det, cap=candidate_cap, use_embeddings=use_embeddings,
-                                          client=client, emb_model=emb_model, max_sentences=max_sentences,
-                                          variant_boost=variant_boost, label_variants=label_variants_det)
+    allowed_del_f = _prefilter_candidates(review, allowed_del, candidate_cap,
+                                          use_embeddings, client, emb_model,
+                                          max_sentences, variant_boost, lv_del)
+    allowed_det_f = _prefilter_candidates(review, allowed_det, candidate_cap,
+                                          use_embeddings, client, emb_model,
+                                          max_sentences, variant_boost, lv_det)
 
-    # Cache key now includes variant_boost
     cache_key = "|".join([
-        str(model_choice), str(min_conf), str(evidence_hits_required), str(candidate_cap),
+        model_choice, str(min_conf), str(evidence_hits_required), str(candidate_cap),
         str(use_embeddings), emb_model, str(max_sentences), str(variant_boost),
         hashlib.sha256("\x1f".join(sorted(allowed_del_f)).encode()).hexdigest(),
         hashlib.sha256("\x1f".join(sorted(allowed_det_f)).encode()).hexdigest(),
-        hashlib.sha256((review or "").encode("utf-8")).hexdigest(), str(stars)
+        hashlib.sha256(review.encode()).hexdigest(), str(stars)
     ])
     store = _get_store()
     with store["lock"]:
         if cache_key in store["pick_cache"]:
             return store["pick_cache"][cache_key]
 
-    sys_prompt = (
-        """
-You are labeling a single customer review. Choose ONLY from the provided lists.
+    sys_prompt = """
+You are labelling a single customer review. Choose ONLY from the provided lists.
 Return compact JSON:
 {
- "delighters":[{"name":"", "confidence":0.00, "quote":""}],
- "detractors":[{"name":"", "confidence":0.00, "quote":""}]
+  "delighters":[{"name":"", "confidence":0.00, "quote":""}],
+  "detractors":[{"name":"", "confidence":0.00, "quote":""}]
 }
 Rules:
-- Only choose items clearly supported by the text. Include a SHORT verbatim quote (5–18 words) that proves it.
-- Prefer precision over recall; avoid stretch matches and near-duplicates (use canonical phrasing).
-- If stars are 1–2, prioritize detractors; if 4–5, prioritize delighters; 3 is neutral.
-- Respect negation: if text says "not loud", do NOT select "Loud".
+- Only pick items that are clearly supported by the text.
+- Include a **short verbatim quote** (5–18 words) that proves the item.
+- Prefer precision over recall; avoid near-duplicates.
+- If stars are 1–2 → prioritize detractors; 4–5 → prioritize delighters; 3 → neutral.
+- Respect negation (e.g., “not loud” → do **not** pick “Loud”).
 - At most 10 per group. Confidence ∈ [0,1].
-- IMPORTANT: If the concept appears via a synonym/phrase (e.g., "doesn't hold charge" → Battery life), you may still pick the canonical label.
-        """
-    )
+- Synonyms/paraphrases are allowed **as long as the canonical label exists** in the list.
+"""
 
-    user =  {
-        "review": review,  # full text
-        "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
+    user_msg = {
+        "review": review,
+        "stars": float(stars) if stars is not None and not pd.isna(stars) else None,
         "allowed_delighters": allowed_del_f[:120],
         "allowed_detractors": allowed_det_f[:120]
     }
 
-    dels: list[str] = []; dets: list[str] = []
-    novel_dels: list[str] = []; novel_dets: list[str] = []
-    evidence_map: dict[str, list[str]] = {}
-
-    def _post_process(items, allowed_set, text, lv: dict[str,list[str]]):
-        pairs: list[tuple[str,float,str]] = []
+    # ---------- post-processing helpers ----------
+    def _post_process(items, allowed_set, text, lv):
+        pairs: List[Tuple[str, float, str]] = []
         for d in items or []:
             name = canonicalize(d.get("name", ""))
             conf = float(d.get("confidence", 0))
             quote = (d.get("quote") or "").strip()
-            if not name:
-                continue
-            # Evidence check across VARIANTS
-            ev_ok = False
-            hits, _ = _evidence_score(name, text, lv)
-            if hits >= max(1, evidence_hits_required):
-                ev_ok = True
+            if not name: continue
+            ev_ok = _evidence_score(name, text, lv)[0] >= max(1, evidence_hits_required)
             if quote:
-                # normalize spaces/punct before containment
-                qn = _normalize_name(quote)
-                tn = _normalize_name(text)
-                if qn and qn in tn:
+                if _normalize_name(quote) in _normalize_name(text):
                     ev_ok = True
-            if quote and _has_negation(quote):
-                # Refined: Only penalize if negation likely inverts (simple: if negator before label variant)
-                if any(n in qn.split()[:3] for n in NEGATORS):  # Basic check for inversion
+                if _has_negation(quote):
                     conf *= 0.6
             if ev_ok and name in allowed_set:
                 pairs.append((name, max(0.0, min(1.0, conf)), quote))
-        # Dedupe by best confidence
-        best: dict[str,tuple[float,str]] = {}
-        for n,c,q in pairs:
+        # dedupe by best confidence
+        best: Dict[str, Tuple[float, str]] = {}
+        for n, c, q in pairs:
             if n not in best or c > best[n][0]:
-                best[n] = (c,q)
+                best[n] = (c, q)
         final = sorted(best.items(), key=lambda x: -x[1][0])[:10]
-        for n,(c,q) in final:
-            if q:
-                evidence_map.setdefault(n, []).append(q)
-        return [(n, c) for n,(c,_) in final]
+        evidence_map = {n: [q] for n, (_, q) in final if q}
+        return [(n, c) for n, (c, _) in final], evidence_map
 
-    def _dedupe_keep_top(items: list[tuple[str,float]], top_n: int = 10, min_conf_: float = 0.60) -> list[str]:
-        canon_pairs: list[tuple[str,float]] = []
-        for (n, c) in items:
-            if c >= min_conf_ and n:
-                canon_pairs.append((canonicalize(n), c))
-        kept: list[tuple[str,float]] = []
+    def _dedupe_keep_top(pairs: List[Tuple[str, float]], top_n: int, min_c: float) -> List[str]:
+        canon_pairs = [(canonicalize(n), c) for n, c in pairs if c >= min_c and n]
+        kept: List[Tuple[str, float]] = []
         for n, c in sorted(canon_pairs, key=lambda x: -x[1]):
             n_norm = _normalize_name(n)
             if not any(difflib.SequenceMatcher(None, n_norm, _normalize_name(k)).ratio() > 0.88 for k, _ in kept):
                 kept.append((n, c))
-            if len(kept) >= top_n:
-                break
-        return [n for n,_ in kept]
+            if len(kept) >= top_n: break
+        return [n for n, _ in kept]
 
-    # LLM path
-    if client is not None:
+    # ---------- LLM call ----------
+    if client:
         try:
             req = {
                 "model": model_choice,
                 "messages": [
                     {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": json.dumps(user)}
+                    {"role": "user", "content": json.dumps(user_msg)}
                 ],
                 "response_format": {"type": "json_object"},
                 "max_tokens": max_output_tokens,
+                "temperature": 0.0 if not model_choice.startswith("gpt-5") else 0.0
             }
-            if not str(model_choice).startswith("gpt-5"):
-                req["temperature"] = 0.0
             out = _chat_with_retry(client, req)
-            content = out.choices[0].message.content or "{}"
-            data = json.loads(content)
+            data = json.loads(out.choices[0].message.content or "{}")
 
-            dels_pairs = _post_process(data.get("delighters", []), set(allowed_del_f), review, label_variants_del)
-            dets_pairs = _post_process(data.get("detractors", []), set(allowed_det_f), review, label_variants_det)
+            dels_pairs, del_ev = _post_process(data.get("delighters", []), set(allowed_del_f), review, lv_del)
+            dets_pairs, det_ev = _post_process(data.get("detractors", []), set(allowed_det_f), review, lv_det)
 
-            dels_final = _dedupe_keep_top(dels_pairs, 10, min_conf)
-            dets_final = _dedupe_keep_top(dets_pairs, 10, min_conf)
+            dels = _dedupe_keep_top(dels_pairs, 10, min_conf)
+            dets = _dedupe_keep_top(dets_pairs, 10, min_conf)
 
-            # Ensemble rerank: if enabled, lightly boost items that have strong lexical variant evidence
+            # optional ensemble boost
             if ensemble_check:
-                def _boost(lst: list[str], lv):
-                    scored = []
-                    for n in lst:
-                        ev, _ = _evidence_score(n, review, lv)
-                        scored.append((n, ev))
-                    scored.sort(key=lambda x: -x[1])
-                    return [n for n,_ in scored]
-                dels_final = _boost(dels_final, label_variants_del)
-                dets_final = _boost(dets_final, label_variants_det)
+                def boost(lst, lv):
+                    return [n for n, _ in sorted(
+                        [(n, _evidence_score(n, review, lv)[0]) for n in lst],
+                        key=lambda x: -x[1])][:10]
+                dels = boost(dels, lv_del)
+                dets = boost(dets, lv_det)
 
-            # Auto-relax if nothing found: lower min_conf, widen candidates, and try once more
-            if auto_relax and (not dels_final and not dets_final):
-                req_relaxed = req.copy()
-                req_relaxed["max_tokens"] = max_output_tokens
-                # gently hint the model to be inclusive on second pass
-                req_relaxed["messages"] = [
-                    {"role":"system","content": sys_prompt + "\nIf nothing is clearly present, pick plausible items ONLY with direct textual evidence."},
-                    {"role":"user","content": json.dumps(user)}
-                ]
-                out2 = _chat_with_retry(client, req_relaxed)
-                content2 = out2.choices[0].message.content or "{}"
-                data2 = json.loads(content2)
-                dels_pairs2 = _post_process(data2.get("delighters", []), set(allowed_del_f), review, label_variants_del)
-                dets_pairs2 = _post_process(data2.get("detractors", []), set(allowed_det_f), review, label_variants_det)
-                dels_final = _dedupe_keep_top(dels_pairs2, 10, min_conf * 0.9)
-                dets_final = _dedupe_keep_top(dets_pairs2, 10, min_conf * 0.9)
+            # auto-relax
+            if auto_relax and not (dels or dets):
+                req2 = req.copy()
+                req2["messages"][0]["content"] += "\nIf nothing is clearly present, pick plausible items ONLY with direct textual evidence."
+                out2 = _chat_with_retry(client, req2)
+                data2 = json.loads(out2.choices[0].message.content or "{}")
+                dels2, del_ev2 = _post_process(data2.get("delighters", []), set(allowed_del_f), review, lv_del)
+                dets2, det_ev2 = _post_process(data2.get("detractors", []), set(allowed_det_f), review, lv_det)
+                dels = _dedupe_keep_top(dels2, 10, min_conf * 0.9)
+                dets = _dedupe_keep_top(dets2, 10, min_conf * 0.9)
 
-            result = (dels_final, dets_final, [], [], evidence_map)
+            result = (dels, dets, [], [], {**del_ev, **det_ev})
             with store["lock"]:
                 store["pick_cache"][cache_key] = result
             return result
         except Exception:
             pass
 
-    # Fallback (no-API): lexical variant based
-    text = (review or "").lower()
-    def pick_from_allowed(allowed: list[str], lv: dict[str,list[str]]):
+    # ---------- lexical fallback ----------
+    text_lc = review.lower()
+    def lexical_pick(allowed, lv):
         scored = []
         for a in allowed:
-            a_can = canonicalize(a)
-            ev_hits, _ = _evidence_score(a_can, text, lv)
-            if ev_hits >= max(1, evidence_hits_required):
-                scored.append((a_can, 0.65 + 0.1 * min(3, ev_hits)))
+            hits, _ = _evidence_score(canonicalize(a), text_lc, lv)
+            if hits >= max(1, evidence_hits_required):
+                scored.append((canonicalize(a), 0.65 + 0.1 * min(3, hits)))
         scored.sort(key=lambda x: -x[1])
-        return [n for n,_ in scored[:10]]
-
-    dels_f = pick_from_allowed(allowed_del_f, label_variants_del)
-    dets_f = pick_from_allowed(allowed_det_f, label_variants_det)
-    result = (dels_f, dets_f, [], [], {})
+        return [n for n, _ in scored[:10]]
+    dels = lexical_pick(allowed_del_f, lv_del)
+    dets = lexical_pick(allowed_det_f, lv_det)
+    result = (dels, dets, [], [], {})
     with store["lock"]:
         store["pick_cache"][cache_key] = result
     return result
 
-# Sample _process_one
-def _process_one(idx, review_txt, stars):
-    return idx, _llm_pick(
-        review_txt,
-        stars,
-        ALLOWED_DELIGHTERS,
-        ALLOWED_DETRACTORS,
-        strictness,
-        evidence_hits_required=evidence_hits_required,
-        candidate_cap=candidate_cap,
-        max_output_tokens=max_output_tokens,
-        use_embeddings=use_embeddings,
-        emb_model=emb_model,
-        max_sentences=max_sentences,
-        variant_boost=variant_boost,
-        auto_relax=auto_relax,
-        ensemble_check=ensemble_check,
-    )
-
-# Main app
+# ----------------------------------------------------------------------
+# 6. UI – presets + all toggles (Fast / Accurate)
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="Star Walk – Symptomize v3", layout="wide")
 st.title("Star Walk — Symptomize v3")
 
-# Sidebar (assume two presets: Fast and Accurate)
 preset = st.sidebar.selectbox("Preset", ["Fast", "Accurate"])
 
 with st.sidebar:
@@ -610,10 +437,7 @@ with st.sidebar:
         use_embeddings = True
         emb_model = "text-embedding-3-small"
         max_sentences = 18
-        variant_boost = st.checkbox("Use auto-generated synonyms/variants", value=True)
-        auto_relax = st.checkbox("Auto-relax if nothing found", value=True)
-        ensemble_check = st.checkbox("Ensemble rerank (lexical+embed+LLM)", value=True)
-    else:
+    else:  # Accurate
         model_choice = "gpt-4o"
         strictness = 0.78
         evidence_hits_required = 1
@@ -622,22 +446,53 @@ with st.sidebar:
         use_embeddings = True
         emb_model = "text-embedding-3-large"
         max_sentences = 25
-        variant_boost = st.checkbox("Use auto-generated synonyms/variants", value=True)
-        auto_relax = st.checkbox("Auto-relax if nothing found", value=True)
-        ensemble_check = st.checkbox("Ensemble rerank (lexical+embed+LLM)", value=True)
 
-# Upload and process
-uploaded_file = st.file_uploader("Upload reviews CSV (columns: review, stars)")
-if uploaded_file and st.button("Run Symptomize"):
-    df = pd.read_csv(uploaded_file)
+    # ----- shared toggles (appear for both presets) -----
+    variant_boost = st.checkbox("Use auto-generated synonyms/variants", value=True)
+    auto_relax = st.checkbox("Auto-relax if nothing found", value=True)
+    ensemble_check = st.checkbox("Ensemble rerank (lexical+embed+LLM)", value=True)
+
+# ----------------------------------------------------------------------
+# 7. FILE UPLOAD & PROCESSING
+# ----------------------------------------------------------------------
+uploaded = st.file_uploader("Upload reviews CSV (columns: `review`, `stars`)", type=["csv"])
+if uploaded and st.button("Run Symptomize"):
+    df = pd.read_csv(uploaded)
+
+    # Derive allowed lists from the *first* row’s Symptom columns (or use empty lists)
+    ALLOWED_DELIGHTERS = list({canonicalize(v) for v in df.filter(like="Symptom").stack().dropna().unique() if "delight" in v.lower()})
+    ALLOWED_DETRACTORS = list({canonicalize(v) for v in df.filter(like="Symptom").stack().dropna().unique() if "detract" in v.lower()})
+    if not ALLOWED_DELIGHTERS and not ALLOWED_DETRACTORS:
+        st.warning("No Symptom columns detected – using empty allow-lists (lexical fallback only).")
+        ALLOWED_DELIGHTERS = ALLOWED_DETRACTORS = []
+
     results = []
-    for idx, row in df.iterrows():
-        res = _process_one(idx, row['review'], row.get('stars', None))
-        results.append(res)
-    st.write("Results:", results)  # Placeholder output
+    prog = st.progress(0)
+    for i, row in df.iterrows():
+        idx, (dels, dets, _, _, ev) = _process_one(
+            i, row.get("review", ""), row.get("stars"),
+            strictness, evidence_hits_required, candidate_cap,
+            max_output_tokens, use_embeddings, emb_model, max_sentences,
+            variant_boost, auto_relax, ensemble_check
+        )
+        results.append({"row": idx, "delighters": dels, "detractors": dets, "evidence": ev})
+        prog.progress((i + 1) / len(df))
 
+    st.success("Done!")
+    st.dataframe(pd.DataFrame(results))
 
-
-
-
-
+def _process_one(idx, review_txt, stars):
+    return idx, _llm_pick(
+        review_txt, stars,
+        ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS,
+        strictness,
+        evidence_hits_required=evidence_hits_required,
+        candidate_cap=candidate_cap,
+        max_output_tokens=max_output_tokens,
+        use_embeddings=use_embeddings,
+        emb_model=emb_model,
+        max_sentences=max_sentences,
+        variant_boost=variant_boost,
+        auto_relax=auto_relax,
+        ensemble_check=ensemble_check,
+    )
