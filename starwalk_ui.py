@@ -1,4 +1,5 @@
-# ---------- Star Walk — Upload + Symptomize (Enhanced UX, Accuracy & Approvals) ----------
+# Write the enhanced Streamlit app to a file for download
+code = r'''# ---------- Star Walk — Upload + Symptomize (Enhanced UX, 14" UI & Real-time + Speed) ----------
 # Streamlit 1.38+
 
 import io
@@ -6,7 +7,10 @@ import os
 import re
 import json
 import difflib
+import time
+import hashlib
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -31,7 +35,8 @@ except Exception:
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
 
 # ---------------- Force Light Mode ----------------
-st_html("""
+st_html(
+    """
 <script>
 (function () {
   function setLight() {
@@ -48,47 +53,49 @@ st_html("""
   );
 })();
 </script>
-""", height=0)
+""",
+    height=0,
+)
 
-# ---------------- Global CSS ----------------
+# ---------------- Global CSS (14" compact) ----------------
 GLOBAL_CSS = """
 <style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
+  :root { scroll-behavior: smooth; scroll-padding-top: 80px; }
   *, ::before, ::after { box-sizing: border-box; }
   @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
   :root{
     --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
+    --border-strong:#94a3b8; --border:#cbd5e1; --border-soft:#e2e8f0;
     --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-    --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
+    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626; --warn:#b45309;
+    --gap-sm:10px; --gap-md:16px; --gap-lg:24px;
   }
-  html, body, .stApp { background: var(--bg-app); font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif; color: var(--text); }
-  .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
-  .hero-wrap{ position:relative; overflow:hidden; border-radius:14px; min-height:120px; margin:.25rem 0 1rem 0; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); background:linear-gradient(90deg, var(--bg-card) 0% 55%, transparent 55% 100%); }
-  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:10px 18px; color:var(--text); }
-  .hero-title{ font-size:clamp(22px,3.1vw,40px); font-weight:800; margin:0; }
-  .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); }
-  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:40%; }
-  .sn-logo{ height:46px; width:auto; display:block; opacity:.92; }
-  .card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); }
+  html, body, .stApp { background: var(--bg-app); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif; color: var(--text); }
+  .block-container { padding-top:.6rem; padding-bottom:.9rem; max-width: 1280px; }
+  .hero-wrap{ position:relative; overflow:hidden; border-radius:12px; min-height:92px; margin:.15rem 0 .6rem 0; box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05); background:linear-gradient(90deg, var(--bg-card) 0% 60%, transparent 60% 100%); }
+  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:8px 14px; color:var(--text); }
+  .hero-title{ font-size:clamp(18px,2.3vw,30px); font-weight:800; margin:0; line-height:1.1; }
+  .hero-sub{ margin:2px 0 0 0; color:var(--muted); font-size:clamp(11px,1vw,14px); }
+  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:36%; }
+  .sn-logo{ height:36px; width:auto; display:block; opacity:.92; }
+  .card{ background:var(--bg-card); border-radius:12px; padding:12px; box-shadow:0 0 0 1px var(--border-strong), 0 6px 12px rgba(15,23,42,.05); }
   .muted{ color:var(--muted); }
-  .kpi{ display:flex; gap:14px; flex-wrap:wrap }
-  .pill{ padding:8px 12px; border-radius:999px; border:1.5px solid var(--border); background:var(--bg-tile); font-weight:700 }
-  .review-quote { white-space:pre-wrap; background:var(--bg-tile); border:1.5px solid var(--border); border-radius:12px; padding:8px 10px; }
+  .pill{ padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:var(--bg-tile); font-weight:700; font-size:12px; }
+  .kpi{ display:flex; gap:10px; flex-wrap:wrap }
+  .review-quote { white-space:pre-wrap; background:var(--bg-tile); border:1px solid var(--border); border-radius:10px; padding:8px 10px; font-size:13px; }
   mark { background:#fff2a8; padding:0 .15em; border-radius:3px; }
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+  .chip{padding:5px 9px;border-radius:999px;border:1px solid var(--border);background:var(--bg-tile);font-weight:700;font-size:.85rem}
+  .chip.pos{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
+  .chip.neg{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
+  .badge{display:inline-flex;gap:6px;align-items:center;padding:3px 8px;border-radius:999px;border:1px solid var(--border);font-size:12px;background:var(--bg-card)}
+  .badge.ok{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
+  .badge.warn{border-color:#FDECC8;background:#FFF7ED;color:#7C2D12}
+  .badge.bad{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
+  .tight > div[data-testid="stHorizontalBlock"]{ gap: 8px !important; }
 </style>
 """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
-# Extra CSS enhancements for chips
-st.markdown("""
-<style>
-  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
-  .chip{padding:6px 10px;border-radius:999px;border:1.5px solid var(--border);background:var(--bg-tile);font-weight:700;font-size:.9rem}
-  .chip.pos{border-color:#CDEFE1;background:#EAF9F2;color:#065F46}
-  .chip.neg{border-color:#F7D1D1;background:#FDEBEB;color:#7F1D1D}
-</style>
-""", unsafe_allow_html=True)
 
 # ---------------- Header ----------------
 st.markdown(
@@ -106,9 +113,28 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------- Upload ----------------
-st.sidebar.header("📁 Upload Star Walk File")
-uploaded = st.sidebar.file_uploader("Choose Excel File", type=["xlsx"], accept_multiple_files=False)
+# ========================== SIDEBAR ==========================
+with st.sidebar:
+    st.header("📁 Upload Star Walk File")
+    uploaded = st.file_uploader("Choose Excel File", type=["xlsx"], accept_multiple_files=False)
+
+    st.markdown("---")
+    st.subheader("⚙️ Run Settings")
+    speed_mode = st.toggle("Speed mode", value=False, help="Uses faster model & shorter reviews first (does not shorten text).")
+    strictness = st.slider("Strictness", 0.55, 0.95, 0.75, 0.01,
+                           help="Confidence + evidence threshold; also reduces near-duplicates.")
+    require_evidence = st.checkbox("Require textual evidence", value=True)
+    evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1 if strictness>=0.8 else 0)
+
+    st.caption("Advanced")
+    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
+    max_output_tokens = st.number_input("Max output tokens", 64, 2000, 400, 32,
+                                        help="Limits LLM output to keep latency low.")
+    candidate_cap = st.slider("Cap candidates per review", 10, 120, 40, 5,
+                              help="Prefilter allowed lists per review to reduce tokens. This does NOT shorten the review text.")
+    api_concurrency = st.slider("API concurrency", 1, 8, 4, help="Parallelize requests (watch rate limits).")
+
+    st.info("Reviews are sent in full — no truncation applied.")
 
 # Persist raw bytes for formatting-preserving save
 if uploaded and "uploaded_bytes" not in st.session_state:
@@ -120,14 +146,21 @@ if not uploaded:
     st.info("Upload a .xlsx workbook to begin.")
     st.stop()
 
-# Load main sheet
-try:
+# ---------------- Load main sheet ----------------
+@st.cache_data(show_spinner=False)
+def _load_main_sheet(_uploaded: io.BytesIO) -> pd.DataFrame:
     try:
-        df = pd.read_excel(uploaded, sheet_name="Star Walk scrubbed verbatims")
-    except ValueError:
-        df = pd.read_excel(uploaded)
+        try:
+            return pd.read_excel(_uploaded, sheet_name="Star Walk scrubbed verbatims")
+        except ValueError:
+            return pd.read_excel(_uploaded)
+    except Exception as e:
+        raise RuntimeError(f"Could not read the Excel file: {e}")
+
+try:
+    df = _load_main_sheet(uploaded)
 except Exception as e:
-    st.error(f"Could not read the Excel file: {e}")
+    st.error(str(e))
     st.stop()
 
 # ---------------- Identify Symptom Columns ----------------
@@ -140,7 +173,11 @@ if not SYMPTOM_COLS:
     st.stop()
 
 # Missing symptom rows
-is_empty = df[SYMPTOM_COLS].isna() | (df[SYMPTOM_COLS].astype(str).applymap(lambda x: str(x).strip().upper() in {"", "NA", "N/A", "NONE", "NULL", "-"}))
+is_empty = df[SYMPTOM_COLS].isna() | (
+    df[SYMPTOM_COLS]
+    .astype(str)
+    .applymap(lambda x: str(x).strip().upper() in {"", "NA", "N/A", "NONE", "NULL", "-"})
+)
 mask_empty = is_empty.all(axis=1)
 missing_idx = df.index[mask_empty].tolist()
 missing_count = len(missing_idx)
@@ -216,6 +253,7 @@ def _extract_from_df(df_sheet: pd.DataFrame):
         return dels, dets, debug
     return [], [], {"strategy":"none","columns":list(df_sheet.columns)}
 
+
 def autodetect_symptom_sheet(xls: pd.ExcelFile) -> str | None:
     names = xls.sheet_names
     cands = [n for n in names if _looks_like_symptom_sheet(n)]
@@ -223,6 +261,8 @@ def autodetect_symptom_sheet(xls: pd.ExcelFile) -> str | None:
         return min(cands, key=lambda n: len(_norm(n)))
     return names[0] if names else None
 
+
+@st.cache_data(show_spinner=False)
 def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, user_del_col: str | None = None, user_det_col: str | None = None):
     meta = {"sheet": None, "strategy": None, "columns": [], "note": ""}
     if not raw_bytes:
@@ -255,7 +295,6 @@ def load_symptom_lists_robust(raw_bytes: bytes, user_sheet: str | None = None, u
     return dels, dets, meta
 
 # ---- Symptoms sheet picker (UI) ----
-st.sidebar.markdown("### 🧾 Symptoms Source")
 raw_bytes = st.session_state.get("uploaded_bytes", b"")
 
 sheet_names = []
@@ -266,35 +305,37 @@ except Exception:
     pass
 
 auto_sheet = autodetect_symptom_sheet(_xls_tmp) if sheet_names else None
-chosen_sheet = st.sidebar.selectbox(
-    "Choose the sheet that contains Delighters/Detractors",
-    options=sheet_names if sheet_names else ["(no sheets detected)"],
-    index=(sheet_names.index(auto_sheet) if (sheet_names and auto_sheet in sheet_names) else 0)
-)
 
-# Preview columns for manual selection
-symp_cols_preview = []
-if sheet_names:
-    try:
-        _df_symp_prev = pd.read_excel(_io.BytesIO(raw_bytes), sheet_name=chosen_sheet)
-        symp_cols_preview = list(_df_symp_prev.columns)
-    except Exception:
-        _df_symp_prev = pd.DataFrame()
-        symp_cols_preview = []
+with st.sidebar:
+    chosen_sheet = st.selectbox(
+        "Choose the sheet that contains Delighters/Detractors",
+        options=sheet_names if sheet_names else ["(no sheets detected)"],
+        index=(sheet_names.index(auto_sheet) if (sheet_names and auto_sheet in sheet_names) else 0)
+    )
 
-manual_cols = False
-picked_del_col = None
-picked_det_col = None
+    # Preview columns for manual selection
+    symp_cols_preview = []
+    if sheet_names:
+        try:
+            _df_symp_prev = pd.read_excel(_io.BytesIO(raw_bytes), sheet_name=chosen_sheet)
+            symp_cols_preview = list(_df_symp_prev.columns)
+        except Exception:
+            _df_symp_prev = pd.DataFrame()
+            symp_cols_preview = []
 
-if symp_cols_preview:
-    st.sidebar.caption("Detected columns:")
-    st.sidebar.write(", ".join(map(str, symp_cols_preview)))
-    manual_cols = st.sidebar.checkbox("Manually choose Delighters/Detractors columns", value=False)
-    if manual_cols:
-        picked_del_col = st.sidebar.selectbox("Delighters column", options=["(none)"] + symp_cols_preview, index=0)
-        picked_det_col = st.sidebar.selectbox("Detractors column", options=["(none)"] + symp_cols_preview, index=0)
-        if picked_del_col == "(none)": picked_del_col = None
-        if picked_det_col == "(none)": picked_det_col = None
+    manual_cols = False
+    picked_del_col = None
+    picked_det_col = None
+
+    if symp_cols_preview:
+        st.caption("Detected columns:")
+        st.write(", ".join(map(str, symp_cols_preview)))
+        manual_cols = st.checkbox("Manually choose Delighters/Detractors columns", value=False)
+        if manual_cols:
+            picked_del_col = st.selectbox("Delighters column", options=["(none)"] + symp_cols_preview, index=0)
+            picked_det_col = st.selectbox("Detractors column", options=["(none)"] + symp_cols_preview, index=0)
+            if picked_del_col == "(none)": picked_del_col = None
+            if picked_det_col == "(none)": picked_det_col = None
 
 ALLOWED_DELIGHTERS, ALLOWED_DETRACTORS, SYM_META = load_symptom_lists_robust(
     raw_bytes, user_sheet=chosen_sheet if sheet_names else None, user_del_col=picked_del_col, user_det_col=picked_det_col
@@ -304,92 +345,85 @@ ALLOWED_DETRACTORS = [x for x in ALLOWED_DETRACTORS if x]
 ALLOWED_DELIGHTERS_SET = set(ALLOWED_DELIGHTERS)
 ALLOWED_DETRACTORS_SET = set(ALLOWED_DETRACTORS)
 
-if ALLOWED_DELIGHTERS or ALLOWED_DETRACTORS:
-    st.sidebar.success(
-        f"Loaded {len(ALLOWED_DELIGHTERS)} delighters, {len(ALLOWED_DETRACTORS)} detractors (sheet: '{SYM_META.get('sheet','?')}', mode: {SYM_META.get('strategy','?')})."
-    )
-else:
-    st.sidebar.warning(
-        f"Didn't find clear Delighters/Detractors lists in '{SYM_META.get('sheet','?')}'. Using conservative keyword fallback. Adjust options above if needed."
-    )
+with st.sidebar:
+    if ALLOWED_DELIGHTERS or ALLOWED_DETRACTORS:
+        st.success(
+            f"Loaded {len(ALLOWED_DELIGHTERS)} delighters, {len(ALLOWED_DETRACTORS)} detractors (sheet: '{SYM_META.get('sheet','?')}', mode: {SYM_META.get('strategy','?')})."
+        )
+    else:
+        st.warning(
+            f"Didn't find clear Delighters/Detractors lists in '{SYM_META.get('sheet','?')}'. Using conservative keyword fallback. Adjust options above if needed."
+        )
 
-# ---------------- Top KPIs & Actions ----------------
-
-st.markdown("### Status")
+# ========================== TOP KPIs ==========================
 colA, colB, colC, colD = st.columns([2,2,2,3])
 with colA:
-    st.markdown(f"<div class='pill'>🧾 Total reviews: <b>{len(df)}</b></div>", unsafe_allow_html=True)
+    st.markdown(f"<span class='pill'>🧾 Total reviews: <b>{len(df)}</b></span>", unsafe_allow_html=True)
 with colB:
-    st.markdown(f"<div class='pill'>❌ Missing symptoms: <b>{missing_count}</b></div>", unsafe_allow_html=True)
+    st.markdown(f"<span class='pill'>❌ Missing symptoms: <b>{missing_count}</b></span>", unsafe_allow_html=True)
 with colC:
-    st.markdown(f"<div class='pill'>✂ IQR chars: <b>{int(IQR)}</b></div>", unsafe_allow_html=True)
+    st.markdown(f"<span class='pill'>✂ IQR chars: <b>{int(IQR)}</b></span>", unsafe_allow_html=True)
 with colD:
     st.caption("Estimates scale by model, token budget and text length; indicative only.")
 
-left, mid, right = st.columns([2,2,3])
+left, right = st.columns([1.4, 2.6], gap="small")
+
 with left:
-    batch_n = st.slider("How many to process this run", 1, 20, min(10, max(1, missing_count)) if missing_count else 10)
-with mid:
-    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"], index=0)
+    st.markdown("### Run Controller")
+    batch_n = st.slider("How many to process this run", 1, 30, min(12, max(1, missing_count)) if missing_count else 12)
+
+    # ETA (heuristic) — token-aware
+    MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
+    MODEL_LAT = {"gpt-4o-mini": 0.6, "gpt-4o": 0.9, "gpt-4.1": 1.1, "gpt-5": 1.3}
+    rows = min(batch_n, missing_count)
+    chars_est = max(200, int((q1+q3)/2)) if (q1 or q3) else 400
+    tok_est = int(chars_est/4)
+    rt = rows * (MODEL_LAT.get(model_choice,1.0) + tok_est/max(8, MODEL_TPS.get(model_choice,12)))
+    eta_secs = int(round(rt))
+    st.caption(f"Will attempt {rows} rows • Rough ETA: ~{eta_secs}s")
+
+    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    if missing_count and not _HAS_OPENAI:
+        st.warning("Install `openai` and set `OPENAI_API_KEY` to enable AI labeling.")
+    if missing_count and _HAS_OPENAI and not api_key:
+        st.warning("Set `OPENAI_API_KEY` (env or secrets) to enable AI labeling.")
+
+    st.markdown("---")
+    can_run = missing_count > 0 and ((not _HAS_OPENAI) or (api_key is not None))
+
+    col_runA, col_runB = st.columns([1,1])
+    with col_runA:
+        run = st.button(
+            f"✨ Symptomize next {min(batch_n, missing_count)}",
+            disabled=not can_run,
+            help="Runs on the next batch of reviews missing symptoms.",
+            use_container_width=True,
+        )
+    with col_runB:
+        enable_all = st.checkbox("Enable ALL (bulk)")
+        run_all = st.button(
+            f"⚡ Symptomize ALL {missing_count}",
+            disabled=(not can_run) or missing_count==0 or (not enable_all),
+            help="Processes every review that has empty Symptom 1–20. Uses many API calls.",
+            use_container_width=True,
+        )
+    st.caption("Tip: Use batch mode first to review accuracy, then run ALL.")
+
 with right:
-    strictness = st.slider("Strictness (higher = fewer, more precise)", 0.55, 0.95, 0.75, 0.01, help="Confidence + evidence threshold; also reduces near-duplicates.")
+    st.markdown("### Live Processing")
+    if "live_rows" not in st.session_state:
+        st.session_state["live_rows"] = []  # list of dict rows for the live table
+    live_table_ph = st.empty()
+    live_detail_ph = st.empty()
+    live_progress = st.progress(0)
 
-# Allowed lists viewer
-with st.expander("📚 View allowed symptom palettes (from 'Symptoms' sheet)", expanded=False):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"**Allowed Detractors** ({len(ALLOWED_DETRACTORS)}):")
-        if ALLOWED_DETRACTORS:
-            st.markdown("<div class='chips'>" + "".join([f"<span class='chip neg'>{x}</span>" for x in ALLOWED_DETRACTORS]) + "</div>", unsafe_allow_html=True)
-        else:
-            st.caption("None detected")
-    with c2:
-        st.markdown(f"**Allowed Delighters** ({len(ALLOWED_DELIGHTERS)}):")
-        if ALLOWED_DELIGHTERS:
-            st.markdown("<div class='chips'>" + "".join([f"<span class='chip pos'>{x}</span>" for x in ALLOWED_DELIGHTERS]) + "</div>", unsafe_allow_html=True)
-        else:
-            st.caption("None detected")
-
-# Additional accuracy knobs
-acc1, acc2, acc3 = st.columns([2,2,3])
-with acc1:
-    require_evidence = st.checkbox("Require textual evidence", value=True, help="Rejects a pick unless at least N key tokens from the symptom appear in the review text.")
-with acc2:
-    evidence_hits_required = st.selectbox("Min evidence tokens", options=[1,2], index=1 if strictness>=0.8 else 0)
-with acc3:
-    process_longest_first = st.checkbox("Process longest reviews first", value=True)
-
-# Speed mode (reduce latency): forces smaller model & shorter batch hint
-speed_col = st.container()
-with speed_col:
-    speed_mode = st.checkbox("⚡ Speed mode (optimize for latency)", value=False, help="Uses a faster model and sorts by shorter reviews first. Accuracy settings still apply.")
-    if speed_mode:
-        if model_choice != "gpt-4o-mini":
-            st.info("Speed mode suggests 'gpt-4o-mini' for fastest responses.")
-        process_longest_first = False
-
-# ETA (heuristic) — token-aware
-MODEL_TPS = {"gpt-4o-mini": 55, "gpt-4o": 25, "gpt-4.1": 16, "gpt-5": 12}
-MODEL_LAT = {"gpt-4o-mini": 0.6, "gpt-4o": 0.9, "gpt-4.1": 1.1, "gpt-5": 1.3}
-rows = min(batch_n, missing_count)
-chars_est = max(200, int((q1+q3)/2)) if (q1 or q3) else 400
-tok_est = int(chars_est/4)
-rt = rows * (MODEL_LAT.get(model_choice,1.0) + tok_est/max(8, MODEL_TPS.get(model_choice,12)))
-eta_secs = int(round(rt))
-st.caption(f"Will attempt {rows} rows • Rough ETA: ~{eta_secs}s")
-
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-if missing_count and not _HAS_OPENAI:
-    st.warning("Install `openai` and set `OPENAI_API_KEY` to enable AI labeling.")
-if missing_count and _HAS_OPENAI and not api_key:
-    st.warning("Set `OPENAI_API_KEY` (env or secrets) to enable AI labeling.")
-
-# ---------------- Session State ----------------
+# ---------------- Session State (non-UI) ----------------
 
 st.session_state.setdefault("symptom_suggestions", [])
 st.session_state.setdefault("sug_selected", set())
 st.session_state.setdefault("approved_new_delighters", set())
 st.session_state.setdefault("approved_new_detractors", set())
+st.session_state.setdefault("pick_cache", {})
 
 # ---------------- Helpers ----------------
 
@@ -459,12 +493,57 @@ def _highlight_terms(text: str, allowed: list[str]) -> str:
             pass
     return out
 
+# ---- Speed helpers: cached client, candidate prefilter, and caching ----
+@st.cache_resource(show_spinner=False)
+def _get_openai_client_cached(key: str):
+    return OpenAI(api_key=key)
+
+def _hash_list(lst: list[str]) -> str:
+    return hashlib.sha1("\x1f".join(lst).encode("utf-8")).hexdigest()
+
+def _prefilter_candidates(review: str, allowed: list[str], cap: int = 40) -> list[str]:
+    """Quickly score allowed terms by evidence hits; keep top-N to cut tokens (does not shorten review text)."""
+    text = (review or "").lower()
+    scored = []
+    for a in allowed:
+        toks = [t for t in _normalize_name(a).split() if len(t) > 2]
+        if not toks:
+            continue
+        hits = sum(1 for t in toks if f" {t} " in f" {text} ")
+        if hits:
+            scored.append((a, hits/len(toks)))
+    # if nothing hits, fall back to the first few allowed to avoid empty lists
+    if not scored:
+        return allowed[:cap]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    keep = [s[0] for s in scored[:cap]]
+    return keep
+
 # Model call (JSON-only) with evidence guardrails
 
-def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float, evidence_hits_required: int = 1):
-    """Return (allowed_delighters, allowed_detractors, novel_delighters, novel_detractors)."""
+def _llm_pick(review: str, stars, allowed_del: list[str], allowed_det: list[str], min_conf: float,
+              evidence_hits_required: int = 1, candidate_cap: int = 40, max_output_tokens: int = 400):
+    """Return (allowed_delighters, allowed_detractors, novel_delighters, novel_detractors).
+    Faster via: prefiltered candidates, cached client, small max tokens, local cache.
+    NOTE: The full review text is sent; no truncation applied.
+    """
     if not review or (not allowed_del and not allowed_det):
         return [], [], [], []
+
+    # Prefilter candidates to trim tokens massively (does not touch review text)
+    allowed_del_f = _prefilter_candidates(review, allowed_del, cap=candidate_cap)
+    allowed_det_f = _prefilter_candidates(review, allowed_det, cap=candidate_cap)
+
+    # Cache key based on inputs
+    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    cache_key = "|".join([
+        str(model_choice), str(min_conf), str(evidence_hits_required),
+        _hash_list(sorted(allowed_del_f)), _hash_list(sorted(allowed_det_f)),
+        hashlib.sha1((review or "").encode("utf-8")).hexdigest(), str(stars)
+    ])
+    pcache = st.session_state.get("pick_cache", {})
+    if cache_key in pcache:
+        return pcache[cache_key]
 
     sys_prompt = (
         """
@@ -482,28 +561,28 @@ Rules:
     )
 
     user =  {
-        "review": review[:4000],
+        "review": review,  # <-- full text, no truncation
         "stars": float(stars) if (stars is not None and (not pd.isna(stars))) else None,
-        "allowed_delighters": allowed_del[:120],
-        "allowed_detractors": allowed_det[:120]
+        "allowed_delighters": allowed_del_f[:120],
+        "allowed_detractors": allowed_det_f[:120]
     }
 
     dels, dets, novel_dels, novel_dets = [], [], [], []
 
     if _HAS_OPENAI and api_key:
         try:
-            client = OpenAI(api_key=api_key)
+            client = _get_openai_client_cached(api_key)
             req = {
                 "model": model_choice,
                 "messages": [
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": json.dumps(user)}
                 ],
-                "response_format": {"type": "json_object"}
+                "response_format": {"type": "json_object"},
+                "max_tokens": max_output_tokens,
             }
-            # GPT-5 rejects non-default temperature; omit for that family
             if not str(model_choice).startswith("gpt-5"):
-                req["temperature"] = 0.2
+                req["temperature"] = 0.0
             out = client.chat.completions.create(**req)
             content = out.choices[0].message.content or "{}"
             data = json.loads(content)
@@ -521,17 +600,19 @@ Rules:
             for n, c in dets_pairs:
                 if n in ALLOWED_DETRACTORS_SET: dets.append((n, c))
                 else: novel_dets.append((n, c))
-            return (
+            result = (
                 _dedupe_keep_top(dels, 10, min_conf),
                 _dedupe_keep_top(dets, 10, min_conf),
                 _dedupe_keep_top(novel_dels, 5, max(0.70, min_conf)),
                 _dedupe_keep_top(novel_dets, 5, max(0.70, min_conf))
             )
+            st.session_state["pick_cache"][cache_key] = result
+            return result
         except Exception:
             pass
 
     # Conservative keyword fallback (no-API)
-    text = " " + review.lower() + " "
+    text = " " + (review or "").lower() + " "
     def pick_from_allowed(allowed: list[str]) -> list[str]:
         scored = []
         for a in allowed:
@@ -545,64 +626,130 @@ Rules:
                 scored.append((a_can, 0.60 + 0.4 * score))
         return _dedupe_keep_top(scored, 10, min_conf)
 
-    return pick_from_allowed(allowed_del), pick_from_allowed(allowed_det), [], []
+    result = (pick_from_allowed(allowed_del_f), pick_from_allowed(allowed_det_f), [], [])
+    st.session_state["pick_cache"][cache_key] = result
+    return result
 
-# ---------------- Run Symptomize ----------------
+# ---------------- Live renderer helpers ----------------
 
-can_run = missing_count > 0 and ((not _HAS_OPENAI) or (api_key is not None))
-
-col_runA, col_runB, col_runC = st.columns([2,2,3])
-with col_runA:
-    run = st.button(
-        f"✨ Symptomize next {min(batch_n, missing_count)} review(s)",
-        disabled=not can_run,
-        help="Runs on the next batch of reviews missing symptoms."
+def _render_live_table():
+    rows = st.session_state.get("live_rows", [])
+    if not rows:
+        live_table_ph.info("Nothing processed yet. Click Symptomize to start.")
+        return
+    live_df = pd.DataFrame(rows, columns=[
+        "Row #", "Stars", "Len", "Detractors #", "Delighters #", "Status"
+    ])
+    live_table_ph.dataframe(
+        live_df,
+        use_container_width=True,
+        hide_index=True,
+        height=320,
     )
-with col_runB:
-    enable_all = st.checkbox("Enable ALL (bulk)")
-    run_all = st.button(
-        f"⚡ Symptomize ALL {missing_count} missing",
-        disabled=(not can_run) or missing_count==0 or (not enable_all),
-        help="Processes every review that has empty Symptom 1–20. Uses many API calls."
-    )
-with col_runC:
-    st.caption("Tip: Use batch mode first to review accuracy, then run ALL.")
+
+# ---------------- Run Symptomize (with real-time UI + parallelism) ----------------
 
 if (run or run_all) and missing_idx:
-    todo = missing_idx if run_all else missing_idx[:batch_n]
-    progress = st.progress(0)
-    status = st.empty()
-    for i, idx in enumerate(todo, start=1):
+    # Determine todo order
+    if speed_mode:
+        # process shortest reviews first (does not shorten text, only ordering)
+        missing_idx_sorted = sorted(missing_idx, key=lambda i: len(str(df.loc[i].get("Verbatim",""))))
+    else:
+        missing_idx_sorted = missing_idx
+
+    todo = missing_idx_sorted if run_all else missing_idx_sorted[:batch_n]
+
+    # Seed the queue view
+    st.session_state["live_rows"] = [
+        [int(idx),
+         (float(df.loc[idx].get("Star Rating")) if pd.notna(df.loc[idx].get("Star Rating")) else None),
+         int(len(str(df.loc[idx].get("Verbatim", "")))),
+         0, 0,
+         "queued"]
+        for idx in todo
+    ]
+    _render_live_table()
+
+    def _process_one(idx: int):
         row = df.loc[idx]
         review_txt = str(row.get("Verbatim", "") or "").strip()
         stars = row.get("Star Rating", None)
-        dels, dets, novel_dels, novel_dets = _llm_pick(
+        return idx, _llm_pick(
             review_txt,
             stars,
             ALLOWED_DELIGHTERS,
             ALLOWED_DETRACTORS,
-            strictness
+            strictness,
+            evidence_hits_required=evidence_hits_required,
+            candidate_cap=candidate_cap,
+            max_output_tokens=max_output_tokens,
         )
-        st.session_state["symptom_suggestions"].append({
-            "row_index": int(idx),
-            "stars": float(stars) if pd.notna(stars) else None,
-            "review": review_txt,
-            "delighters": dels,
-            "detractors": dets,
-            "novel_delighters": novel_dels,
-            "novel_detractors": novel_dets,
-            "approve_novel_del": [],
-            "approve_novel_det": [],
-        })
-        progress.progress(i/len(todo))
-        status.info(f"Processed {i}/{len(todo)}")
-    status.success("Finished generating suggestions! Review below, then Apply to write into the sheet.")
+
+    with st.status("Processing reviews…", expanded=True) as status_box:
+        completed = 0
+        live_progress.progress(0)
+        if st.session_state["live_rows"]:
+            st.session_state["live_rows"][0][-1] = "processing"
+            _render_live_table()
+
+        with ThreadPoolExecutor(max_workers=api_concurrency) as ex:
+            futures = {ex.submit(_process_one, idx): idx for idx in todo}
+            for fut in as_completed(futures):
+                idx, (dels, dets, novel_dels, novel_dets) = fut.result()
+                # find display row by df idx
+                try:
+                    row_pos = [r[0] for r in st.session_state["live_rows"]].index(int(idx))
+                except ValueError:
+                    row_pos = None
+                if row_pos is not None:
+                    st.session_state["live_rows"][row_pos][3] = len(dets)
+                    st.session_state["live_rows"][row_pos][4] = len(dels)
+                    st.session_state["live_rows"][row_pos][-1] = "done"
+
+                # Save suggestion bundle
+                st.session_state["symptom_suggestions"].append({
+                    "row_index": int(idx),
+                    "stars": float(df.loc[idx].get("Star Rating")) if pd.notna(df.loc[idx].get("Star Rating")) else None,
+                    "review": str(df.loc[idx].get("Verbatim", "") or "").strip(),
+                    "delighters": dels,
+                    "detractors": dets,
+                    "novel_delighters": novel_dels,
+                    "novel_detractors": novel_dets,
+                    "approve_novel_del": [],
+                    "approve_novel_det": [],
+                })
+                completed += 1
+                live_progress.progress(completed/len(todo))
+                status_box.write(f"Completed {completed}/{len(todo)} — df idx {idx}: det {len(dets)} / del {len(dels)}")
+                try:
+                    st.toast(f"df idx {idx}: det {len(dets)} / del {len(dels)}")
+                except Exception:
+                    pass
+                _render_live_table()
+
+        status_box.update(label="Finished generating suggestions! Review below, then Apply to write into the sheet.", state="complete")
     st.rerun()
 
 # ---------------- Review & Approve ----------------
 sugs = st.session_state.get("symptom_suggestions", [])
 if sugs:
     st.markdown("## 🔍 Review & Approve Suggestions")
+
+    # Allowed lists viewer (compact)
+    with st.expander("📚 View allowed symptom palettes (from 'Symptoms' sheet)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**Allowed Detractors** ({len(ALLOWED_DETRACTORS)}):")
+            if ALLOWED_DETRACTORS:
+                st.markdown("<div class='chips'>" + "".join([f"<span class='chip neg'>{x}</span>" for x in ALLOWED_DETRACTORS]) + "</div>", unsafe_allow_html=True)
+            else:
+                st.caption("None detected")
+        with c2:
+            st.markdown(f"**Allowed Delighters** ({len(ALLOWED_DELIGHTERS)}):")
+            if ALLOWED_DELIGHTERS:
+                st.markdown("<div class='chips'>" + "".join([f"<span class='chip pos'>{x}</span>" for x in ALLOWED_DELIGHTERS]) + "</div>", unsafe_allow_html=True)
+            else:
+                st.caption("None detected")
 
     # Fast bulk actions using direct session updates (no per-checkbox loops)
     with st.expander("Bulk actions", expanded=True):
@@ -613,7 +760,6 @@ if sugs:
         with c1:
             if st.button("Select all (fast)"):
                 st.session_state["sug_selected"] = set(range(total))
-                # also tick any checkbox state keys so the UI shows them checked
                 for i in range(total):
                     st.session_state[f"sel_{i}"] = True
         with c2:
@@ -697,7 +843,8 @@ if sugs:
                                 picks.append(name)
                         s["approve_novel_del"] = picks
 
-    if st.button("✅ Apply selected to DataFrame"):
+    # Apply button
+    if st.button("✅ Apply selected to DataFrame", use_container_width=True):
         picked = [i for i in st.session_state["sug_selected"]]
         if not picked:
             st.warning("Nothing selected.")
@@ -725,7 +872,6 @@ if sugs:
             st.success(f"Applied {len(picked)} row(s) to DataFrame.")
 
 # ---------------- Novel Symptoms Review Center ----------------
-
 # Aggregate proposals across all suggestions for a single review hub
 pending_novel_del = {}
 pending_novel_det = {}
@@ -842,5 +988,14 @@ def offer_downloads():
     st.download_button("Download updated workbook (.xlsx) — no formatting", data=out2.getvalue(), file_name="StarWalk_updated_basic.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 offer_downloads()
+'''
+path = "/mnt/data/star_walk_app.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
+
+import os, textwrap
+size = os.path.getsize(path)
+print(f"Saved {path} ({size} bytes)")
+
 
 
