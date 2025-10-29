@@ -1,9 +1,4 @@
-# Write the complete enhanced Streamlit app to a downloadable file so nothing gets truncated.
-# The file will include all original features plus: semantic recall (embeddings), a Global Primer (Step 0),
-# primer-aware evidence checks, OpenAI wrapper (Chat + Responses), LRU session control, safer highlights,
-# and sturdier workbook writing. 
-
-code = r'''# ---------- Star Walk — Upload + Symptomize (Enhanced UX, Accuracy, Primer & Approvals) ----------
+# ---------- Star Walk — Upload + Symptomize (Enhanced UX, Accuracy, Primer & Approvals) ----------
 # Streamlit 1.38+
 
 import io
@@ -91,7 +86,7 @@ GLOBAL_CSS = """
   html, body, .stApp { background: var(--bg-app); font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif; color: var(--text); }
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
   .hero-wrap{ position:relative; overflow:hidden; border-radius:14px; min-height:120px; margin:.25rem 0 1rem 0; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); background:linear-gradient(90deg, var(--bg-card) 0% 55%, transparent 55% 100%); }
-  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:10px 18px; color:var(--text); }
+  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:10px 18px; color: var(--text); }
   .hero-title{ font-size:clamp(22px,3.1vw,40px); font-weight:800; margin:0; }
   .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); }
   .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:40%; }
@@ -1534,13 +1529,3 @@ def offer_downloads():
 
 # Call once UI is ready
 offer_downloads()
-'''
-
-# Write the file
-path = "/mnt/data/star_walk_enhanced.py"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
-
-print(f"Wrote: {path}")
-
-
