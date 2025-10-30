@@ -463,18 +463,22 @@ if run_it:
                         existing.add(str(cell.value).strip())
                 last = ws.max_row + 1
                 added = 0
-                def _add_items(items: List[str], type_label: str):
-                    nonlocal last, added
+                def _add_items(items: List[str], type_label: str, start_row: int, added_count: int) -> Tuple[int, int]:
+                    row_ptr = start_row
+                    added_local = added_count
                     for s in items:
-                        if not s: continue
-                        if s in existing: continue
-                        ws.cell(row=last, column=1, value=s)
-                        ws.cell(row=last, column=2, value=type_label)
+                        if not s:
+                            continue
+                        if s in existing:
+                            continue
+                        ws.cell(row=row_ptr, column=1, value=s)
+                        ws.cell(row=row_ptr, column=2, value=type_label)
                         existing.add(s)
-                        last += 1
-                        added += 1
-                _add_items(add_del, "Delighter")
-                _add_items(add_det, "Detractor")
+                        row_ptr += 1
+                        added_local += 1
+                    return row_ptr, added_local
+                last, added = _add_items(add_del, "Delighter", last, added)
+                last, added = _add_items(add_det, "Detractor", last, added)
 
                 out = io.BytesIO(); wb.save(out); out.seek(0)
                 st.download_button(
@@ -487,6 +491,7 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
