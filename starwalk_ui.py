@@ -1,4 +1,4 @@
-# starwalk_ui_v4.py (fixed)
+# starwalk_ui_v4.py (final consolidated)
 # Streamlit App — Dynamic Symptoms + Model Selector + Smart Auto‑Symptomization + Approval Queue + Color‑Coded Excel Export
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai
 
@@ -28,8 +28,7 @@ st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4")
 st.title("🌟 Star Walk Review Analyzer v4")
 st.caption("Dynamic Symptoms • Model Selector • Smart Auto‑Symptomize • Approval Queue • Color‑Coded Excel Export")
 
-# Compatibility shim: some legacy blocks referenced this flag.
-# We set a default so NameError cannot occur even if an old branch remains.
+# Compatibility shim for legacy branches
 build_clicked = False
 
 # ------------------- Utilities -------------------
@@ -42,9 +41,7 @@ def clean_text(x):
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
 def is_filled(val) -> bool:
-    """Return True only if a cell has a real, non-placeholder value.
-    Prevent np.nan/None from being counted as filled.
-    """
+    """Return True only if a cell has a real, non-placeholder value."""
     if pd.isna(val):
         return False
     s = str(val).strip()
@@ -120,7 +117,7 @@ def read_symptoms_sheet(file_bytes: bytes) -> pd.DataFrame:
 
 
 def build_alias_expansion_df(df_sym: pd.DataFrame, delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]) -> pd.DataFrame:
-    """Create a long table with one row per (Label, Side, Alias). Side derived from sheet or whitelist membership."""
+    """Create a long table with one row per (Label, Side, Alias)."""
     side_by_sheet: Dict[str, str] = {}
     if not df_sym.empty:
         lowcols = {c.lower(): c for c in df_sym.columns}
@@ -144,13 +141,10 @@ def build_alias_expansion_df(df_sym: pd.DataFrame, delighters: List[str], detrac
             rows.append({"Label": lbl, "Side": side, "Alias": ""})
     return pd.DataFrame(rows)
 
+# ------------------- Column detection & missing flags -------------------
 
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Detect symptom columns using exact Star Walk schema with robust AI column detection.
-    Manual detractors: Symptom 1..10
-    Manual delighters: Symptom 11..20
-    AI columns: AI Symptom Detractor 1..6, AI Symptom Delighter 1..6
-    """
+    """Detect symptom columns using expected schema with robust AI column detection."""
     cols = [str(c).strip() for c in df.columns]
 
     # Manual ranges (keep convention)
@@ -179,9 +173,7 @@ def row_has_any(row: pd.Series, columns: List[str]) -> bool:
 
 
 def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFrame:
-    """Return a copy with helper flags showing what's missing per row.
-    Counts both manual and AI columns when determining if a side is already present.
-    """
+    """Return a copy with helper flags showing what's missing per row."""
     det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
     del_cols = colmap["manual_delighters"] + colmap["ai_delighters"]
 
@@ -190,36 +182,16 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Has_Delighters"] = out.apply(lambda r: row_has_any(r, del_cols), axis=1)
     out["Needs_Detractors"] = ~out["Has_Detractors"]
     out["Needs_Delighters"] = ~out["Has_Delighters"]
-    # Final gating logic no longer forced; we respect user scope selection downstream
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
 
-# ------------------- Fixed template column mapping -------------------
-# Detractors must live in K–T (10 cols) and Delighters in U–AD (10 cols)
-DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]
-DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
-DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
-DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
-
-AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
-AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
-
-
-def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
-    """Make sure the 10+10 AI columns exist in the DataFrame (filled with None if missing)."""
-    for h in AI_DET_HEADERS + AI_DEL_HEADERS:
-        if h not in df_in.columns:
-            df_in[h] = None
-    return df_in
-
-
 # ---------- Canonicalization helpers for robust matching ----------
+
 def _canon(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip().lower()
 
 
 def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
-    """Build maps for case/space-insensitive matching and alias resolution."""
     del_map = {_canon(x): x for x in delighters}
     det_map = {_canon(x): x for x in detractors}
 
@@ -242,10 +214,7 @@ def _openai_labeler(
     det_map: Dict[str, str],
     alias_to_label: Dict[str, str],
 ) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """Classify a review strictly using whitelist labels.
-    Returns (dels, dets, unlisted_dels, unlisted_dets).
-    - Robustly maps case/spacing variants and known aliases back to canonical labels.
-    """
+    """Classify a review strictly using whitelist labels. Returns (dels, dets, unlisted_dels, unlisted_dets)."""
     if not verbatim or not verbatim.strip():
         return [], [], [], []
 
@@ -290,15 +259,34 @@ def _openai_labeler(
                             label = alias_label
                 if label and label not in mapped:
                     mapped.append(label)
-            return mapped[:6]
+            # hard cap 10 per side
+            return mapped[:10]
 
         dels = _map_side(data.get("delighters", []), side="del")
         dets = _map_side(data.get("detractors", []), side="det")
-        unl_dels = [x for x in (data.get("unlisted_delighters", []) or [])][:6]
-        unl_dets = [x for x in (data.get("unlisted_detractors", []) or [])][:6]
+        unl_dels = [x for x in (data.get("unlisted_delighters", []) or [])][:10]
+        unl_dets = [x for x in (data.get("unlisted_detractors", []) or [])][:10]
         return dels, dets, unl_dels, unl_dets
     except Exception:
         return [], [], [], []
+
+# ------------------- Fixed template column mapping -------------------
+# Detractors must live in K–T (10 cols) and Delighters in U–AD (10 cols)
+DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]
+DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
+DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
+DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
+
+AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
+AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
+
+
+def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Make sure the 10+10 AI columns exist in the DataFrame (filled with None if missing)."""
+    for h in AI_DET_HEADERS + AI_DEL_HEADERS:
+        if h not in df_in.columns:
+            df_in[h] = None
+    return df_in
 
 
 def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI_Symptomized_Reviews.xlsx"):
@@ -318,16 +306,15 @@ def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI
     updated_df = ensure_ai_columns(updated_df)
 
     # Set fixed headers in template locations
-    for j, (col_idx, header) in enumerate(zip(DET_INDEXES, AI_DET_HEADERS), start=1):
+    for col_idx, header in zip(DET_INDEXES, AI_DET_HEADERS):
         ws.cell(row=1, column=col_idx, value=header)
-    for j, (col_idx, header) in enumerate(zip(DEL_INDEXES, AI_DEL_HEADERS), start=1):
+    for col_idx, header in zip(DEL_INDEXES, AI_DEL_HEADERS):
         ws.cell(row=1, column=col_idx, value=header)
 
     fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
     fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
 
     # Write rows
-    max_row = max(len(updated_df) + 1, ws.max_row)
     for i, (_, r) in enumerate(updated_df.iterrows(), start=2):
         # Detractors K–T
         for j, col_idx in enumerate(DET_INDEXES, start=1):
@@ -358,48 +345,6 @@ def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # Append all AI columns from df
-    ai_cols = [c for c in updated_df.columns if c.startswith("AI Symptom ")]
-    if not ai_cols:
-        # Nothing to write; still offer download of unchanged workbook
-        out = io.BytesIO(); wb.save(out); out.seek(0)
-        st.download_button(
-            "⬇️ Download Excel (no AI columns to add)", out,
-            file_name=output_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        return
-
-    base_col = ws.max_column + 1
-    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
-    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
-
-    for j, col in enumerate(ai_cols):
-        col_idx = base_col + j
-        ws.cell(row=1, column=col_idx, value=col)
-        is_delighter = "Delighter" in col
-        fill = fill_green if is_delighter else fill_red
-        # Optional: set width a bit wider
-        try:
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 28
-        except Exception:
-            pass
-        for i, val in enumerate(updated_df[col].values, start=2):
-            # Only color truly filled cells
-            if pd.isna(val) or str(val).strip() == "":
-                cell_value = None
-            else:
-                cell_value = val
-            cell = ws.cell(row=i, column=col_idx, value=cell_value)
-            if cell_value is not None:
-                cell.fill = fill
-
-    out = io.BytesIO(); wb.save(out); out.seek(0)
-    st.download_button(
-        "⬇️ Download Updated Excel (Color‑Coded)", out,
-        file_name=output_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
 
 def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> bytes:
     """Return bytes for a workbook matching the original, with AI columns placed in template slots:
@@ -438,46 +383,6 @@ def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> 
 
     out = io.BytesIO(); wb.save(out)
     return out.getvalue()
- -> bytes:
-    """Return bytes for a workbook matching the original, with AI columns appended & color-coded."""
-    original_file.seek(0)
-    wb = load_workbook(original_file)
-    sheet_name = "Star Walk scrubbed verbatims"
-    if sheet_name not in wb.sheetnames:
-        sheet_name = wb.sheetnames[0]
-    ws: Worksheet = wb[sheet_name]
-
-    # Remove any existing AI columns in sheet
-    headers = [cell.value for cell in ws[1]]
-    del_idxs = [i+1 for i, h in enumerate(headers) if h and str(h).startswith("AI Symptom")]
-    for col_idx in sorted(del_idxs, reverse=True):
-        ws.delete_cols(col_idx)
-
-    # Find AI columns present in DF; if none, return original bytes
-    ai_cols = [c for c in updated_df.columns if c.startswith("AI Symptom ")]
-    if not ai_cols:
-        out0 = io.BytesIO(); wb.save(out0); return out0.getvalue()
-
-    base_col = ws.max_column + 1
-    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-
-    for j, col in enumerate(ai_cols):
-        col_idx = base_col + j
-        ws.cell(row=1, column=col_idx, value=col)
-        is_delighter = "Delighter" in col
-        fill = fill_green if is_delighter else fill_red
-        try:
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 28
-        except Exception:
-            pass
-        for i, val in enumerate(updated_df[col].values, start=2):
-            cell_value = None if (pd.isna(val) or str(val).strip() == "") else val
-            cell = ws.cell(row=i, column=col_idx, value=cell_value)
-            if cell_value is not None:
-                cell.fill = fill
-
-    out = io.BytesIO(); wb.save(out); return out.getvalue()
 
 # ------------------- File Upload -------------------
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
@@ -514,48 +419,7 @@ else:
 # Build canonical maps for robust matching
 DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
 
-# ------------------- Quick Symptoms Download -------------------
-sym_df = read_symptoms_sheet(uploaded_bytes)
-st.sidebar.header("📥 Download Symptoms")
-if sym_df is None or sym_df.empty:
-    st.sidebar.caption("No 'Symptoms' sheet found in the uploaded workbook.")
-else:
-    # Raw XLSX
-    bio_xlsx = io.BytesIO()
-    with pd.ExcelWriter(bio_xlsx, engine="openpyxl") as writer:
-        sym_df.to_excel(writer, index=False, sheet_name="Symptoms")
-    bio_xlsx.seek(0)
-    st.sidebar.download_button(
-        "⬇️ Symptoms tab (XLSX)", data=bio_xlsx.getvalue(), file_name="Symptoms_Tab.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    # Raw CSV
-    csv_bytes = sym_df.to_csv(index=False).encode("utf-8")
-    st.sidebar.download_button("⬇️ Symptoms tab (CSV)", data=csv_bytes, file_name="Symptoms_Tab.csv", mime="text/csv")
-
-    # Alias expansion CSV
-    alias_df = build_alias_expansion_df(sym_df, DELIGHTERS, DETRACTORS, ALIASES)
-    alias_csv = alias_df.to_csv(index=False).encode("utf-8")
-    st.sidebar.download_button("⬇️ Alias expansion (CSV)", data=alias_csv, file_name="Symptoms_Aliases_Expanded.csv", mime="text/csv")
-
-    # Whitelist snapshot JSON
-    snapshot = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "delighters": DELIGHTERS,
-        "detractors": DETRACTORS,
-        "aliases": ALIASES,
-        "counts": {
-            "delighters": len(DELIGHTERS),
-            "detractors": len(DETRACTORS),
-            "aliases": sum(len(v) for v in ALIASES.values()) if ALIASES else 0,
-        },
-    }
-    json_bytes = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
-    st.sidebar.download_button("⬇️ Whitelist snapshot (JSON)", data=json_bytes, file_name="Whitelist_Snapshot.json", mime="application/json")
-
-
-# ------------------- Model Selector -------------------
+# ------------------- Model & Approvals -------------------
 st.sidebar.header("🤖 LLM Settings")
 MODEL_CHOICES = {
     "Fast – GPT‑4o‑mini": "gpt-4o-mini",
@@ -572,7 +436,7 @@ if not _HAS_OPENAI or not api_key:
     st.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'. Auto‑symptomize will be disabled.")
 client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 
-# ------------------- Approvals & Roles -------------------
+# Approvals & Roles
 st.sidebar.header("🔒 Approvals")
 approver_name = st.sidebar.text_input("Approver name")
 pin_required = st.secrets.get("APPROVER_PIN")
@@ -587,7 +451,6 @@ rule_alias_on = st.sidebar.checkbox("Default to 'Alias of' when count ≥", valu
 rule_alias_threshold = st.sidebar.slider("Alias threshold", 1, 50, 5)
 rule_new_on = st.sidebar.checkbox("Default to 'Add as new' when no suggestion and count ≥", value=False)
 rule_new_threshold = st.sidebar.slider("New‑label threshold", 1, 50, 10)
-
 
 # ------------------- Detection & Preview -------------------
 colmap = detect_symptom_columns(df)
@@ -605,7 +468,7 @@ st.markdown(
 """
 )
 
-# Scope filter (now respected)
+# Scope filter (respected)
 scope = st.radio(
     "Process scope",
     ["Any missing", "Missing both", "Missing delighters only", "Missing detractors only"],
@@ -678,67 +541,9 @@ with st.sidebar:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    if build_clicked:
-        max_per_side = 10
-        pb = st.progress(0.0)
-        total_n = max(1, len(target))
-        for k, (idx, row) in enumerate(target.iterrows(), start=1):
-            vb = row.get("Verbatim", "")
-            needs_deli = bool(row.get("Needs_Delighters", False))
-            needs_detr = bool(row.get("Needs_Detractors", False))
-            try:
-                dels, dets, _, _ = (
-                    _openai_labeler(
-                        vb, client, selected_model, temperature,
-                        DELIGHTERS, DETRACTORS, ALIASES,
-                        DEL_MAP, DET_MAP, ALIAS_TO_LABEL
-                    ) if client else ([], [], [], [])
-                )
-            except Exception:
-                dels, dets = [], []
-            if needs_detr and dets:
-                for j, lab in enumerate(dets[:max_per_side]):
-                    df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
-            if needs_deli and dels:
-                for j, lab in enumerate(dels[:max_per_side]):
-                    df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
-            pb.progress(k/total_n)
-
-        # Build bytes and expose a single download button
-        try:
-            file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
-        except Exception:
-            file_base = 'Reviews'
-        st.session_state["export_bytes"] = generate_updated_workbook_bytes(uploaded_file, df)
-        st.session_state["export_name"] = f"{file_base}_Symptomized.xlsx"
-
-    if st.session_state.get("export_bytes"):
-        st.download_button(
-            "⬇️ Download symptomized workbook (XLSX)",
-            data=st.session_state["export_bytes"],
-            file_name=st.session_state.get("export_name", "AI_Symptomized_Reviews.xlsx"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-# ------------------- Detection diagnostics (advanced) -------------------
-with st.expander("Detection diagnostics (advanced)", expanded=False):
-    det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
-    del_cols = colmap["manual_delighters"] + colmap["ai_delighters"]
-
-    def _filled_counts(df_in: pd.DataFrame, cols: List[str], label: str):
-        if not cols:
-            st.info(f"No {label} columns detected.")
-            return
-        sample = df_in[[*cols]].head(100).copy()
-        counts = sample.applymap(is_filled).sum(axis=1)
-        st.write(f"{label}: first 100 rows — filled cell count per row (higher means already symptomized)")
-        st.dataframe(pd.DataFrame({"filled_count": counts}).join(sample), use_container_width=True)
-
-    _filled_counts(work, det_cols, "Detractors")
-    _filled_counts(work, del_cols, "Delighters")
-
+# ------------------- Auto‑Symptomize (on-screen run) -------------------
 st.divider()
-st.subheader("🧠 Auto‑Symptomize Reviews")
+st.subheader("🧠 Auto‑Symptomize Reviews (inline run)")
 
 limit = st.slider("Max reviews this run", 5, 500, min(50, max(5, len(target))))
 dry_run = st.checkbox("Preview only (don’t write AI columns)", value=True)
@@ -746,10 +551,7 @@ clear_ai_for_processed = st.checkbox("Clear existing AI Symptom columns for proc
 run_it = st.button("🚀 Run Auto‑Symptomize", type="primary", disabled=(client is None or len(target) == 0))
 
 if run_it:
-    # Ensure AI columns exist (we'll create on write)
     max_per_side = 10
-
-    # Prepare results
     rows = []
     failed_calls = 0
     filled_deli = 0
@@ -764,16 +566,13 @@ if run_it:
         for idx, row in target.head(limit).iterrows():
             vb = row.get("Verbatim", "")
 
-            # Determine what this row needs (based on helper flags)
             needs_deli = bool(row.get("Needs_Delighters", False))
             needs_detr = bool(row.get("Needs_Detractors", False))
 
-            # Optional clear AI columns for this row to avoid duplicates on re-run
             if clear_ai_for_processed and not dry_run:
                 for c in [c for c in df.columns if c.startswith("AI Symptom ")]:
                     df.loc[idx, c] = None
 
-            # Call model
             try:
                 dels, dets, unl_dels, unl_dets = (
                     _openai_labeler(
@@ -790,7 +589,6 @@ if run_it:
             wrote_detr = []
 
             if not dry_run:
-                # Write only what is missing
                 if needs_detr and dets:
                     for j, lab in enumerate(dets[:max_per_side]):
                         df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
@@ -831,14 +629,17 @@ if run_it:
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     if not dry_run:
-        # Offer Excel download with AI columns appended + color coding
+        # Offer Excel download with AI columns appended in template positions
         write_updated_excel(uploaded_file, df, output_name="AI_Symptomized_Reviews.xlsx")
 
-    # ------------------- Approval Queue -------------------
-    # Aggregate unlisted suggestions across processed rows + keep examples
+# ------------------- New Symptom Inbox — Review & Approve -------------------
+# Aggregate unlisted suggestions across processed rows + keep examples
+# (This block runs only after results exist; safe to leave for later interaction.)
+
+# Helper to safely read any rows from the last run (if none, show nothing)
+if "rows" in locals() and isinstance(rows, list) and len(rows) > 0:
     unlisted_del_all = []
     unlisted_det_all = []
-    # candidate -> list of row indices (for examples)
     cand_examples_del: Dict[str, List[int]] = {}
     cand_examples_det: Dict[str, List[int]] = {}
     for r in rows:
@@ -862,24 +663,15 @@ if run_it:
                 return pd.DataFrame({"Symptom": [], "Side": [], "Count": [], "Examples": [], "Suggested Mapping": [], "Impact (now)": []})
             vc = pd.Series(items).value_counts()
             rows_local = []
-            # Build suggestions using fuzzy match vs canonical lists
             search_space = (DELIGHTERS if side == "Delighter" else DETRACTORS)
             for sym, cnt in vc.items():
-                # collect up to 2 example verbatims
                 ex_idxs = (example_map.get(sym, []) or [])[:2]
                 examples = []
-                months = []
                 for exi in ex_idxs:
                     try:
                         examples.append(df.loc[exi, "Verbatim"][:180])
-                        if "Review Date" in df.columns:
-                            d = pd.to_datetime(df.loc[exi, "Review Date"], errors="coerce")
-                            if pd.notna(d):
-                                months.append(d.strftime("%Y-%m"))
                     except Exception:
                         pass
-                examples_text = " | ".join(["— "+e for e in examples]) if examples else ""
-                # fuzzy suggestion
                 suggestion = ""
                 try:
                     matches = difflib.get_close_matches(sym, search_space, n=1, cutoff=0.82)
@@ -891,9 +683,9 @@ if run_it:
                     "Symptom": sym,
                     "Side": side,
                     "Count": int(cnt),
-                    "Examples": examples_text,
+                    "Examples": " | ".join(["— "+e for e in examples]) if examples else "",
                     "Suggested Mapping": suggestion,
-                    "Impact (now)": int(cnt),  # at least these many rows become fillable
+                    "Impact (now)": int(cnt),
                 })
             df_out = pd.DataFrame(rows_local).sort_values(["Count", "Symptom"], ascending=[False, True]).reset_index(drop=True)
             return df_out
@@ -907,7 +699,6 @@ if run_it:
             tbl_det[tbl_det["Count"] >= min_count]
         ], ignore_index=True)
 
-        # Optional dataset-wide impact estimate (slower)
         estimate_dataset = st.checkbox("Estimate dataset‑wide impact for shown candidates (slower)", value=False)
         if estimate_dataset and not show_df.empty:
             def _estimate_impact_row(row):
@@ -924,7 +715,6 @@ if run_it:
         else:
             st.markdown("**Decide for each candidate:** set *Action* to `Add as new` or `Alias of`, and choose a *Target Label* if aliasing.")
 
-            # Build default actions using sidebar bulk rules
             def _default_action(rec):
                 cnt = int(rec["Count"])
                 has_suggestion = bool(rec["Suggested Mapping"])
@@ -949,27 +739,8 @@ if run_it:
                 key="new_symptom_inbox"
             )
 
-        # Optional trend explorer
-        if (unlisted_del_all or unlisted_det_all) and "Review Date" in df.columns:
-            st.markdown("### 📈 Candidate Trend Explorer")
-            all_syms = sorted(set(unlisted_del_all + unlisted_det_all))
-            sym_pick = st.selectbox("Pick a candidate to view monthly trend", all_syms)
-            if sym_pick:
-                # Use entire dataset for trend (substring contains)
-                try:
-                    patt = re.escape(sym_pick)
-                    df_tr = df.copy()
-                    if "Review Date" in df_tr.columns:
-                        df_tr["_month"] = pd.to_datetime(df_tr["Review Date"], errors="coerce").dt.to_period("M").astype(str)
-                        mask = df_tr["Verbatim"].str.contains(patt, case=False, na=False)
-                        trend = df_tr.loc[mask].groupby("_month").size().reindex(sorted(df_tr["_month"].dropna().unique())).fillna(0)
-                        st.line_chart(trend)
-                except Exception:
-                    pass
-
         st.caption("Tip: *Impact (now)* equals how many processed reviews already contained this candidate.")
 
-        # Safety: confirmation & PIN gate
         confirm_changes = st.checkbox("I confirm the actions above are correct.")
 
         if st.button("✅ Apply actions & Download updated 'Symptoms' workbook"):
@@ -984,7 +755,6 @@ if run_it:
                     st.error("No 'Symptoms' sheet found; cannot apply approvals.")
                 else:
                     ws = wb["Symptoms"]
-                    # Build header map (case-insensitive)
                     headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
                     hlow = [h.lower() for h in headers]
 
@@ -999,11 +769,9 @@ if run_it:
                     col_alias = _col_idx(["aliases", "alias"])  # may be -1
 
                     if col_alias == -1:
-                        # Create Aliases column at end
                         col_alias = len(headers) + 1
                         ws.cell(row=1, column=col_alias, value="Aliases")
 
-                    # Build existing label rows and alias text
                     label_to_row: Dict[str, int] = {}
                     existing_aliases: Dict[str, str] = {}
                     for r_i in range(2, ws.max_row + 1):
@@ -1012,7 +780,6 @@ if run_it:
                             label_to_row[str(lbl).strip()] = r_i
                             existing_aliases[str(lbl).strip()] = str(ws.cell(row=r_i, column=col_alias).value or "").strip()
 
-                    # Prepare audit sheet
                     audit_name = "Symptoms_Audit"
                     if audit_name not in wb.sheetnames:
                         ws_a = wb.create_sheet(audit_name)
@@ -1036,7 +803,6 @@ if run_it:
                         if not sym:
                             continue
                         if action == "Add as new":
-                            # Add brand new label if it doesn't already exist
                             if sym not in label_to_row:
                                 new_row = ws.max_row + 1
                                 ws.cell(row=new_row, column=col_label, value=sym)
@@ -1047,10 +813,8 @@ if run_it:
                                 added_new += 1
                                 ws_a.append([now_iso, approver, "Add Label", side, sym, "", "", cnt, src_tag])
                         else:
-                            # Alias mapping requires a valid target label
                             if not target:
                                 continue
-                            # Ensure target exists; if not, create it with the same side
                             if target not in label_to_row:
                                 new_row = ws.max_row + 1
                                 ws.cell(row=new_row, column=col_label, value=target)
@@ -1080,7 +844,4 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
-st.divider()
-st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
-st.divider()
-st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
