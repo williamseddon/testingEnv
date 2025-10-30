@@ -562,6 +562,7 @@ if run_it:
                                 months.append(d.strftime("%Y-%m"))
                     except Exception:
                         pass
+                examples_text = " | ".join(["— "+e for e in examples]) if examples else ""
                 # fuzzy suggestion
                 suggestion = ""
                 try:
@@ -574,8 +575,7 @@ if run_it:
                     "Symptom": sym,
                     "Side": side,
                     "Count": int(cnt),
-                    "Examples": " 
-— ".join(["— "+e for e in examples]) if examples else "",
+                    "Examples": examples_text,
                     "Suggested Mapping": suggestion,
                     "Impact (now)": int(cnt),  # at least these many rows become fillable
                 })
@@ -768,6 +768,7 @@ st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
