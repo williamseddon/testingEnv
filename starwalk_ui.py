@@ -367,7 +367,8 @@ if run_it:
     total_to_process = min(limit, len(target))
 
     progress = st.progress(0.0)
-        with st.status("Classifying reviews…", expanded=True) as status:
+
+    with st.status("Classifying reviews…", expanded=True) as status:
         for idx, row in target.head(limit).iterrows():
             vb = row.get("Verbatim", "")
 
@@ -510,4 +511,5 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
