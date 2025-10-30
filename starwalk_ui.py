@@ -326,6 +326,23 @@ with st.expander("Preview rows that need symptomization", expanded=False):
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
 # ------------------- Auto‑Symptomize Controls -------------------
+# ------------------- Detection diagnostics (advanced) -------------------
+with st.expander("Detection diagnostics (advanced)", expanded=False):
+    det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
+    del_cols = colmap["manual_delighters"] + colmap["ai_delighters"]
+
+    def _filled_counts(df_in: pd.DataFrame, cols: List[str], label: str):
+        if not cols:
+            st.info(f"No {label} columns detected.")
+            return
+        sample = df_in[[*cols]].head(100).copy()
+        counts = sample.applymap(is_filled).sum(axis=1)
+        st.write(f"{label}: first 100 rows — filled cell count per row (higher means already symptomized)")
+        st.dataframe(pd.DataFrame({"filled_count": counts}).join(sample), use_container_width=True)
+
+    _filled_counts(work, det_cols, "Detractors")
+    _filled_counts(work, del_cols, "Delighters")
+
 st.divider()
 st.subheader("🧠 Auto‑Symptomize Reviews")
 
@@ -349,7 +366,8 @@ if run_it:
     processed = 0
     total_to_process = min(limit, len(target))
 
-    with st.status("Classifying reviews…", expanded=True) as status:
+    progress = st.progress(0.0)
+        with st.status("Classifying reviews…", expanded=True) as status:
         for idx, row in target.head(limit).iterrows():
             vb = row.get("Verbatim", "")
 
@@ -399,6 +417,7 @@ if run_it:
             })
 
             processed += 1
+            progress.progress(processed/total_to_process)
             status.write(f"Row {idx} — needs: [Delighters={needs_deli} Detractors={needs_detr}] → "
                          f"AI[Dels={len(dels)} Dets={len(dets)}] • Unlisted[{len(unl_dels)}/{len(unl_dets)}]")
             status.update(label=f"Classifying reviews… {processed}/{total_to_process}")
@@ -491,3 +510,4 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
