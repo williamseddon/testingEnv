@@ -100,6 +100,46 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
     return delighters, detractors, alias_map
 
 
+@st.cache_data(show_spinner=False)
+def read_symptoms_sheet(file_bytes: bytes) -> pd.DataFrame:
+    """Return the raw 'Symptoms' sheet as a DataFrame for easy export; empty DF if missing."""
+    bio = io.BytesIO(file_bytes)
+    try:
+        df_sym = pd.read_excel(bio, sheet_name="Symptoms")
+        if df_sym is None:
+            return pd.DataFrame()
+        df_sym.columns = [str(c).strip() for c in df_sym.columns]
+        return df_sym
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_alias_expansion_df(df_sym: pd.DataFrame, delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]) -> pd.DataFrame:
+    """Create a long table with one row per (Label, Side, Alias). Side derived from sheet or whitelist membership."""
+    side_by_sheet: Dict[str, str] = {}
+    if not df_sym.empty:
+        lowcols = {c.lower(): c for c in df_sym.columns}
+        label_col = next((lowcols.get(c) for c in ["symptom", "label", "name", "item"] if c in lowcols), None)
+        type_col  = next((lowcols.get(c) for c in ["type", "polarity", "category", "side"] if c in lowcols), None)
+        if label_col and type_col:
+            for _, r in df_sym.iterrows():
+                lbl = str(r.get(label_col, "")).strip()
+                typ = str(r.get(type_col, "")).strip()
+                if lbl:
+                    side_by_sheet[lbl] = typ
+
+    rows = []
+    for lbl in sorted(set(list(delighters) + list(detractors) + list(alias_map.keys()))):
+        side = side_by_sheet.get(lbl, "Delighter" if lbl in delighters else ("Detractor" if lbl in detractors else ""))
+        aliases = alias_map.get(lbl, [])
+        if aliases:
+            for a in aliases:
+                rows.append({"Label": lbl, "Side": side, "Alias": a})
+        else:
+            rows.append({"Label": lbl, "Side": side, "Alias": ""})
+    return pd.DataFrame(rows)
+
+
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
     """Detect symptom columns using exact Star Walk schema with robust AI column detection.
     Manual detractors: Symptom 1..10
@@ -331,6 +371,47 @@ else:
 
 # Build canonical maps for robust matching
 DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
+
+# ------------------- Quick Symptoms Download -------------------
+sym_df = read_symptoms_sheet(uploaded_bytes)
+st.sidebar.header("📥 Download Symptoms")
+if sym_df is None or sym_df.empty:
+    st.sidebar.caption("No 'Symptoms' sheet found in the uploaded workbook.")
+else:
+    # Raw XLSX
+    bio_xlsx = io.BytesIO()
+    with pd.ExcelWriter(bio_xlsx, engine="openpyxl") as writer:
+        sym_df.to_excel(writer, index=False, sheet_name="Symptoms")
+    bio_xlsx.seek(0)
+    st.sidebar.download_button(
+        "⬇️ Symptoms tab (XLSX)", data=bio_xlsx.getvalue(), file_name="Symptoms_Tab.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # Raw CSV
+    csv_bytes = sym_df.to_csv(index=False).encode("utf-8")
+    st.sidebar.download_button("⬇️ Symptoms tab (CSV)", data=csv_bytes, file_name="Symptoms_Tab.csv", mime="text/csv")
+
+    # Alias expansion CSV
+    alias_df = build_alias_expansion_df(sym_df, DELIGHTERS, DETRACTORS, ALIASES)
+    alias_csv = alias_df.to_csv(index=False).encode("utf-8")
+    st.sidebar.download_button("⬇️ Alias expansion (CSV)", data=alias_csv, file_name="Symptoms_Aliases_Expanded.csv", mime="text/csv")
+
+    # Whitelist snapshot JSON
+    snapshot = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "delighters": DELIGHTERS,
+        "detractors": DETRACTORS,
+        "aliases": ALIASES,
+        "counts": {
+            "delighters": len(DELIGHTERS),
+            "detractors": len(DETRACTORS),
+            "aliases": sum(len(v) for v in ALIASES.values()) if ALIASES else 0,
+        },
+    }
+    json_bytes = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
+    st.sidebar.download_button("⬇️ Whitelist snapshot (JSON)", data=json_bytes, file_name="Whitelist_Snapshot.json", mime="application/json")
+
 
 # ------------------- Model Selector -------------------
 st.sidebar.header("🤖 LLM Settings")
@@ -768,6 +849,7 @@ st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
