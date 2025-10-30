@@ -337,6 +337,47 @@ def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> bytes:
+    """Return bytes for a workbook matching the original, with AI columns appended & color-coded."""
+    original_file.seek(0)
+    wb = load_workbook(original_file)
+    sheet_name = "Star Walk scrubbed verbatims"
+    if sheet_name not in wb.sheetnames:
+        sheet_name = wb.sheetnames[0]
+    ws: Worksheet = wb[sheet_name]
+
+    # Remove any existing AI columns in sheet
+    headers = [cell.value for cell in ws[1]]
+    del_idxs = [i+1 for i, h in enumerate(headers) if h and str(h).startswith("AI Symptom")]
+    for col_idx in sorted(del_idxs, reverse=True):
+        ws.delete_cols(col_idx)
+
+    # Find AI columns present in DF; if none, return original bytes
+    ai_cols = [c for c in updated_df.columns if c.startswith("AI Symptom ")]
+    if not ai_cols:
+        out0 = io.BytesIO(); wb.save(out0); return out0.getvalue()
+
+    base_col = ws.max_column + 1
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    for j, col in enumerate(ai_cols):
+        col_idx = base_col + j
+        ws.cell(row=1, column=col_idx, value=col)
+        is_delighter = "Delighter" in col
+        fill = fill_green if is_delighter else fill_red
+        try:
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 28
+        except Exception:
+            pass
+        for i, val in enumerate(updated_df[col].values, start=2):
+            cell_value = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cell_value)
+            if cell_value is not None:
+                cell.fill = fill
+
+    out = io.BytesIO(); wb.save(out); return out.getvalue()
+
 # ------------------- File Upload -------------------
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
 if not uploaded_file:
@@ -484,6 +525,99 @@ with st.expander("Preview rows that need symptomization", expanded=False):
     preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
+
+# ------------------- Export (sidebar) -------------------
+with st.sidebar:
+    st.header("📦 Download Symptomized Workbook")
+    run_before_export = st.checkbox("Compute symptomization across entire dataset now", value=True)
+    overwrite_ai_export = st.checkbox("Overwrite existing AI columns during export", value=True)
+
+    # Prepare export dataframe (optionally compute fresh symptomization for ALL rows)
+    df_export = df.copy()
+    if run_before_export and (client is not None):
+        max_per_side = 6
+        work_all = detect_missing(df_export, colmap)
+        prog = st.progress(0.0)
+        total_n = max(1, len(work_all))
+        for k, (idx, row) in enumerate(work_all.iterrows(), start=1):
+            vb = row.get("Verbatim", "")
+            needs_deli = bool(row.get("Needs_Delighters", False))
+            needs_detr = bool(row.get("Needs_Detractors", False))
+            if overwrite_ai_export:
+                for c in [c for c in df_export.columns if c.startswith("AI Symptom ")]:
+                    df_export.at[idx, c] = None
+            try:
+                dels, dets, _, _ = _openai_labeler(
+                    vb, client, selected_model, temperature,
+                    DELIGHTERS, DETRACTORS, ALIASES,
+                    DEL_MAP, DET_MAP, ALIAS_TO_LABEL
+                ) if client else ([], [], [], [])
+            except Exception:
+                dels, dets = [], []
+            if needs_detr and dets:
+                for j, lab in enumerate(dets[:max_per_side]):
+                    df_export.at[idx, f"AI Symptom Detractor {j+1}"] = lab
+            if needs_deli and dels:
+                for j, lab in enumerate(dels[:max_per_side]):
+                    df_export.at[idx, f"AI Symptom Delighter {j+1}"] = lab
+            prog.progress(k/total_n)
+    elif run_before_export and (client is None):
+        st.info("OpenAI not configured — exporting current content without recomputing.")
+
+    try:
+        file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
+    except Exception:
+        file_base = 'Reviews'
+
+    export_bytes = generate_updated_workbook_bytes(uploaded_file, df_export)
+    st.download_button(
+        "⬇️ Download symptomized workbook (XLSX)",
+        data=export_bytes,
+        file_name=f"{file_base}_Symptomized.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    if build_clicked:
+        max_per_side = 6
+        pb = st.progress(0.0)
+        total_n = max(1, len(target))
+        for k, (idx, row) in enumerate(target.iterrows(), start=1):
+            vb = row.get("Verbatim", "")
+            needs_deli = bool(row.get("Needs_Delighters", False))
+            needs_detr = bool(row.get("Needs_Detractors", False))
+            try:
+                dels, dets, _, _ = (
+                    _openai_labeler(
+                        vb, client, selected_model, temperature,
+                        DELIGHTERS, DETRACTORS, ALIASES,
+                        DEL_MAP, DET_MAP, ALIAS_TO_LABEL
+                    ) if client else ([], [], [], [])
+                )
+            except Exception:
+                dels, dets = [], []
+            if needs_detr and dets:
+                for j, lab in enumerate(dets[:max_per_side]):
+                    df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
+            if needs_deli and dels:
+                for j, lab in enumerate(dels[:max_per_side]):
+                    df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
+            pb.progress(k/total_n)
+
+        # Build bytes and expose a single download button
+        try:
+            file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
+        except Exception:
+            file_base = 'Reviews'
+        st.session_state["export_bytes"] = generate_updated_workbook_bytes(uploaded_file, df)
+        st.session_state["export_name"] = f"{file_base}_Symptomized.xlsx"
+
+    if st.session_state.get("export_bytes"):
+        st.download_button(
+            "⬇️ Download symptomized workbook (XLSX)",
+            data=st.session_state["export_bytes"],
+            file_name=st.session_state.get("export_name", "AI_Symptomized_Reviews.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
 # ------------------- Detection diagnostics (advanced) -------------------
 with st.expander("Detection diagnostics (advanced)", expanded=False):
@@ -849,6 +983,7 @@ st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
