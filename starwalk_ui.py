@@ -144,6 +144,8 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Has_Delighters"] = out.apply(lambda r: row_has_any(r, del_cols), axis=1)
     out["Needs_Detractors"] = ~out["Has_Detractors"]
     out["Needs_Delighters"] = ~out["Has_Delighters"]
+    # Final gating logic: only symptomize when BOTH sides are missing
+    out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
 
 
@@ -295,7 +297,7 @@ work = detect_missing(df, colmap)
 total = len(work)
 need_del = int(work["Needs_Delighters"].sum())
 need_det = int(work["Needs_Detractors"].sum())
-need_both = int(((work["Needs_Delighters"]) & (work["Needs_Detractors"])) .sum())
+need_both = int(work["Needs_Symptomization"].sum())
 
 st.markdown(
     f"""
@@ -319,7 +321,10 @@ elif scope == "Missing detractors only":
 else:
     target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"]) ]
 
-st.write(f"🔎 **{len(target):,} reviews** match the selected scope.")
+# Enforce final logic: process ONLY rows missing BOTH sides
+# (overrides any scope selection for correctness)
+target = work[work["Needs_Symptomization"]]
+st.write(f"🔎 **{len(target):,} reviews** match the **final logic** (missing BOTH delighters and detractors).")
 with st.expander("Preview rows that need symptomization", expanded=False):
     preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
@@ -511,5 +516,6 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
