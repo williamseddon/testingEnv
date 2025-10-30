@@ -1,10 +1,11 @@
-# starwalk_ui_v5.py — Improved UI & UX
-# Streamlit App — Dynamic Symptoms • Manual Symptomize (Run N/ALL) • Template‑Exact Export
-# New Symptom Inbox (Approval + References) • Browse & Stats • Clean, central UI
+# starwalk_ui_v4.py — CLEAN FULL UPDATE
+# Streamlit App — Manual Symptomize (Run N/ALL) • Template‑Exact Export (K–T dets, U–AD dels)
+# New Symptom Inbox (Approval + References) • Browse & Stats • Robust dtype & layout fixes
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io, os, re, json, difflib
 from typing import List, Dict, Tuple
 from datetime import datetime
@@ -24,8 +25,8 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v5")
-st.title("🌟 Star Walk Review Analyzer v5")
+st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4 (Clean)")
+st.title("🌟 Star Walk Review Analyzer v4 (Clean)")
 st.caption("Manual Symptomize • Approval Inbox • Browse & Stats • Export to Template (K–T dets, U–AD dels)")
 
 # ------------------- Utilities -------------------
@@ -95,6 +96,19 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 
     return delighters, detractors, alias_map
 
+# Also load raw Symptoms sheet for optional exporting
+@st.cache_data(show_spinner=False)
+def read_symptoms_sheet(file_bytes: bytes) -> pd.DataFrame:
+    bio = io.BytesIO(file_bytes)
+    try:
+        df_sym = pd.read_excel(bio, sheet_name="Symptoms")
+        if df_sym is None:
+            return pd.DataFrame()
+        df_sym.columns = [str(c).strip() for c in df_sym.columns]
+        return df_sym
+    except Exception:
+        return pd.DataFrame()
+
 # ---------- Column detection & missing flags ----------
 
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -130,6 +144,20 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Needs_Delighters"] = ~out["Has_Delighters"]
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
+
+# ------------------- Fixed template mapping -------------------
+DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]  # 10
+DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]  # 10
+DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
+DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
+AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
+AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
+
+def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    for h in AI_DET_HEADERS + AI_DEL_HEADERS:
+        if h not in df_in.columns:
+            df_in[h] = None
+    return df_in
 
 # ---------- Canonicalization helpers ----------
 
@@ -214,20 +242,6 @@ def _openai_labeler(
     except Exception:
         return [], [], [], []
 
-# ------------------- Fixed template mapping -------------------
-DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]  # 10
-DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]  # 10
-DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
-DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
-AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
-AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
-
-def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
-    for h in AI_DET_HEADERS + AI_DEL_HEADERS:
-        if h not in df_in.columns:
-            df_in[h] = None
-    return df_in
-
 # ------------------- Export helpers -------------------
 
 def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> bytes:
@@ -262,10 +276,17 @@ def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> 
             if cell_value is not None:
                 cell.fill = fill_green
 
+    # Optional widths
+    for c in DET_INDEXES + DEL_INDEXES:
+        try:
+            ws.column_dimensions[get_column_letter(c)].width = 28
+        except Exception:
+            pass
+
     out = io.BytesIO(); wb.save(out)
     return out.getvalue()
 
-# ------------------- Helpers: add new symptoms to Symptoms sheet -------------------
+# --- Add new symptoms to Symptoms sheet ---
 
 def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]]) -> bytes:
     """Add (label, side) pairs to the 'Symptoms' sheet and return workbook bytes.
@@ -307,7 +328,9 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
     for label, side in selections:
         lab = str(label).strip()
-        if not lab or lab in existing:
+        if not lab:
+            continue
+        if lab in existing:
             continue
         row_new = ws.max_row + 1
         ws.cell(row=row_new, column=col_label, value=lab)
@@ -316,6 +339,35 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
     out = io.BytesIO(); wb.save(out); out.seek(0)
     return out.getvalue()
+
+# --- Editor schema helper (prevents Streamlit dtype errors in st.data_editor) ---
+
+def _ensure_editor_schema(df_edit: pd.DataFrame) -> pd.DataFrame:
+    try:
+        if df_edit is None or not isinstance(df_edit, pd.DataFrame) or df_edit.empty:
+            return pd.DataFrame({
+                "Add": pd.Series(dtype="bool"),
+                "Label": pd.Series(dtype="string"),
+                "Side": pd.Series(dtype="string"),
+                "Count": pd.Series(dtype="int64"),
+                "Examples": pd.Series(dtype="string"),
+            })
+        if "Add" in df_edit.columns:
+            df_edit["Add"] = df_edit["Add"].fillna(False).astype("bool")
+        for col in ["Label", "Side", "Examples"]:
+            if col in df_edit.columns:
+                df_edit[col] = df_edit[col].astype("string")
+        if "Count" in df_edit.columns:
+            df_edit["Count"] = pd.to_numeric(df_edit["Count"], errors="coerce").fillna(0).astype("int64")
+        return df_edit
+    except Exception:
+        return pd.DataFrame({
+            "Add": pd.Series(dtype="bool"),
+            "Label": pd.Series(dtype="string"),
+            "Side": pd.Series(dtype="string"),
+            "Count": pd.Series(dtype="int64"),
+            "Examples": pd.Series(dtype="string"),
+        })
 
 # ------------------- File Upload -------------------
 
@@ -349,49 +401,48 @@ if not DELIGHTERS and not DETRACTORS:
 else:
     st.success(f"Loaded {len(DELIGHTERS)} Delighters, {len(DETRACTORS)} Detractors from Symptoms tab.")
 
+# Sidebar LLM settings + client (defined once)
+st.sidebar.header("🤖 LLM Settings")
+MODEL_CHOICES = {
+    "Fast – GPT-4o-mini": "gpt-4o-mini",
+    "Balanced – GPT-4o": "gpt-4o",
+    "Advanced – GPT-4.1": "gpt-4.1",
+    "Most Advanced – GPT-5": "gpt-5",
+}
+model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=1)
+selected_model = MODEL_CHOICES[model_label]
+temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
+if client is None:
+    st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
+
 # Build canonical maps for robust matching
 DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
 
-# ------------------- Detection & Metrics -------------------
+# ------------------- Detection & Preview -------------------
 colmap = detect_symptom_columns(df)
 work = detect_missing(df, colmap)
 
+# Summary chips
 total = len(work)
 need_del = int(work["Needs_Delighters"].sum())
 need_det = int(work["Needs_Detractors"].sum())
 need_both = int(work["Needs_Symptomization"].sum())
 
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.metric("Total reviews", f"{total:,}")
-with m2:
-    st.metric("Missing both", f"{need_both:,}")
-with m3:
-    st.metric("Missing either side", f"{(need_del + need_det - need_both):,}")
+st.markdown(
+    f"""
+**Dataset:** {total:,} reviews • **Need Delighters:** {need_del:,} • **Need Detractors:** {need_det:,} • **Missing Both:** {need_both:,}
+"""
+)
 
-# ------------------- Global Settings (clean, compact) -------------------
-with st.expander("⚙️ Settings", expanded=False):
-    scope = st.radio(
-        "Scope",
-        ["Any missing", "Missing both", "Missing delighters only", "Missing detractors only"],
-        horizontal=True,
-    )
-    model_choices = {
-        "Fast – GPT‑4o‑mini": "gpt-4o-mini",
-        "Balanced – GPT‑4o": "gpt-4o",
-        "Advanced – GPT‑4.1": "gpt-4.1",
-        "Most Advanced – GPT‑5": "gpt-5",
-    }
-    model_label = st.selectbox("Model", list(model_choices.keys()), index=1)
-    selected_model = model_choices[model_label]
-    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
+# Scope filter
+scope = st.radio(
+    "Process scope",
+    ["Any missing", "Missing both", "Missing delighters only", "Missing detractors only"],
+    horizontal=True,
+)
 
-    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-    client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
-    if client is None:
-        st.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
-
-# Determine target subset now that scope is known
 if scope == "Missing both":
     target = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
 elif scope == "Missing delighters only":
@@ -401,275 +452,277 @@ elif scope == "Missing detractors only":
 else:
     target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"]) ]
 
-st.info(f"🔎 {len(target):,} reviews match the selected scope.")
+st.write(f"🔎 **{len(target):,} reviews** match the **selected scope**.")
+with st.expander("Preview rows that need symptomization", expanded=False):
+    preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
+    extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
+    st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# ------------------- Tabs: Symptomize | Inbox | Browse & Stats | Export -------------------
-
-sym_tab, inbox_tab, browse_tab, export_tab = st.tabs([
-    "🧪 Symptomize",
-    "🟡 New Symptom Inbox",
-    "🔎 Browse & Stats",
-    "📦 Export",
-])
-
-# === Tab 1: Symptomize ===
-with sym_tab:
-    with st.expander("Preview rows in scope", expanded=False):
-        preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
-        extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
-        st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
-
-    count_max = int(len(target))
-    if count_max == 0:
-        st.info("Nothing to symptomize in this scope.")
-    else:
-        c1, c2, c3 = st.columns([2,1,1])
-        with c1:
-            n_default = int(min(50, max(1, count_max)))
-            n_to_run = st.number_input("Count to symptomize (from top of scope)", min_value=1, max_value=count_max, value=n_default, step=1)
-        with c2:
-            run_n = st.button("Run N", use_container_width=True)
-        with c3:
-            run_all = st.button("Run ALL", use_container_width=True)
-
-        if run_n or run_all:
-            if client is None:
-                st.error("OpenAI not configured — cannot symptomize.")
-            else:
-                max_per_side = 10
-                rows_iter = target if run_all else target.head(int(n_to_run))
-                prog = st.progress(0.0)
-                total_n = max(1, len(rows_iter))
-
-                processed_rows: List[Dict] = []
-                cand_del: Dict[str, List[int]] = {}
-                cand_det: Dict[str, List[int]] = {}
-
-                for k, (idx, row) in enumerate(rows_iter.iterrows(), start=1):
-                    vb = row.get("Verbatim", "")
-                    needs_deli = bool(row.get("Needs_Delighters", False))
-                    needs_detr = bool(row.get("Needs_Detractors", False))
-
-                    try:
-                        dels, dets, unl_dels, unl_dets = _openai_labeler(
-                            vb, client, selected_model, temperature,
-                            DELIGHTERS, DETRACTORS, ALIASES,
-                            DEL_MAP, DET_MAP, ALIAS_TO_LABEL
-                        )
-                    except Exception:
-                        dels, dets, unl_dels, unl_dets = [], [], [], []
-
-                    wrote_dets: List[str] = []
-                    wrote_dels: List[str] = []
-
-                    if needs_detr and dets:
-                        for j, lab in enumerate(dets[:max_per_side]):
-                            col = f"AI Symptom Detractor {j+1}"
-                            if col not in df.columns: df[col] = None
-                            df.loc[idx, col] = lab
-                        wrote_dets = dets[:max_per_side]
-                    if needs_deli and dels:
-                        for j, lab in enumerate(dels[:max_per_side]):
-                            col = f"AI Symptom Delighter {j+1}"
-                            if col not in df.columns: df[col] = None
-                            df.loc[idx, col] = lab
-                        wrote_dels = dels[:max_per_side]
-
-                    for u in unl_dels:
-                        cand_del.setdefault(u, []).append(idx)
-                    for u in unl_dets:
-                        cand_det.setdefault(u, []).append(idx)
-
-                    processed_rows.append({
-                        "Index": int(idx),
-                        "Verbatim": str(vb)[:300],
-                        "Added_Delighters": wrote_dels,
-                        "Added_Detractors": wrote_dets,
-                        "Unlisted_Delighters": unl_dels,
-                        "Unlisted_Detractors": unl_dets,
-                    })
-
-                    prog.progress(k/total_n)
-
-                st.session_state["processed_rows"] = processed_rows
-                st.session_state["cand_del_map"] = cand_del
-                st.session_state["cand_det_map"] = cand_det
-
-                st.success(f"Symptomized {len(processed_rows)} review(s).")
-
-                # Processed log
-                with st.expander("🧾 Processed reviews (this run)", expanded=False):
-                    for rec in processed_rows:
-                        head = f"Row {rec['Index']} — Dets added: {len(rec['Added_Detractors'])}, Dels added: {len(rec['Added_Delighters'])}"
-                        with st.expander(head):
-                            st.markdown(f"**Verbatim**: {rec['Verbatim']}")
-                            st.markdown("**Detractors added:** " + (", ".join(rec["Added_Detractors"]) if rec["Added_Detractors"] else "—"))
-                            st.markdown("**Delighters added:** " + (", ".join(rec["Added_Delighters"]) if rec["Added_Delighters"] else "—"))
-                            st.markdown("**Unlisted detractors (candidates):** " + (", ".join(rec["Unlisted_Detractors"]) if rec["Unlisted_Detractors"] else "—"))
-                            st.markdown("**Unlisted delighters (candidates):** " + (", ".join(rec["Unlisted_Delighters"]) if rec["Unlisted_Delighters"] else "—"))
-
-# === Tab 2: New Symptom Inbox ===
-with inbox_tab:
-    cand_del = st.session_state.get("cand_del_map", {})
-    cand_det = st.session_state.get("cand_det_map", {})
-
-    if not cand_del and not cand_det:
-        st.info("No new candidate symptoms from this session yet. Run Symptomize first.")
-    else:
-        st.success(f"Found {len(cand_del) + len(cand_det)} candidate(s). Review & approve below.")
-
-        def _mk_table(cmap: Dict[str, List[int]], side_label: str) -> pd.DataFrame:
-            rows_tbl = []
-            for sym, refs in sorted(cmap.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-                examples = []
-                for ridx in refs[:2]:
-                    try:
-                        ex = df.loc[ridx, "Verbatim"]
-                        examples.append((str(ex) or "")[:160])
-                    except Exception:
-                        pass
-                rows_tbl.append({
-                    "Add": False,
-                    "Label": sym,
-                    "Side": side_label,
-                    "Count": len(refs),
-                    "Examples": " | ".join(["— "+e for e in examples])
-                })
-            return pd.DataFrame(rows_tbl) if rows_tbl else pd.DataFrame({"Add": [], "Label": [], "Side": [], "Count": [], "Examples": []})
-
-        tbl_del = _mk_table(cand_del, "Delighter")
-        tbl_det = _mk_table(cand_det, "Detractor")
-
-        cA, cB = st.columns(2)
-        with cA:
-            st.markdown("**Delighter candidates**")
-            editor_del = st.data_editor(
-                tbl_del,
-                num_rows="fixed",
-                use_container_width=True,
-                column_config={
-                    "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
-                    "Label": st.column_config.TextColumn(),
-                    "Side": st.column_config.TextColumn(disabled=True),
-                    "Count": st.column_config.NumberColumn(format="%d"),
-                    "Examples": st.column_config.TextColumn(width="large"),
-                },
-                key="cand_del_editor",
-            )
-        with cB:
-            st.markdown("**Detractor candidates**")
-            editor_det = st.data_editor(
-                tbl_det,
-                num_rows="fixed",
-                use_container_width=True,
-                column_config={
-                    "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
-                    "Label": st.column_config.TextColumn(),
-                    "Side": st.column_config.TextColumn(disabled=True),
-                    "Count": st.column_config.NumberColumn(format="%d"),
-                    "Examples": st.column_config.TextColumn(width="large"),
-                },
-                key="cand_det_editor",
-            )
-
-        st.markdown("**References per candidate**")
-        for sym, refs in sorted(cand_det.items(), key=lambda kv: -len(kv[1])):
-            with st.expander(f"Detractor — {sym} • {len(refs)} reference(s)"):
-                ref_rows = []
-                for ridx in refs:
-                    row_dict = {"Index": int(ridx)}
-                    if "Star Rating" in df.columns:
-                        row_dict["Star Rating"] = df.loc[ridx, "Star Rating"]
-                    row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])[:400]
-                    ref_rows.append(row_dict)
-                st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
-        for sym, refs in sorted(cand_del.items(), key=lambda kv: -len(kv[1])):
-            with st.expander(f"Delighter — {sym} • {len(refs)} reference(s)"):
-                ref_rows = []
-                for ridx in refs:
-                    row_dict = {"Index": int(ridx)}
-                    if "Star Rating" in df.columns:
-                        row_dict["Star Rating"] = df.loc[ridx, "Star Rating"]
-                    row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])[:400]
-                    ref_rows.append(row_dict)
-                st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
-
-        st.divider()
-        if st.button("✅ Add selected to Symptoms & Download updated workbook", type="primary"):
-            selections: List[Tuple[str, str]] = []
-            try:
-                if isinstance(editor_del, pd.DataFrame) and not editor_del.empty:
-                    for _, r_ in editor_del.iterrows():
-                        if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
-                            selections.append((str(r_["Label"]).strip(), "Delighter"))
-            except Exception:
-                pass
-            try:
-                if isinstance(editor_det, pd.DataFrame) and not editor_det.empty:
-                    for _, r_ in editor_det.iterrows():
-                        if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
-                            selections.append((str(r_["Label"]).strip(), "Detractor"))
-            except Exception:
-                pass
-
-            if selections:
-                updated_bytes = add_new_symptoms_to_workbook(uploaded_file, selections)
-                st.download_button(
-                    "⬇️ Download 'Symptoms' (updated)",
-                    data=updated_bytes,
-                    file_name="Symptoms_Updated.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                st.success(f"Queued {len(selections)} new label(s) into the Symptoms tab.")
-            else:
-                st.info("No candidates selected.")
-
-# === Tab 3: Browse & Stats ===
-with browse_tab:
-    view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
-
-    col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
-    col_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
-
-    def _label_counts(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-        vals: List[str] = []
-        for c in cols:
-            if c in df_in.columns:
-                series = df_in[c].dropna().astype(str).map(str.strip)
-                vals.extend([v for v in series if is_filled(v)])
-        if not vals:
-            return pd.DataFrame({"Label": [], "Count": []})
-        vc = pd.Series(vals).value_counts().reset_index()
-        vc.columns = ["Label", "Count"]
-        return vc
-
-    if view_side == "Detractors":
-        counts_df = _label_counts(df, col_det_all)
-        whitelist = pd.DataFrame({"Label": DETRACTORS}) if DETRACTORS else pd.DataFrame({"Label": []})
-    else:
-        counts_df = _label_counts(df, col_del_all)
-        whitelist = pd.DataFrame({"Label": DELIGHTERS}) if DELIGHTERS else pd.DataFrame({"Label": []})
-
-    c1, c2 = st.columns(2)
+# ------------------- Symptomize Center (main) -------------------
+st.subheader("🧪 Symptomize")
+count_max = int(len(target))
+if count_max == 0:
+    st.info("Nothing in scope to symptomize.")
+else:
+    st.caption("Choose how many to process — nothing runs automatically.")
+    c1, c2, c3, _ = st.columns([2,1,1,2])
     with c1:
-        st.markdown("**Top labels in data**")
-        st.dataframe(counts_df.head(50), use_container_width=True, hide_index=True)
+        n_default = int(min(50, max(1, count_max)))
+        n_to_sym_main = st.number_input("Count to symptomize (from top of scope)", min_value=1, max_value=count_max, value=n_default, step=1)
     with c2:
-        st.markdown("**Whitelist**")
-        st.dataframe(whitelist, use_container_width=True, hide_index=True)
+        run_n_main = st.button("Run N", use_container_width=True)
+    with c3:
+        run_all_main = st.button("Run ALL", use_container_width=True)
 
-# === Tab 4: Export ===
-with export_tab:
-    try:
-        file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
-    except Exception:
-        file_base = 'Reviews'
-    export_bytes = generate_updated_workbook_bytes(uploaded_file, df)
-    st.download_button(
-        "⬇️ Download symptomized workbook (XLSX)",
-        data=export_bytes,
-        file_name=f"{file_base}_Symptomized.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    if run_n_main or run_all_main:
+        if client is None:
+            st.error("OpenAI not configured — cannot symptomize.")
+        else:
+            max_per_side = 10
+            rows_iter = target if run_all_main else target.head(int(n_to_sym_main))
+            prog = st.progress(0.0)
+            total_n = max(1, len(rows_iter))
 
-st.caption("Tip: Nothing runs automatically. Choose a scope, preview, then Run N/ALL. Export writes exactly to K–T (dets) and U–AD (dels).")
+            processed_rows: List[Dict] = []
+            cand_del: Dict[str, List[int]] = {}
+            cand_det: Dict[str, List[int]] = {}
+
+            for k, (idx, row) in enumerate(rows_iter.iterrows(), start=1):
+                vb = row.get("Verbatim", "")
+                needs_deli = bool(row.get("Needs_Delighters", False))
+                needs_detr = bool(row.get("Needs_Detractors", False))
+
+                try:
+                    dels, dets, unl_dels, unl_dets = _openai_labeler(
+                        vb, client, selected_model, temperature,
+                        DELIGHTERS, DETRACTORS, ALIASES,
+                        DEL_MAP, DET_MAP, ALIAS_TO_LABEL
+                    )
+                except Exception:
+                    dels, dets, unl_dels, unl_dets = [], [], [], []
+
+                wrote_dets: List[str] = []
+                wrote_dels: List[str] = []
+
+                if needs_detr and dets:
+                    for j, lab in enumerate(dets[:max_per_side]):
+                        col = f"AI Symptom Detractor {j+1}"
+                        if col not in df.columns: df[col] = None
+                        df.loc[idx, col] = lab
+                    wrote_dets = dets[:max_per_side]
+                if needs_deli and dels:
+                    for j, lab in enumerate(dels[:max_per_side]):
+                        col = f"AI Symptom Delighter {j+1}"
+                        if col not in df.columns: df[col] = None
+                        df.loc[idx, col] = lab
+                    wrote_dels = dels[:max_per_side]
+
+                for u in unl_dels:
+                    cand_del.setdefault(u, []).append(idx)
+                for u in unl_dets:
+                    cand_det.setdefault(u, []).append(idx)
+
+                processed_rows.append({
+                    "Index": int(idx),
+                    "Verbatim": str(vb)[:300],
+                    "Added_Delighters": wrote_dels,
+                    "Added_Detractors": wrote_dets,
+                    "Unlisted_Delighters": unl_dels,
+                    "Unlisted_Detractors": unl_dets,
+                })
+
+                prog.progress(k/total_n)
+
+            st.session_state["processed_rows"] = processed_rows
+            st.session_state["cand_del_map"] = cand_del
+            st.session_state["cand_det_map"] = cand_det
+
+            st.success(f"Symptomized {len(processed_rows)} review(s) in the selected scope.")
+
+            # Processed log
+            with st.expander("🧾 Processed reviews (this run)", expanded=False):
+                for rec in processed_rows:
+                    head = f"Row {rec['Index']} — Dets added: {len(rec['Added_Detractors'])}, Dels added: {len(rec['Added_Delighters'])}"
+                    with st.expander(head):
+                        st.markdown(f"**Verbatim**: {rec['Verbatim']}")
+                        st.markdown("**Detractors added:** " + (", ".join(rec["Added_Detractors"]) if rec["Added_Detractors"] else "—"))
+                        st.markdown("**Delighters added:** " + (", ".join(rec["Added_Delighters"]) if rec["Added_Delighters"] else "—"))
+                        st.markdown("**Unlisted detractors (candidates):** " + (", ".join(rec["Unlisted_Detractors"]) if rec["Unlisted_Detractors"] else "—"))
+                        st.markdown("**Unlisted delighters (candidates):** " + (", ".join(rec["Unlisted_Delighters"]) if rec["Unlisted_Delighters"] else "—"))
+
+# ------------------- New Symptom Inbox -------------------
+st.subheader("🟡 New Symptom Inbox — Review & Approve")
+cand_del = st.session_state.get("cand_del_map", {})
+cand_det = st.session_state.get("cand_det_map", {})
+
+if not cand_del and not cand_det:
+    st.info("No new candidate symptoms from this session yet. Run Symptomize first.")
+else:
+    st.success(f"Found {len(cand_del) + len(cand_det)} candidate(s). Review & approve below.")
+
+    def _mk_table(cmap: Dict[str, List[int]], side_label: str) -> pd.DataFrame:
+        rows_tbl = []
+        for sym, refs in sorted(cmap.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            examples = []
+            for ridx in refs[:2]:
+                try:
+                    ex = df.loc[ridx, "Verbatim"]
+                    examples.append((str(ex) or "")[:160])
+                except Exception:
+                    pass
+            rows_tbl.append({
+                "Add": False,
+                "Label": sym,
+                "Side": side_label,
+                "Count": len(refs),
+                "Examples": " | ".join(["— "+e for e in examples])
+            })
+        return pd.DataFrame(rows_tbl) if rows_tbl else pd.DataFrame({"Add": [], "Label": [], "Side": [], "Count": [], "Examples": []})
+
+    tbl_del = _ensure_editor_schema(_mk_table(cand_del, "Delighter"))
+    tbl_det = _ensure_editor_schema(_mk_table(cand_det, "Detractor"))
+
+    cA, cB = st.columns(2)
+    with cA:
+        st.markdown("**Delighter candidates**")
+        editor_del = st.data_editor(
+            tbl_del,
+            num_rows="fixed",
+            use_container_width=True,
+            column_config={
+                "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
+                "Label": st.column_config.TextColumn(),
+                "Side": st.column_config.TextColumn(disabled=True),
+                "Count": st.column_config.NumberColumn(format="%d"),
+                "Examples": st.column_config.TextColumn(width="large"),
+            },
+            key="cand_del_editor",
+        )
+    with cB:
+        st.markdown("**Detractor candidates**")
+        editor_det = st.data_editor(
+            tbl_det,
+            num_rows="fixed",
+            use_container_width=True,
+            column_config={
+                "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
+                "Label": st.column_config.TextColumn(),
+                "Side": st.column_config.TextColumn(disabled=True),
+                "Count": st.column_config.NumberColumn(format="%d"),
+                "Examples": st.column_config.TextColumn(width="large"),
+            },
+            key="cand_det_editor",
+        )
+
+    # References per candidate
+    st.markdown("**References per candidate**")
+    for sym, refs in sorted(cand_det.items(), key=lambda kv: -len(kv[1])):
+        with st.expander(f"Detractor — {sym} • {len(refs)} reference(s)"):
+            ref_rows = []
+            for ridx in refs:
+                row_dict = {"Index": int(ridx)}
+                if "Star Rating" in df.columns:
+                    row_dict["Star Rating"] = df.loc[ridx, "Star Rating"]
+                row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])[:400]
+                ref_rows.append(row_dict)
+            st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
+    for sym, refs in sorted(cand_del.items(), key=lambda kv: -len(kv[1])):
+        with st.expander(f"Delighter — {sym} • {len(refs)} reference(s)"):
+            ref_rows = []
+            for ridx in refs:
+                row_dict = {"Index": int(ridx)}
+                if "Star Rating" in df.columns:
+                    row_dict["Star Rating"] = df.loc[ridx, "Star Rating"]
+                row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])[:400]
+                ref_rows.append(row_dict)
+            st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    if st.button("✅ Add selected to Symptoms & Download updated workbook", type="primary"):
+        selections: List[Tuple[str, str]] = []
+        try:
+            if isinstance(editor_del, pd.DataFrame) and not editor_del.empty:
+                for _, r_ in editor_del.iterrows():
+                    if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
+                        selections.append((str(r_["Label"]).strip(), "Delighter"))
+        except Exception:
+            pass
+        try:
+            if isinstance(editor_det, pd.DataFrame) and not editor_det.empty:
+                for _, r_ in editor_det.iterrows():
+                    if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
+                        selections.append((str(r_["Label"]).strip(), "Detractor"))
+        except Exception:
+            pass
+
+        if selections:
+            updated_bytes = add_new_symptoms_to_workbook(uploaded_file, selections)
+            st.download_button(
+                "⬇️ Download 'Symptoms' (updated)",
+                data=updated_bytes,
+                file_name="Symptoms_Updated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.success(f"Queued {len(selections)} new label(s) into the Symptoms tab.")
+        else:
+            st.info("No candidates selected.")
+
+# ------------------- Download Symptomized Workbook -------------------
+st.subheader("📦 Download Symptomized Workbook")
+try:
+    file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
+except Exception:
+    file_base = 'Reviews'
+export_bytes = generate_updated_workbook_bytes(uploaded_file, df)
+st.download_button(
+    "⬇️ Download symptomized workbook (XLSX)",
+    data=export_bytes,
+    file_name=f"{file_base}_Symptomized.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+# ------------------- Browse Symptoms (main) -------------------
+st.subheader("🔎 Browse & Stats")
+view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
+
+col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
+col_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
+
+def _label_counts(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    vals: List[str] = []
+    for c in cols:
+        if c in df_in.columns:
+            series = df_in[c].dropna().astype(str).map(str.strip)
+            vals.extend([v for v in series if is_filled(v)])
+    if not vals:
+        return pd.DataFrame({"Label": [], "Count": []})
+    vc = pd.Series(vals).value_counts().reset_index()
+    vc.columns = ["Label", "Count"]
+    return vc
+
+if view_side == "Detractors":
+    counts_df = _label_counts(df, col_det_all)
+    whitelist = pd.DataFrame({"Label": DETRACTORS}) if DETRACTORS else pd.DataFrame({"Label": []})
+else:
+    counts_df = _label_counts(df, col_del_all)
+    whitelist = pd.DataFrame({"Label": DELIGHTERS}) if DELIGHTERS else pd.DataFrame({"Label": []})
+
+m1, m2, m3 = st.columns(3)
+with m1:
+    st.metric("Total reviews", f"{len(df):,}")
+with m2:
+    st.metric("In-scope now", f"{len(target):,}")
+with m3:
+    st.metric("Unique labels (found)", f"{counts_df['Label'].nunique() if not counts_df.empty else 0}")
+
+c_left, c_right = st.columns(2)
+with c_left:
+    st.markdown("**Top labels in data**")
+    st.dataframe(counts_df.head(50), use_container_width=True, hide_index=True)
+with c_right:
+    st.markdown("**Whitelist**")
+    st.dataframe(whitelist, use_container_width=True, hide_index=True)
+
+# ------------------- Footer -------------------
+st.divider()
+st.caption("Tip: Choose a scope, preview, then Run N/ALL. Export writes exactly to K–T (dets) and U–AD (dels). No extra headers added.")
