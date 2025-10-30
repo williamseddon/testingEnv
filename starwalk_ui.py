@@ -95,26 +95,18 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 
 
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Detect manual and AI symptom columns by naming patterns."""
-    cols = list(df.columns)
-    # Manual: Symptom 1..10 (detractors), 11..20 (delighters)
-    man_det = [c for c in cols if re.match(r"(?i)^symptom\s*(?:[1-9]|10)$", str(c))]
-    man_del = [c for c in cols if re.match(r"(?i)^symptom\s*(1[1-9]|20)$", str(c))]
-    # If names are non-standard but contain numbers, fallback by index
-    if not man_det or not man_del:
-        num_map = []
-        for c in cols:
-            m = re.findall(r"\d+", str(c))
-            if m and str(c).lower().startswith("symptom"):
-                num_map.append((int(m[0]), c))
-        nums_sorted = sorted(num_map)
-        man_det = [c for n, c in nums_sorted if 1 <= n <= 10] or man_det
-        man_del = [c for n, c in nums_sorted if 11 <= n <= 20] or man_del
-
-    # AI columns
-    ai_det = [c for c in cols if re.match(r"(?i)^ai\s*symptom.*detractor", str(c))]
-    ai_del = [c for c in cols if re.match(r"(?i)^ai\s*symptom.*delighter", str(c))]
-
+    """Detect symptom columns using exact Star Walk schema.
+    Manual detractors: Symptom 1..10
+    Manual delighters: Symptom 11..20
+    AI columns: AI Symptom Detractor 1..6, AI Symptom Delighter 1..6
+    This avoids regex over‑matching.
+    """
+    cols = [str(c).strip() for c in df.columns]
+    # exact expected names
+    man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
+    man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in cols]
+    ai_det  = [f"AI Symptom Detractor {i}" for i in range(1, 7) if f"AI Symptom Detractor {i}" in cols]
+    ai_del  = [f"AI Symptom Delighter {i}" for i in range(1, 7) if f"AI Symptom Delighter {i}" in cols]
     return {
         "manual_detractors": man_det,
         "manual_delighters": man_del,
@@ -262,6 +254,9 @@ except ValueError:
 if "Verbatim" not in df.columns:
     st.error("Missing 'Verbatim' column.")
     st.stop()
+
+# Normalize column names (trim whitespace)
+df.columns = [str(c).strip() for c in df.columns]
 
 df["Verbatim"] = df["Verbatim"].astype(str).map(clean_text)
 
@@ -516,6 +511,7 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
