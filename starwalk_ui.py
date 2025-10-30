@@ -1,4 +1,4 @@
-# starwalk_ui_v4.py — Minimalist Dashboard + One‑Click Symptomize (Missing BOTH)
+# starwalk_ui_v4.py — Super‑Clean UI, N or ALL, Overwrite vs Just Missing
 # Streamlit App — Exact Template Export (K–T dets, U–AD dels) • New Symptom Inbox • Tiles UI
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai
 
@@ -24,11 +24,11 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4 — Minimal UI")
+st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4 — Clean UI")
 st.title("🌟 Star Walk Review Analyzer v4")
-st.caption("Two clear metrics • One‑click 'Missing BOTH' symptomize • Tiles for fast browsing • Exact K–T / U–AD export")
+st.caption("N or ALL • Overwrite or Just Missing • Chips UI • Exact K–T / U–AD export")
 
-# Lightweight tile styles
+# Lightweight styles
 st.markdown(
     """
     <style>
@@ -37,6 +37,7 @@ st.markdown(
       .chip-det{background:#FDECEC;border-color:#F5A5A5;color:#991B1B}
       .muted{color:#64748b}
       .card{padding:16px;border-radius:14px;border:1px solid rgba(0,0,0,.08);background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.04);margin-bottom:12px}
+      .section{padding:14px 16px;border:1px solid rgba(0,0,0,.06);border-radius:14px;background:#fafafa}
     </style>
     """,
     unsafe_allow_html=True,
@@ -394,7 +395,7 @@ client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
 
-# ------------------- Minimal Metrics + One‑Click -------------------
+# ------------------- Minimal Metrics + Controls -------------------
 colmap = detect_symptom_columns(df)
 work = detect_missing(df, colmap)
 
@@ -406,26 +407,50 @@ with left:
 with right:
     st.metric("Number of reviews that need symptomization", f"{need_both:,}")
 
-# Target = missing BOTH
-target = work[work["Needs_Symptomization"]]
+# Controls (clean)
+st.subheader("🧪 Symptomize Controls")
+with st.container():
+    c1, c2 = st.columns([2,2])
+    with c1:
+        scope_choice = st.radio("Scope", ["Only rows missing BOTH", "All reviews"], horizontal=True)
+    with c2:
+        mode_choice = st.radio("Mode", ["Just Missing (don't touch filled AI)", "Overwrite AI (clear & refill)"] , horizontal=True)
 
-process_missing_both = st.button(
-    "🚀 Process reviews missing BOTH (detractors & delighters)",
-    type="primary",
-    disabled=(client is None or need_both == 0)
-)
+    # Determine scope
+    if scope_choice == "Only rows missing BOTH":
+        scoped = work[work["Needs_Symptomization"]].copy()
+    else:
+        scoped = work.copy()
 
-# ------------------- Run (Missing BOTH) -------------------
+    count_max = len(scoped)
+    d1, d2, d3 = st.columns([2,1,1])
+    with d1:
+        default_n = int(min(50, max(1, count_max)))
+        n_to_run = st.number_input("How many reviews?", min_value=1, max_value=max(1, count_max), value=default_n, step=1)
+    with d2:
+        run_n_btn = st.button("Run N", use_container_width=True)
+    with d3:
+        run_all_btn = st.button("Run ALL", use_container_width=True)
+
+# ------------------- Run (according to controls) -------------------
 processed_rows: List[Dict] = st.session_state.get("processed_rows", [])
 cand_del_map: Dict[str, List[int]] = st.session_state.get("cand_del_map", {})
 cand_det_map: Dict[str, List[int]] = st.session_state.get("cand_det_map", {})
 
-if process_missing_both:
+if run_n_btn or run_all_btn:
     if client is None:
         st.error("OpenAI not configured — cannot symptomize.")
     else:
         max_per_side = 10
-        rows_iter = target
+        rows_scope = scoped
+        rows_iter = rows_scope if run_all_btn else rows_scope.head(int(n_to_run))
+
+        # Prepare DF columns and, if overwrite, clear AI for rows in scope
+        ensure_ai_columns(df)
+        ai_cols = AI_DET_HEADERS + AI_DEL_HEADERS
+        if mode_choice.startswith("Overwrite"):
+            df.loc[rows_iter.index, ai_cols] = None
+
         prog = st.progress(0.0)
         total_n = max(1, len(rows_iter))
 
@@ -434,6 +459,23 @@ if process_missing_both:
 
         for k, (idx, row) in enumerate(rows_iter.iterrows(), start=1):
             vb = row.get("Verbatim", "")
+
+            # Decide if we should skip in "Just Missing" mode
+            if mode_choice.startswith("Just"):
+                row_needs_both = bool(row.get("Needs_Symptomization", False))
+                if not row_needs_both:
+                    processed_rows.append({
+                        "Index": int(idx),
+                        "Verbatim": str(vb),
+                        "Added_Delighters": [],
+                        "Added_Detractors": [],
+                        "Unlisted_Delighters": [],
+                        "Unlisted_Detractors": [],
+                        "Note": "Skipped (already has symptoms)"
+                    })
+                    prog.progress(k/total_n)
+                    continue
+
             try:
                 dels, dets, unl_dels, unl_dets = _openai_labeler(
                     vb, client, selected_model, temperature,
@@ -443,16 +485,20 @@ if process_missing_both:
             except Exception:
                 dels, dets, unl_dels, unl_dets = [], [], [], []
 
-            # Ensure 10/10 max written to AI columns
-            ensure_ai_columns(df)
+            # Write up to 10/10 to AI columns in DF (kept internally; export maps to K–T / U–AD)
+            wrote_dets: List[str] = []
+            wrote_dels: List[str] = []
+
             if dets:
                 for j, lab in enumerate(dets[:max_per_side]):
                     col = f"AI Symptom Detractor {j+1}"
                     df.loc[idx, col] = lab
+                wrote_dets = dets[:max_per_side]
             if dels:
                 for j, lab in enumerate(dels[:max_per_side]):
                     col = f"AI Symptom Delighter {j+1}"
                     df.loc[idx, col] = lab
+                wrote_dels = dels[:max_per_side]
 
             for u in unl_dels:
                 cand_del_map.setdefault(u, []).append(idx)
@@ -461,9 +507,9 @@ if process_missing_both:
 
             processed_rows.append({
                 "Index": int(idx),
-                "Verbatim": str(vb),  # full verbatim (no truncation)
-                "Added_Delighters": dels[:max_per_side],
-                "Added_Detractors": dets[:max_per_side],
+                "Verbatim": str(vb),  # full verbatim
+                "Added_Delighters": wrote_dels,
+                "Added_Detractors": wrote_dets,
                 "Unlisted_Delighters": unl_dels,
                 "Unlisted_Detractors": unl_dets,
             })
@@ -473,7 +519,7 @@ if process_missing_both:
         st.session_state["processed_rows"] = processed_rows
         st.session_state["cand_del_map"] = cand_del_map
         st.session_state["cand_det_map"] = cand_det_map
-        st.success(f"Processed {len(processed_rows)} review(s) missing both.")
+        st.success(f"Processed {len(processed_rows)} review(s) in scope.")
 
 # ------------------- Download Symptomized Workbook -------------------
 st.subheader("📦 Download Symptomized Workbook")
@@ -512,8 +558,12 @@ with st.expander("🧩 Browse all symptoms (chips)", expanded=False):
 
 # ------------------- New Symptom Inbox (Approval + References) -------------------
 st.subheader("🟡 New Symptom Inbox — Review & Approve")
+processed_rows: List[Dict] = st.session_state.get("processed_rows", [])
+cand_del_map: Dict[str, List[int]] = st.session_state.get("cand_del_map", {})
+cand_det_map: Dict[str, List[int]] = st.session_state.get("cand_det_map", {})
+
 if not cand_del_map and not cand_det_map:
-    st.info("No new candidate symptoms from this session yet. Click the button above to process reviews.")
+    st.info("No new candidate symptoms from this session yet. Use Run N / Run ALL above.")
 else:
     def _mk_table(cmap: Dict[str, List[int]], side_label: str) -> pd.DataFrame:
         rows_tbl = []
@@ -618,4 +668,5 @@ if processed_rows:
 
 # ------------------- Footer -------------------
 st.divider()
-st.caption("Exports write exactly to K–T (detractors) and U–AD (delighters). No header renames. Use the button above to process only rows missing BOTH sides.")
+st.caption("Use Run N / Run ALL with the chosen scope and mode. Export writes exactly to K–T (detractors) and U–AD (delighters). No header renames.")
+
