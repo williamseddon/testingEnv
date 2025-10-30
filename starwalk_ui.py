@@ -1,12 +1,4 @@
-# starwalk_ui_v4.py — Best-in-class UI + AE/AF/AG Meta (Safety/Reliability/Ownership) + Duplicate-safe Inbox
-# Streamlit App — Dynamic Symptoms • Clean UI • Model Selector • Smart Auto-Symptomization
-# Approval Inbox with examples (near-duplicate suppression) • Exact Excel export (K–T dets, U–AD dels) + AE/AF/AG meta • Color-Coded
-# Notes:
-# - Writes detractors ONLY to K–T (10) and delighters ONLY to U–AD (10). Never renames your existing headers.
-# - Adds three columns after AD: AE=Safety, AF=Reliability, AG=Ownership Period (creates headers only if blank).
-# - Caps at 10 per side and flags rows where >10 were detected.
-# - Nothing runs automatically; you choose N or ALL, or one-click "Process ALL missing BOTH".
-# - New Symptom Inbox suppresses candidates that are near-duplicates of the whitelist or its aliases.
+# starwalk_ui_v5.py — Best-in-class UI (K–T dets, U–AD dels) + AE/AF/AG meta (Safety, Reliability, # of Sessions)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
 import streamlit as st
@@ -31,7 +23,7 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4")
+st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v5")
 
 # Global WOW CSS ----------------------------------------------------
 st.markdown(
@@ -86,11 +78,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🌟 Star Walk Review Analyzer v4")
-st.caption("Dynamic Symptoms • Smart Auto-Symptomize • Approval Inbox • Exact Export (K–T / U–AD) + AE/AF/AG meta")
-
-# Compatibility shim
-build_clicked = False
+st.title("🌟 Star Walk Review Analyzer v5")
+st.caption("Dynamic Symptoms • Smart Auto‑Symptomize • Approval Inbox • Exact Export (K–T / U–AD) + AE/AF/AG meta")
 
 # ------------------- Utilities -------------------
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
@@ -169,7 +158,16 @@ def read_symptoms_sheet(file_bytes: bytes) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# ------------------- Column detection & missing flags -------------------
+# Canonicalization helpers
+
+def _canon(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+def _canon_simple(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _canon(s))
+
+# Column detection & missing flags
+
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
     cols = [str(c).strip() for c in df.columns]
     man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
@@ -208,14 +206,14 @@ DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
 DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
 DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
 
-# New meta fields after AD
+# Meta columns after AD
 META_ORDER = [
     ("Safety", "AE"),
     ("Reliability", "AF"),
-    ("Ownership Period", "AG"),
+    ("# of Sessions", "AG"),
 ]
 META_INDEXES = {name: column_index_from_string(col) for name, col in META_ORDER}
-AI_META_HEADERS = ["AI Safety", "AI Reliability", "AI Ownership Period"]
+AI_META_HEADERS = ["AI Safety", "AI Reliability", "AI # of Sessions"]
 
 AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
 AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
@@ -226,12 +224,7 @@ def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
             df_in[h] = None
     return df_in
 
-# ------------------- Canonicalization & alias mapping -------------------
-def _canon(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s)).strip().lower()
-
-def _canon_simple(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _canon(s))
+# Build canonical maps
 
 def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
     del_map = {_canon(x): x for x in delighters}
@@ -243,6 +236,7 @@ def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map
     return del_map, det_map, alias_to_label
 
 # ---------- LLM labelers ----------
+
 def _openai_labeler(
     verbatim: str,
     client,
@@ -257,7 +251,6 @@ def _openai_labeler(
 ) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
     """Classify a review using only whitelist labels.
     Returns (dels10, dets10, unlisted_dels10, unlisted_dets10, raw_del_count, raw_det_count).
-    raw_* counts are before the 10-cap and help us flag over-limit rows.
     """
     if not verbatim or not verbatim.strip():
         return [], [], [], [], 0, 0
@@ -317,7 +310,7 @@ def _openai_labeler(
 # Systematic meta extraction (enforced enums)
 SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
 RELIABILITY_ENUM = ["Not Mentioned", "Negative", "Neutral", "Positive"]
-OWNERSHIP_ENUM = ["<1 week", "1–4 weeks", "1–3 months", "3–12 months", ">12 months", "Unknown"]
+SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
 
 def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
     if not verbatim or not verbatim.strip():
@@ -327,8 +320,8 @@ def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float
         "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
         "SAFETY one of: ['Not Mentioned','Concern','Positive']\n"
         "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']\n"
-        "OWNERSHIP_PERIOD one of: ['<1 week','1–4 weeks','1–3 months','3–12 months','>12 months','Unknown']\n"
-        'Return strict JSON {"safety":"…","reliability":"…","ownership_period":"…"}'
+        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']\n"
+        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
     )
 
     try:
@@ -345,15 +338,16 @@ def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float
         data = json.loads(content)
         s = str(data.get("safety", "Not Mentioned")).strip()
         r = str(data.get("reliability", "Not Mentioned")).strip()
-        o = str(data.get("ownership_period", "Unknown")).strip()
+        n = str(data.get("sessions", "Unknown")).strip()
         s = s if s in SAFETY_ENUM else "Not Mentioned"
         r = r if r in RELIABILITY_ENUM else "Not Mentioned"
-        o = o if o in OWNERSHIP_ENUM else "Unknown"
-        return s, r, o
+        n = n if n in SESSIONS_ENUM else "Unknown"
+        return s, r, n
     except Exception:
         return "Not Mentioned", "Not Mentioned", "Unknown"
 
 # ------------------- Export helpers -------------------
+
 def _clear_template_slots(ws: Worksheet, row_index: int):
     for col_idx in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
         ws.cell(row=row_index, column=col_idx, value=None)
@@ -365,7 +359,7 @@ def generate_template_workbook_bytes(
     overwrite_processed_slots: bool = False,
 ) -> bytes:
     """Return workbook bytes with K–T (dets), U–AD (dels), and AE/AF/AG meta written.
-    - Does NOT change existing headers. If AE/AF/AG headers are blank, sets them to Safety/Reliability/Ownership Period.
+    - Does NOT rename your headers. If AE/AF/AG headers are blank, set to Safety/Reliability/# of Sessions.
     - If overwrite_processed_slots is True, clears only rows we processed.
     """
     original_file.seek(0)
@@ -377,17 +371,17 @@ def generate_template_workbook_bytes(
 
     df2 = ensure_ai_columns(updated_df.copy())
 
-    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
-    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
-    fill_yel   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # Safety
-    fill_blu   = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")  # Reliability
-    fill_pur   = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")  # Ownership
-
-    # Ensure headers present for meta columns if blank
+    # Ensure meta headers
     for name, col in META_ORDER:
         col_idx = column_index_from_string(col)
         if not ws.cell(row=1, column=col_idx).value:
             ws.cell(row=1, column=col_idx, value=name)
+
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
+    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
+    fill_yel   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # Safety
+    fill_blu   = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")  # Reliability
+    fill_pur   = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")  # # of Sessions
 
     pset = set(processed_idx or [])
 
@@ -411,15 +405,15 @@ def generate_template_workbook_bytes(
         # Meta AE/AF/AG
         safety = r.get("AI Safety")
         reliab = r.get("AI Reliability")
-        ownper = r.get("AI Ownership Period")
+        sess   = r.get("AI # of Sessions")
         if not (pd.isna(safety) or str(safety).strip()==""):
             c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety))
             c.fill = fill_yel
         if not (pd.isna(reliab) or str(reliab).strip()==""):
             c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab))
             c.fill = fill_blu
-        if not (pd.isna(ownper) or str(ownper).strip()==""):
-            c = ws.cell(row=i, column=META_INDEXES["Ownership Period"], value=str(ownper))
+        if not (pd.isna(sess) or str(sess).strip()==""):
+            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess))
             c.fill = fill_pur
 
     # column widths
@@ -433,6 +427,7 @@ def generate_template_workbook_bytes(
     return out.getvalue()
 
 # ------------------- Helpers: add new symptoms to Symptoms sheet -------------------
+
 def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]]) -> bytes:
     original_file.seek(0)
     wb = load_workbook(original_file)
@@ -453,7 +448,7 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
     col_label = _col_idx(["symptom", "label", "name", "item"]) or 1
     col_type  = _col_idx(["type", "polarity", "category", "side"]) or 2
-    col_alias = _col_idx(["aliases", "alias"])  # may be -1
+    col_alias = _col_idx(["aliases", "alias"])
 
     if len(headers) < col_label or not headers[col_label-1]:
         ws.cell(row=1, column=col_label, value="Symptom")
@@ -501,7 +496,7 @@ if "Verbatim" not in df.columns:
     st.error("Missing 'Verbatim' column.")
     st.stop()
 
-# Normalize column names (trim whitespace)
+# Normalize column names (trim)
 df.columns = [str(c).strip() for c in df.columns]
 df["Verbatim"] = df["Verbatim"].astype(str).map(clean_text)
 
@@ -525,33 +520,40 @@ need_det = int(work["Needs_Detractors"].sum())
 need_both = int(work["Needs_Symptomization"].sum())
 
 st.markdown(f"""
-<div class="hero">
-  <div class="hero-stats">
-    <div class="stat"><div class="label">Total Reviews</div><div class="value">{total:,}</div></div>
-    <div class="stat"><div class="label">Need Delighters</div><div class="value">{need_del:,}</div></div>
-    <div class="stat"><div class="label">Need Detractors</div><div class="value">{need_det:,}</div></div>
-    <div class="stat accent"><div class="label">Missing Both</div><div class="value">{need_both:,}</div></div>
+<div class=\"hero\">
+  <div class=\"hero-stats\">
+    <div class=\"stat\"><div class=\"label\">Total Reviews</div><div class=\"value\">{total:,}</div></div>
+    <div class=\"stat\"><div class=\"label\">Need Delighters</div><div class=\"value\">{need_del:,}</div></div>
+    <div class=\"stat\"><div class=\"label\">Need Detractors</div><div class=\"value\">{need_det:,}</div></div>
+    <div class=\"stat accent\"><div class=\"label\">Missing Both</div><div class=\"value\">{need_both:,}</div></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
+# ------------------- LLM Settings -------------------
+st.sidebar.header("🤖 LLM Settings")
+MODEL_CHOICES = {
+    "Fast – GPT-4o-mini": "gpt-4o-mini",
+    "Balanced – GPT-4o": "gpt-4o",
+    "Advanced – GPT-4.1": "gpt-4.1",
+    "Most Advanced – GPT-5": "gpt-5",
+}
+model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=1)
+selected_model = MODEL_CHOICES[model_label]
+temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
+if client is None:
+    st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
+
 # ------------------- Symptomize Center -------------------
 st.subheader("🧪 Symptomize")
+scope = st.selectbox(
+    "Choose scope",
+    ["Missing both", "Any missing", "Missing delighters only", "Missing detractors only"],
+    index=0,
+)
 
-left, mid, right = st.columns([2,1.1,1.4])
-with left:
-    scope = st.selectbox(
-        "Choose scope",
-        ["Missing both", "Any missing", "Missing delighters only", "Missing detractors only"],
-        index=0,
-    )
-with mid:
-    n_to_process = st.number_input("N (from top of scope)", min_value=1, max_value=max(1, total), value=min(50, max(1, need_both)), step=1)
-with right:
-    overwrite_slots = st.toggle("Overwrite template slots (processed rows)", value=False, help="Clears K–T, U–AD and AE/AF/AG for processed rows before writing new values in the export.")
-    force_fill = st.toggle("Force fill both sides (processed rows)", value=False, help="If on, fill both sides even if a side wasn’t missing.")
-
-# Build target per scope
 if scope == "Missing both":
     target = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"]) ]
 elif scope == "Missing delighters only":
@@ -563,13 +565,15 @@ else:
 
 st.write(f"🔎 **{len(target):,} reviews** match the selected scope.")
 
-c_run1, c_run2, c_run3 = st.columns([1.3,1,1.8])
-with c_run1:
-    run_n_btn = st.button("▶️ Run N in scope")
-with c_run2:
-    run_all_btn = st.button("⏩ Run ALL in scope")
-with c_run3:
-    run_missing_both_btn = st.button("✨ One-click: Process ALL missing BOTH")
+c1, c2, c3 = st.columns([1.2,1,1.6])
+with c1:
+    n_to_process = st.number_input("N (from top of scope)", min_value=1, max_value=max(1, len(target)), value=min(50, max(1, len(target))), step=1)
+with c2:
+    run_n_btn = st.button("▶️ Run N in scope", use_container_width=True)
+with c3:
+    run_all_btn = st.button("⏩ Run ALL in scope", use_container_width=True)
+
+run_missing_both_btn = st.button("✨ One‑click: Process ALL missing BOTH", use_container_width=True)
 
 with st.expander("Preview in-scope rows", expanded=False):
     preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
@@ -581,21 +585,6 @@ processed_idx_set: Set[int] = set()
 over10_deli_count = 0
 over10_detr_count = 0
 
-client = OpenAI(api_key=(st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))) if (_HAS_OPENAI and (st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))) else None
-
-st.sidebar.header("🤖 LLM Settings")
-MODEL_CHOICES = {
-    "Fast – GPT-4o-mini": "gpt-4o-mini",
-    "Balanced – GPT-4o": "gpt-4o",
-    "Advanced – GPT-4.1": "gpt-4.1",
-    "Most Advanced – GPT-5": "gpt-5",
-}
-model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=1)
-selected_model = MODEL_CHOICES[model_label]
-temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
-if client is None:
-    st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
-
 # Helper for chips
 _def_esc_repl = [("&", "&amp;"), ("<", "&lt;"), (">", "&gt;")]
 
@@ -605,7 +594,8 @@ def _esc_html(s: str) -> str:
         t = t.replace(a, b)
     return t
 
-# --- Run handlers ---
+# --- Run core ---
+
 def _run_symptomize(rows_df: pd.DataFrame):
     global df, over10_deli_count, over10_detr_count
     max_per_side = 10
@@ -625,23 +615,22 @@ def _run_symptomize(rows_df: pd.DataFrame):
         except Exception:
             dels, dets, unl_dels, unl_dets, raw_deli_count, raw_detr_count = [], [], [], [], 0, 0
 
-        # Meta extraction (systematic enums)
+        # Meta extraction
         try:
-            safety, reliability, ownperiod = _openai_meta_extractor(vb, client, selected_model, temperature) if client else ("Not Mentioned","Not Mentioned","Unknown")
+            safety, reliability, sessions = _openai_meta_extractor(vb, client, selected_model, temperature) if client else ("Not Mentioned","Not Mentioned","Unknown")
         except Exception:
-            safety, reliability, ownperiod = "Not Mentioned","Not Mentioned","Unknown"
+            safety, reliability, sessions = "Not Mentioned","Not Mentioned","Unknown"
 
         df = ensure_ai_columns(df)
 
         wrote_dets, wrote_dels = [], []
-        # Respect force_fill
-        if (force_fill or needs_detr) and dets:
+        if needs_detr and dets:
             for j, lab in enumerate(dets[:max_per_side]):
                 col = f"AI Symptom Detractor {j+1}"
                 if col not in df.columns: df[col] = None
                 df.loc[idx, col] = lab
             wrote_dets = dets[:max_per_side]
-        if (force_fill or needs_deli) and dels:
+        if needs_deli and dels:
             for j, lab in enumerate(dels[:max_per_side]):
                 col = f"AI Symptom Delighter {j+1}"
                 if col not in df.columns: df[col] = None
@@ -651,20 +640,20 @@ def _run_symptomize(rows_df: pd.DataFrame):
         # Always set meta for processed rows
         df.loc[idx, "AI Safety"] = safety
         df.loc[idx, "AI Reliability"] = reliability
-        df.loc[idx, "AI Ownership Period"] = ownperiod
+        df.loc[idx, "AI # of Sessions"] = sessions
 
         processed_rows.append({
             "Index": int(idx),
-            "Verbatim": str(vb),
+            "Verbatim": str(vb),  # full text
             "Added_Detractors": wrote_dets,
             "Added_Delighters": wrote_dels,
             "Unlisted_Detractors": unl_dets,
             "Unlisted_Delighters": unl_dels,
-            "Over10_Detractors": bool(raw_detr_count > 10),
-            "Over10_Delighters": bool(raw_deli_count > 10),
+            "+10 Detractors?": bool(raw_detr_count > 10),
+            "+10 Delighters?": bool(raw_deli_count > 10),
             "Safety": safety,
             "Reliability": reliability,
-            "Ownership": ownperiod,
+            "# of Sessions": sessions,
         })
         if raw_deli_count > 10: over10_deli_count += 1
         if raw_detr_count > 10: over10_detr_count += 1
@@ -693,8 +682,8 @@ if processed_rows:
     st.subheader("🧾 Processed Reviews (this run)")
     for rec in processed_rows:
         flags = []
-        if rec.get('Over10_Detractors'): flags.append('⚠️ >10 dets')
-        if rec.get('Over10_Delighters'): flags.append('⚠️ >10 dels')
+        if rec.get('+10 Detractors?'): flags.append('⚠️ >10 dets')
+        if rec.get('+10 Delighters?'): flags.append('⚠️ >10 dels')
         head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}" + (" • " + " | ".join(flags) if flags else "")
         with st.expander(head):
             st.markdown("**Verbatim**")
@@ -708,7 +697,7 @@ if processed_rows:
                 f"<div class='chip-wrap'>"
                 f"<span class='chip yellow'>Safety: {_esc_html(rec['Safety'])}</span>"
                 f"<span class='chip blue'>Reliability: {_esc_html(rec['Reliability'])}</span>"
-                f"<span class='chip purple'>Ownership: {_esc_html(rec['Ownership'])}</span>"
+                f"<span class='chip purple'># Sessions: {_esc_html(rec['# of Sessions'])}</span>"
                 f"</div>"
             )
             st.markdown(meta_html, unsafe_allow_html=True)
@@ -887,7 +876,7 @@ export_bytes = generate_template_workbook_bytes(
     uploaded_file,
     df,
     processed_idx=processed_idx_set if processed_idx_set else None,
-    overwrite_processed_slots=bool(overwrite_slots),
+    overwrite_processed_slots=False,
 )
 
 st.download_button(
@@ -943,7 +932,7 @@ else:
 
 # Footer
 st.divider()
-st.caption("Run N for audits, or one-click to fill everything missing both sides. Export writes EXACTLY to K–T (dets) and U–AD (dels), with AE/AF/AG for Safety/Reliability/Ownership.")
+st.caption("Run N for audits, or one-click to fill everything missing both sides. Export writes EXACTLY to K–T (dets) and U–AD (dels), with AE/AF/AG for Safety/Reliability/# of Sessions.")
 
 
 
