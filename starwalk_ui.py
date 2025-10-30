@@ -1,5 +1,5 @@
-# starwalk_ui_v4.py — Super‑Clean UI, N or ALL, Overwrite vs Just Missing
-# Streamlit App — Exact Template Export (K–T dets, U–AD dels) • New Symptom Inbox • Tiles UI
+# starwalk_ui_v4.py — Best‑in‑Class Clean UI (N/ALL • Overwrite/Just Missing)
+# Exact template export (Detractors → K–T, Delighters → U–AD) • New Symptom Inbox w/ references
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai
 
 import streamlit as st
@@ -23,27 +23,44 @@ from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
-# ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4 — Clean UI")
-st.title("🌟 Star Walk Review Analyzer v4")
-st.caption("N or ALL • Overwrite or Just Missing • Chips UI • Exact K–T / U–AD export")
+# =================== Page Setup & Styles ===================
+st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4")
 
-# Lightweight styles
 st.markdown(
     """
     <style>
-      .chip{display:inline-block;padding:6px 10px;margin:3px 6px 3px 0;border-radius:999px;font-size:12.5px;font-weight:500;border:1px solid transparent}
+      /* Page */
+      .main {padding-top: 1rem;}
+      h1, h2, h3 { letter-spacing: -0.02em; }
+      .headline{display:flex;align-items:center;gap:10px;margin:0 0 8px 0}
+      .subtitle{color:#64748b;margin-bottom:8px}
+
+      /* Metric cards */
+      .kpi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:6px 0 12px}
+      .kpic{border:1px solid rgba(0,0,0,.06);background:#fff;border-radius:14px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+      .kpit{font-size:12px;color:#64748b;margin-bottom:6px}
+      .kpiv{font-size:22px;font-weight:700}
+
+      /* Controls */
+      .panel{border:1px solid rgba(0,0,0,.06);background:#fafafa;border-radius:14px;padding:14px 16px;margin:6px 0 12px}
+
+      /* Chips */
+      .chip{display:inline-block;padding:6px 10px;margin:4px 6px 4px 0;border-radius:999px;font-size:12.5px;font-weight:500;border:1px solid transparent}
       .chip-del{background:#E8F6EC;border-color:#8FD6A5;color:#166534}
       .chip-det{background:#FDECEC;border-color:#F5A5A5;color:#991B1B}
       .muted{color:#64748b}
+
+      /* Cards */
       .card{padding:16px;border-radius:14px;border:1px solid rgba(0,0,0,.08);background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.04);margin-bottom:12px}
-      .section{padding:14px 16px;border:1px solid rgba(0,0,0,.06);border-radius:14px;background:#fafafa}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ------------------- Utilities -------------------
+st.markdown("<div class='headline'><h1>🌟 Star Walk Review Analyzer v4</h1></div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>N or ALL • Overwrite or Just Missing • Tiles UI • Exact K–T / U–AD export</div>", unsafe_allow_html=True)
+
+# =================== Utilities ===================
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
 def clean_text(x: object) -> str:
@@ -255,7 +272,7 @@ def _openai_labeler(
 # ------------------- Export helpers -------------------
 
 def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> bytes:
-    """Return bytes for a workbook matching the original, with values written to
+    """Return bytes for a workbook matching the original, writing values into
     Detractors K–T and Delighters U–AD (10 each). Header row is preserved; no header renames."""
     original_file.seek(0)
     wb = load_workbook(original_file)
@@ -345,7 +362,7 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
     out = io.BytesIO(); wb.save(out); out.seek(0)
     return out.getvalue()
 
-# ------------------- File Upload -------------------
+# =================== File Upload ===================
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
 if not uploaded_file:
     st.stop()
@@ -379,7 +396,7 @@ else:
 # Build canonical maps
 DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
 
-# LLM settings
+# LLM settings (sidebar)
 st.sidebar.header("🤖 LLM Settings")
 MODEL_CHOICES = {
     "Fast – GPT‑4o‑mini": "gpt-4o-mini",
@@ -395,44 +412,42 @@ client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
 
-# ------------------- Minimal Metrics + Controls -------------------
+# =================== KPIs ===================
 colmap = detect_symptom_columns(df)
 work = detect_missing(df, colmap)
 
 total = len(work)
 need_both = int(work["Needs_Symptomization"].sum())
-left, right = st.columns(2)
-with left:
-    st.metric("Total review count", f"{total:,}")
-with right:
-    st.metric("Number of reviews that need symptomization", f"{need_both:,}")
 
-# Controls (clean)
-st.subheader("🧪 Symptomize Controls")
-with st.container():
-    c1, c2 = st.columns([2,2])
-    with c1:
-        scope_choice = st.radio("Scope", ["Only rows missing BOTH", "All reviews"], horizontal=True)
-    with c2:
-        mode_choice = st.radio("Mode", ["Just Missing (don't touch filled AI)", "Overwrite AI (clear & refill)"] , horizontal=True)
+st.markdown("<div class='kpi'>" \
+            + f"<div class='kpic'><div class='kpit'>Total review count</div><div class='kpiv'>{total:,}</div></div>" \
+            + f"<div class='kpic'><div class='kpit'>Number of reviews that need symptomization</div><div class='kpiv'>{need_both:,}</div></div>" \
+            + "</div>", unsafe_allow_html=True)
 
-    # Determine scope
-    if scope_choice == "Only rows missing BOTH":
-        scoped = work[work["Needs_Symptomization"]].copy()
-    else:
-        scoped = work.copy()
+# =================== Controls ===================
+st.markdown("<div class='panel'>", unsafe_allow_html=True)
+colA, colB = st.columns([2,2])
+with colA:
+    scope_choice = st.radio("Scope", ["Only rows missing BOTH", "All reviews"], horizontal=True)
+with colB:
+    mode_choice = st.radio("Mode", ["Just Missing (skip rows already symptomized)", "Overwrite AI (clear & refill)"] , horizontal=True)
 
-    count_max = len(scoped)
-    d1, d2, d3 = st.columns([2,1,1])
-    with d1:
-        default_n = int(min(50, max(1, count_max)))
-        n_to_run = st.number_input("How many reviews?", min_value=1, max_value=max(1, count_max), value=default_n, step=1)
-    with d2:
-        run_n_btn = st.button("Run N", use_container_width=True)
-    with d3:
-        run_all_btn = st.button("Run ALL", use_container_width=True)
+# Determine scope
+scoped = work[work["Needs_Symptomization"]].copy() if scope_choice.startswith("Only") else work.copy()
+count_max = len(scoped)
 
-# ------------------- Run (according to controls) -------------------
+colN, colBN, colBA = st.columns([2,1,1])
+with colN:
+    default_n = int(min(50, max(1, count_max)))
+    n_to_run = st.number_input("How many reviews?", min_value=1, max_value=max(1, count_max), value=default_n, step=1)
+with colBN:
+    run_n_btn = st.button("Run N", use_container_width=True)
+with colBA:
+    run_all_btn = st.button("Run ALL", use_container_width=True)
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =================== Run ===================
 processed_rows: List[Dict] = st.session_state.get("processed_rows", [])
 cand_del_map: Dict[str, List[int]] = st.session_state.get("cand_del_map", {})
 cand_det_map: Dict[str, List[int]] = st.session_state.get("cand_det_map", {})
@@ -445,7 +460,6 @@ if run_n_btn or run_all_btn:
         rows_scope = scoped
         rows_iter = rows_scope if run_all_btn else rows_scope.head(int(n_to_run))
 
-        # Prepare DF columns and, if overwrite, clear AI for rows in scope
         ensure_ai_columns(df)
         ai_cols = AI_DET_HEADERS + AI_DEL_HEADERS
         if mode_choice.startswith("Overwrite"):
@@ -460,21 +474,19 @@ if run_n_btn or run_all_btn:
         for k, (idx, row) in enumerate(rows_iter.iterrows(), start=1):
             vb = row.get("Verbatim", "")
 
-            # Decide if we should skip in "Just Missing" mode
-            if mode_choice.startswith("Just"):
-                row_needs_both = bool(row.get("Needs_Symptomization", False))
-                if not row_needs_both:
-                    processed_rows.append({
-                        "Index": int(idx),
-                        "Verbatim": str(vb),
-                        "Added_Delighters": [],
-                        "Added_Detractors": [],
-                        "Unlisted_Delighters": [],
-                        "Unlisted_Detractors": [],
-                        "Note": "Skipped (already has symptoms)"
-                    })
-                    prog.progress(k/total_n)
-                    continue
+            # Skip when in Just Missing mode and row already has both sides
+            if mode_choice.startswith("Just") and not bool(row.get("Needs_Symptomization", False)):
+                processed_rows.append({
+                    "Index": int(idx),
+                    "Verbatim": str(vb),
+                    "Added_Delighters": [],
+                    "Added_Detractors": [],
+                    "Unlisted_Delighters": [],
+                    "Unlisted_Detractors": [],
+                    "Note": "Skipped (already symptomized)",
+                })
+                prog.progress(k/total_n)
+                continue
 
             try:
                 dels, dets, unl_dels, unl_dets = _openai_labeler(
@@ -485,19 +497,16 @@ if run_n_btn or run_all_btn:
             except Exception:
                 dels, dets, unl_dels, unl_dets = [], [], [], []
 
-            # Write up to 10/10 to AI columns in DF (kept internally; export maps to K–T / U–AD)
             wrote_dets: List[str] = []
             wrote_dels: List[str] = []
 
             if dets:
                 for j, lab in enumerate(dets[:max_per_side]):
-                    col = f"AI Symptom Detractor {j+1}"
-                    df.loc[idx, col] = lab
+                    df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
                 wrote_dets = dets[:max_per_side]
             if dels:
                 for j, lab in enumerate(dels[:max_per_side]):
-                    col = f"AI Symptom Delighter {j+1}"
-                    df.loc[idx, col] = lab
+                    df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
                 wrote_dels = dels[:max_per_side]
 
             for u in unl_dels:
@@ -507,7 +516,7 @@ if run_n_btn or run_all_btn:
 
             processed_rows.append({
                 "Index": int(idx),
-                "Verbatim": str(vb),  # full verbatim
+                "Verbatim": str(vb),  # full verbatim (no truncation)
                 "Added_Delighters": wrote_dels,
                 "Added_Detractors": wrote_dets,
                 "Unlisted_Delighters": unl_dels,
@@ -521,7 +530,7 @@ if run_n_btn or run_all_btn:
         st.session_state["cand_det_map"] = cand_det_map
         st.success(f"Processed {len(processed_rows)} review(s) in scope.")
 
-# ------------------- Download Symptomized Workbook -------------------
+# =================== Download Symptomized Workbook ===================
 st.subheader("📦 Download Symptomized Workbook")
 try:
     file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
@@ -535,8 +544,8 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# ------------------- Browse all symptoms (chips) -------------------
-with st.expander("🧩 Browse all symptoms (chips)", expanded=False):
+# =================== Browse All Symptoms (chips) ===================
+with st.expander("🧩 Browse all symptoms", expanded=False):
     col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
     col_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
 
@@ -551,12 +560,12 @@ with st.expander("🧩 Browse all symptoms (chips)", expanded=False):
     uniq_det = _collect_unique(col_det_all)
     uniq_del = _collect_unique(col_del_all)
 
-    st.markdown("**Detractors**", unsafe_allow_html=True)
+    st.markdown("**Detractors**")
     st.markdown(render_tiles(uniq_det, side="det"), unsafe_allow_html=True)
-    st.markdown("**Delighters**", unsafe_allow_html=True)
+    st.markdown("**Delighters**")
     st.markdown(render_tiles(uniq_del, side="del"), unsafe_allow_html=True)
 
-# ------------------- New Symptom Inbox (Approval + References) -------------------
+# =================== New Symptom Inbox (Approve) ===================
 st.subheader("🟡 New Symptom Inbox — Review & Approve")
 processed_rows: List[Dict] = st.session_state.get("processed_rows", [])
 cand_del_map: Dict[str, List[int]] = st.session_state.get("cand_del_map", {})
@@ -569,7 +578,7 @@ else:
         rows_tbl = []
         for sym, refs in sorted(cmap.items(), key=lambda kv: (-len(kv[1]), kv[0])):
             examples = []
-            for ridx in refs[:2]:
+            for ridx in refs[:3]:
                 try:
                     ex = df.loc[ridx, "Verbatim"]
                     examples.append((str(ex) or ""))  # full text
@@ -648,7 +657,7 @@ else:
         else:
             st.info("No candidates selected.")
 
-# ------------------- Processed reviews log -------------------
+# =================== Processed Reviews Log ===================
 if processed_rows:
     st.subheader("🧾 Processed reviews (this session)")
     for rec in processed_rows:
@@ -666,7 +675,7 @@ if processed_rows:
                         + "</div>",
                         unsafe_allow_html=True)
 
-# ------------------- Footer -------------------
+# =================== Footer ===================
 st.divider()
-st.caption("Use Run N / Run ALL with the chosen scope and mode. Export writes exactly to K–T (detractors) and U–AD (delighters). No header renames.")
+st.caption("Exports map exactly to K–T (detractors) and U–AD (delighters). No header renames. Use Run N / Run ALL with your chosen scope and mode.")
 
