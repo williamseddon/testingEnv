@@ -1,12 +1,13 @@
-# starwalk_ui_v4.py — CLEAN FULL UPDATE
+# starwalk_ui_v4.py — BEST-IN-CLASS UI UPDATE
 # Streamlit App — Manual Symptomize (Run N/ALL) • Template‑Exact Export (K–T dets, U–AD dels)
 # New Symptom Inbox (Approval + References) • Browse & Stats • Robust dtype & layout fixes
+# Visual: green/red chips for labels; full verbatim (no truncation)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io, os, re, json, difflib
+import io, os, re, json, difflib, html
 from typing import List, Dict, Tuple
 from datetime import datetime
 
@@ -25,9 +26,27 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4 (Clean)")
-st.title("🌟 Star Walk Review Analyzer v4 (Clean)")
+st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4 — Premium UI")
+st.title("🌟 Star Walk Review Analyzer v4")
 st.caption("Manual Symptomize • Approval Inbox • Browse & Stats • Export to Template (K–T dets, U–AD dels)")
+
+# Best-in-class visuals: cards + green/red chips
+st.markdown(
+    """
+    <style>
+    :root { --chip-radius:999px; --gray:#64748b; }
+    .card{padding:16px;border-radius:14px;border:1px solid rgba(0,0,0,.08);background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.04);margin-bottom:12px}
+    .chips{margin-top:6px;margin-bottom:2px}
+    .chip{display:inline-block;padding:6px 10px;margin:2px 6px 2px 0;border-radius:999px;font-size:12.5px;font-weight:500;border:1px solid transparent}
+    .chip-del{background:#E8F6EC;border-color:#8FD6A5;color:#166534}
+    .chip-det{background:#FDECEC;border-color:#F5A5A5;color:#991B1B}
+    .muted{color:#64748b}
+    .hrow{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+    .pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid rgba(0,0,0,.06);background:#fafafa}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ------------------- Utilities -------------------
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
@@ -96,7 +115,6 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 
     return delighters, detractors, alias_map
 
-# Also load raw Symptoms sheet for optional exporting
 @st.cache_data(show_spinner=False)
 def read_symptoms_sheet(file_bytes: bytes) -> pd.DataFrame:
     bio = io.BytesIO(file_bytes)
@@ -174,6 +192,17 @@ def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map
             alias_to_label[_canon(a)] = label
     return del_map, det_map, alias_to_label
 
+# --- Tile renderer (green for delighters, red for detractors) ---
+
+def render_tiles(items: List[str], side: str) -> str:
+    try:
+        if not items:
+            return "<span class='muted'>—</span>"
+        cls = "chip chip-del" if side == "del" else "chip chip-det"
+        return "".join(f"<span class='{cls}'>" + html.escape(str(x)) + "</span>" for x in items)
+    except Exception:
+        return "<span class='muted'>—</span>"
+
 # ---------- LLM labeler ----------
 
 def _openai_labeler(
@@ -246,8 +275,7 @@ def _openai_labeler(
 
 def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> bytes:
     """Return bytes for a workbook matching the original, with values written to
-    Detractors K–T and Delighters U–AD (10 each). Header row is preserved.
-    """
+    Detractors K–T and Delighters U–AD (10 each). Header row is preserved."""
     original_file.seek(0)
     wb = load_workbook(original_file)
     sheet_name = "Star Walk scrubbed verbatims"
@@ -424,16 +452,13 @@ DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, 
 colmap = detect_symptom_columns(df)
 work = detect_missing(df, colmap)
 
-# Summary chips
-total = len(work)
-need_del = int(work["Needs_Delighters"].sum())
-need_det = int(work["Needs_Detractors"].sum())
-need_both = int(work["Needs_Symptomization"].sum())
-
+# Summary row
 st.markdown(
-    f"""
-**Dataset:** {total:,} reviews • **Need Delighters:** {need_del:,} • **Need Detractors:** {need_det:,} • **Missing Both:** {need_both:,}
-"""
+    f"<div class='hrow'><span class='pill'>Dataset: <b>{len(work):,}</b></span>"
+    f"<span class='pill'>Need Delighters: <b>{int(work['Needs_Delighters'].sum()):,}</b></span>"
+    f"<span class='pill'>Need Detractors: <b>{int(work['Needs_Detractors'].sum()):,}</b></span>"
+    f"<span class='pill'>Missing Both: <b>{int(work['Needs_Symptomization'].sum()):,}</b></span></div>",
+    unsafe_allow_html=True,
 )
 
 # Scope filter
@@ -524,7 +549,7 @@ else:
 
                 processed_rows.append({
                     "Index": int(idx),
-                    "Verbatim": str(vb)[:300],
+                    "Verbatim": str(vb),  # full text, no truncation
                     "Added_Delighters": wrote_dels,
                     "Added_Detractors": wrote_dets,
                     "Unlisted_Delighters": unl_dels,
@@ -544,11 +569,19 @@ else:
                 for rec in processed_rows:
                     head = f"Row {rec['Index']} — Dets added: {len(rec['Added_Detractors'])}, Dels added: {len(rec['Added_Delighters'])}"
                     with st.expander(head):
-                        st.markdown(f"**Verbatim**: {rec['Verbatim']}")
-                        st.markdown("**Detractors added:** " + (", ".join(rec["Added_Detractors"]) if rec["Added_Detractors"] else "—"))
-                        st.markdown("**Delighters added:** " + (", ".join(rec["Added_Delighters"]) if rec["Added_Delighters"] else "—"))
-                        st.markdown("**Unlisted detractors (candidates):** " + (", ".join(rec["Unlisted_Detractors"]) if rec["Unlisted_Detractors"] else "—"))
-                        st.markdown("**Unlisted delighters (candidates):** " + (", ".join(rec["Unlisted_Delighters"]) if rec["Unlisted_Delighters"] else "—"))
+                        html_block = (
+                            "<div class='card'>"
+                            "<div class='muted'>Verbatim</div>"
+                            f"<div>{html.escape(rec['Verbatim'])}</div>"
+                            "<div class='muted' style='margin-top:10px'>Detractors</div>"
+                            f"<div class='chips'>{render_tiles(rec.get('Added_Detractors', []), 'det')}</div>"
+                            "<div class='muted' style='margin-top:6px'>Delighters</div>"
+                            f"<div class='chips'>{render_tiles(rec.get('Added_Delighters', []), 'del')}</div>"
+                            "<div class='muted' style='margin-top:6px'>Unlisted candidates</div>"
+                            f"<div class='chips'>{render_tiles(rec.get('Unlisted_Detractors', []), 'det')}{render_tiles(rec.get('Unlisted_Delighters', []), 'del')}</div>"
+                            "</div>"
+                        )
+                        st.markdown(html_block, unsafe_allow_html=True)
 
 # ------------------- New Symptom Inbox -------------------
 st.subheader("🟡 New Symptom Inbox — Review & Approve")
@@ -567,7 +600,7 @@ else:
             for ridx in refs[:2]:
                 try:
                     ex = df.loc[ridx, "Verbatim"]
-                    examples.append((str(ex) or "")[:160])
+                    examples.append((str(ex) or ""))  # full text
                 except Exception:
                     pass
             rows_tbl.append({
@@ -623,7 +656,7 @@ else:
                 row_dict = {"Index": int(ridx)}
                 if "Star Rating" in df.columns:
                     row_dict["Star Rating"] = df.loc[ridx, "Star Rating"]
-                row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])[:400]
+                row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])  # full text
                 ref_rows.append(row_dict)
             st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
     for sym, refs in sorted(cand_del.items(), key=lambda kv: -len(kv[1])):
@@ -633,7 +666,7 @@ else:
                 row_dict = {"Index": int(ridx)}
                 if "Star Rating" in df.columns:
                     row_dict["Star Rating"] = df.loc[ridx, "Star Rating"]
-                row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])[:400]
+                row_dict["Verbatim"] = str(df.loc[ridx, "Verbatim"])  # full text
                 ref_rows.append(row_dict)
             st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
 
@@ -681,7 +714,7 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# ------------------- Browse Symptoms (main) -------------------
+# ------------------- Browse & Stats -------------------
 st.subheader("🔎 Browse & Stats")
 view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
 
