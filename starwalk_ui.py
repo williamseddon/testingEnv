@@ -5,7 +5,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io, os, re, json
+import io, os, re, json, difflib
 from typing import List, Dict, Tuple
 from datetime import datetime
 
@@ -349,6 +349,23 @@ if not _HAS_OPENAI or not api_key:
     st.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'. Auto‑symptomize will be disabled.")
 client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 
+# ------------------- Approvals & Roles -------------------
+st.sidebar.header("🔒 Approvals")
+approver_name = st.sidebar.text_input("Approver name")
+pin_required = st.secrets.get("APPROVER_PIN")
+pin_input = st.sidebar.text_input("Approval PIN", type="password") if pin_required else ""
+pin_ok = (not pin_required) or (pin_input == pin_required)
+if pin_required and not pin_ok:
+    st.sidebar.info("Enter the Approval PIN to enable applying changes.")
+
+# Optional bulk rules for defaults
+st.sidebar.subheader("⚙️ Bulk Rules (defaults)")
+rule_alias_on = st.sidebar.checkbox("Default to 'Alias of' when count ≥", value=True)
+rule_alias_threshold = st.sidebar.slider("Alias threshold", 1, 50, 5)
+rule_new_on = st.sidebar.checkbox("Default to 'Add as new' when no suggestion and count ≥", value=False)
+rule_new_threshold = st.sidebar.slider("New‑label threshold", 1, 50, 10)
+
+
 # ------------------- Detection & Preview -------------------
 colmap = detect_symptom_columns(df)
 work = detect_missing(df, colmap)
@@ -502,80 +519,256 @@ if run_it:
         write_updated_excel(uploaded_file, df, output_name="AI_Symptomized_Reviews.xlsx")
 
     # ------------------- Approval Queue -------------------
-    # Aggregate unlisted suggestions across processed rows
+    # Aggregate unlisted suggestions across processed rows + keep examples
     unlisted_del_all = []
     unlisted_det_all = []
+    # candidate -> list of row indices (for examples)
+    cand_examples_del: Dict[str, List[int]] = {}
+    cand_examples_det: Dict[str, List[int]] = {}
     for r in rows:
+        idx = r["Index"]
         if r["Unlisted Delighters"] != "-":
-            unlisted_del_all.extend([s.strip() for s in r["Unlisted Delighters"].split(",") if s.strip()])
+            items = [s.strip() for s in r["Unlisted Delighters"].split(",") if s.strip()]
+            unlisted_del_all.extend(items)
+            for it in items:
+                cand_examples_del.setdefault(it, []).append(idx)
         if r["Unlisted Detractors"] != "-":
-            unlisted_det_all.extend([s.strip() for s in r["Unlisted Detractors"].split(",") if s.strip()])
+            items = [s.strip() for s in r["Unlisted Detractors"].split(",") if s.strip()]
+            unlisted_det_all.extend(items)
+            for it in items:
+                cand_examples_det.setdefault(it, []).append(idx)
 
     if unlisted_del_all or unlisted_det_all:
-        st.subheader("🟡 Pending New Symptoms (Approval)")
-        def count_unique(items: List[str]) -> pd.DataFrame:
+        st.subheader("🟡 New Symptom Inbox — Review & Approve")
+
+        def count_unique_with_examples(items: List[str], example_map: Dict[str, List[int]], side: str) -> pd.DataFrame:
             if not items:
-                return pd.DataFrame({"Symptom": [], "Count": []})
-            vc = pd.Series(items).value_counts().reset_index()
-            vc.columns = ["Symptom", "Count"]
-            return vc
+                return pd.DataFrame({"Symptom": [], "Side": [], "Count": [], "Examples": [], "Suggested Mapping": [], "Impact (now)": []})
+            vc = pd.Series(items).value_counts()
+            rows_local = []
+            # Build suggestions using fuzzy match vs canonical lists
+            search_space = (DELIGHTERS if side == "Delighter" else DETRACTORS)
+            for sym, cnt in vc.items():
+                # collect up to 2 example verbatims
+                ex_idxs = (example_map.get(sym, []) or [])[:2]
+                examples = []
+                months = []
+                for exi in ex_idxs:
+                    try:
+                        examples.append(df.loc[exi, "Verbatim"][:180])
+                        if "Review Date" in df.columns:
+                            d = pd.to_datetime(df.loc[exi, "Review Date"], errors="coerce")
+                            if pd.notna(d):
+                                months.append(d.strftime("%Y-%m"))
+                    except Exception:
+                        pass
+                # fuzzy suggestion
+                suggestion = ""
+                try:
+                    matches = difflib.get_close_matches(sym, search_space, n=1, cutoff=0.82)
+                    if matches:
+                        suggestion = matches[0]
+                except Exception:
+                    suggestion = ""
+                rows_local.append({
+                    "Symptom": sym,
+                    "Side": side,
+                    "Count": int(cnt),
+                    "Examples": " 
+— ".join(["— "+e for e in examples]) if examples else "",
+                    "Suggested Mapping": suggestion,
+                    "Impact (now)": int(cnt),  # at least these many rows become fillable
+                })
+            df_out = pd.DataFrame(rows_local).sort_values(["Count", "Symptom"], ascending=[False, True]).reset_index(drop=True)
+            return df_out
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Unlisted Delighters**")
-            tbl_del = count_unique(unlisted_del_all)
-            st.dataframe(tbl_del, use_container_width=True, hide_index=True)
-            add_del = st.multiselect("Approve delighters to add", tbl_del["Symptom"].tolist(), key="approve_dels")
-        with c2:
-            st.markdown("**Unlisted Detractors**")
-            tbl_det = count_unique(unlisted_det_all)
-            st.dataframe(tbl_det, use_container_width=True, hide_index=True)
-            add_det = st.multiselect("Approve detractors to add", tbl_det["Symptom"].tolist(), key="approve_dets")
+        tbl_del = count_unique_with_examples(unlisted_del_all, cand_examples_del, side="Delighter")
+        tbl_det = count_unique_with_examples(unlisted_det_all, cand_examples_det, side="Detractor")
 
-        if st.button("✅ Add Approved to Symptoms sheet"):
-            # Write a new workbook with Symptoms tab updated
-            uploaded_file.seek(0)
-            wb = load_workbook(uploaded_file)
-            if "Symptoms" not in wb.sheetnames:
-                st.error("No 'Symptoms' sheet found; cannot add approvals.")
+        min_count = st.slider("Only show candidates with count ≥", 1, 20, 1)
+        show_df = pd.concat([
+            tbl_del[tbl_del["Count"] >= min_count],
+            tbl_det[tbl_det["Count"] >= min_count]
+        ], ignore_index=True)
+
+        # Optional dataset-wide impact estimate (slower)
+        estimate_dataset = st.checkbox("Estimate dataset‑wide impact for shown candidates (slower)", value=False)
+        if estimate_dataset and not show_df.empty:
+            def _estimate_impact_row(row):
+                try:
+                    patt = re.escape(str(row["Symptom"]))
+                    mask = df["Verbatim"].str.contains(patt, case=False, na=False)
+                    return int(mask.sum())
+                except Exception:
+                    return int(row["Count"])  # fallback
+            show_df["Dataset Impact (est.)"] = show_df.apply(_estimate_impact_row, axis=1)
+
+        if show_df.empty:
+            st.info("No candidates meet the current threshold.")
+        else:
+            st.markdown("**Decide for each candidate:** set *Action* to `Add as new` or `Alias of`, and choose a *Target Label* if aliasing.")
+
+            # Build default actions using sidebar bulk rules
+            def _default_action(rec):
+                cnt = int(rec["Count"])
+                has_suggestion = bool(rec["Suggested Mapping"])
+                if rule_alias_on and has_suggestion and cnt >= rule_alias_threshold:
+                    return "Alias of"
+                if (not has_suggestion) and rule_new_on and cnt >= rule_new_threshold:
+                    return "Add as new"
+                return "Alias of" if has_suggestion else "Add as new"
+
+            show_df["Action"] = show_df.apply(_default_action, axis=1)
+            show_df["Target Label"] = show_df["Suggested Mapping"].fillna("")
+
+            edited = st.data_editor(
+                show_df,
+                num_rows="fixed",
+                use_container_width=True,
+                column_config={
+                    "Action": st.column_config.SelectboxColumn(options=["Add as new", "Alias of"], required=True),
+                    "Target Label": st.column_config.SelectboxColumn(options=[], required=False),
+                    "Examples": st.column_config.TextColumn(width="large"),
+                },
+                key="new_symptom_inbox"
+            )
+
+        # Optional trend explorer
+        if (unlisted_del_all or unlisted_det_all) and "Review Date" in df.columns:
+            st.markdown("### 📈 Candidate Trend Explorer")
+            all_syms = sorted(set(unlisted_del_all + unlisted_det_all))
+            sym_pick = st.selectbox("Pick a candidate to view monthly trend", all_syms)
+            if sym_pick:
+                # Use entire dataset for trend (substring contains)
+                try:
+                    patt = re.escape(sym_pick)
+                    df_tr = df.copy()
+                    if "Review Date" in df_tr.columns:
+                        df_tr["_month"] = pd.to_datetime(df_tr["Review Date"], errors="coerce").dt.to_period("M").astype(str)
+                        mask = df_tr["Verbatim"].str.contains(patt, case=False, na=False)
+                        trend = df_tr.loc[mask].groupby("_month").size().reindex(sorted(df_tr["_month"].dropna().unique())).fillna(0)
+                        st.line_chart(trend)
+                except Exception:
+                    pass
+
+        st.caption("Tip: *Impact (now)* equals how many processed reviews already contained this candidate.")
+
+        # Safety: confirmation & PIN gate
+        confirm_changes = st.checkbox("I confirm the actions above are correct.")
+
+        if st.button("✅ Apply actions & Download updated 'Symptoms' workbook"):
+            if not confirm_changes:
+                st.error("Please confirm the actions before applying.")
+            elif not pin_ok:
+                st.error("Approval PIN required or incorrect.")
             else:
-                ws = wb["Symptoms"]
-                # Build existing set to avoid duplicates (check column A for label)
-                existing = set()
-                for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=1):
-                    cell = row[0]
-                    if cell.value:
-                        existing.add(str(cell.value).strip())
-                last = ws.max_row + 1
-                added = 0
-                def _add_items(items: List[str], type_label: str, start_row: int, added_count: int) -> Tuple[int, int]:
-                    row_ptr = start_row
-                    added_local = added_count
-                    for s in items:
-                        if not s:
-                            continue
-                        if s in existing:
-                            continue
-                        ws.cell(row=row_ptr, column=1, value=s)
-                        ws.cell(row=row_ptr, column=2, value=type_label)
-                        existing.add(s)
-                        row_ptr += 1
-                        added_local += 1
-                    return row_ptr, added_local
-                last, added = _add_items(add_del, "Delighter", last, added)
-                last, added = _add_items(add_det, "Detractor", last, added)
+                uploaded_file.seek(0)
+                wb = load_workbook(uploaded_file)
+                if "Symptoms" not in wb.sheetnames:
+                    st.error("No 'Symptoms' sheet found; cannot apply approvals.")
+                else:
+                    ws = wb["Symptoms"]
+                    # Build header map (case-insensitive)
+                    headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+                    hlow = [h.lower() for h in headers]
 
-                out = io.BytesIO(); wb.save(out); out.seek(0)
-                st.download_button(
-                    "⬇️ Download Workbook (Symptoms Updated)", out,
-                    file_name="Symptoms_Updated.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                st.success(f"Added {added} new symptom(s) to Symptoms sheet.")
+                    def _col_idx(names: List[str]) -> int:
+                        for nm in names:
+                            if nm.lower() in hlow:
+                                return hlow.index(nm.lower()) + 1
+                        return -1
+
+                    col_label = _col_idx(["symptom", "label", "name", "item"]) or 1
+                    col_type  = _col_idx(["type", "polarity", "category", "side"]) or 2
+                    col_alias = _col_idx(["aliases", "alias"])  # may be -1
+
+                    if col_alias == -1:
+                        # Create Aliases column at end
+                        col_alias = len(headers) + 1
+                        ws.cell(row=1, column=col_alias, value="Aliases")
+
+                    # Build existing label rows and alias text
+                    label_to_row: Dict[str, int] = {}
+                    existing_aliases: Dict[str, str] = {}
+                    for r_i in range(2, ws.max_row + 1):
+                        lbl = ws.cell(row=r_i, column=col_label).value
+                        if lbl:
+                            label_to_row[str(lbl).strip()] = r_i
+                            existing_aliases[str(lbl).strip()] = str(ws.cell(row=r_i, column=col_alias).value or "").strip()
+
+                    # Prepare audit sheet
+                    audit_name = "Symptoms_Audit"
+                    if audit_name not in wb.sheetnames:
+                        ws_a = wb.create_sheet(audit_name)
+                        ws_a.append(["Timestamp", "Approver", "Action", "Side", "Label", "Alias", "Target", "Count", "Source"])
+                    else:
+                        ws_a = wb[audit_name]
+
+                    added_new = 0
+                    added_aliases = 0
+
+                    src_tag = "starwalk_ui_v4"
+                    now_iso = datetime.utcnow().isoformat()
+                    approver = approver_name or "(unknown)"
+
+                    for _, rec in edited.iterrows():
+                        sym = str(rec["Symptom"]).strip()
+                        side = str(rec["Side"]).strip()
+                        action = str(rec["Action"]).strip()
+                        target = str(rec.get("Target Label", "")).strip()
+                        cnt = int(rec.get("Count", 0))
+                        if not sym:
+                            continue
+                        if action == "Add as new":
+                            # Add brand new label if it doesn't already exist
+                            if sym not in label_to_row:
+                                new_row = ws.max_row + 1
+                                ws.cell(row=new_row, column=col_label, value=sym)
+                                ws.cell(row=new_row, column=col_type, value=side)
+                                if col_alias > 0:
+                                    ws.cell(row=new_row, column=col_alias, value="")
+                                label_to_row[sym] = new_row
+                                added_new += 1
+                                ws_a.append([now_iso, approver, "Add Label", side, sym, "", "", cnt, src_tag])
+                        else:
+                            # Alias mapping requires a valid target label
+                            if not target:
+                                continue
+                            # Ensure target exists; if not, create it with the same side
+                            if target not in label_to_row:
+                                new_row = ws.max_row + 1
+                                ws.cell(row=new_row, column=col_label, value=target)
+                                ws.cell(row=new_row, column=col_type, value=side)
+                                if col_alias > 0:
+                                    ws.cell(row=new_row, column=col_alias, value="")
+                                label_to_row[target] = new_row
+                                ws_a.append([now_iso, approver, "Add Label (for alias)", side, target, "", "", 0, src_tag])
+                            row_i = label_to_row[target]
+                            current = existing_aliases.get(target, "")
+                            alias_list = [a.strip() for a in re.split(r"[|,]", current) if a.strip()]
+                            if sym not in alias_list and sym != target:
+                                alias_list.append(sym)
+                                ws.cell(row=row_i, column=col_alias, value=" | ".join(alias_list))
+                                existing_aliases[target] = " | ".join(alias_list)
+                                added_aliases += 1
+                                ws_a.append([now_iso, approver, "Add Alias", side, target, sym, target, cnt, src_tag])
+
+                    out = io.BytesIO(); wb.save(out); out.seek(0)
+                    st.download_button(
+                        "⬇️ Download Workbook (Symptoms + Aliases + Audit Updated)", out,
+                        file_name="Symptoms_Updated.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    st.success(f"Added {added_new} new label(s) and {added_aliases} alias(es). Audit trail written to 'Symptoms_Audit'.")
 
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+st.divider()
+st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+st.divider()
+st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
