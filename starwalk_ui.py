@@ -533,20 +533,7 @@ if not _HAS_OPENAI or not api_key:
 client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 
 # ------------------- Approvals & Roles -------------------
-st.sidebar.header("🔒 Approvals")
-approver_name = st.sidebar.text_input("Approver name")
-pin_required = st.secrets.get("APPROVER_PIN")
-pin_input = st.sidebar.text_input("Approval PIN", type="password") if pin_required else ""
-pin_ok = (not pin_required) or (pin_input == pin_required)
-if pin_required and not pin_ok:
-    st.sidebar.info("Enter the Approval PIN to enable applying changes.")
-
-# Optional bulk rules for defaults
-st.sidebar.subheader("⚙️ Bulk Rules (defaults)")
-rule_alias_on = st.sidebar.checkbox("Default to 'Alias of' when count ≥", value=True)
-rule_alias_threshold = st.sidebar.slider("Alias threshold", 1, 50, 5)
-rule_new_on = st.sidebar.checkbox("Default to 'Add as new' when no suggestion and count ≥", value=False)
-rule_new_threshold = st.sidebar.slider("New‑label threshold", 1, 50, 10)
+# (Approvals UI removed per request)
 
 
 # ------------------- Detection & Preview -------------------
@@ -852,10 +839,8 @@ if run_it:
 
             # Build default actions using sidebar bulk rules
             def _default_action(rec):
-                cnt = int(rec["Count"])
-                has_suggestion = bool(rec["Suggested Mapping"])
-                if rule_alias_on and has_suggestion and cnt >= rule_alias_threshold:
-                    return "Alias of"
+                # Simple default: alias when a suggestion exists; otherwise add as new
+                return "Alias of" if bool(rec["Suggested Mapping"]) else "Add as new"
                 if (not has_suggestion) and rule_new_on and cnt >= rule_new_threshold:
                     return "Add as new"
                 return "Alias of" if has_suggestion else "Add as new"
@@ -901,8 +886,6 @@ if run_it:
         if st.button("✅ Apply actions & Download updated 'Symptoms' workbook"):
             if not confirm_changes:
                 st.error("Please confirm the actions before applying.")
-            elif not pin_ok:
-                st.error("Approval PIN required or incorrect.")
             else:
                 uploaded_file.seek(0)
                 wb = load_workbook(uploaded_file)
@@ -951,7 +934,7 @@ if run_it:
 
                     src_tag = "starwalk_ui_v4"
                     now_iso = datetime.utcnow().isoformat()
-                    approver = approver_name or "(unknown)"
+                    approver = ""  # Approver field optional; UI removed per request
 
                     for _, rec in edited.iterrows():
                         sym = str(rec["Symptom"]).strip()
@@ -1010,3 +993,4 @@ st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
