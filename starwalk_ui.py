@@ -21,11 +21,16 @@ except Exception:
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.styles import PatternFill
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
 st.set_page_config(layout="wide", page_title="Star Walk Review Analyzer v4")
 st.title("🌟 Star Walk Review Analyzer v4")
 st.caption("Dynamic Symptoms • Model Selector • Smart Auto‑Symptomize • Approval Queue • Color‑Coded Excel Export")
+
+# Compatibility shim: some legacy blocks referenced this flag.
+# We set a default so NameError cannot occur even if an old branch remains.
+build_clicked = False
 
 # ------------------- Utilities -------------------
 def clean_text(x):
@@ -189,6 +194,24 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
 
+# ------------------- Fixed template column mapping -------------------
+# Detractors must live in K–T (10 cols) and Delighters in U–AD (10 cols)
+DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]
+DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
+DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
+DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
+
+AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
+AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
+
+
+def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Make sure the 10+10 AI columns exist in the DataFrame (filled with None if missing)."""
+    for h in AI_DET_HEADERS + AI_DEL_HEADERS:
+        if h not in df_in.columns:
+            df_in[h] = None
+    return df_in
+
 
 # ---------- Canonicalization helpers for robust matching ----------
 def _canon(s: str) -> str:
@@ -279,20 +302,61 @@ def _openai_labeler(
 
 
 def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI_Symptomized_Reviews.xlsx"):
-    """Write AI columns into Excel while preserving formatting and color-coding."""
+    """Write AI columns into the exact template positions:
+    - Detractors → K..T (10 cols)
+    - Delighters → U..AD (10 cols)
+    Preserves workbook formatting and color-codes only non-empty cells.
+    """
     original_file.seek(0)
     wb = load_workbook(original_file)
-    # Reviews sheet name
     sheet_name = "Star Walk scrubbed verbatims"
     if sheet_name not in wb.sheetnames:
         sheet_name = wb.sheetnames[0]
     ws: Worksheet = wb[sheet_name]
 
-    # Collect header labels and safely delete any previous AI columns
-    headers = [cell.value for cell in ws[1]]
-    del_idxs = [i+1 for i, h in enumerate(headers) if h and str(h).startswith("AI Symptom")]
-    for col_idx in sorted(del_idxs, reverse=True):
-        ws.delete_cols(col_idx)
+    # Ensure DF has the 20 AI columns
+    updated_df = ensure_ai_columns(updated_df)
+
+    # Set fixed headers in template locations
+    for j, (col_idx, header) in enumerate(zip(DET_INDEXES, AI_DET_HEADERS), start=1):
+        ws.cell(row=1, column=col_idx, value=header)
+    for j, (col_idx, header) in enumerate(zip(DEL_INDEXES, AI_DEL_HEADERS), start=1):
+        ws.cell(row=1, column=col_idx, value=header)
+
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
+    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
+
+    # Write rows
+    max_row = max(len(updated_df) + 1, ws.max_row)
+    for i, (_, r) in enumerate(updated_df.iterrows(), start=2):
+        # Detractors K–T
+        for j, col_idx in enumerate(DET_INDEXES, start=1):
+            val = r.get(f"AI Symptom Detractor {j}")
+            cell_value = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cell_value)
+            if cell_value is not None:
+                cell.fill = fill_red
+        # Delighters U–AD
+        for j, col_idx in enumerate(DEL_INDEXES, start=1):
+            val = r.get(f"AI Symptom Delighter {j}")
+            cell_value = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cell_value)
+            if cell_value is not None:
+                cell.fill = fill_green
+
+    # Optional widths
+    for c in DET_INDEXES + DEL_INDEXES:
+        try:
+            ws.column_dimensions[get_column_letter(c)].width = 28
+        except Exception:
+            pass
+
+    out = io.BytesIO(); wb.save(out); out.seek(0)
+    st.download_button(
+        "⬇️ Download Updated Excel (Color‑Coded)", out,
+        file_name=output_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
     # Append all AI columns from df
     ai_cols = [c for c in updated_df.columns if c.startswith("AI Symptom ")]
@@ -338,6 +402,43 @@ def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI
     )
 
 def generate_updated_workbook_bytes(original_file, updated_df: pd.DataFrame) -> bytes:
+    """Return bytes for a workbook matching the original, with AI columns placed in template slots:
+    Detractors K–T, Delighters U–AD (10 each)."""
+    original_file.seek(0)
+    wb = load_workbook(original_file)
+    sheet_name = "Star Walk scrubbed verbatims"
+    if sheet_name not in wb.sheetnames:
+        sheet_name = wb.sheetnames[0]
+    ws: Worksheet = wb[sheet_name]
+
+    updated_df = ensure_ai_columns(updated_df.copy())
+
+    # Set headers in fixed positions
+    for col_idx, header in zip(DET_INDEXES, AI_DET_HEADERS):
+        ws.cell(row=1, column=col_idx, value=header)
+    for col_idx, header in zip(DEL_INDEXES, AI_DEL_HEADERS):
+        ws.cell(row=1, column=col_idx, value=header)
+
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    for i, (_, r) in enumerate(updated_df.iterrows(), start=2):
+        for j, col_idx in enumerate(DET_INDEXES, start=1):
+            val = r.get(f"AI Symptom Detractor {j}")
+            cell_value = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cell_value)
+            if cell_value is not None:
+                cell.fill = fill_red
+        for j, col_idx in enumerate(DEL_INDEXES, start=1):
+            val = r.get(f"AI Symptom Delighter {j}")
+            cell_value = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cell_value)
+            if cell_value is not None:
+                cell.fill = fill_green
+
+    out = io.BytesIO(); wb.save(out)
+    return out.getvalue()
+ -> bytes:
     """Return bytes for a workbook matching the original, with AI columns appended & color-coded."""
     original_file.seek(0)
     wb = load_workbook(original_file)
@@ -535,7 +636,7 @@ with st.sidebar:
     # Prepare export dataframe (optionally compute fresh symptomization for ALL rows)
     df_export = df.copy()
     if run_before_export and (client is not None):
-        max_per_side = 6
+        max_per_side = 10
         work_all = detect_missing(df_export, colmap)
         prog = st.progress(0.0)
         total_n = max(1, len(work_all))
@@ -578,7 +679,7 @@ with st.sidebar:
     )
 
     if build_clicked:
-        max_per_side = 6
+        max_per_side = 10
         pb = st.progress(0.0)
         total_n = max(1, len(target))
         for k, (idx, row) in enumerate(target.iterrows(), start=1):
@@ -646,7 +747,7 @@ run_it = st.button("🚀 Run Auto‑Symptomize", type="primary", disabled=(clien
 
 if run_it:
     # Ensure AI columns exist (we'll create on write)
-    max_per_side = 6
+    max_per_side = 10
 
     # Prepare results
     rows = []
@@ -983,14 +1084,3 @@ st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
-
-
-
-
-
-
-
-
-
-
-
