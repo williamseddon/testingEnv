@@ -1,4 +1,4 @@
-# starwalk_ui_v4.py
+# starwalk_ui_v4.py (fixed)
 # Streamlit App — Dynamic Symptoms + Model Selector + Smart Auto‑Symptomization + Approval Queue + Color‑Coded Excel Export
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai
 
@@ -33,11 +33,17 @@ def clean_text(x):
         return ""
     return str(x).strip()
 
-NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", ""}
+# Include common placeholder variants
+NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
-def is_filled(val: str) -> bool:
+def is_filled(val) -> bool:
+    """Return True only if a cell has a real, non-placeholder value.
+    Prevent np.nan/None from being counted as filled.
+    """
+    if pd.isna(val):
+        return False
     s = str(val).strip()
-    return s.upper() not in NON_VALUES
+    return (s != "") and (s.upper() not in NON_VALUES)
 
 @st.cache_data(show_spinner=False)
 def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
@@ -95,18 +101,21 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 
 
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Detect symptom columns using exact Star Walk schema.
+    """Detect symptom columns using exact Star Walk schema with robust AI column detection.
     Manual detractors: Symptom 1..10
     Manual delighters: Symptom 11..20
     AI columns: AI Symptom Detractor 1..6, AI Symptom Delighter 1..6
-    This avoids regex over‑matching.
     """
     cols = [str(c).strip() for c in df.columns]
-    # exact expected names
+
+    # Manual ranges (keep convention)
     man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
     man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in cols]
-    ai_det  = [f"AI Symptom Detractor {i}" for i in range(1, 7) if f"AI Symptom Detractor {i}" in cols]
-    ai_del  = [f"AI Symptom Delighter {i}" for i in range(1, 7) if f"AI Symptom Delighter {i}" in cols]
+
+    # Flexible regex for AI columns
+    ai_det  = [c for c in cols if re.fullmatch(r"AI Symptom Detractor \d+", c)]
+    ai_del  = [c for c in cols if re.fullmatch(r"AI Symptom Delighter \d+", c)]
+
     return {
         "manual_detractors": man_det,
         "manual_delighters": man_del,
@@ -136,16 +145,43 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Has_Delighters"] = out.apply(lambda r: row_has_any(r, del_cols), axis=1)
     out["Needs_Detractors"] = ~out["Has_Detractors"]
     out["Needs_Delighters"] = ~out["Has_Delighters"]
-    # Final gating logic: only symptomize when BOTH sides are missing
+    # Final gating logic no longer forced; we respect user scope selection downstream
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
 
 
-def _openai_labeler(verbatim: str, client, model: str, temperature: float,
-                    delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]
-                   ) -> Tuple[List[str], List[str], List[str], List[str]]:
+# ---------- Canonicalization helpers for robust matching ----------
+def _canon(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
+    """Build maps for case/space-insensitive matching and alias resolution."""
+    del_map = {_canon(x): x for x in delighters}
+    det_map = {_canon(x): x for x in detractors}
+
+    alias_to_label: Dict[str, str] = {}
+    for label, aliases in (alias_map or {}).items():
+        for a in aliases:
+            alias_to_label[_canon(a)] = label
+    return del_map, det_map, alias_to_label
+
+
+def _openai_labeler(
+    verbatim: str,
+    client,
+    model: str,
+    temperature: float,
+    delighters: List[str],
+    detractors: List[str],
+    alias_map: Dict[str, List[str]],
+    del_map: Dict[str, str],
+    det_map: Dict[str, str],
+    alias_to_label: Dict[str, str],
+) -> Tuple[List[str], List[str], List[str], List[str]]:
     """Classify a review strictly using whitelist labels.
     Returns (dels, dets, unlisted_dels, unlisted_dets).
+    - Robustly maps case/spacing variants and known aliases back to canonical labels.
     """
     if not verbatim or not verbatim.strip():
         return [], [], [], []
@@ -153,11 +189,11 @@ def _openai_labeler(verbatim: str, client, model: str, temperature: float,
     sys = (
         "Classify this Shark Glossi review into delighters and detractors. "
         "Use ONLY the provided whitelists; do NOT invent labels. "
-        "If a synonym is close but not listed, output it under the correct 'unlisted' bucket.\n" \
-        f"DELIGHTERS = {json.dumps(delighters, ensure_ascii=False)}\n" \
-        f"DETRACTORS = {json.dumps(detractors, ensure_ascii=False)}\n" \
-        f"ALIASES = {json.dumps(alias_map, ensure_ascii=False)}\n" \
-        "Return strict JSON: {\"delighters\":[],\"detractors\":[],\"unlisted_delighters\":[],\"unlisted_detractors\":[]}"
+        "If a synonym is close but not listed, output it under the correct 'unlisted' bucket.\n"
+        f"DELIGHTERS = {json.dumps(delighters, ensure_ascii=False)}\n"
+        f"DETRACTORS = {json.dumps(detractors, ensure_ascii=False)}\n"
+        f"ALIASES = {json.dumps(alias_map, ensure_ascii=False)}\n"
+        'Return strict JSON: {"delighters":[],"detractors":[],"unlisted_delighters":[],"unlisted_detractors":[]}'
     )
 
     try:
@@ -172,10 +208,31 @@ def _openai_labeler(verbatim: str, client, model: str, temperature: float,
         )
         content = resp.choices[0].message.content or "{}"
         data = json.loads(content)
-        dels = [x for x in data.get("delighters", []) if x in delighters][:6]
-        dets = [x for x in data.get("detractors", []) if x in detractors][:6]
-        unl_dels = [x for x in data.get("unlisted_delighters", [])][:6]
-        unl_dets = [x for x in data.get("unlisted_detractors", [])][:6]
+
+        def _map_side(items: List[str], side: str) -> List[str]:
+            mapped: List[str] = []
+            for x in (items or []):
+                key = _canon(x)
+                if side == "del":
+                    label = del_map.get(key)
+                    if not label:
+                        alias_label = alias_to_label.get(key)
+                        if alias_label and alias_label in delighters:
+                            label = alias_label
+                else:
+                    label = det_map.get(key)
+                    if not label:
+                        alias_label = alias_to_label.get(key)
+                        if alias_label and alias_label in detractors:
+                            label = alias_label
+                if label and label not in mapped:
+                    mapped.append(label)
+            return mapped[:6]
+
+        dels = _map_side(data.get("delighters", []), side="del")
+        dets = _map_side(data.get("detractors", []), side="det")
+        unl_dels = [x for x in (data.get("unlisted_delighters", []) or [])][:6]
+        unl_dets = [x for x in (data.get("unlisted_detractors", []) or [])][:6]
         return dels, dets, unl_dels, unl_dets
     except Exception:
         return [], [], [], []
@@ -224,8 +281,13 @@ def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI
         except Exception:
             pass
         for i, val in enumerate(updated_df[col].values, start=2):
-            cell = ws.cell(row=i, column=col_idx, value=None if (pd.isna(val) or val == "") else val)
-            if is_filled(val):
+            # Only color truly filled cells
+            if pd.isna(val) or str(val).strip() == "":
+                cell_value = None
+            else:
+                cell_value = val
+            cell = ws.cell(row=i, column=col_idx, value=cell_value)
+            if cell_value is not None:
                 cell.fill = fill
 
     out = io.BytesIO(); wb.save(out); out.seek(0)
@@ -267,6 +329,9 @@ if not DELIGHTERS and not DETRACTORS:
 else:
     st.success(f"Loaded {len(DELIGHTERS)} Delighters, {len(DETRACTORS)} Detractors from Symptoms tab.")
 
+# Build canonical maps for robust matching
+DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
+
 # ------------------- Model Selector -------------------
 st.sidebar.header("🤖 LLM Settings")
 MODEL_CHOICES = {
@@ -300,7 +365,7 @@ st.markdown(
 """
 )
 
-# Scope filter
+# Scope filter (now respected)
 scope = st.radio(
     "Process scope",
     ["Any missing", "Missing both", "Missing delighters only", "Missing detractors only"],
@@ -316,16 +381,12 @@ elif scope == "Missing detractors only":
 else:
     target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"]) ]
 
-# Enforce final logic: process ONLY rows missing BOTH sides
-# (overrides any scope selection for correctness)
-target = work[work["Needs_Symptomization"]]
-st.write(f"🔎 **{len(target):,} reviews** match the **final logic** (missing BOTH delighters and detractors).")
+st.write(f"🔎 **{len(target):,} reviews** match the **selected scope**.")
 with st.expander("Preview rows that need symptomization", expanded=False):
     preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# ------------------- Auto‑Symptomize Controls -------------------
 # ------------------- Detection diagnostics (advanced) -------------------
 with st.expander("Detection diagnostics (advanced)", expanded=False):
     det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
@@ -353,8 +414,6 @@ run_it = st.button("🚀 Run Auto‑Symptomize", type="primary", disabled=(clien
 
 if run_it:
     # Ensure AI columns exist (we'll create on write)
-    # Determine starting indices for AI columns
-    # We'll support up to 6 per side
     max_per_side = 6
 
     # Prepare results
@@ -383,9 +442,13 @@ if run_it:
 
             # Call model
             try:
-                dels, dets, unl_dels, unl_dets = _openai_labeler(
-                    vb, client, selected_model, temperature, DELIGHTERS, DETRACTORS, ALIASES
-                ) if client else ([], [], [], [])
+                dels, dets, unl_dels, unl_dets = (
+                    _openai_labeler(
+                        vb, client, selected_model, temperature,
+                        DELIGHTERS, DETRACTORS, ALIASES,
+                        DEL_MAP, DET_MAP, ALIAS_TO_LABEL
+                    ) if client else ([], [], [], [])
+                )
             except Exception:
                 dels, dets, unl_dels, unl_dets = [], [], [], []
                 failed_calls += 1
@@ -419,8 +482,10 @@ if run_it:
 
             processed += 1
             progress.progress(processed/total_to_process)
-            status.write(f"Row {idx} — needs: [Delighters={needs_deli} Detractors={needs_detr}] → "
-                         f"AI[Dels={len(dels)} Dets={len(dets)}] • Unlisted[{len(unl_dels)}/{len(unl_dets)}]")
+            status.write(
+                f"Row {idx} — needs: [Delighters={needs_deli} Detractors={needs_detr}] → "
+                f"AI[Dels={len(dels)} Dets={len(dets)}] • Unlisted[{len(unl_dels)}/{len(unl_dets)}]"
+            )
             status.update(label=f"Classifying reviews… {processed}/{total_to_process}")
 
         status.update(state="complete", label="Classification finished")
@@ -511,6 +576,7 @@ if run_it:
 # Footer
 st.divider()
 st.caption("Tip: Use ‘Preview only’ first to audit the AI tags, then uncheck to write and export.")
+
 
 
 
