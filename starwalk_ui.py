@@ -373,7 +373,7 @@ def write_updated_excel(original_file, updated_df: pd.DataFrame, output_name="AI
     updated_df = ensure_ai_columns(updated_df)
 
     # (Preserve template headers; do not overwrite)
-fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
     fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
 
     # Write rows
