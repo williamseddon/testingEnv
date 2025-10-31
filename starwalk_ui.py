@@ -243,7 +243,6 @@ def _openai_labeler(
     if not verbatim or not verbatim.strip():
         return [], [], [], []
 
-    sys = "
     # --- inside _openai_meta_extractor(...) ---
     sys = (
         "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
