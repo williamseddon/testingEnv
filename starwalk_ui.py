@@ -1,10 +1,10 @@
-# starwalk_ui_v6.py — ETA, presets, overwrite mode, polished UI (no header relabeling)
+# starwalk_ui_v7_1.py — ETA, presets, overwrite, undo, similarity guard, polished UI, evidence highlighting (no header relabeling)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io, os, re, json, difflib, time
+import io, os, json, difflib, time, re, html
 from typing import List, Dict, Tuple, Optional, Set
 from datetime import datetime
 
@@ -23,9 +23,9 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v6")
-st.title("✨ Review Symptomizer — v6")
-st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • New‑symptom inbox with submit • Tiles UI")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.1")
+st.title("✨ Review Symptomizer — v7.1")
+st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New‑symptom inbox • Tiles UI • Similarity guard • Highlighted evidence")
 
 # ------------------- Global CSS -------------------
 st.markdown(
@@ -56,8 +56,11 @@ st.markdown(
       .chip.yellow { background: #fff7ed; border-color:#fed7aa; }
       .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
       .muted{ color:#64748b; font-size:12px; }
-      .chips-block { margin-bottom: 14px; }
+      .chips-block { margin-bottom: 16px; }
       div[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, var(--brand), var(--brand2)); }
+      /* Sticky toolbar for run controls */
+      .toolbar { position: sticky; top: 8px; z-index: 5; background: rgba(255,255,255,.85); backdrop-filter: blur(6px); border: 1px solid #e6eaf0; border-radius: 12px; padding: 10px 12px; box-shadow: 0 4px 14px rgba(16,24,40,.06); }
+      mark.hl { background: #fde68a; padding: 0 .15em; border-radius: .25em; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -116,7 +119,8 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
                 lbl = str(r.get(label_col, "")).strip()
                 als = str(r.get(alias_col, "")).strip()
                 if lbl and als:
-                    alias_map[lbl] = [p.strip() for p in re.split(r"[|,]", als) if p.strip()]
+                    als_norm = als.replace(",", "|")
+                    alias_map[lbl] = [p.strip() for p in als_norm.split("|") if p.strip()]
     else:
         for lc, orig in lowcols.items():
             if ("delight" in lc) or ("positive" in lc) or lc in {"pros"}:
@@ -131,10 +135,25 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 # Canonicalization helpers
 
 def _canon(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s)).strip().lower()
+    return " ".join(str(s).split()).lower().strip()
 
 def _canon_simple(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _canon(s))
+    return "".join(ch for ch in _canon(s) if ch.isalnum())
+
+# Evidence highlighting
+
+def highlight_text(text: str, terms: List[str]) -> str:
+    safe = html.escape(str(text))
+    terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
+    if not terms:
+        return safe
+    # Unique, longest-first to avoid nested matches
+    uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
+    try:
+        pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
+    except Exception:
+        return safe
+    return pattern.sub(lambda m: f"<mark class='hl'>{html.escape(m.group(0))}</mark>", safe)
 
 # Schema detection
 
@@ -142,8 +161,8 @@ def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
     cols = [str(c).strip() for c in df.columns]
     man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
     man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in cols]
-    ai_det  = [c for c in cols if re.fullmatch(r"AI Symptom Detractor \d+", c)]
-    ai_del  = [c for c in cols if re.fullmatch(r"AI Symptom Delighter \d+", c)]
+    ai_det  = [c for c in cols if c.startswith("AI Symptom Detractor ")]
+    ai_del  = [c for c in cols if c.startswith("AI Symptom Delighter ")]
     return {
         "manual_detractors": man_det,
         "manual_delighters": man_del,
@@ -224,15 +243,16 @@ def _openai_labeler(
     if not verbatim or not verbatim.strip():
         return [], [], [], []
 
-    sys = (
-        "Classify this Shark Glossi review into delighters and detractors. "
-        "Use ONLY the provided whitelists; do NOT invent labels. "
-        "If a synonym is close but not listed, output it under the correct 'unlisted' bucket.\n"
-        f"DELIGHTERS = {json.dumps(delighters, ensure_ascii=False)}\n"
-        f"DETRACTORS = {json.dumps(detractors, ensure_ascii=False)}\n"
-        f"ALIASES = {json.dumps(alias_map, ensure_ascii=False)}\n"
-        'Return strict JSON: {"delighters":[],"detractors":[],"unlisted_delighters":[],"unlisted_detractors":[]}'
-    )
+    sys = "
+".join([
+        "Classify this Shark Glossi review into delighters and detractors.",
+        "Use ONLY the provided whitelists; do NOT invent labels.",
+        "If a synonym is close but not listed, output it under the correct 'unlisted' bucket.",
+        f"DELIGHTERS = {json.dumps(delighters, ensure_ascii=False)}",
+        f"DETRACTORS = {json.dumps(detractors, ensure_ascii=False)}",
+        f"ALIASES = {json.dumps(alias_map, ensure_ascii=False)}",
+        'Return strict JSON: {"delighters":[],"detractors":[],"unlisted_delighters":[],"unlisted_detractors":[]}',
+    ])
 
     try:
         resp = client.chat.completions.create(
@@ -240,7 +260,8 @@ def _openai_labeler(
             temperature=float(temperature),
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f"Review:\n\"\"\"{verbatim.strip()}\"\"\""},
+                {"role": "user", "content": f'Review:
+"""{verbatim.strip()}"""'},
             ],
             response_format={"type": "json_object"}
         )
@@ -273,20 +294,22 @@ def _openai_labeler(
 def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
     if not verbatim or not verbatim.strip():
         return "Not Mentioned", "Not Mentioned", "Unknown"
-    sys = (
-        "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
-        "SAFETY one of: ['Not Mentioned','Concern','Positive']\n"
-        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']\n"
-        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']\n"
-        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
-    )
+    sys = "
+".join([
+        "Extract three fields from this consumer review. Use ONLY the allowed values.",
+        "SAFETY one of: ['Not Mentioned','Concern','Positive']",
+        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
+        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
+        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}',
+    ])
     try:
         resp = client.chat.completions.create(
             model=model,
             temperature=float(temperature),
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f"Review:\n\"\"\"{verbatim.strip()}\"\"\""},
+                {"role": "user", "content": f'Review:
+"""{verbatim.strip()}"""'},
             ],
             response_format={"type": "json_object"}
         )
@@ -506,7 +529,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ------------------- LLM Settings -------------------
+# ------------------- LLM & Similarity Settings -------------------
 st.sidebar.header("🤖 LLM Settings")
 MODEL_CHOICES = {
     "Fast – GPT-4o-mini": "gpt-4o-mini",
@@ -521,6 +544,10 @@ api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
+
+# Similarity guard for new-symptom proposals
+sim_threshold = st.sidebar.slider("New‑symptom similarity guard", 0.80, 0.99, 0.94, 0.01,
+                                  help="Raise to suppress near‑duplicates; lower to see more proposals.")
 
 # ------------------- Scope & Preview -------------------
 st.subheader("🧪 Symptomize")
@@ -545,22 +572,45 @@ with st.expander("Preview in-scope rows", expanded=False):
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# Controls (presets + ETA)
-c1, c2, c3, c4 = st.columns([1.6,1,1.4,1.6])
-with c1:
-    n_default = 10 if len(target) >= 10 else max(1, len(target))
-    n_to_process = st.number_input("How many to symptomize (from top of scope)", min_value=1, max_value=max(1, len(target)), value=n_default, step=1)
-with c2:
-    run_n_btn = st.button("Symptomize N", use_container_width=True)
-with c3:
-    run_all_btn = st.button("Symptomize All", use_container_width=True)
-with c4:
-    overwrite_btn = st.button("Overwrite & Re‑symptomize", use_container_width=True)
-
-run_missing_both_btn = st.button("✨ Process Missing Both (one‑click)", use_container_width=True)
+# Controls (presets + ETA + sticky toolbar)
+with st.container():
+    st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
+    c1, c2, c3, c4, c5, c6 = st.columns([1.8,1,1.2,1.6,1.3,1.3])
+    with c1:
+        n_default = 10 if len(target) >= 10 else max(1, len(target))
+        if "n_to_process" not in st.session_state:
+            st.session_state["n_to_process"] = n_default
+        n_to_process = st.number_input("How many to symptomize (from top of scope)", min_value=1, max_value=max(1, len(target)), value=st.session_state["n_to_process"], step=1, key="n_to_process")
+        # quick presets
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            if st.button("10"):
+                st.session_state["n_to_process"] = min(10, max(1, len(target)))
+        with p2:
+            if st.button("25"):
+                st.session_state["n_to_process"] = min(25, max(1, len(target)))
+        with p3:
+            if st.button("50"):
+                st.session_state["n_to_process"] = min(50, max(1, len(target)))
+        with p4:
+            if st.button("100"):
+                st.session_state["n_to_process"] = min(100, max(1, len(target)))
+    with c2:
+        run_n_btn = st.button("Symptomize N", use_container_width=True)
+    with c3:
+        run_all_btn = st.button("Symptomize All", use_container_width=True)
+    with c4:
+        overwrite_btn = st.button("Overwrite & Re‑symptomize", use_container_width=True)
+    with c5:
+        run_missing_both_btn = st.button("✨ Missing‑Both One‑Click", use_container_width=True)
+    with c6:
+        undo_btn = st.button("↩️ Undo last run", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 processed_rows: List[Dict] = []
 processed_idx_set: Set[int] = set()
+if "undo_stack" not in st.session_state:
+    st.session_state["undo_stack"] = []
 
 # --- Core runner ---
 
@@ -577,12 +627,22 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     t0 = time.perf_counter()
     eta_box = st.empty()
 
+    # Prepare undo snapshot for this run
+    snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
+
     # Overwrite mode: clear AI columns for these rows first
     if overwrite_mode:
         df = ensure_ai_columns(df)
         idxs = rows_df.index.tolist()
         for idx_clear in idxs:
-            for j in range(1, 11):
+            # record old values for undo
+            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
+            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
+            old_vals.update({"AI Safety": df.loc[idx_clear, "AI Safety"] if "AI Safety" in df.columns else None,
+                             "AI Reliability": df.loc[idx_clear, "AI Reliability"] if "AI Reliability" in df.columns else None,
+                             "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None})
+            snapshot.append((int(idx_clear), old_vals))
+            for j in range(1, 10+1):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
             # meta stays; re-write below
@@ -592,6 +652,16 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         vb = row.get("Verbatim", "")
         needs_deli = bool(row.get("Needs_Delighters", False))
         needs_detr = bool(row.get("Needs_Detractors", False))
+
+        # Record old values for undo if not already recorded
+        if not overwrite_mode:
+            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
+            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
+            old_vals.update({"AI Safety": df.loc[idx, "AI Safety"] if "AI Safety" in df.columns else None,
+                             "AI Reliability": df.loc[idx, "AI Reliability"] if "AI Reliability" in df.columns else None,
+                             "AI # of Sessions": df.loc[idx, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None})
+            snapshot.append((int(idx), old_vals))
+
         try:
             dels, dets, unl_dels, unl_dets = _openai_labeler(
                 vb, client, selected_model, temperature,
@@ -654,20 +724,41 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         eta_sec = (rem / rate) if rate > 0 else 0.0
         eta_box.markdown(f"**Progress:** {k}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min")
 
+    # Push snapshot to undo stack at end of run
+    st.session_state["undo_stack"].append({"rows": snapshot})
+
 # Execute by buttons
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
     if run_missing_both_btn:
         rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
         _run_symptomize(rows_iter, overwrite_mode=False)
     elif overwrite_btn:
-        rows_iter = target if run_all_btn else target.head(int(n_to_process))
+        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
         _run_symptomize(rows_iter, overwrite_mode=True)
     else:
-        rows_iter = target if run_all_btn else target.head(int(n_to_process))
+        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
         _run_symptomize(rows_iter, overwrite_mode=False)
     st.success(f"Symptomized {len(processed_rows)} review(s).")
 
-# ------------------- Processed Reviews (chips) -------------------
+# Undo last run
+
+def _undo_last_run():
+    global df
+    if not st.session_state["undo_stack"]:
+        st.info("Nothing to undo.")
+        return
+    snap = st.session_state["undo_stack"].pop()
+    for idx, old_vals in snap.get("rows", []):
+        for col, val in old_vals.items():
+            if col not in df.columns:
+                df[col] = None
+            df.loc[idx, col] = val
+    st.success("Reverted last run.")
+
+if undo_btn:
+    _undo_last_run()
+
+# ------------------- Processed Reviews (chips + highlighted evidence) -------------------
 if processed_rows:
     st.subheader("🧾 Processed Reviews (this run)")
 
@@ -679,8 +770,14 @@ if processed_rows:
         if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
             head += " • ⚠︎ >10 detected (trimmed to 10)"
         with st.expander(head):
-            st.markdown("**Verbatim**")
-            st.write(rec["Verbatim"])  # full text
+            # Build highlight term list = labels + known aliases for those labels
+            terms: List[str] = []
+            for lab in list(rec["Added_Detractors"]) + list(rec["Added_Delighters"]):
+                terms.append(lab)
+                if ALIASES and lab in ALIASES:
+                    terms.extend(ALIASES[lab])
+            st.markdown("**Verbatim (evidence highlighted)**")
+            st.markdown(highlight_text(rec["Verbatim"], terms), unsafe_allow_html=True)
 
             # Meta chips (Safety / Reliability / Sessions)
             meta_html = (
@@ -738,8 +835,8 @@ def _filter_near_dupes(cmap: Dict[str, List[int]], cutoff: float = 0.94) -> Dict
             seen_key[c] = sym
     return filtered
 
-cand_del = _filter_near_dupes(cand_del)
-cand_det = _filter_near_dupes(cand_det)
+cand_del = _filter_near_dupes(cand_del, cutoff=sim_threshold)
+cand_det = _filter_near_dupes(cand_det, cutoff=sim_threshold)
 
 if cand_del or cand_det:
     st.subheader("🟡 New Symptom Inbox — Review & Approve")
@@ -785,7 +882,7 @@ if cand_del or cand_det:
                 column_config={
                     "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
                     "Label": st.column_config.TextColumn(),
-                    "Side": st.column_config.TextColumn(disabled=True),
+                    "Side": st.column_config.SelectboxColumn(options=["Delighter","Detractor"]),
                     "Count": st.column_config.NumberColumn(format="%d"),
                     "Examples": st.column_config.TextColumn(width="large"),
                 },
@@ -800,7 +897,7 @@ if cand_del or cand_det:
                 column_config={
                     "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
                     "Label": st.column_config.TextColumn(),
-                    "Side": st.column_config.TextColumn(disabled=True),
+                    "Side": st.column_config.SelectboxColumn(options=["Delighter","Detractor"]),
                     "Count": st.column_config.NumberColumn(format="%d"),
                     "Examples": st.column_config.TextColumn(width="large"),
                 },
@@ -814,14 +911,16 @@ if cand_del or cand_det:
             if isinstance(editor_del, pd.DataFrame) and not editor_del.empty:
                 for _, r_ in editor_del.iterrows():
                     if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
-                        selections.append((str(r_["Label"]).strip(), "Delighter"))
+                        side_val = str(r_.get("Side","Delighter")).strip() or "Delighter"
+                        selections.append((str(r_["Label"]).strip(), side_val))
         except Exception:
             pass
         try:
             if isinstance(editor_det, pd.DataFrame) and not editor_det.empty:
                 for _, r_ in editor_det.iterrows():
                     if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
-                        selections.append((str(r_["Label"]).strip(), "Detractor"))
+                        side_val = str(r_.get("Side","Detractor")).strip() or "Detractor"
+                        selections.append((str(r_["Label"]).strip(), side_val))
         except Exception:
             pass
 
@@ -858,12 +957,31 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
+# ------------------- Symptoms Catalog quick export -------------------
+st.subheader("🗂️ Download Symptoms Catalog")
+sym_df = pd.DataFrame({
+    "Symptom": (DELIGHTERS + DETRACTORS),
+    "Type":    ["Delighter"]*len(DELIGHTERS) + ["Detractor"]*len(DETRACTORS)
+})
+if ALIASES:
+    alias_rows = [{"Symptom": k, "Aliases": " | ".join(v)} for k, v in ALIASES.items()]
+    alias_df = pd.DataFrame(alias_rows)
+    sym_df = sym_df.merge(alias_df, how="left", on="Symptom")
+
+sym_bytes = io.BytesIO()
+with pd.ExcelWriter(sym_bytes, engine="openpyxl") as xw:
+    sym_df.to_excel(xw, index=False, sheet_name="Symptoms")
+sym_bytes.seek(0)
+st.download_button("⬇️ Download Symptoms Catalog (XLSX)", sym_bytes.getvalue(),
+                   file_name=f"{file_base}_Symptoms_Catalog.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 # ------------------- View Symptoms from Workbook (expander) -------------------
 st.subheader("📘 View Symptoms from Excel Workbook")
 with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
     st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
 
-    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])  # added Meta tab
+    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])  # includes Meta tab
 
     def _esc(s: str) -> str:
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -873,8 +991,8 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
         if not items_sorted:
             st.write("(none)")
         else:
-            html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc(x)}</span>" for x in items_sorted]) + "</div>"
-            st.markdown(html, unsafe_allow_html=True)
+            htmlchips = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc(x)}</span>" for x in items_sorted]) + "</div>"
+            st.markdown(htmlchips, unsafe_allow_html=True)
 
     with tabs[0]:
         st.markdown("**Delighter labels from workbook**")
@@ -927,7 +1045,6 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             st.markdown(chips, unsafe_allow_html=True)
 
 # ------------------- Browse Symptoms -------------------
-
 
 st.subheader("🔎 Browse Symptoms")
 view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
@@ -994,8 +1111,7 @@ else:
 
     # Also show plain-text mentions in verbatims as a fallback view
     try:
-        patt = re.escape(qp_label)
-        verb_mask = df["Verbatim"].str.contains(patt, case=False, na=False)
+        verb_mask = df["Verbatim"].str.contains(qp_label, case=False, na=False, regex=False)
         mention_hits = df.loc[verb_mask & (~mask_any)]  # exclude already labeled rows
     except Exception:
         mention_hits = pd.DataFrame()
@@ -1009,7 +1125,8 @@ else:
 
 # Footer
 st.divider()
-st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Approvals use a real submit button. ETA & speed shown during runs.")
+st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near‑dupe proposals. Evidence highlighting shows where terms appear.")
+
 
 
 
