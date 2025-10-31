@@ -243,15 +243,15 @@ def _openai_labeler(
     if not verbatim or not verbatim.strip():
         return [], [], [], []
 
-    # --- inside _openai_meta_extractor(...) ---
     sys = (
-        "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
-        "SAFETY one of: ['Not Mentioned','Concern','Positive']\n"
-        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']\n"
-        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']\n"
-        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
+        "Classify this Shark Glossi review into delighters and detractors. "
+        "Use ONLY the provided whitelists; do NOT invent labels. "
+        "If a synonym is close but not listed, output it under the correct 'unlisted' bucket.\n"
+        f"DELIGHTERS = {json.dumps(delighters, ensure_ascii=False)}\n"
+        f"DETRACTORS = {json.dumps(detractors, ensure_ascii=False)}\n"
+        f"ALIASES = {json.dumps(alias_map, ensure_ascii=False)}\n"
+        'Return strict JSON: {"delighters":[],"detractors":[],"unlisted_delighters":[],"unlisted_detractors":[]}'
     )
-
 
     try:
         resp = client.chat.completions.create(
@@ -259,8 +259,7 @@ def _openai_labeler(
             temperature=float(temperature),
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f'Review:
-"""{verbatim.strip()}"""'},
+                {"role": "user", "content": f'Review:\n"""{verbatim.strip()}"""'},
             ],
             response_format={"type": "json_object"}
         )
@@ -293,22 +292,20 @@ def _openai_labeler(
 def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
     if not verbatim or not verbatim.strip():
         return "Not Mentioned", "Not Mentioned", "Unknown"
-    sys = "
-".join([
-        "Extract three fields from this consumer review. Use ONLY the allowed values.",
-        "SAFETY one of: ['Not Mentioned','Concern','Positive']",
-        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
-        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
-        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}',
-    ])
+    sys = (
+        "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
+        "SAFETY one of: ['Not Mentioned','Concern','Positive']\n"
+        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']\n"
+        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']\n"
+        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
+    )
     try:
         resp = client.chat.completions.create(
             model=model,
             temperature=float(temperature),
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f'Review:
-"""{verbatim.strip()}"""'},
+                {"role": "user", "content": f'Review:\n"""{verbatim.strip()}"""'},
             ],
             response_format={"type": "json_object"}
         )
@@ -729,13 +726,13 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
 # Execute by buttons
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
     if run_missing_both_btn:
-        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])].copy()
         _run_symptomize(rows_iter, overwrite_mode=False)
     elif overwrite_btn:
-        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
+        rows_iter = target.copy() if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10))).copy()
         _run_symptomize(rows_iter, overwrite_mode=True)
     else:
-        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
+        rows_iter = target.copy() if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10))).copy()
         _run_symptomize(rows_iter, overwrite_mode=False)
     st.success(f"Symptomized {len(processed_rows)} review(s).")
 
@@ -1125,6 +1122,7 @@ else:
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near‑dupe proposals. Evidence highlighting shows where terms appear.")
+
 
 
 
