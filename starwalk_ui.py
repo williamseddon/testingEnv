@@ -52,6 +52,9 @@ st.markdown(
       .chip { padding:6px 10px; border-radius:999px; font-size:12.5px; border:1px solid #e6eaf0; background:#fff; box-shadow: 0 1px 2px rgba(16,24,40,.06); }
       .chip.red { background: #fff1f2; border-color:#fecdd3; }
       .chip.green { background: #ecfdf3; border-color:#bbf7d0; }
+      .chip.blue { background: #e0f2fe; border-color:#bae6fd; }
+      .chip.yellow { background: #fff7ed; border-color:#fed7aa; }
+      .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
       .muted{ color:#64748b; font-size:12px; }
       div[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, var(--brand), var(--brand2)); }
     </style>
@@ -468,12 +471,12 @@ need_det = int(work["Needs_Detractors"].sum())
 need_both = int(work["Needs_Symptomization"].sum())
 
 st.markdown(f"""
-<div class="hero">
-  <div class="hero-stats">
-    <div class="stat"><div class="label">Total Reviews</div><div class="value">{total:,}</div></div>
-    <div class="stat"><div class="label">Need Delighters</div><div class="value">{need_del:,}</div></div>
-    <div class="stat"><div class="label">Need Detractors</div><div class="value">{need_det:,}</div></div>
-    <div class="stat accent"><div class="label">Missing Both</div><div class="value">{need_both:,}</div></div>
+<div class=\"hero\">
+  <div class=\"hero-stats\">
+    <div class=\"stat\"><div class=\"label\">Total Reviews</div><div class=\"value\">{total:,}</div></div>
+    <div class=\"stat\"><div class=\"label\">Need Delighters</div><div class=\"value\">{need_del:,}</div></div>
+    <div class=\"stat\"><div class=\"label\">Need Detractors</div><div class=\"value\">{need_det:,}</div></div>
+    <div class=\"stat accent\"><div class=\"label\">Missing Both</div><div class=\"value\">{need_both:,}</div></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -494,7 +497,7 @@ client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
 
-# ------------------- Scope & Preview -------------------
+# ------------------- Symptomize Controls -------------------
 st.subheader("🧪 Symptomize")
 scope = st.selectbox(
     "Choose scope",
@@ -626,7 +629,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
 # Execute by buttons
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
     if run_missing_both_btn:
-        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"]) ]
         _run_symptomize(rows_iter, overwrite_mode=False)
     elif overwrite_btn:
         rows_iter = target if run_all_btn else target.head(int(n_to_process))
@@ -819,7 +822,7 @@ st.subheader("📘 View Symptoms from Excel Workbook")
 with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
     st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
 
-    tabs = st.tabs(["Delighters", "Detractors", "Aliases"])  # dropdown-like tabs
+    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])
 
     def _esc(s:str)->str:
         return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
@@ -845,9 +848,37 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             st.dataframe(pd.DataFrame(alias_rows), use_container_width=True, hide_index=True)
         else:
             st.write("(no aliases defined)")
+    with tabs[3]:
+        st.markdown("**Meta fields used in this dataset**")
+        # Ensure meta columns exist to avoid key errors
+        df_meta = ensure_ai_columns(df.copy())
+        # Counters
+        def _count(col: str, order: List[str]) -> pd.DataFrame:
+            s = df_meta[col].fillna("Not Mentioned").astype(str)
+            vc = s.value_counts().reindex(order, fill_value=0)
+            return vc.reset_index().rename(columns={"index": "Value", col: "Count"})
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Safety**")
+            df_s = _count("AI Safety", SAFETY_ENUM)
+            st.bar_chart(df_s.set_index("Value"))
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_esc(v)} · {int(c)}</span>" for v,c in df_s.itertuples(index=False)]) + "</div>"
+            st.markdown(chips, unsafe_allow_html=True)
+        with c2:
+            st.markdown("**Reliability**")
+            df_r = _count("AI Reliability", RELIABILITY_ENUM)
+            st.bar_chart(df_r.set_index("Value"))
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_esc(v)} · {int(c)}</span>" for v,c in df_r.itertuples(index=False)]) + "</div>"
+            st.markdown(chips, unsafe_allow_html=True)
+        with c3:
+            st.markdown("**# of Sessions**")
+            df_n = _count("AI # of Sessions", SESSIONS_ENUM)
+            st.bar_chart(df_n.set_index("Value"))
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc(v)} · {int(c)}</span>" for v,c in df_n.itertuples(index=False)]) + "</div>"
+            st.markdown(chips, unsafe_allow_html=True)
 
-# ------------------- Browse Symptoms -------------------
-st.subheader("🔎 Browse Symptoms")
+# ------------------- Browse Symptoms (from labeled data) -------------------
+st.subheader("🔎 Browse Symptoms (from labeled data)")
 view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
 
 col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
@@ -873,57 +904,6 @@ else:
     color = "red" if view_side=="Detractors" else "green"
     chips_html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{l} · {c}</span>" for l, c in counts_df.head(60).itertuples(index=False)]) + "</div>"
     st.markdown(chips_html, unsafe_allow_html=True)
-
-# ------------------- Quick Label Picker (dropdowns for all options) -------------------
-st.subheader("🎯 Quick Label Picker")
-qp_col1, qp_col2, qp_col3 = st.columns([1.2,2,2])
-with qp_col1:
-    qp_side = st.selectbox("Side", ["Delighters", "Detractors"], index=0, key="qp_side")
-
-# Build option list from whitelist (not from data, so you can browse everything available)
-qp_options = sorted(DELIGHTERS) if qp_side == "Delighters" else sorted(DETRACTORS)
-if not qp_options:
-    st.info("No options found in the Symptoms tab for this side.")
-else:
-    with qp_col2:
-        qp_label = st.selectbox("Label", qp_options, key="qp_label")
-    with qp_col3:
-        st.markdown("**Picked**")
-        color = "green" if qp_side=="Delighters" else "red"
-        st.markdown(f"<div class='chip-wrap'><span class='chip {color}'>{qp_label}</span></div>", unsafe_allow_html=True)
-
-    # Show where this label already appears in labeled columns (manual + AI)
-    side_cols = (colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])) if qp_side=="Delighters" else (colmap.get("manual_detractors", []) + colmap.get("ai_detractors", []))
-    mask_any = pd.Series([False]*len(df))
-    for c in side_cols:
-        if c in df.columns:
-            try:
-                mask_any = mask_any | (df[c].astype(str).str.strip() == qp_label)
-            except Exception:
-                pass
-    labeled_hits = df.loc[mask_any]
-
-    st.markdown("**Labeled occurrences**")
-    if labeled_hits.empty:
-        st.write("(no labeled occurrences found in the current sheet)")
-    else:
-        show_cols = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in labeled_hits.columns]
-        st.dataframe(labeled_hits[show_cols].head(200), use_container_width=True)
-
-    # Also show plain-text mentions in verbatims as a fallback view
-    try:
-        patt = re.escape(qp_label)
-        verb_mask = df["Verbatim"].str.contains(patt, case=False, na=False)
-        mention_hits = df.loc[verb_mask & (~mask_any)]  # exclude already labeled rows
-    except Exception:
-        mention_hits = pd.DataFrame()
-
-    st.markdown("**Mentions in verbatims (not yet labeled)**")
-    if mention_hits.empty:
-        st.write("(no additional verbatim mentions)")
-    else:
-        show_cols2 = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in mention_hits.columns]
-        st.dataframe(mention_hits[show_cols2].head(200), use_container_width=True)
 
 # Footer
 st.divider()
