@@ -38,8 +38,6 @@ st.markdown(
         radial-gradient(1200px 500px at 10% -20%, rgba(124,58,237,.18), transparent 60%),
         radial-gradient(1200px 500px at 100% 0%, rgba(6,182,212,.16), transparent 60%);
       }
-
-      /* Card for KPI */
       .hero { border-radius: 20px; padding: 18px 22px; color: #0b1020;
         background: linear-gradient(180deg, rgba(255,255,255,.95), rgba(255,255,255,.86));
         border: 1px solid rgba(226,232,240,.9);
@@ -60,36 +58,24 @@ st.markdown(
       .muted{ color:#64748b; font-size:12px; }
       .chips-block { margin-bottom: 16px; }
 
-      div[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, var(--brand), var(--brand2)); }
-
-      /* Sticky toolbars  */
-      .toolbar { position: sticky; top: 8px; z-index: 5; background: rgba(255,255,255,.9);
-        backdrop-filter: blur(6px); border: 1px solid #e6eaf0; border-radius: 14px; padding: 10px 12px;
-        box-shadow: 0 4px 14px rgba(16,24,40,.06); }
-
-      /* Top row action buttons */
-      .toolbar .stButton > button {
+      /* Light, global button polish (no empty wrapper boxes) */
+      .stButton > button {
         height: 40px; border-radius: 10px; font-weight: 600;
         background: linear-gradient(180deg, #ffffff, #f7f8fb);
         border: 1px solid #e6eaf0; box-shadow: 0 1px 2px rgba(16,24,40,.04);
       }
-      .toolbar .stButton > button:hover {
+      .stButton > button:hover {
         border-color: rgba(124,58,237,.35);
         box-shadow: 0 2px 6px rgba(124,58,237,.15);
       }
 
-      /* Batch bar (second row) */
-      .batchbar { margin-top: 6px; padding-top: 8px; border-top: 1px dashed #e6eaf0; }
-      .batchbar .stNumberInput input {
-        height: 40px; font-weight: 700;
-      }
-      .batchbar .stButton > button {
-        border-radius: 999px; height: 36px; font-weight: 700; min-width: 70px;
+      /* Batch controls look */
+      div.batch-row .stNumberInput input { height: 40px; font-weight: 700; }
+      div.batch-row .stButton > button {
+        border-radius: 999px; height: 36px; font-weight: 700; min-width: 72px;
         background: #fff; border: 1px solid rgba(6,182,212,.45);
       }
-      .batchbar .stButton > button:hover {
-        background: #f0fdff; border-color: var(--brand2);
-      }
+      div.batch-row .stButton > button:hover { background: #f0fdff; border-color: var(--brand2); }
 
       mark.hl { background: #fde68a; padding: 0 .15em; border-radius: .25em; }
     </style>
@@ -258,18 +244,16 @@ def _openai_labeler(
     det_map: Dict[str, str],
     alias_to_label: Dict[str, str],
 ) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """Return (listed_delighters, listed_detractors, unlisted_delighters, unlisted_detractors)."""
     if (client is None) or (not verbatim or not verbatim.strip()):
         return [], [], [], []
 
     sys = "\n".join([
         "You label consumer reviews with predefined symptom lists.",
         "Pick up to 10 detractors and up to 10 delighters that are CLEARLY supported by the review.",
-        "For the 'detractors' and 'delighters' arrays, you MUST use ONLY the exact strings from the provided allowed lists.",
-        "If you see a meaningful symptom that's NOT in the allowed lists, place the short phrase in 'unlisted_detractors' or 'unlisted_delighters' instead.",
+        "For the 'detractors' and 'delighters' arrays, use ONLY exact strings from provided allowed lists.",
+        "If you see a meaningful symptom not in the lists, put it in 'unlisted_*'.",
         "Return STRICT JSON with keys: detractors, delighters, unlisted_detractors, unlisted_delighters."
     ])
-
     user_content = json.dumps({
         "review": verbatim.strip(),
         "allowed_delighters": delighters,
@@ -280,10 +264,8 @@ def _openai_labeler(
         resp = client.chat.completions.create(
             model=model,
             temperature=float(temperature),
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user_content},
-            ],
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": user_content}],
             response_format={"type": "json_object"}
         )
         content = resp.choices[0].message.content or "{}"
@@ -325,10 +307,8 @@ def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float
         resp = client.chat.completions.create(
             model=model,
             temperature=float(temperature),
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": f'Review:\n"""{verbatim.strip()}"""'},
-            ],
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": f'Review:\n"""{verbatim.strip()}"""'}],
             response_format={"type": "json_object"}
         )
         content = resp.choices[0].message.content or "{}"
@@ -360,17 +340,16 @@ def generate_template_workbook_bytes(
 
     df2 = ensure_ai_columns(updated_df.copy())
 
-    # Ensure meta headers if we wrote meta values
     for name, col in META_ORDER:
         col_idx = column_index_from_string(col)
         if not ws.cell(row=1, column=col_idx).value:
             ws.cell(row=1, column=col_idx, value=name)
 
-    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Delighters
-    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Detractors
-    fill_yel   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # Safety
-    fill_blu   = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")  # Reliability
-    fill_pur   = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")  # # of Sessions
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    fill_yel   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    fill_blu   = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
+    fill_pur   = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")
 
     pset = set(processed_idx or [])
 
@@ -381,40 +360,27 @@ def generate_template_workbook_bytes(
     for i, (rid, r) in enumerate(df2.iterrows(), start=2):
         if overwrite_processed_slots and (int(rid) in pset):
             _clear_template_slots(i)
-        # Detractors → K..T
         for j, col_idx in enumerate(DET_INDEXES, start=1):
             val = r.get(f"AI Symptom Detractor {j}")
             cv = None if (pd.isna(val) or str(val).strip() == "") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
-            if cv is not None:
-                cell.fill = fill_red
-        # Delighters → U..AD
+            if cv is not None: cell.fill = fill_red
         for j, col_idx in enumerate(DEL_INDEXES, start=1):
             val = r.get(f"AI Symptom Delighter {j}")
             cv = None if (pd.isna(val) or str(val).strip() == "") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
-            if cv is not None:
-                cell.fill = fill_green
-        # Meta → AE/AF/AG
-        safety = r.get("AI Safety")
-        reliab = r.get("AI Reliability")
-        sess   = r.get("AI # of Sessions")
+            if cv is not None: cell.fill = fill_green
+        safety = r.get("AI Safety"); reliab = r.get("AI Reliability"); sess = r.get("AI # of Sessions")
         if is_filled(safety):
-            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety))
-            c.fill = fill_yel
+            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety)); c.fill = fill_yel
         if is_filled(reliab):
-            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab))
-            c.fill = fill_blu
+            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab)); c.fill = fill_blu
         if is_filled(sess):
-            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess))
-            c.fill = fill_pur
+            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess)); c.fill = fill_pur
 
-    # column widths
     for c in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
-        try:
-            ws.column_dimensions[get_column_letter(c)].width = 28
-        except Exception:
-            pass
+        try: ws.column_dimensions[get_column_letter(c)].width = 28
+        except Exception: pass
 
     out = io.BytesIO(); wb.save(out)
     return out.getvalue()
@@ -425,13 +391,11 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
     original_file.seek(0)
     wb = load_workbook(original_file)
 
-    # Ensure the sheet exists
     if "Symptoms" not in wb.sheetnames:
         ws = wb.create_sheet("Symptoms")
     else:
         ws = wb["Symptoms"]
 
-    # Read current header row (may be partially/fully blank)
     try:
         headers_row = [c.value for c in ws[1]]
     except Exception:
@@ -442,43 +406,31 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
     used_cols: Set[int] = set()
 
     def _ensure_header(name: str, synonyms: List[str], preferred_index: Optional[int] = None) -> int:
-        """Return a 1-based column index for a header. Create header if needed."""
         for syn in synonyms:
             idx = header_map.get(str(syn).lower())
             if idx:
                 if not ws.cell(row=1, column=idx).value:
                     ws.cell(row=1, column=idx, value=name)
-                used_cols.add(idx)
-                return idx
+                used_cols.add(idx); return idx
         max_col = int(getattr(ws, "max_column", 0) or 0)
         idx = preferred_index if (preferred_index and preferred_index > 0) else (max_col + 1 if max_col > 0 else 1)
-        while idx in used_cols:
-            idx += 1
-        ws.cell(row=1, column=idx, value=name)
-        used_cols.add(idx)
-        return idx
+        while idx in used_cols: idx += 1
+        ws.cell(row=1, column=idx, value=name); used_cols.add(idx); return idx
 
-    # Ensure columns exist and get their indices (1-based)
     col_label = _ensure_header("Symptom", ["symptom", "label", "name", "item"], preferred_index=1)
     col_type  = _ensure_header("Type", ["type", "polarity", "category", "side"], preferred_index=2)
     col_alias = _ensure_header("Aliases", ["aliases", "alias"], preferred_index=3)
 
-    # Build set of existing labels to avoid duplicates
     existing: Set[str] = set()
-    try:
-        last_row = int(getattr(ws, "max_row", 0) or 0)
-    except Exception:
-        last_row = 0
+    try: last_row = int(getattr(ws, "max_row", 0) or 0)
+    except Exception: last_row = 0
     for r_i in range(2, last_row + 1):
         v = ws.cell(row=r_i, column=col_label).value
-        if v:
-            existing.add(str(v).strip())
+        if v: existing.add(str(v).strip())
 
-    # Append new selections
     for label, side in selections:
         lab = str(label).strip()
-        if not lab or (lab in existing):
-            continue
+        if not lab or (lab in existing): continue
         rnew = (int(getattr(ws, "max_row", 1) or 1)) + 1
         ws.cell(row=rnew, column=col_label, value=lab)
         ws.cell(row=rnew, column=col_type, value=str(side).strip() or "")
@@ -491,18 +443,14 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
 if not uploaded_file: st.stop()
 
-uploaded_bytes = uploaded_file.read()
-uploaded_file.seek(0)
-
+uploaded_bytes = uploaded_file.read(); uploaded_file.seek(0)
 try:
     df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
 except ValueError:
-    uploaded_file.seek(0)
-    df = pd.read_excel(uploaded_file)
+    uploaded_file.seek(0); df = pd.read_excel(uploaded_file)
 
 if "Verbatim" not in df.columns:
-    st.error("Missing 'Verbatim' column.")
-    st.stop()
+    st.error("Missing 'Verbatim' column."); st.stop()
 
 # Normalize
 df.columns = [str(c).strip() for c in df.columns]
@@ -567,13 +515,13 @@ scope = st.selectbox(
 )
 
 if scope == "Missing both":
-    target = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"]) ]
+    target = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
 elif scope == "Missing delighters only":
-    target = work[(work["Needs_Delighters"]) & (~work["Needs_Detractors"]) ]
+    target = work[(work["Needs_Delighters"]) & (~work["Needs_Detractors"])]
 elif scope == "Missing detractors only":
-    target = work[(~work["Needs_Delighters"]) & (work["Needs_Detractors"]) ]
+    target = work[(~work["Needs_Delighters"]) & (work["Needs_Detractors"])]
 else:
-    target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"]) ]
+    target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
 
 st.write(f"🔎 **{len(target):,} reviews** match the selected scope.")
 with st.expander("Preview in-scope rows", expanded=False):
@@ -581,69 +529,54 @@ with st.expander("Preview in-scope rows", expanded=False):
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# ------------------- Controls (New Polished Toolbar) -------------------
+# ------------------- Controls (no HTML wrappers — no empty bar) -------------------
 processed_rows: List[Dict] = []
 processed_idx_set: Set[int] = set()
 if "undo_stack" not in st.session_state:
     st.session_state["undo_stack"] = []
 
-with st.container():
-    st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
+# Row 1: actions
+r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
+with r1a: run_n_btn = st.button("▶️ Symptomize N", use_container_width=True)
+with r1b: run_all_btn = st.button("🚀 Symptomize All", use_container_width=True)
+with r1c: overwrite_btn = st.button("♻️ Overwrite & Re-symptomize", use_container_width=True)
+with r1d: run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
+with r1e: undo_btn = st.button("↩️ Undo last run", use_container_width=True)
 
-    # ---------- ROW 1: Primary actions ----------
-    r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
-    with r1a:
-        run_n_btn = st.button("▶️ Symptomize N", use_container_width=True)
-    with r1b:
-        run_all_btn = st.button("🚀 Symptomize All", use_container_width=True)
-    with r1c:
-        overwrite_btn = st.button("♻️ Overwrite & Re-symptomize", use_container_width=True)
-    with r1d:
-        run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
-    with r1e:
-        undo_btn = st.button("↩️ Undo last run", use_container_width=True)
+# Small spacer
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-    # ---------- ROW 2: Batch size + presets ----------
-    st.markdown("<div class='batchbar'>", unsafe_allow_html=True)
-    cA, cB, cC, cD, cE = st.columns([1.0, 0.5, 0.5, 0.5, 0.5])
+# Row 2: batch size + presets (scoped styling via a simple class on an empty div before columns)
+st.markdown("<div class='batch-row'></div>", unsafe_allow_html=True)
+cA, cB, cC, cD, cE = st.columns([1.0, 0.5, 0.5, 0.5, 0.5])
 
-    with cA:
-        bound_min = 1
-        bound_max = max(1, len(target))
+with cA:
+    bound_min = 1
+    bound_max = max(1, len(target))
+    if "n_to_process" not in st.session_state:
+        st.session_state["n_to_process"] = min(10, bound_max)
+    cur = int(st.session_state.get("n_to_process", 1))
+    if cur < bound_min:
+        st.session_state["n_to_process"] = bound_min
+    elif cur > bound_max:
+        st.session_state["n_to_process"] = bound_max
 
-        if "n_to_process" not in st.session_state:
-            st.session_state["n_to_process"] = min(10, bound_max)
+    n_to_process = st.number_input(
+        "How many to symptomize (from top of scope)",
+        min_value=bound_min,
+        max_value=bound_max,
+        step=1,
+        key="n_to_process",
+    )
 
-        # clamp before rendering any widgets
-        cur = int(st.session_state.get("n_to_process", 1))
-        if cur < bound_min:
-            st.session_state["n_to_process"] = bound_min
-        elif cur > bound_max:
-            st.session_state["n_to_process"] = bound_max
+def _set_n(v: int):
+    st.session_state["n_to_process"] = min(max(int(v), 1), max(1, len(target)))
+    st.rerun()
 
-        n_to_process = st.number_input(
-            "How many to symptomize (from top of scope)",
-            min_value=bound_min,
-            max_value=bound_max,
-            step=1,
-            key="n_to_process",
-        )
-
-    def _set_n(v: int):
-        st.session_state["n_to_process"] = min(max(int(v), bound_min), bound_max)
-        st.rerun()
-
-    with cB:
-        st.button("10", use_container_width=True, on_click=_set_n, args=(10,))
-    with cC:
-        st.button("25", use_container_width=True, on_click=_set_n, args=(25,))
-    with cD:
-        st.button("50", use_container_width=True, on_click=_set_n, args=(50,))
-    with cE:
-        st.button("100", use_container_width=True, on_click=_set_n, args=(100,))
-
-    st.markdown("</div>", unsafe_allow_html=True)  # end batchbar
-    st.markdown("</div>", unsafe_allow_html=True)  # end toolbar
+with cB: st.button("10",  use_container_width=True, on_click=_set_n, args=(10,))
+with cC: st.button("25",  use_container_width=True, on_click=_set_n, args=(25,))
+with cD: st.button("50",  use_container_width=True, on_click=_set_n, args=(50,))
+with cE: st.button("100", use_container_width=True, on_click=_set_n, args=(100,))
 
 # --- Core runner ---
 def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
@@ -652,17 +585,12 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     prog = st.progress(0.0)
 
     def _fmt_secs(sec: float) -> str:
-        m = int(sec // 60)
-        s = int(round(sec - m*60))
-        return f"{m}:{s:02d}"
+        m = int(sec // 60); s = int(round(sec - m*60)); return f"{m}:{s:02d}"
 
-    t0 = time.perf_counter()
-    eta_box = st.empty()
+    t0 = time.perf_counter(); eta_box = st.empty()
 
-    # Prepare undo snapshot for this run
     snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
 
-    # Overwrite mode: clear AI columns for these rows first
     if overwrite_mode:
         df = ensure_ai_columns(df)
         idxs = rows_df.index.tolist()
@@ -673,7 +601,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                              "AI Reliability": df.loc[idx_clear, "AI Reliability"] if "AI Reliability" in df.columns else None,
                              "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None})
             snapshot.append((int(idx_clear), old_vals))
-            for j in range(1, 10+1):
+            for j in range(1, 11):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
 
@@ -700,30 +628,28 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         except Exception:
             dels, dets, unl_dels, unl_dets = [], [], [], []
 
-        # Meta
         try:
             safety, reliability, sessions = _openai_meta_extractor(vb, client, selected_model, temperature) if client else ("Not Mentioned","Not Mentioned","Unknown")
         except Exception:
             safety, reliability, sessions = "Not Mentioned","Not Mentioned","Unknown"
 
         df = ensure_ai_columns(df)
-
         wrote_dets, wrote_dels = [], []
         more_than_10_dets = len(dets) > 10
         more_than_10_dels = len(dels) > 10
 
         if needs_detr and dets:
-            for j, lab in enumerate(dets[:max_per_side]):
+            for j, lab in enumerate(dets[:10]):
                 col = f"AI Symptom Detractor {j+1}"
                 if col not in df.columns: df[col] = None
                 df.loc[idx, col] = lab
-            wrote_dets = dets[:max_per_side]
+            wrote_dets = dets[:10]
         if needs_deli and dels:
-            for j, lab in enumerate(dels[:max_per_side]):
+            for j, lab in enumerate(dels[:10]):
                 col = f"AI Symptom Delighter {j+1}"
                 if col not in df.columns: df[col] = None
                 df.loc[idx, col] = lab
-            wrote_dels = dels[:max_per_side]
+            wrote_dels = dels[:10]
 
         df.loc[idx, "AI Safety"] = safety
         df.loc[idx, "AI Reliability"] = reliability
@@ -744,7 +670,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         })
         processed_idx_set.add(int(idx))
 
-        # progress + ETA
         prog.progress(k/total_n)
         elapsed = time.perf_counter() - t0
         rate = (k / elapsed) if elapsed > 0 else 0.0
@@ -780,7 +705,7 @@ def _undo_last_run():
             df.loc[idx, col] = val
     st.success("Reverted last run.")
 
-if 'undo_btn' in locals() and undo_btn:
+if undo_btn:
     _undo_last_run()
 
 # ------------------- Processed Reviews (chips + highlighted evidence) -------------------
@@ -1001,7 +926,7 @@ st.subheader("📘 View Symptoms from Excel Workbook")
 with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
     st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
 
-    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])  # includes Meta tab
+    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])
 
     def _esc(s: str) -> str:
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1015,11 +940,9 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             st.markdown(htmlchips, unsafe_allow_html=True)
 
     with tabs[0]:
-        st.markdown("**Delighter labels from workbook**")
-        _chips(DELIGHTERS, "green")
+        st.markdown("**Delighter labels from workbook**"); _chips(DELIGHTERS, "green")
     with tabs[1]:
-        st.markdown("**Detractor labels from workbook**")
-        _chips(DETRACTORS, "red")
+        st.markdown("**Detractor labels from workbook**"); _chips(DETRACTORS, "red")
     with tabs[2]:
         st.markdown("**Aliases (if present)**")
         if ALIASES:
@@ -1034,13 +957,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
         def _count(col: str, order: List[str]) -> pd.DataFrame:
             if col not in df_meta.columns:
                 return pd.DataFrame({"Value": order, "Count": [0] * len(order)})
-            vc = (
-                df_meta[col]
-                .fillna("Not Mentioned")
-                .astype(str)
-                .value_counts()
-                .reindex(order, fill_value=0)
-            )
+            vc = df_meta[col].fillna("Not Mentioned").astype(str).value_counts().reindex(order, fill_value=0)
             return vc.rename_axis("Value").reset_index(name="Count")
 
         c1, c2, c3 = st.columns(3)
@@ -1066,6 +983,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near-dupe proposals. Evidence highlighting shows where terms appear.")
+
 
 
 
