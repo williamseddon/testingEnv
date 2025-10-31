@@ -244,14 +244,15 @@ def _openai_labeler(
         return [], [], [], []
 
     sys = "
-".join([
-        "Classify this Shark Glossi review into delighters and detractors.",
-        "Use ONLY the provided whitelists; do NOT invent labels.",
-        "If a synonym is close but not listed, output it under the correct 'unlisted' bucket.",
-        f"DELIGHTERS = {json.dumps(delighters, ensure_ascii=False)}",
-        f"DETRACTORS = {json.dumps(detractors, ensure_ascii=False)}",
-        f"ALIASES = {json.dumps(alias_map, ensure_ascii=False)}",
-        'Return strict JSON: {"delighters":[],"detractors":[],"unlisted_delighters":[],"unlisted_detractors":[]}',
+    # --- inside _openai_meta_extractor(...) ---
+    sys = (
+        "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
+        "SAFETY one of: ['Not Mentioned','Concern','Positive']\n"
+        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']\n"
+        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']\n"
+        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
+    )
+
     ])
 
     try:
