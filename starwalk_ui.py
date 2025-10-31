@@ -814,6 +814,38 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
+# ------------------- View Symptoms from Workbook (expander) -------------------
+st.subheader("📘 View Symptoms from Excel Workbook")
+with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
+    st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
+
+    tabs = st.tabs(["Delighters", "Detractors", "Aliases"])  # dropdown-like tabs
+
+    def _esc(s:str)->str:
+        return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+
+    def _chips(items, color:str):
+        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
+        if not items_sorted:
+            st.write("(none)")
+        else:
+            html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc(x)}</span>" for x in items_sorted]) + "</div>"
+            st.markdown(html, unsafe_allow_html=True)
+
+    with tabs[0]:
+        st.markdown("**Delighter labels from workbook**")
+        _chips(DELIGHTERS, "green")
+    with tabs[1]:
+        st.markdown("**Detractor labels from workbook**")
+        _chips(DETRACTORS, "red")
+    with tabs[2]:
+        st.markdown("**Aliases (if present)**")
+        if ALIASES:
+            alias_rows = [{"Label": k, "Aliases": " | ".join(v)} for k, v in sorted(ALIASES.items())]
+            st.dataframe(pd.DataFrame(alias_rows), use_container_width=True, hide_index=True)
+        else:
+            st.write("(no aliases defined)")
+
 # ------------------- Browse Symptoms -------------------
 st.subheader("🔎 Browse Symptoms")
 view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
@@ -896,4 +928,3 @@ else:
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Approvals use a real submit button. ETA & speed shown during runs.")
-
