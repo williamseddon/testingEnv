@@ -1,4 +1,4 @@
-# starwalk_ui_v6.py — ETA, presets, overwrite mode, polished UI (no header relabeling)
+# starwalk_ui_v6.py — ETA, presets, overwrite mode, polished UI (exact export + Meta)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
 import streamlit as st
@@ -25,7 +25,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 # ------------------- Page Setup -------------------
 st.set_page_config(layout="wide", page_title="Review Symptomizer — v6")
 st.title("✨ Review Symptomizer — v6")
-st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • New‑symptom inbox with submit • Tiles UI")
+st.caption("Exact export (K–T dets, U–AD dels, AE/AF/AG meta) • ETA + presets + overwrite • New‑symptom inbox • Tiles UI")
 
 # ------------------- Global CSS -------------------
 st.markdown(
@@ -65,16 +65,19 @@ st.markdown(
 # ------------------- Utilities -------------------
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
+
 def clean_text(x):
     if pd.isna(x):
         return ""
     return str(x).strip()
+
 
 def is_filled(val) -> bool:
     if pd.isna(val):
         return False
     s = str(val).strip()
     return (s != "") and (s.upper() not in NON_VALUES)
+
 
 @st.cache_data(show_spinner=False)
 def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
@@ -101,7 +104,8 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
         out, seen = [], set()
         for v in vals:
             if v and v not in seen:
-                seen.add(v); out.append(v)
+                seen.add(v)
+                out.append(v)
         return out
 
     delighters, detractors, alias_map = [], [], {}
@@ -127,13 +131,16 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 
     return delighters, detractors, alias_map
 
+
 # Canonicalization helpers
 
 def _canon(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip().lower()
 
+
 def _canon_simple(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", _canon(s))
+
 
 # Schema detection
 
@@ -171,6 +178,7 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
 
+
 # ------------------- Fixed template mapping -------------------
 DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]
 DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
@@ -201,6 +209,7 @@ def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map
         for a in aliases:
             alias_to_label[_canon(a)] = label
     return del_map, det_map, alias_to_label
+
 
 # ---------- LLM helpers ----------
 SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
@@ -301,6 +310,7 @@ def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float
     except Exception:
         return "Not Mentioned", "Not Mentioned", "Unknown"
 
+
 # ------------------- Export helpers -------------------
 
 def generate_template_workbook_bytes(
@@ -319,7 +329,7 @@ def generate_template_workbook_bytes(
 
     df2 = ensure_ai_columns(updated_df.copy())
 
-    # Ensure meta headers if we wrote meta values
+    # Ensure meta headers (only if blank)
     for name, col in META_ORDER:
         col_idx = column_index_from_string(col)
         if not ws.cell(row=1, column=col_idx).value:
@@ -378,6 +388,7 @@ def generate_template_workbook_bytes(
     out = io.BytesIO(); wb.save(out)
     return out.getvalue()
 
+
 # ------------------- Helpers: add new symptoms -------------------
 
 def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]]) -> bytes:
@@ -401,7 +412,7 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
     col_label = _col_idx(["symptom", "label", "name", "item"]) or 1
     col_type  = _col_idx(["type", "polarity", "category", "side"]) or 2
-    col_alias = _col_idx(["aliases", "alias"])
+    col_alias = _col_idx(["aliases", "alias"])  # may be -1
 
     if len(headers) < col_label or not headers[col_label-1]:
         ws.cell(row=1, column=col_label, value="Symptom")
@@ -428,6 +439,7 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
     out = io.BytesIO(); wb.save(out); out.seek(0)
     return out.getvalue()
+
 
 # ------------------- File Upload -------------------
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
@@ -471,14 +483,8 @@ need_det = int(work["Needs_Detractors"].sum())
 need_both = int(work["Needs_Symptomization"].sum())
 
 st.markdown(f"""
-<div class="hero">
-  <div class="hero-stats">
-    <div class="stat"><div class="label">Total Reviews</div><div class="value">{total:,}</div></div>
-    <div class="stat"><div class="label">Need Delighters</div><div class="value">{need_del:,}</div></div>
-    <div class="stat"><div class="label">Need Detractors</div><div class="value">{need_det:,}</div></div>
-    <div class="stat accent"><div class="label">Missing Both</div><div class="value">{need_both:,}</div></div>
-  </div>
-</div>
+<div class=\"hero\">
+  <div class=\"hero-stats\">\n    <div class=\"stat\"><div class=\"label\">Total Reviews</div><div class=\"value\">{total:,}</div></div>\n    <div class=\"stat\"><div class=\"label\">Need Delighters</div><div class=\"value\">{need_del:,}</div></div>\n    <div class=\"stat\"><div class=\"label\">Need Detractors</div><div class=\"value\">{need_det:,}</div></div>\n    <div class=\"stat accent\"><div class=\"label\">Missing Both</div><div class=\"value\">{need_both:,}</div></div>\n  </div>\n</div>
 """, unsafe_allow_html=True)
 
 # ------------------- LLM Settings -------------------
@@ -497,7 +503,7 @@ client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
 
-# ------------------- Scope & Preview -------------------
+# ------------------- Symptomize -------------------
 st.subheader("🧪 Symptomize")
 scope = st.selectbox(
     "Choose scope",
@@ -534,8 +540,14 @@ with c4:
 
 run_missing_both_btn = st.button("✨ Process Missing Both (one‑click)", use_container_width=True)
 
-processed_rows: List[Dict] = []
-processed_idx_set: Set[int] = set()
+# Persist logs across reruns
+if "processed_rows" not in st.session_state:
+    st.session_state.processed_rows = []
+if "processed_idx_set" not in st.session_state:
+    st.session_state.processed_idx_set = set()
+processed_rows: List[Dict] = st.session_state.processed_rows
+processed_idx_set: Set[int] = st.session_state.processed_idx_set
+
 
 # --- Core runner ---
 
@@ -560,7 +572,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             for j in range(1, 11):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
-            # meta stays; re-write below
+            # meta fields will be rewritten below
 
     total_n = max(1, len(rows_df))
     for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
@@ -626,6 +638,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         eta_sec = (rem / rate) if rate > 0 else 0.0
         eta_box.markdown(f"**Progress:** {k}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min")
 
+
 # Execute by buttons
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
     if run_missing_both_btn:
@@ -639,11 +652,14 @@ if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_miss
         _run_symptomize(rows_iter, overwrite_mode=False)
     st.success(f"Symptomized {len(processed_rows)} review(s).")
 
+
 # ------------------- Processed Reviews (chips) -------------------
 if processed_rows:
     st.subheader("🧾 Processed Reviews (this run)")
-    def _esc(s:str)->str:
+
+    def _esc(s: str) -> str:
         return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+
     for rec in processed_rows:
         head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}"
         if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
@@ -662,6 +678,7 @@ if processed_rows:
                 st.markdown("**Unlisted delighters (candidates)**")
                 st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Unlisted_Delighters"]]) + "</div>", unsafe_allow_html=True)
 
+
 # ------------------- New Symptom Candidates (Approval form) -------------------
 cand_del: Dict[str, List[int]] = {}
 cand_det: Dict[str, List[int]] = {}
@@ -676,6 +693,7 @@ whitelist_all = set(DELIGHTERS + DETRACTORS)
 alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
 wl_canon = {_canon_simple(x) for x in whitelist_all}
 ali_canon = {_canon_simple(x) for x in alias_all}
+
 
 def _filter_near_dupes(cmap: Dict[str, List[int]], cutoff: float = 0.94) -> Dict[str, List[int]]:
     filtered: Dict[str, List[int]] = {}
@@ -696,6 +714,7 @@ def _filter_near_dupes(cmap: Dict[str, List[int]], cutoff: float = 0.94) -> Dict
             filtered[sym] = list(refs)
             seen_key[c] = sym
     return filtered
+
 
 cand_del = _filter_near_dupes(cand_del)
 cand_det = _filter_near_dupes(cand_det)
@@ -796,26 +815,6 @@ if cand_del or cand_det:
         else:
             st.info("No candidates selected.")
 
-# ------------------- Download Symptomized Workbook -------------------
-st.subheader("📦 Download Symptomized Workbook")
-try:
-    file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
-except Exception:
-    file_base = 'Reviews'
-
-export_bytes = generate_template_workbook_bytes(
-    uploaded_file,
-    df,
-    processed_idx=processed_idx_set if processed_idx_set else None,
-    overwrite_processed_slots=False,
-)
-
-st.download_button(
-    "⬇️ Download symptomized workbook (XLSX)",
-    data=export_bytes,
-    file_name=f"{file_base}_Symptomized.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
 
 # ------------------- View Symptoms from Workbook (expander) -------------------
 st.subheader("📘 View Symptoms from Excel Workbook")
@@ -824,7 +823,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 
     tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])  # added Meta tab
 
-    def _esc(s: str) -> str:
+    def _esc2(s: str) -> str:
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _chips(items, color: str):
@@ -832,7 +831,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
         if not items_sorted:
             st.write("(none)")
         else:
-            html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc(x)}</span>" for x in items_sorted]) + "</div>"
+            html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc2(x)}</span>" for x in items_sorted]) + "</div>"
             st.markdown(html, unsafe_allow_html=True)
 
     with tabs[0]:
@@ -870,29 +869,51 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             st.markdown("**Safety**")
             df_s = _count("AI Safety", SAFETY_ENUM)
             st.bar_chart(df_s.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_esc(v)} · {int(c)}</span>" for v, c in df_s.itertuples(index=False)]) + "</div>"
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_esc2(v)} · {int(c)}</span>" for v, c in df_s.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
         with c2:
             st.markdown("**Reliability**")
             df_r = _count("AI Reliability", RELIABILITY_ENUM)
             st.bar_chart(df_r.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_esc(v)} · {int(c)}</span>" for v, c in df_r.itertuples(index=False)]) + "</div>"
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_esc2(v)} · {int(c)}</span>" for v, c in df_r.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
         with c3:
             st.markdown("**# of Sessions**")
             df_n = _count("AI # of Sessions", SESSIONS_ENUM)
             st.bar_chart(df_n.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc(v)} · {int(c)}</span>" for v, c in df_n.itertuples(index=False)]) + "</div>"
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc2(v)} · {int(c)}</span>" for v, c in df_n.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
 
+
+# ------------------- Download Symptomized Workbook -------------------
+st.subheader("📦 Download Symptomized Workbook")
+try:
+    file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
+except Exception:
+    file_base = 'Reviews'
+
+export_bytes = generate_template_workbook_bytes(
+    uploaded_file,
+    df,
+    processed_idx=processed_idx_set if processed_idx_set else None,
+    overwrite_processed_slots=False,
+)
+
+st.download_button(
+    "⬇️ Download symptomized workbook (XLSX)",
+    data=export_bytes,
+    file_name=f"{file_base}_Symptomized.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
 # ------------------- Browse Symptoms -------------------
-
-
 st.subheader("🔎 Browse Symptoms")
 view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
 
 col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
 col_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
+
 
 def _label_counts(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     vals: List[str] = []
@@ -915,59 +936,9 @@ else:
     chips_html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{l} · {c}</span>" for l, c in counts_df.head(60).itertuples(index=False)]) + "</div>"
     st.markdown(chips_html, unsafe_allow_html=True)
 
-# ------------------- Quick Label Picker (dropdowns for all options) -------------------
-st.subheader("🎯 Quick Label Picker")
-qp_col1, qp_col2, qp_col3 = st.columns([1.2,2,2])
-with qp_col1:
-    qp_side = st.selectbox("Side", ["Delighters", "Detractors"], index=0, key="qp_side")
-
-# Build option list from whitelist (not from data, so you can browse everything available)
-qp_options = sorted(DELIGHTERS) if qp_side == "Delighters" else sorted(DETRACTORS)
-if not qp_options:
-    st.info("No options found in the Symptoms tab for this side.")
-else:
-    with qp_col2:
-        qp_label = st.selectbox("Label", qp_options, key="qp_label")
-    with qp_col3:
-        st.markdown("**Picked**")
-        color = "green" if qp_side=="Delighters" else "red"
-        st.markdown(f"<div class='chip-wrap'><span class='chip {color}'>{qp_label}</span></div>", unsafe_allow_html=True)
-
-    # Show where this label already appears in labeled columns (manual + AI)
-    side_cols = (colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])) if qp_side=="Delighters" else (colmap.get("manual_detractors", []) + colmap.get("ai_detractors", []))
-    mask_any = pd.Series([False]*len(df))
-    for c in side_cols:
-        if c in df.columns:
-            try:
-                mask_any = mask_any | (df[c].astype(str).str.strip() == qp_label)
-            except Exception:
-                pass
-    labeled_hits = df.loc[mask_any]
-
-    st.markdown("**Labeled occurrences**")
-    if labeled_hits.empty:
-        st.write("(no labeled occurrences found in the current sheet)")
-    else:
-        show_cols = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in labeled_hits.columns]
-        st.dataframe(labeled_hits[show_cols].head(200), use_container_width=True)
-
-    # Also show plain-text mentions in verbatims as a fallback view
-    try:
-        patt = re.escape(qp_label)
-        verb_mask = df["Verbatim"].str.contains(patt, case=False, na=False)
-        mention_hits = df.loc[verb_mask & (~mask_any)]  # exclude already labeled rows
-    except Exception:
-        mention_hits = pd.DataFrame()
-
-    st.markdown("**Mentions in verbatims (not yet labeled)**")
-    if mention_hits.empty:
-        st.write("(no additional verbatim mentions)")
-    else:
-        show_cols2 = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in mention_hits.columns]
-        st.dataframe(mention_hits[show_cols2].head(200), use_container_width=True)
-
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Approvals use a real submit button. ETA & speed shown during runs.")
+
 
 
