@@ -38,6 +38,8 @@ st.markdown(
         radial-gradient(1200px 500px at 10% -20%, rgba(124,58,237,.18), transparent 60%),
         radial-gradient(1200px 500px at 100% 0%, rgba(6,182,212,.16), transparent 60%);
       }
+
+      /* Card for KPI */
       .hero { border-radius: 20px; padding: 18px 22px; color: #0b1020;
         background: linear-gradient(180deg, rgba(255,255,255,.95), rgba(255,255,255,.86));
         border: 1px solid rgba(226,232,240,.9);
@@ -57,9 +59,38 @@ st.markdown(
       .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
       .muted{ color:#64748b; font-size:12px; }
       .chips-block { margin-bottom: 16px; }
+
       div[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, var(--brand), var(--brand2)); }
-      /* Sticky toolbar for run controls */
-      .toolbar { position: sticky; top: 8px; z-index: 5; background: rgba(255,255,255,.85); backdrop-filter: blur(6px); border: 1px solid #e6eaf0; border-radius: 12px; padding: 10px 12px; box-shadow: 0 4px 14px rgba(16,24,40,.06); }
+
+      /* Sticky toolbars  */
+      .toolbar { position: sticky; top: 8px; z-index: 5; background: rgba(255,255,255,.9);
+        backdrop-filter: blur(6px); border: 1px solid #e6eaf0; border-radius: 14px; padding: 10px 12px;
+        box-shadow: 0 4px 14px rgba(16,24,40,.06); }
+
+      /* Top row action buttons */
+      .toolbar .stButton > button {
+        height: 40px; border-radius: 10px; font-weight: 600;
+        background: linear-gradient(180deg, #ffffff, #f7f8fb);
+        border: 1px solid #e6eaf0; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+      }
+      .toolbar .stButton > button:hover {
+        border-color: rgba(124,58,237,.35);
+        box-shadow: 0 2px 6px rgba(124,58,237,.15);
+      }
+
+      /* Batch bar (second row) */
+      .batchbar { margin-top: 6px; padding-top: 8px; border-top: 1px dashed #e6eaf0; }
+      .batchbar .stNumberInput input {
+        height: 40px; font-weight: 700;
+      }
+      .batchbar .stButton > button {
+        border-radius: 999px; height: 36px; font-weight: 700; min-width: 70px;
+        background: #fff; border: 1px solid rgba(6,182,212,.45);
+      }
+      .batchbar .stButton > button:hover {
+        background: #f0fdff; border-color: var(--brand2);
+      }
+
       mark.hl { background: #fde68a; padding: 0 .15em; border-radius: .25em; }
     </style>
     """,
@@ -133,21 +164,16 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
     return delighters, detractors, alias_map
 
 # Canonicalization helpers
-
 def _canon(s: str) -> str:
     return " ".join(str(s).split()).lower().strip()
-
 def _canon_simple(s: str) -> str:
     return "".join(ch for ch in _canon(s) if ch.isalnum())
 
 # Evidence highlighting
-
 def highlight_text(text: str, terms: List[str]) -> str:
     safe = html.escape(str(text))
     terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
-    if not terms:
-        return safe
-    # Unique, longest-first to avoid nested matches
+    if not terms: return safe
     uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
     try:
         pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
@@ -156,7 +182,6 @@ def highlight_text(text: str, terms: List[str]) -> str:
     return pattern.sub(lambda m: f"<mark class='hl'>{html.escape(m.group(0))}</mark>", safe)
 
 # Schema detection
-
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
     cols = [str(c).strip() for c in df.columns]
     man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
@@ -170,15 +195,11 @@ def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
         "ai_delighters": ai_del,
     }
 
-
 def row_has_any(row: pd.Series, columns: List[str]) -> bool:
-    if not columns:
-        return False
+    if not columns: return False
     for c in columns:
-        if c in row and is_filled(row[c]):
-            return True
+        if c in row and is_filled(row[c]): return True
     return False
-
 
 def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFrame:
     det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
@@ -205,13 +226,11 @@ AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
 AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
 AI_META_HEADERS = ["AI Safety", "AI Reliability", "AI # of Sessions"]
 
-
 def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
     for h in AI_DET_HEADERS + AI_DEL_HEADERS + AI_META_HEADERS:
         if h not in df_in.columns:
             df_in[h] = None
     return df_in
-
 
 def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
     del_map = {_canon(x): x for x in delighters}
@@ -226,7 +245,6 @@ def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map
 SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
 RELIABILITY_ENUM = ["Not Mentioned", "Negative", "Neutral", "Positive"]
 SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
-
 
 def _openai_labeler(
     verbatim: str,
@@ -244,14 +262,12 @@ def _openai_labeler(
     if (client is None) or (not verbatim or not verbatim.strip()):
         return [], [], [], []
 
-    # Strict JSON instruction for listed/unlisted outputs
     sys = "\n".join([
         "You label consumer reviews with predefined symptom lists.",
         "Pick up to 10 detractors and up to 10 delighters that are CLEARLY supported by the review.",
         "For the 'detractors' and 'delighters' arrays, you MUST use ONLY the exact strings from the provided allowed lists.",
         "If you see a meaningful symptom that's NOT in the allowed lists, place the short phrase in 'unlisted_detractors' or 'unlisted_delighters' instead.",
-        "Return STRICT JSON with keys: detractors, delighters, unlisted_detractors, unlisted_delighters.",
-        "Example: {\"detractors\": [\"Loud\"], \"delighters\": [\"Easy to clean\"], \"unlisted_detractors\": [], \"unlisted_delighters\": []}"
+        "Return STRICT JSON with keys: detractors, delighters, unlisted_detractors, unlisted_delighters."
     ])
 
     user_content = json.dumps({
@@ -295,7 +311,6 @@ def _openai_labeler(
     except Exception:
         return [], [], [], []
 
-
 def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
     if (client is None) or (not verbatim or not verbatim.strip()):
         return "Not Mentioned", "Not Mentioned", "Unknown"
@@ -329,7 +344,6 @@ def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float
         return "Not Mentioned", "Not Mentioned", "Unknown"
 
 # ------------------- Export helpers -------------------
-
 def generate_template_workbook_bytes(
     original_file,
     updated_df: pd.DataFrame,
@@ -406,11 +420,8 @@ def generate_template_workbook_bytes(
     return out.getvalue()
 
 # ------------------- Helpers: add new symptoms -------------------
-
 def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]]) -> bytes:
-    """Safely add new symptoms to the 'Symptoms' sheet.
-    Robust to missing/blank headers and never writes to negative/zero columns.
-    """
+    """Safely add new symptoms to the 'Symptoms' sheet."""
     original_file.seek(0)
     wb = load_workbook(original_file)
 
@@ -432,16 +443,13 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
     def _ensure_header(name: str, synonyms: List[str], preferred_index: Optional[int] = None) -> int:
         """Return a 1-based column index for a header. Create header if needed."""
-        # Try to find an existing header by any synonym
         for syn in synonyms:
             idx = header_map.get(str(syn).lower())
             if idx:
-                # If header cell text is blank, fill with canonical name
                 if not ws.cell(row=1, column=idx).value:
                     ws.cell(row=1, column=idx, value=name)
                 used_cols.add(idx)
                 return idx
-        # Not found: choose a safe new column index
         max_col = int(getattr(ws, "max_column", 0) or 0)
         idx = preferred_index if (preferred_index and preferred_index > 0) else (max_col + 1 if max_col > 0 else 1)
         while idx in used_cols:
@@ -474,7 +482,6 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
         rnew = (int(getattr(ws, "max_row", 1) or 1)) + 1
         ws.cell(row=rnew, column=col_label, value=lab)
         ws.cell(row=rnew, column=col_type, value=str(side).strip() or "")
-        # Aliases left blank intentionally
         existing.add(lab)
 
     out = io.BytesIO(); wb.save(out); out.seek(0)
@@ -482,8 +489,7 @@ def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]
 
 # ------------------- File Upload -------------------
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
-if not uploaded_file:
-    st.stop()
+if not uploaded_file: st.stop()
 
 uploaded_bytes = uploaded_file.read()
 uploaded_file.seek(0)
@@ -575,17 +581,36 @@ with st.expander("Preview in-scope rows", expanded=False):
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# Controls (presets + ETA + sticky toolbar)
+# ------------------- Controls (New Polished Toolbar) -------------------
+processed_rows: List[Dict] = []
+processed_idx_set: Set[int] = set()
+if "undo_stack" not in st.session_state:
+    st.session_state["undo_stack"] = []
+
 with st.container():
     st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
-    c1, c2, c3, c4, c5, c6 = st.columns([1.8,1,1.2,1.6,1.3,1.3])
 
-    # ---- SAFE N picker block (FIX) ----
-    with c1:
+    # ---------- ROW 1: Primary actions ----------
+    r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
+    with r1a:
+        run_n_btn = st.button("▶️ Symptomize N", use_container_width=True)
+    with r1b:
+        run_all_btn = st.button("🚀 Symptomize All", use_container_width=True)
+    with r1c:
+        overwrite_btn = st.button("♻️ Overwrite & Re-symptomize", use_container_width=True)
+    with r1d:
+        run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
+    with r1e:
+        undo_btn = st.button("↩️ Undo last run", use_container_width=True)
+
+    # ---------- ROW 2: Batch size + presets ----------
+    st.markdown("<div class='batchbar'>", unsafe_allow_html=True)
+    cA, cB, cC, cD, cE = st.columns([1.0, 0.5, 0.5, 0.5, 0.5])
+
+    with cA:
         bound_min = 1
         bound_max = max(1, len(target))
 
-        # init once
         if "n_to_process" not in st.session_state:
             st.session_state["n_to_process"] = min(10, bound_max)
 
@@ -593,27 +618,9 @@ with st.container():
         cur = int(st.session_state.get("n_to_process", 1))
         if cur < bound_min:
             st.session_state["n_to_process"] = bound_min
-            cur = bound_min
         elif cur > bound_max:
             st.session_state["n_to_process"] = bound_max
-            cur = bound_max
 
-        # presets FIRST, with on_click + rerun to avoid same-run widget mutation issues
-        def _set_n(v: int):
-            st.session_state["n_to_process"] = min(max(int(v), bound_min), bound_max)
-            st.rerun()
-
-        p1, p2, p3, p4 = st.columns(4)
-        with p1:
-            st.button("10", on_click=_set_n, args=(10,))
-        with p2:
-            st.button("25", on_click=_set_n, args=(25,))
-        with p3:
-            st.button("50", on_click=_set_n, args=(50,))
-        with p4:
-            st.button("100", on_click=_set_n, args=(100,))
-
-        # now render the number input; it reads from session_state by key
         n_to_process = st.number_input(
             "How many to symptomize (from top of scope)",
             min_value=bound_min,
@@ -621,27 +628,24 @@ with st.container():
             step=1,
             key="n_to_process",
         )
-    # -----------------------------------
 
-    with c2:
-        run_n_btn = st.button("Symptomize N", use_container_width=True)
-    with c3:
-        run_all_btn = st.button("Symptomize All", use_container_width=True)
-    with c4:
-        overwrite_btn = st.button("Overwrite & Re-symptomize", use_container_width=True)
-    with c5:
-        run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
-    with c6:
-        undo_btn = st.button("↩️ Undo last run", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    def _set_n(v: int):
+        st.session_state["n_to_process"] = min(max(int(v), bound_min), bound_max)
+        st.rerun()
 
-processed_rows: List[Dict] = []
-processed_idx_set: Set[int] = set()
-if "undo_stack" not in st.session_state:
-    st.session_state["undo_stack"] = []
+    with cB:
+        st.button("10", use_container_width=True, on_click=_set_n, args=(10,))
+    with cC:
+        st.button("25", use_container_width=True, on_click=_set_n, args=(25,))
+    with cD:
+        st.button("50", use_container_width=True, on_click=_set_n, args=(50,))
+    with cE:
+        st.button("100", use_container_width=True, on_click=_set_n, args=(100,))
+
+    st.markdown("</div>", unsafe_allow_html=True)  # end batchbar
+    st.markdown("</div>", unsafe_allow_html=True)  # end toolbar
 
 # --- Core runner ---
-
 def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     global df
     max_per_side = 10
@@ -663,7 +667,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         df = ensure_ai_columns(df)
         idxs = rows_df.index.tolist()
         for idx_clear in idxs:
-            # record old values for undo
             old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
             old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
             old_vals.update({"AI Safety": df.loc[idx_clear, "AI Safety"] if "AI Safety" in df.columns else None,
@@ -673,7 +676,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             for j in range(1, 10+1):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
-            # meta stays; re-write below
 
     total_n = max(1, len(rows_df))
     for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
@@ -681,7 +683,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         needs_deli = bool(row.get("Needs_Delighters", False))
         needs_detr = bool(row.get("Needs_Detractors", False))
 
-        # Record old values for undo if not already recorded
         if not overwrite_mode:
             old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
             old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
@@ -724,7 +725,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                 df.loc[idx, col] = lab
             wrote_dels = dels[:max_per_side]
 
-        # meta always saved
         df.loc[idx, "AI Safety"] = safety
         df.loc[idx, "AI Reliability"] = reliability
         df.loc[idx, "AI # of Sessions"] = sessions
@@ -752,7 +752,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         eta_sec = (rem / rate) if rate > 0 else 0.0
         eta_box.markdown(f"**Progress:** {k}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min")
 
-    # Push snapshot to undo stack at end of run
     st.session_state["undo_stack"].append({"rows": snapshot})
 
 # Execute by buttons
@@ -769,12 +768,10 @@ if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_miss
     st.success(f"Symptomized {len(processed_rows)} review(s).")
 
 # Undo last run
-
 def _undo_last_run():
     global df
     if not st.session_state["undo_stack"]:
-        st.info("Nothing to undo.")
-        return
+        st.info("Nothing to undo."); return
     snap = st.session_state["undo_stack"].pop()
     for idx, old_vals in snap.get("rows", []):
         for col, val in old_vals.items():
@@ -783,7 +780,7 @@ def _undo_last_run():
             df.loc[idx, col] = val
     st.success("Reverted last run.")
 
-if undo_btn:
+if 'undo_btn' in locals() and undo_btn:
     _undo_last_run()
 
 # ------------------- Processed Reviews (chips + highlighted evidence) -------------------
@@ -798,7 +795,6 @@ if processed_rows:
         if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
             head += " • ⚠︎ >10 detected (trimmed to 10)"
         with st.expander(head):
-            # Build highlight term list = labels + known aliases for those labels
             terms: List[str] = []
             for lab in list(rec["Added_Detractors"]) + list(rec["Added_Delighters"]):
                 terms.append(lab)
@@ -807,7 +803,6 @@ if processed_rows:
             st.markdown("**Verbatim (evidence highlighted)**")
             st.markdown(highlight_text(rec["Verbatim"], terms), unsafe_allow_html=True)
 
-            # Meta chips (Safety / Reliability / Sessions)
             meta_html = (
                 "<div class='chips-block chip-wrap'>"
                 f"<span class='chip yellow'>Safety: {_esc(rec.get('Safety','Not Mentioned'))}</span>"
@@ -837,7 +832,6 @@ for rec in processed_rows:
     for u in rec.get("Unlisted_Detractors", []) or []:
         cand_det.setdefault(u, []).append(rec["Index"])
 
-# Suppress near-duplicates vs whitelist & aliases
 whitelist_all = set(DELIGHTERS + DETRACTORS)
 alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
 wl_canon = {_canon_simple(x) for x in whitelist_all}
@@ -852,15 +846,13 @@ def _filter_near_dupes(cmap: Dict[str, List[int]], cutoff: float = 0.94) -> Dict
             continue
         try:
             m = difflib.get_close_matches(sym, list(whitelist_all), n=1, cutoff=cutoff)
-            if m:
-                continue
+            if m: continue
         except Exception:
             pass
         if c in seen_key:
             filtered[seen_key[c]].extend(refs)
         else:
-            filtered[sym] = list(refs)
-            seen_key[c] = sym
+            filtered[sym] = list(refs); seen_key[c] = sym
     return filtered
 
 cand_del = _filter_near_dupes(cand_del, cutoff=sim_threshold)
@@ -1037,7 +1029,6 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             st.write("(no aliases defined)")
     with tabs[3]:
         st.markdown("**Meta fields usage (from this dataset)**")
-        # ensure meta columns exist
         df_meta = ensure_ai_columns(df.copy())
 
         def _count(col: str, order: List[str]) -> pd.DataFrame:
@@ -1072,88 +1063,10 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc(v)} · {int(c)}</span>" for v, c in df_n.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
 
-# ------------------- Browse Symptoms -------------------
-
-st.subheader("🔎 Browse Symptoms")
-view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
-
-col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
-col_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
-
-def _label_counts(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    vals: List[str] = []
-    for c in cols:
-        if c in df_in.columns:
-            series = df_in[c].dropna().astype(str).map(str.strip)
-            vals.extend([v for v in series if is_filled(v)])
-    vc = pd.Series(vals).value_counts().reset_index() if vals else pd.DataFrame(columns=["Label","Count"]).assign(Label=[], Count=[])
-    if not vc.empty:
-        vc.columns = ["Label", "Count"]
-    return vc
-
-counts_df = _label_counts(df, col_det_all if view_side=="Detractors" else col_del_all)
-
-st.markdown("**Top labels**")
-if counts_df.empty:
-    st.write("(none found)")
-else:
-    color = "red" if view_side=="Detractors" else "green"
-    chips_html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{l} · {c}</span>" for l, c in counts_df.head(60).itertuples(index=False)]) + "</div>"
-    st.markdown(chips_html, unsafe_allow_html=True)
-
-# ------------------- Quick Label Picker (dropdowns for all options) -------------------
-st.subheader("🎯 Quick Label Picker")
-qp_col1, qp_col2, qp_col3 = st.columns([1.2,2,2])
-with qp_col1:
-    qp_side = st.selectbox("Side", ["Delighters", "Detractors"], index=0, key="qp_side")
-
-# Build option list from whitelist (not from data, so you can browse everything available)
-qp_options = sorted(DELIGHTERS) if qp_side == "Delighters" else sorted(DETRACTORS)
-if not qp_options:
-    st.info("No options found in the Symptoms tab for this side.")
-else:
-    with qp_col2:
-        qp_label = st.selectbox("Label", qp_options, key="qp_label")
-    with qp_col3:
-        st.markdown("**Picked**")
-        color = "green" if qp_side=="Delighters" else "red"
-        st.markdown(f"<div class='chip-wrap'><span class='chip {color}'>{qp_label}</span></div>", unsafe_allow_html=True)
-
-    # Show where this label already appears in labeled columns (manual + AI)
-    side_cols = (colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])) if qp_side=="Delighters" else (colmap.get("manual_detractors", []) + colmap.get("ai_detractors", []))
-    mask_any = pd.Series(False, index=df.index)
-    for c in side_cols:
-        if c in df.columns:
-            try:
-                mask_any = mask_any | (df[c].astype(str).str.strip() == qp_label)
-            except Exception:
-                pass
-    labeled_hits = df.loc[mask_any]
-
-    st.markdown("**Labeled occurrences**")
-    if labeled_hits.empty:
-        st.write("(no labeled occurrences found in the current sheet)")
-    else:
-        show_cols = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in labeled_hits.columns]
-        st.dataframe(labeled_hits[show_cols].head(200), use_container_width=True)
-
-    # Also show plain-text mentions in verbatims as a fallback view
-    try:
-        verb_mask = df["Verbatim"].str.contains(qp_label, case=False, na=False, regex=False)
-        mention_hits = df.loc[verb_mask & (~mask_any)]  # exclude already labeled rows
-    except Exception:
-        mention_hits = pd.DataFrame()
-
-    st.markdown("**Mentions in verbatims (not yet labeled)**")
-    if mention_hits.empty:
-        st.write("(no additional verbatim mentions)")
-    else:
-        show_cols2 = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in mention_hits.columns]
-        st.dataframe(mention_hits[show_cols2].head(200), use_container_width=True)
-
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near-dupe proposals. Evidence highlighting shows where terms appear.")
+
 
 
 
