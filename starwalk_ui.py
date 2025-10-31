@@ -822,10 +822,10 @@ if processed_rows:
             st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Added_Detractors"]]) + "</div>", unsafe_allow_html=True)
             st.markdown("**Delighters added**")
             st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Added_Delighters"]]) + "</div>", unsafe_allow_html=True)
-            if rec["Unlisted_Detractors"]]:
+            if rec["Unlisted_Detractors"]:
                 st.markdown("**Unlisted detractors (candidates)**")
                 st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Unlisted_Detractors"]]) + "</div>", unsafe_allow_html=True)
-            if rec["Unlisted_Delighters"]]:
+            if rec["Unlisted_Delighters"]:
                 st.markdown("**Unlisted delighters (candidates)**")
                 st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Unlisted_Delighters"]]) + "</div>", unsafe_allow_html=True)
 
@@ -1053,25 +1053,46 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             )
             return vc.rename_axis("Value").reset_index(name="Count")
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Safety**")
-            df_s = _count("AI Safety", SAFETY_ENUM)
-            st.bar_chart(df_s.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_esc(v)} · {int(c)}</span>" for v, c in df_s.itertuples(index=False)]) + "</div>"
-            st.markdown(chips, unsafe_allow_html=True)
-        with c2:
-            st.markdown("**Reliability**")
-            df_r = _count("AI Reliability", RELIABILITY_ENUM)
-            st.bar_chart(df_r.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_esc(v)} · {int(c)}</span>" for v, c in df_r.itertuples(index=False)]) + "</div>"
-            st.markdown(chips, unsafe_allow_html=True)
-        with c3:
-            st.markdown("**# of Sessions**")
-            df_n = _count("AI # of Sessions", SESSIONS_ENUM)
-            st.bar_chart(df_n.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc(v)} · {int(c)}</span>" for v, c in df_n.itertuples(index=False)]) + "</div>"
-            st.markdown(chips, unsafe_allow_html=True)
+            with c1:
+        # Bounds that depend on current scope
+        bound_min = 1
+        bound_max = max(1, len(target))
+    
+        # Initialize once
+        if "n_to_process" not in st.session_state:
+            st.session_state["n_to_process"] = min(10, bound_max)
+    
+        # Clamp BEFORE rendering widgets (handles when scope changes)
+        cur = int(st.session_state.get("n_to_process", 1))
+        if cur < bound_min:
+            st.session_state["n_to_process"] = bound_min
+        elif cur > bound_max:
+            st.session_state["n_to_process"] = bound_max
+    
+        # Presets FIRST; use a callback so Streamlit is happy
+        def _set_n(v: int):
+            st.session_state["n_to_process"] = min(max(int(v), bound_min), bound_max)
+            st.rerun()  # ensures the widget is recreated with the new value
+    
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            st.button("10", on_click=_set_n, args=(10,))
+        with p2:
+            st.button("25", on_click=_set_n, args=(25,))
+        with p3:
+            st.button("50", on_click=_set_n, args=(50,))
+        with p4:
+            st.button("100", on_click=_set_n, args=(100,))
+    
+        # Now render the number input. Do NOT pass `value=`; it reads from session_state by key.
+        n_to_process = st.number_input(
+            "How many to symptomize (from top of scope)",
+            min_value=bound_min,
+            max_value=bound_max,
+            step=1,
+            key="n_to_process",
+        )
+
 
 # ------------------- Browse Symptoms -------------------
 
