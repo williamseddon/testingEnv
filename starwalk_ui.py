@@ -1,4 +1,3 @@
-
 # starwalk_ui_v7_1.py — ETA, presets, overwrite, undo, similarity guard, polished UI, evidence highlighting (no header relabeling)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
@@ -26,7 +25,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 # ------------------- Page Setup -------------------
 st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.1")
 st.title("✨ Review Symptomizer — v7.1")
-st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New‑symptom inbox • Tiles UI • Similarity guard • Highlighted evidence")
+st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Highlighted evidence")
 
 # ------------------- Global CSS -------------------
 st.markdown(
@@ -241,18 +240,26 @@ def _openai_labeler(
     det_map: Dict[str, str],
     alias_to_label: Dict[str, str],
 ) -> Tuple[List[str], List[str], List[str], List[str]]:
-    if not verbatim or not verbatim.strip():
+    """Return (listed_delighters, listed_detractors, unlisted_delighters, unlisted_detractors)."""
+    if (client is None) or (not verbatim or not verbatim.strip()):
         return [], [], [], []
 
-    # --- inside _openai_meta_extractor(...) ---
-    sys = (
-        "Extract three fields from this consumer review. Use ONLY the allowed values.\n"
-        "SAFETY one of: ['Not Mentioned','Concern','Positive']\n"
-        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']\n"
-        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']\n"
-        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
-    )
+    # Strict JSON instruction: choose only from whitelists for listed sets; put novel phrases into "unlisted_*".
+    sys = "\n".join([
+        "You label consumer reviews with predefined symptom lists.",
+        "Pick up to 10 detractors and up to 10 delighters that are CLEARLY supported by the review.",
+        "For the 'detractors' and 'delighters' arrays, you MUST use ONLY the exact strings from the provided allowed lists.",
+        "If you see a meaningful symptom that's NOT in the allowed lists, place the short phrase in 'unlisted_detractors' or 'unlisted_delighters' instead.",
+        "Return STRICT JSON with keys: detractors, delighters, unlisted_detractors, unlisted_delighters.",
+        "Example: {\"detractors\": [\"Loud\"], \"delighters\": [\"Easy to clean\"], \"unlisted_detractors\": [], \"unlisted_delighters\": []}"
+    ])
 
+    # Keep the allowed lists compact but explicit for strict matching
+    user_content = json.dumps({
+        "review": verbatim.strip(),
+        "allowed_delighters": delighters,
+        "allowed_detractors": detractors
+    })
 
     try:
         resp = client.chat.completions.create(
@@ -260,8 +267,7 @@ def _openai_labeler(
             temperature=float(temperature),
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f'Review:
-"""{verbatim.strip()}"""'},
+                {"role": "user", "content": user_content},
             ],
             response_format={"type": "json_object"}
         )
@@ -292,10 +298,9 @@ def _openai_labeler(
 
 
 def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
-    if not verbatim or not verbatim.strip():
+    if (client is None) or (not verbatim or not verbatim.strip()):
         return "Not Mentioned", "Not Mentioned", "Unknown"
-    sys = "
-".join([
+    sys = "\n".join([
         "Extract three fields from this consumer review. Use ONLY the allowed values.",
         "SAFETY one of: ['Not Mentioned','Concern','Positive']",
         "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
@@ -308,8 +313,7 @@ def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float
             temperature=float(temperature),
             messages=[
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f'Review:
-"""{verbatim.strip()}"""'},
+                {"role": "user", "content": f'Review:\n"""{verbatim.strip()}"""'},
             ],
             response_format={"type": "json_object"}
         )
@@ -497,7 +501,8 @@ if "Verbatim" not in df.columns:
 
 # Normalize
 df.columns = [str(c).strip() for c in df.columns]
-df["Verbatim"] = df["Verbatim"].astype(str).map(clean_text)
+# IMPORTANT: don't cast to str first or NaN becomes "nan"; rely on clean_text.
+df["Verbatim"] = df["Verbatim"].map(clean_text)
 
 # Load Symptoms
 DELIGHTERS, DETRACTORS, ALIASES = get_symptom_whitelists(uploaded_bytes)
@@ -546,8 +551,8 @@ if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
 
 # Similarity guard for new-symptom proposals
-sim_threshold = st.sidebar.slider("New‑symptom similarity guard", 0.80, 0.99, 0.94, 0.01,
-                                  help="Raise to suppress near‑duplicates; lower to see more proposals.")
+sim_threshold = st.sidebar.slider("New-symptom similarity guard", 0.80, 0.99, 0.94, 0.01,
+                                  help="Raise to suppress near-duplicates; lower to see more proposals.")
 
 # ------------------- Scope & Preview -------------------
 st.subheader("🧪 Symptomize")
@@ -600,9 +605,9 @@ with st.container():
     with c3:
         run_all_btn = st.button("Symptomize All", use_container_width=True)
     with c4:
-        overwrite_btn = st.button("Overwrite & Re‑symptomize", use_container_width=True)
+        overwrite_btn = st.button("Overwrite & Re-symptomize", use_container_width=True)
     with c5:
-        run_missing_both_btn = st.button("✨ Missing‑Both One‑Click", use_container_width=True)
+        run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
     with c6:
         undo_btn = st.button("↩️ Undo last run", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -630,7 +635,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     # Prepare undo snapshot for this run
     snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
 
-    # Overwrite mode: clear AI columns for these rows first
+    # Overwrite mode: clear AI columns for these rows first (keeps meta; repopulated below)
     if overwrite_mode:
         df = ensure_ai_columns(df)
         idxs = rows_df.index.tolist()
@@ -645,7 +650,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             for j in range(1, 10+1):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
-            # meta stays; re-write below
 
     total_n = max(1, len(rows_df))
     for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
@@ -1093,7 +1097,7 @@ else:
 
     # Show where this label already appears in labeled columns (manual + AI)
     side_cols = (colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])) if qp_side=="Delighters" else (colmap.get("manual_detractors", []) + colmap.get("ai_detractors", []))
-    mask_any = pd.Series([False]*len(df))
+    mask_any = pd.Series(False, index=df.index)  # ensure aligned index
     for c in side_cols:
         if c in df.columns:
             try:
@@ -1125,5 +1129,6 @@ else:
 
 # Footer
 st.divider()
-st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near‑dupe proposals. Evidence highlighting shows where terms appear.")
+st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near-dupe proposals. Evidence highlighting shows where terms appear.")
+
 
