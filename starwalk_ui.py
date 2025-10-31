@@ -52,6 +52,9 @@ st.markdown(
       .chip { padding:6px 10px; border-radius:999px; font-size:12.5px; border:1px solid #e6eaf0; background:#fff; box-shadow: 0 1px 2px rgba(16,24,40,.06); }
       .chip.red { background: #fff1f2; border-color:#fecdd3; }
       .chip.green { background: #ecfdf3; border-color:#bbf7d0; }
+      .chip.blue { background: #e0f2fe; border-color:#bae6fd; }
+      .chip.yellow { background: #fff7ed; border-color:#fed7aa; }
+      .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
       .muted{ color:#64748b; font-size:12px; }
       div[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, var(--brand), var(--brand2)); }
     </style>
@@ -816,17 +819,15 @@ st.download_button(
 
 # ------------------- View Symptoms from Workbook (expander) -------------------
 st.subheader("📘 View Symptoms from Excel Workbook")
-with st.expander("📘 View Symptoms from Excel Workbook", expan# ------------------- View Symptoms from Workbook (expander) -------------------
-st.subheader("📘 View Symptoms from Excel Workbook")
 with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
     st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
 
     tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])  # added Meta tab
 
-    def _esc(s:str)->str:
-        return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+    def _esc(s: str) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    def _chips(items, color:str):
+    def _chips(items, color: str):
         items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
         if not items_sorted:
             st.write("(none)")
@@ -854,7 +855,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 
         def _count(col: str, order: List[str]) -> pd.DataFrame:
             if col not in df_meta.columns:
-                return pd.DataFrame({"Value": order, "Count": [0]*len(order)})
+                return pd.DataFrame({"Value": order, "Count": [0] * len(order)})
             vc = (
                 df_meta[col]
                 .fillna("Not Mentioned")
@@ -869,23 +870,29 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
             st.markdown("**Safety**")
             df_s = _count("AI Safety", SAFETY_ENUM)
             st.bar_chart(df_s.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_esc(v)} · {int(c)}</span>" for v,c in df_s.itertuples(index=False)]) + "</div>"
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_esc(v)} · {int(c)}</span>" for v, c in df_s.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
         with c2:
             st.markdown("**Reliability**")
             df_r = _count("AI Reliability", RELIABILITY_ENUM)
             st.bar_chart(df_r.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_esc(v)} · {int(c)}</span>" for v,c in df_r.itertuples(index=False)]) + "</div>"
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_esc(v)} · {int(c)}</span>" for v, c in df_r.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
         with c3:
             st.markdown("**# of Sessions**")
             df_n = _count("AI # of Sessions", SESSIONS_ENUM)
             st.bar_chart(df_n.set_index("Value")["Count"])
-            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc(v)} · {int(c)}</span>" for v,c in df_n.itertuples(index=False)]) + "</div>"
+            chips = "<div class='chip-wrap'>" + "".join([f"<span class='chip purple'>{_esc(v)} · {int(c)}</span>" for v, c in df_n.itertuples(index=False)]) + "</div>"
             st.markdown(chips, unsafe_allow_html=True)
 
 # ------------------- Browse Symptoms -------------------
-_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
+
+
+st.subheader("🔎 Browse Symptoms")
+view_side = st.selectbox("View", ["Detractors", "Delighters"], index=0)
+
+col_det_all = colmap.get("manual_detractors", []) + colmap.get("ai_detractors", [])
+col_del_all = colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])
 
 def _label_counts(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     vals: List[str] = []
@@ -962,4 +969,5 @@ else:
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Approvals use a real submit button. ETA & speed shown during runs.")
+
 
