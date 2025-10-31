@@ -244,7 +244,7 @@ def _openai_labeler(
     if (client is None) or (not verbatim or not verbatim.strip()):
         return [], [], [], []
 
-    # Strict JSON instruction: choose only from whitelists for listed sets; put novel phrases into "unlisted_*".
+    # Strict JSON instruction for listed/unlisted outputs
     sys = "\n".join([
         "You label consumer reviews with predefined symptom lists.",
         "Pick up to 10 detractors and up to 10 delighters that are CLEARLY supported by the review.",
@@ -254,7 +254,6 @@ def _openai_labeler(
         "Example: {\"detractors\": [\"Loud\"], \"delighters\": [\"Easy to clean\"], \"unlisted_detractors\": [], \"unlisted_delighters\": []}"
     ])
 
-    # Keep the allowed lists compact but explicit for strict matching
     user_content = json.dumps({
         "review": verbatim.strip(),
         "allowed_delighters": delighters,
@@ -501,7 +500,6 @@ if "Verbatim" not in df.columns:
 
 # Normalize
 df.columns = [str(c).strip() for c in df.columns]
-# IMPORTANT: don't cast to str first or NaN becomes "nan"; rely on clean_text.
 df["Verbatim"] = df["Verbatim"].map(clean_text)
 
 # Load Symptoms
@@ -581,25 +579,51 @@ with st.expander("Preview in-scope rows", expanded=False):
 with st.container():
     st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
     c1, c2, c3, c4, c5, c6 = st.columns([1.8,1,1.2,1.6,1.3,1.3])
+
+    # ---- SAFE N picker block (FIX) ----
     with c1:
-        n_default = 10 if len(target) >= 10 else max(1, len(target))
+        bound_min = 1
+        bound_max = max(1, len(target))
+
+        # init once
         if "n_to_process" not in st.session_state:
-            st.session_state["n_to_process"] = n_default
-        n_to_process = st.number_input("How many to symptomize (from top of scope)", min_value=1, max_value=max(1, len(target)), value=st.session_state["n_to_process"], step=1, key="n_to_process")
-        # quick presets
+            st.session_state["n_to_process"] = min(10, bound_max)
+
+        # clamp before rendering any widgets
+        cur = int(st.session_state.get("n_to_process", 1))
+        if cur < bound_min:
+            st.session_state["n_to_process"] = bound_min
+            cur = bound_min
+        elif cur > bound_max:
+            st.session_state["n_to_process"] = bound_max
+            cur = bound_max
+
+        # presets FIRST, with on_click + rerun to avoid same-run widget mutation issues
         p1, p2, p3, p4 = st.columns(4)
+
+        def _set_n(v: int):
+            st.session_state["n_to_process"] = min(max(int(v), bound_min), bound_max)
+            st.rerun()
+
         with p1:
-            if st.button("10"):
-                st.session_state["n_to_process"] = min(10, max(1, len(target)))
+            st.button("10", on_click=_set_n, args=(10,))
         with p2:
-            if st.button("25"):
-                st.session_state["n_to_process"] = min(25, max(1, len(target)))
+            st.button("25", on_click=_set_n, args=(25,))
         with p3:
-            if st.button("50"):
-                st.session_state["n_to_process"] = min(50, max(1, len(target)))
+            st.button("50", on_click=_set_n, args=(50,))
         with p4:
-            if st.button("100"):
-                st.session_state["n_to_process"] = min(100, max(1, len(target)))
+            st.button("100", on_click=_set_n, args=(100,))
+
+        # now render the number input; it reads from session_state by key
+        n_to_process = st.number_input(
+            "How many to symptomize (from top of scope)",
+            min_value=bound_min,
+            max_value=bound_max,
+            step=1,
+            key="n_to_process",
+        )
+    # -----------------------------------
+
     with c2:
         run_n_btn = st.button("Symptomize N", use_container_width=True)
     with c3:
@@ -635,7 +659,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     # Prepare undo snapshot for this run
     snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
 
-    # Overwrite mode: clear AI columns for these rows first (keeps meta; repopulated below)
+    # Overwrite mode: clear AI columns for these rows first
     if overwrite_mode:
         df = ensure_ai_columns(df)
         idxs = rows_df.index.tolist()
@@ -650,6 +674,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             for j in range(1, 10+1):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
+            # meta stays; re-write below
 
     total_n = max(1, len(rows_df))
     for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
@@ -797,10 +822,10 @@ if processed_rows:
             st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Added_Detractors"]]) + "</div>", unsafe_allow_html=True)
             st.markdown("**Delighters added**")
             st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Added_Delighters"]]) + "</div>", unsafe_allow_html=True)
-            if rec["Unlisted_Detractors"]:
+            if rec["Unlisted_Detractors"]]:
                 st.markdown("**Unlisted detractors (candidates)**")
                 st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Unlisted_Detractors"]]) + "</div>", unsafe_allow_html=True)
-            if rec["Unlisted_Delighters"]:
+            if rec["Unlisted_Delighters"]]:
                 st.markdown("**Unlisted delighters (candidates)**")
                 st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Unlisted_Delighters"]]) + "</div>", unsafe_allow_html=True)
 
@@ -1097,7 +1122,7 @@ else:
 
     # Show where this label already appears in labeled columns (manual + AI)
     side_cols = (colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])) if qp_side=="Delighters" else (colmap.get("manual_detractors", []) + colmap.get("ai_detractors", []))
-    mask_any = pd.Series(False, index=df.index)  # ensure aligned index
+    mask_any = pd.Series(False, index=df.index)
     for c in side_cols:
         if c in df.columns:
             try:
@@ -1130,5 +1155,6 @@ else:
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near-dupe proposals. Evidence highlighting shows where terms appear.")
+ring runs. Similarity guard filters near-dupe proposals. Evidence highlighting shows where terms appear.")
 
 
