@@ -252,7 +252,6 @@ def _openai_labeler(
         'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}'
     )
 
-    ])
 
     try:
         resp = client.chat.completions.create(
