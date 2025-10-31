@@ -842,6 +842,58 @@ else:
     chips_html = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{l} · {c}</span>" for l, c in counts_df.head(60).itertuples(index=False)]) + "</div>"
     st.markdown(chips_html, unsafe_allow_html=True)
 
+# ------------------- Quick Label Picker (dropdowns for all options) -------------------
+st.subheader("🎯 Quick Label Picker")
+qp_col1, qp_col2, qp_col3 = st.columns([1.2,2,2])
+with qp_col1:
+    qp_side = st.selectbox("Side", ["Delighters", "Detractors"], index=0, key="qp_side")
+
+# Build option list from whitelist (not from data, so you can browse everything available)
+qp_options = sorted(DELIGHTERS) if qp_side == "Delighters" else sorted(DETRACTORS)
+if not qp_options:
+    st.info("No options found in the Symptoms tab for this side.")
+else:
+    with qp_col2:
+        qp_label = st.selectbox("Label", qp_options, key="qp_label")
+    with qp_col3:
+        st.markdown("**Picked**")
+        color = "green" if qp_side=="Delighters" else "red"
+        st.markdown(f"<div class='chip-wrap'><span class='chip {color}'>{qp_label}</span></div>", unsafe_allow_html=True)
+
+    # Show where this label already appears in labeled columns (manual + AI)
+    side_cols = (colmap.get("manual_delighters", []) + colmap.get("ai_delighters", [])) if qp_side=="Delighters" else (colmap.get("manual_detractors", []) + colmap.get("ai_detractors", []))
+    mask_any = pd.Series([False]*len(df))
+    for c in side_cols:
+        if c in df.columns:
+            try:
+                mask_any = mask_any | (df[c].astype(str).str.strip() == qp_label)
+            except Exception:
+                pass
+    labeled_hits = df.loc[mask_any]
+
+    st.markdown("**Labeled occurrences**")
+    if labeled_hits.empty:
+        st.write("(no labeled occurrences found in the current sheet)")
+    else:
+        show_cols = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in labeled_hits.columns]
+        st.dataframe(labeled_hits[show_cols].head(200), use_container_width=True)
+
+    # Also show plain-text mentions in verbatims as a fallback view
+    try:
+        patt = re.escape(qp_label)
+        verb_mask = df["Verbatim"].str.contains(patt, case=False, na=False)
+        mention_hits = df.loc[verb_mask & (~mask_any)]  # exclude already labeled rows
+    except Exception:
+        mention_hits = pd.DataFrame()
+
+    st.markdown("**Mentions in verbatims (not yet labeled)**")
+    if mention_hits.empty:
+        st.write("(no additional verbatim mentions)")
+    else:
+        show_cols2 = ["Verbatim"] + [c for c in ["Star Rating", "Review Date", "Source"] if c in mention_hits.columns]
+        st.dataframe(mention_hits[show_cols2].head(200), use_container_width=True)
+
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Approvals use a real submit button. ETA & speed shown during runs.")
+
