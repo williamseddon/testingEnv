@@ -56,6 +56,7 @@ st.markdown(
       .chip.yellow { background: #fff7ed; border-color:#fed7aa; }
       .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
       .muted{ color:#64748b; font-size:12px; }
+      .chips-block { margin-bottom: 14px; }
       div[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, var(--brand), var(--brand2)); }
     </style>
     """,
@@ -381,49 +382,73 @@ def generate_template_workbook_bytes(
 # ------------------- Helpers: add new symptoms -------------------
 
 def add_new_symptoms_to_workbook(original_file, selections: List[Tuple[str, str]]) -> bytes:
+    """Safely add new symptoms to the 'Symptoms' sheet.
+    Robust to missing/blank headers and never writes to negative/zero columns.
+    """
     original_file.seek(0)
     wb = load_workbook(original_file)
 
+    # Ensure the sheet exists
     if "Symptoms" not in wb.sheetnames:
         ws = wb.create_sheet("Symptoms")
-        ws.append(["Symptom","Type","Aliases"])  # minimal header
     else:
         ws = wb["Symptoms"]
 
-    headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-    hlow = [h.lower() for h in headers]
+    # Read current header row (may be partially/fully blank)
+    try:
+        headers_row = [c.value for c in ws[1]]
+    except Exception:
+        headers_row = []
+    headers = [str(h).strip() if h is not None else "" for h in headers_row]
+    header_map = {str(h).strip().lower(): i + 1 for i, h in enumerate(headers) if str(h).strip()}
 
-    def _col_idx(names: List[str]) -> int:
-        for nm in names:
-            if nm.lower() in hlow:
-                return hlow.index(nm.lower()) + 1
-        return -1
+    used_cols: Set[int] = set()
 
-    col_label = _col_idx(["symptom", "label", "name", "item"]) or 1
-    col_type  = _col_idx(["type", "polarity", "category", "side"]) or 2
-    col_alias = _col_idx(["aliases", "alias"])
+    def _ensure_header(name: str, synonyms: List[str], preferred_index: Optional[int] = None) -> int:
+        """Return a 1-based column index for a header. Create header if needed."""
+        # Try to find an existing header by any synonym
+        for syn in synonyms:
+            idx = header_map.get(str(syn).lower())
+            if idx:
+                # If header cell text is blank, fill with canonical name
+                if not ws.cell(row=1, column=idx).value:
+                    ws.cell(row=1, column=idx, value=name)
+                used_cols.add(idx)
+                return idx
+        # Not found: choose a safe new column index
+        max_col = int(getattr(ws, "max_column", 0) or 0)
+        idx = preferred_index if (preferred_index and preferred_index > 0) else (max_col + 1 if max_col > 0 else 1)
+        while idx in used_cols:
+            idx += 1
+        ws.cell(row=1, column=idx, value=name)
+        used_cols.add(idx)
+        return idx
 
-    if len(headers) < col_label or not headers[col_label-1]:
-        ws.cell(row=1, column=col_label, value="Symptom")
-    if len(headers) < col_type or not headers[col_type-1]:
-        ws.cell(row=1, column=col_type, value="Type")
-    if col_alias == -1:
-        col_alias = len(headers) + 1
-        ws.cell(row=1, column=col_alias, value="Aliases")
+    # Ensure columns exist and get their indices (1-based)
+    col_label = _ensure_header("Symptom", ["symptom", "label", "name", "item"], preferred_index=1)
+    col_type  = _ensure_header("Type", ["type", "polarity", "category", "side"], preferred_index=2)
+    col_alias = _ensure_header("Aliases", ["aliases", "alias"], preferred_index=3)
 
-    existing = set()
-    for r_i in range(2, ws.max_row + 1):
+    # Build set of existing labels to avoid duplicates
+    existing: Set[str] = set()
+    try:
+        last_row = int(getattr(ws, "max_row", 0) or 0)
+    except Exception:
+        last_row = 0
+    for r_i in range(2, last_row + 1):
         v = ws.cell(row=r_i, column=col_label).value
         if v:
             existing.add(str(v).strip())
 
+    # Append new selections
     for label, side in selections:
         lab = str(label).strip()
-        if not lab or lab in existing:
+        if not lab or (lab in existing):
             continue
-        row_new = ws.max_row + 1
-        ws.cell(row=row_new, column=col_label, value=lab)
-        ws.cell(row=row_new, column=col_type, value=str(side).strip() or "")
+        rnew = (int(getattr(ws, "max_row", 1) or 1)) + 1
+        ws.cell(row=rnew, column=col_label, value=lab)
+        ws.cell(row=rnew, column=col_type, value=str(side).strip() or "")
+        # Aliases left blank intentionally
         existing.add(lab)
 
     out = io.BytesIO(); wb.save(out); out.seek(0)
@@ -615,6 +640,9 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             "Unlisted_Delighters": unl_dels,
             ">10 Detractors Detected": more_than_10_dets,
             ">10 Delighters Detected": more_than_10_dels,
+            "Safety": safety,
+            "Reliability": reliability,
+            "Sessions": sessions,
         })
         processed_idx_set.add(int(idx))
 
@@ -642,8 +670,10 @@ if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_miss
 # ------------------- Processed Reviews (chips) -------------------
 if processed_rows:
     st.subheader("🧾 Processed Reviews (this run)")
-    def _esc(s:str)->str:
+
+    def _esc(s: str) -> str:
         return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+
     for rec in processed_rows:
         head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}"
         if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
@@ -651,16 +681,27 @@ if processed_rows:
         with st.expander(head):
             st.markdown("**Verbatim**")
             st.write(rec["Verbatim"])  # full text
+
+            # Meta chips (Safety / Reliability / Sessions)
+            meta_html = (
+                "<div class='chips-block chip-wrap'>"
+                f"<span class='chip yellow'>Safety: {_esc(rec.get('Safety','Not Mentioned'))}</span>"
+                f"<span class='chip blue'>Reliability: {_esc(rec.get('Reliability','Not Mentioned'))}</span>"
+                f"<span class='chip purple'># Sessions: {_esc(rec.get('Sessions','Unknown'))}</span>"
+                "</div>"
+            )
+            st.markdown(meta_html, unsafe_allow_html=True)
+
             st.markdown("**Detractors added**")
-            st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Added_Detractors"]]) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Added_Detractors"]]) + "</div>", unsafe_allow_html=True)
             st.markdown("**Delighters added**")
-            st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Added_Delighters"]]) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Added_Delighters"]]) + "</div>", unsafe_allow_html=True)
             if rec["Unlisted_Detractors"]:
                 st.markdown("**Unlisted detractors (candidates)**")
-                st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Unlisted_Detractors"]]) + "</div>", unsafe_allow_html=True)
+                st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Unlisted_Detractors"]]) + "</div>", unsafe_allow_html=True)
             if rec["Unlisted_Delighters"]:
                 st.markdown("**Unlisted delighters (candidates)**")
-                st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Unlisted_Delighters"]]) + "</div>", unsafe_allow_html=True)
+                st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Unlisted_Delighters"]]) + "</div>", unsafe_allow_html=True)
 
 # ------------------- New Symptom Candidates (Approval form) -------------------
 cand_del: Dict[str, List[int]] = {}
@@ -969,6 +1010,7 @@ else:
 # Footer
 st.divider()
 st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Approvals use a real submit button. ETA & speed shown during runs.")
+
 
 
 
