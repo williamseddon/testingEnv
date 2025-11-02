@@ -1,12 +1,15 @@
-# starwalk_ui_v7_1.py — ETA, presets, overwrite, undo, similarity guard, polished UI, evidence highlighting (no header relabeling)
+# Write a fully reviewed & optimized version (v7.3) with light cleanup and a small in-session cache
+from pathlib import Path
+import hashlib
+
+code = r'''# starwalk_ui_v7_3_evidence_opt.py — Evidence-Locked Labeling, optimized & error-checked
+# ETA, presets, overwrite, undo, similarity guard, polished UI, evidence highlighting (no header relabeling)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import io, os, json, difflib, time, re, html
-from typing import List, Dict, Tuple, Optional, Set
-from datetime import datetime
+from typing import List, Dict, Tuple, Optional, Set, Any
 
 # Optional: OpenAI
 try:
@@ -23,9 +26,9 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.1")
-st.title("✨ Review Symptomizer — v7.1")
-st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Highlighted evidence")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.3 (Evidence • Optimized)")
+st.title("✨ Review Symptomizer — v7.3 (Evidence • Optimized)")
+st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Evidence-locked labeling • In-session cache")
 
 # ------------------- Global CSS -------------------
 st.markdown(
@@ -57,26 +60,14 @@ st.markdown(
       .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
       .muted{ color:#64748b; font-size:12px; }
       .chips-block { margin-bottom: 16px; }
-
-      /* Light, global button polish (no empty wrapper boxes) */
-      .stButton > button {
-        height: 40px; border-radius: 10px; font-weight: 600;
+      .stButton > button { height: 40px; border-radius: 10px; font-weight: 600;
         background: linear-gradient(180deg, #ffffff, #f7f8fb);
-        border: 1px solid #e6eaf0; box-shadow: 0 1px 2px rgba(16,24,40,.04);
-      }
-      .stButton > button:hover {
-        border-color: rgba(124,58,237,.35);
-        box-shadow: 0 2px 6px rgba(124,58,237,.15);
-      }
-
-      /* Batch controls look */
+        border: 1px solid #e6eaf0; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+      .stButton > button:hover { border-color: rgba(124,58,237,.35); box-shadow: 0 2px 6px rgba(124,58,237,.15); }
       div.batch-row .stNumberInput input { height: 40px; font-weight: 700; }
-      div.batch-row .stButton > button {
-        border-radius: 999px; height: 36px; font-weight: 700; min-width: 72px;
-        background: #fff; border: 1px solid rgba(6,182,212,.45);
-      }
+      div.batch-row .stButton > button { border-radius: 999px; height: 36px; font-weight: 700; min-width: 72px;
+        background: #fff; border: 1px solid rgba(6,182,212,.45); }
       div.batch-row .stButton > button:hover { background: #f0fdff; border-color: var(--brand2); }
-
       mark.hl { background: #fde68a; padding: 0 .15em; border-radius: .25em; }
     </style>
     """,
@@ -232,6 +223,19 @@ SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
 RELIABILITY_ENUM = ["Not Mentioned", "Negative", "Neutral", "Positive"]
 SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
 
+def _symptom_list_version(delighters: List[str], detractors: List[str], aliases: Dict[str, List[str]]) -> str:
+    payload = json.dumps({"del": delighters, "det": detractors, "ali": aliases}, sort_keys=True, ensure_ascii=False)
+    try:
+        import hashlib
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        return str(len(delighters)) + "_" + str(len(detractors))
+
+def _ensure_label_cache():
+    if "_label_cache" not in st.session_state:
+        st.session_state["_label_cache"] = {}
+    return st.session_state["_label_cache"]
+
 def _openai_labeler(
     verbatim: str,
     client,
@@ -243,55 +247,100 @@ def _openai_labeler(
     del_map: Dict[str, str],
     det_map: Dict[str, str],
     alias_to_label: Dict[str, str],
-) -> Tuple[List[str], List[str], List[str], List[str]]:
+    max_ev_per_label: int = 2,
+    max_ev_chars: int = 120,
+) -> Tuple[List[str], List[str], List[str], List[str], Dict[str, List[str]], Dict[str, List[str]]]:
+    """
+    Evidence-locked version with in-session cache.
+    Returns:
+      dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map
+    """
     if (client is None) or (not verbatim or not verbatim.strip()):
-        return [], [], [], []
+        return [], [], [], [], {}, {}
+
+    v = _symptom_list_version(delighters, detractors, alias_map)
+    key = ("lab", _canon(verbatim), model, f"{temperature:.2f}", v, max_ev_per_label, max_ev_chars)
+    cache = _ensure_label_cache()
+    if key in cache:
+        return cache[key]
 
     sys = "\n".join([
         "You label consumer reviews with predefined symptom lists.",
-        "Pick up to 10 detractors and up to 10 delighters that are CLEARLY supported by the review.",
-        "For the 'detractors' and 'delighters' arrays, use ONLY exact strings from provided allowed lists.",
-        "If you see a meaningful symptom not in the lists, put it in 'unlisted_*'.",
-        "Return STRICT JSON with keys: detractors, delighters, unlisted_detractors, unlisted_delighters."
+        "Return STRICT JSON with this schema:",
+        '{"detractors":[{"label":"<one from allowed detractors or close alias>","evidence":["<exact substring from review>", "..."]}],',
+        ' "delighters":[{"label":"<one from allowed delighters or close alias>","evidence":["<exact substring>", "..."]}],',
+        ' "unlisted_detractors":["..."], "unlisted_delighters":["..."]}',
+        "",
+        "Rules:",
+        f"- Evidence MUST be exact substrings from the review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
+        "- Only include a label if there is clear textual support in the review.",
+        "- Use the allowed lists; if close wording appears, pick the closest allowed label or list it under unlisted_*.",
+        "- Cap to maximum 10 detractors and 10 delighters.",
     ])
-    user_content = json.dumps({
+    user_payload = {
         "review": verbatim.strip(),
         "allowed_delighters": delighters,
         "allowed_detractors": detractors
-    })
+    }
 
     try:
         resp = client.chat.completions.create(
             model=model,
             temperature=float(temperature),
             messages=[{"role": "system", "content": sys},
-                      {"role": "user", "content": user_content}],
+                      {"role": "user", "content": json.dumps(user_payload)}],
             response_format={"type": "json_object"}
         )
         content = resp.choices[0].message.content or "{}"
         data = json.loads(content)
-
-        def _map_side(items: List[str], side: str) -> List[str]:
-            mapped: List[str] = []
-            for x in (items or []):
-                key = _canon(x)
-                if side == "del":
-                    label = del_map.get(key) or alias_to_label.get(key)
-                    if label and (label in delighters) and (label not in mapped):
-                        mapped.append(label)
-                else:
-                    label = det_map.get(key) or alias_to_label.get(key)
-                    if label and (label in detractors) and (label not in mapped):
-                        mapped.append(label)
-            return mapped[:10]
-
-        dels = _map_side(data.get("delighters", []), side="del")
-        dets = _map_side(data.get("detractors", []), side="det")
-        unl_dels = [x for x in (data.get("unlisted_delighters", []) or [])][:10]
-        unl_dets = [x for x in (data.get("unlisted_detractors", []) or [])][:10]
-        return dels, dets, unl_dels, unl_dets
     except Exception:
-        return [], [], [], []
+        return [], [], [], [], {}, {}
+
+    # Normalize structure
+    raw_dels = data.get("delighters", []) or []
+    raw_dets = data.get("detractors", []) or []
+    unl_dels = [x for x in (data.get("unlisted_delighters", []) or [])][:10]
+    unl_dets = [x for x in (data.get("unlisted_detractors", []) or [])][:10]
+
+    def _canon_map_item(obj: Any, side: str) -> Tuple[Optional[str], List[str]]:
+        try:
+            lbl_raw = str(obj.get("label", "")).strip()
+            evs = [str(e)[:max_ev_chars] for e in (obj.get("evidence", []) or []) if isinstance(e, str) and e.strip()]
+        except Exception:
+            lbl_raw, evs = "", []
+        key2 = _canon(lbl_raw)
+        if side == "del":
+            label = del_map.get(key2) or alias_to_label.get(key2)
+            if label and (label in delighters):
+                return label, evs[:max_ev_per_label]
+        else:
+            label = det_map.get(key2) or alias_to_label.get(key2)
+            if label and (label in detractors):
+                return label, evs[:max_ev_per_label]
+        return None, []
+
+    dels: List[str] = []
+    dets: List[str] = []
+    ev_del_map: Dict[str, List[str]] = {}
+    ev_det_map: Dict[str, List[str]] = {}
+
+    for obj in raw_dels:
+        label, evs = _canon_map_item(obj, side="del")
+        if label and (label not in dels):
+            dels.append(label)
+            ev_del_map[label] = evs
+        if len(dels) >= 10: break
+
+    for obj in raw_dets:
+        label, evs = _canon_map_item(obj, side="det")
+        if label and (label not in dets):
+            dets.append(label)
+            ev_det_map[label] = evs
+        if len(dets) >= 10: break
+
+    out = (dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map)
+    cache[key] = out
+    return out
 
 def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
     if (client is None) or (not verbatim or not verbatim.strip()):
@@ -506,6 +555,15 @@ if client is None:
 sim_threshold = st.sidebar.slider("New-symptom similarity guard", 0.80, 0.99, 0.94, 0.01,
                                   help="Raise to suppress near-duplicates; lower to see more proposals.")
 
+# ----- Evidence settings ----- (checkbox compatible with Streamlit >=1.28)
+require_evidence = st.sidebar.checkbox(
+    "Require evidence to write labels",
+    value=True,
+    help="If ON, a label must include ≥1 exact snippet from the review to be written."
+)
+max_ev_per_label = st.sidebar.slider("Max evidence per label", 1, 3, 2)
+max_ev_chars = st.sidebar.slider("Max evidence length (chars)", 40, 200, 120, 10)
+
 # ------------------- Scope & Preview -------------------
 st.subheader("🧪 Symptomize")
 scope = st.selectbox(
@@ -529,7 +587,7 @@ with st.expander("Preview in-scope rows", expanded=False):
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# ------------------- Controls (no HTML wrappers — no empty bar) -------------------
+# ------------------- Controls -------------------
 processed_rows: List[Dict] = []
 processed_idx_set: Set[int] = set()
 if "undo_stack" not in st.session_state:
@@ -546,7 +604,7 @@ with r1e: undo_btn = st.button("↩️ Undo last run", use_container_width=True)
 # Small spacer
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-# Row 2: batch size + presets (scoped styling via a simple class on an empty div before columns)
+# Row 2: batch size + presets
 st.markdown("<div class='batch-row'></div>", unsafe_allow_html=True)
 cA, cB, cC, cD, cE = st.columns([1.0, 0.5, 0.5, 0.5, 0.5])
 
@@ -581,7 +639,6 @@ with cE: st.button("100", use_container_width=True, on_click=_set_n, args=(100,)
 # --- Core runner ---
 def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     global df
-    max_per_side = 10
     prog = st.progress(0.0)
 
     def _fmt_secs(sec: float) -> str:
@@ -620,13 +677,15 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             snapshot.append((int(idx), old_vals))
 
         try:
-            dels, dets, unl_dels, unl_dets = _openai_labeler(
+            dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map = _openai_labeler(
                 vb, client, selected_model, temperature,
                 DELIGHTERS, DETRACTORS, ALIASES,
-                DEL_MAP, DET_MAP, ALIAS_TO_LABEL
-            ) if client else ([], [], [], [])
+                DEL_MAP, DET_MAP, ALIAS_TO_LABEL,
+                max_ev_per_label=max_ev_per_label,
+                max_ev_chars=max_ev_chars
+            ) if client else ([], [], [], [], {}, {})
         except Exception:
-            dels, dets, unl_dels, unl_dets = [], [], [], []
+            dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map = [], [], [], [], {}, {}
 
         try:
             safety, reliability, sessions = _openai_meta_extractor(vb, client, selected_model, temperature) if client else ("Not Mentioned","Not Mentioned","Unknown")
@@ -635,38 +694,58 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
 
         df = ensure_ai_columns(df)
         wrote_dets, wrote_dels = [], []
-        more_than_10_dets = len(dets) > 10
-        more_than_10_dels = len(dels) > 10
+        ev_written_det: Dict[str, List[str]] = {}
+        ev_written_del: Dict[str, List[str]] = {}
+
+        def _label_allowed(label: str, side: str) -> bool:
+            if not require_evidence:
+                return True
+            evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
+            return len(evs) > 0
 
         if needs_detr and dets:
-            for j, lab in enumerate(dets[:10]):
+            dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
+            for j, lab in enumerate(dets_to_write):
                 col = f"AI Symptom Detractor {j+1}"
                 if col not in df.columns: df[col] = None
                 df.loc[idx, col] = lab
-            wrote_dets = dets[:10]
+                ev_written_det[lab] = ev_det_map.get(lab, [])
+            wrote_dets = dets_to_write
+
         if needs_deli and dels:
-            for j, lab in enumerate(dels[:10]):
+            dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
+            for j, lab in enumerate(dels_to_write):
                 col = f"AI Symptom Delighter {j+1}"
                 if col not in df.columns: df[col] = None
                 df.loc[idx, col] = lab
-            wrote_dels = dels[:10]
+                ev_written_del[lab] = ev_del_map.get(lab, [])
+            wrote_dels = dels_to_write
 
         df.loc[idx, "AI Safety"] = safety
         df.loc[idx, "AI Reliability"] = reliability
         df.loc[idx, "AI # of Sessions"] = sessions
+
+        # Evidence coverage for this row
+        total_labels = len(wrote_dets) + len(wrote_dels)
+        labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, []))>0) + \
+                         sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, []))>0)
+        row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
 
         processed_rows.append({
             "Index": int(idx),
             "Verbatim": str(vb),
             "Added_Detractors": wrote_dets,
             "Added_Delighters": wrote_dels,
+            "Evidence_Detractors": ev_written_det,
+            "Evidence_Delighters": ev_written_del,
             "Unlisted_Detractors": unl_dets,
             "Unlisted_Delighters": unl_dels,
-            ">10 Detractors Detected": more_than_10_dets,
-            ">10 Delighters Detected": more_than_10_dels,
+            ">10 Detractors Detected": len(dets) > 10,
+            ">10 Delighters Detected": len(dels) > 10,
             "Safety": safety,
             "Reliability": reliability,
             "Sessions": sessions,
+            "Evidence_Coverage": row_ev_cov,
         })
         processed_idx_set.add(int(idx))
 
@@ -711,6 +790,9 @@ if undo_btn:
 # ------------------- Processed Reviews (chips + highlighted evidence) -------------------
 if processed_rows:
     st.subheader("🧾 Processed Reviews (this run)")
+    ev_cov_vals = [float(r.get("Evidence_Coverage", 0.0)) for r in processed_rows]
+    overall_cov = (sum(ev_cov_vals)/len(ev_cov_vals)) if ev_cov_vals else 0.0
+    st.caption(f"**Evidence Coverage (this run):** {overall_cov*100:.1f}% of written labels include ≥1 snippet.")
 
     def _esc(s: str) -> str:
         return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
@@ -720,13 +802,15 @@ if processed_rows:
         if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
             head += " • ⚠︎ >10 detected (trimmed to 10)"
         with st.expander(head):
-            terms: List[str] = []
-            for lab in list(rec["Added_Detractors"]) + list(rec["Added_Delighters"]):
-                terms.append(lab)
-                if ALIASES and lab in ALIASES:
-                    terms.extend(ALIASES[lab])
+            # Collect evidence snippets for highlighting (authoritative)
+            evidence_terms: List[str] = []
+            for _, evs in (rec.get("Evidence_Detractors", {}) or {}).items():
+                evidence_terms.extend(evs or [])
+            for _, evs in (rec.get("Evidence_Delighters", {}) or {}).items():
+                evidence_terms.extend(evs or [])
+
             st.markdown("**Verbatim (evidence highlighted)**")
-            st.markdown(highlight_text(rec["Verbatim"], terms), unsafe_allow_html=True)
+            st.markdown(highlight_text(rec["Verbatim"], evidence_terms), unsafe_allow_html=True)
 
             meta_html = (
                 "<div class='chips-block chip-wrap'>"
@@ -738,15 +822,30 @@ if processed_rows:
             st.markdown(meta_html, unsafe_allow_html=True)
 
             st.markdown("**Detractors added**")
-            st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Added_Detractors"]]) + "</div>", unsafe_allow_html=True)
+            det_html = "<div class='chips-block chip-wrap'>"
+            for lab in rec["Added_Detractors"]:
+                k = len((rec.get("Evidence_Detractors", {}) or {}).get(lab, []))
+                det_html += f"<span class='chip red'>{html.escape(lab)} · Evidence: {k}</span>"
+            det_html += "</div>"
+            st.markdown(det_html, unsafe_allow_html=True)
+
             st.markdown("**Delighters added**")
-            st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Added_Delighters"]]) + "</div>", unsafe_allow_html=True)
-            if rec["Unlisted_Detractors"]:
-                st.markdown("**Unlisted detractors (candidates)**")
-                st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip red'>{_esc(x)}</span>" for x in rec["Unlisted_Detractors"]]) + "</div>", unsafe_allow_html=True)
-            if rec["Unlisted_Delighters"]:
-                st.markdown("**Unlisted delighters (candidates)**")
-                st.markdown("<div class='chips-block chip-wrap'>" + "".join([f"<span class='chip green'>{_esc(x)}</span>" for x in rec["Unlisted_Delighters"]]) + "</div>", unsafe_allow_html=True)
+            del_html = "<div class='chips-block chip-wrap'>"
+            for lab in rec["Added_Delighters"]:
+                k = len((rec.get("Evidence_Delighters", {}) or {}).get(lab, []))
+                del_html += f"<span class='chip green'>{html.escape(lab)} · Evidence: {k}</span>"
+            del_html += "</div>"
+            st.markdown(del_html, unsafe_allow_html=True)
+
+            with st.expander("See evidence snippets", expanded=False):
+                if rec.get("Evidence_Detractors"):
+                    st.markdown("**Detractor evidence**")
+                    for lab, evs in rec["Evidence_Detractors"].items():
+                        for e in evs: st.write(f"- {e}")
+                if rec.get("Evidence_Delighters"):
+                    st.markdown("**Delighter evidence**")
+                    for lab, evs in rec["Evidence_Delighters"].items():
+                        for e in evs: st.write(f"- {e}")
 
 # ------------------- New Symptom Candidates (Approval form) -------------------
 cand_del: Dict[str, List[int]] = {}
@@ -921,7 +1020,7 @@ st.download_button("⬇️ Download Symptoms Catalog (XLSX)", sym_bytes.getvalue
                    file_name=f"{file_base}_Symptoms_Catalog.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ------------------- View Symptoms from Workbook (expander) -------------------
+# ------------------- View Symptoms from Excel Workbook (expander) -------------------
 st.subheader("📘 View Symptoms from Excel Workbook")
 with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
     st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
@@ -982,9 +1081,12 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 
 # Footer
 st.divider()
-st.caption("Exports write EXACTLY to K–T (dets) and U–AD (dels); meta to AE/AF/AG. Undo enabled. Approvals use a real submit button. ETA & speed shown during runs. Similarity guard filters near-dupe proposals. Evidence highlighting shows where terms appear.")
+st.caption("v7.3 — Evidence-locked labeling, in-session caching, minor cleanups. Exports: K–T/U–AD, meta: AE/AF/AG. No header relabeling.")
+'''
 
+path = Path("/mnt/data/starwalk_ui_v7_3_evidence_opt.py")
+path.write_text(code, encoding="utf-8")
 
-
-
-
+sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
+print("Wrote:", str(path))
+print("SHA256:", sha)
