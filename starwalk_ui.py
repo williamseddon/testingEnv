@@ -1,8 +1,4 @@
-# Write a fully reviewed & optimized version (v7.3) with light cleanup and a small in-session cache
-from pathlib import Path
-import hashlib
-
-code = r'''# starwalk_ui_v7_3_evidence_opt.py — Evidence-Locked Labeling, optimized & error-checked
+# starwalk_ui_v7_3_evidence_opt.py — Evidence-Locked Labeling, optimized & error-checked
 # ETA, presets, overwrite, undo, similarity guard, polished UI, evidence highlighting (no header relabeling)
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
@@ -1082,11 +1078,3 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 # Footer
 st.divider()
 st.caption("v7.3 — Evidence-locked labeling, in-session caching, minor cleanups. Exports: K–T/U–AD, meta: AE/AF/AG. No header relabeling.")
-'''
-
-path = Path("/mnt/data/starwalk_ui_v7_3_evidence_opt.py")
-path.write_text(code, encoding="utf-8")
-
-sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
-print("Wrote:", str(path))
-print("SHA256:", sha)
