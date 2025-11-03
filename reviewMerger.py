@@ -20,7 +20,13 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
+st.set_page_config(page_title="Bazaarvoice File Merger", layout="wide")
+
+# ------------------ Tunables ------------------
+HEAVY_MB  = 80     # warn threshold
+GIANT_MB  = 200    # strong warning threshold
+PREVIEW_N = 200    # preview rows
+# ----------------------------------------------
 
 # ---------- Helpers ----------
 
@@ -28,12 +34,10 @@ TRUE_SET  = {"true","t","1","yes","y"}
 FALSE_SET = {"false","f","0","no","n"}
 
 def canonicalize(name: str) -> str:
-    """Lowercase and strip non-alnum for robust header matching."""
     s = str(name).lower().strip()
     return "".join(ch for ch in s if ch.isalnum())
 
 def yes_no_from_any(series: pd.Series) -> pd.Series:
-    """Vectorized conversion of boolean-like values to Yes/No; non-boolean strings are left unchanged."""
     s = series.astype("string", copy=False)
     norm = s.str.strip().str.lower()
     yes_mask = norm.isin(TRUE_SET)
@@ -44,7 +48,6 @@ def yes_no_from_any(series: pd.Series) -> pd.Series:
     return out
 
 def is_boolean_like(series: pd.Series) -> bool:
-    """Check if a column contains only boolean-like values (ignoring NA)."""
     s = series.dropna()
     if s.empty:
         return False
@@ -77,7 +80,7 @@ def parse_short_date_col(series: pd.Series) -> pd.Series:
                 if pd.isna(d):
                     return None
                 try:
-                    return d.tz_localize(None).strftime("%m/%d/%Y")  # drop tz if present
+                    return d.tz_localize(None).strftime("%m/%d/%Y")
                 except Exception:
                     return d.strftime("%m/%d/%Y")
             except Exception:
@@ -144,7 +147,6 @@ def read_any(uploaded_file, compat_mode: bool) -> pd.DataFrame:
         raise ValueError(f"Unsupported file type for {uploaded_file.name}")
 
 def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Return actual column name matching any candidate (punctuation/case-insensitive)."""
     lookup = {canonicalize(c): c for c in df.columns}
     for cand in candidates:
         key = canonicalize(cand)
@@ -153,7 +155,6 @@ def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -> pd.Series:
-    """Vectorized country inference based on product_id content or source filename hints."""
     pid = product_id.fillna("").astype("string")
     src = source_name_series.fillna("").astype("string")
     up_pid = pid.str.upper()
@@ -194,10 +195,8 @@ CANDIDATES = {
 }
 
 # --- JSON safety ---
-
 def to_serializable(x):
     """Make any scalar JSON-safe: handle pd.NA, NaN, Timestamp, numpy scalars, bytes, etc."""
-    # None / NA / empty string handling
     try:
         if x is None or pd.isna(x):
             return None
@@ -208,7 +207,7 @@ def to_serializable(x):
     if isinstance(x, (bool, int, float)):
         return x
     if isinstance(x, (pd.Timestamp, datetime, date)):
-        return x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, date) or isinstance(x, datetime) else x.strftime("%Y-%m-%d")
+        return x.strftime("%Y-%m-%d %H:%M:%S") if isinstance(x, datetime) else x.strftime("%Y-%m-%d")
     if isinstance(x, np.generic):
         return x.item()
     if isinstance(x, (bytes, bytearray)):
@@ -220,18 +219,12 @@ def to_serializable(x):
         return [to_serializable(v) for v in x]
     if isinstance(x, dict):
         return {str(k): to_serializable(v) for k, v in x.items()}
-    # Fallback
     return str(x)
 
 # ---------- UI ----------
 
 st.title("Bazaarvoice Review Merger — High-Performance")
-st.caption("Optimized for large files: Polars/PyArrow acceleration, vectorized transforms, and optional JSON.")
-st.markdown(
-    "Upload **1 or more** Bazaarvoice export files (CSV/TSV/XLSX). "
-    "We'll merge them, convert boolean-like fields to **Yes/No**, and provide two outputs: "
-    "**Raw Merged** (optionally with a **Raw Data (JSON)** column) and your **Formatted Export**."
-)
+st.caption("Optimized for large files: Polars/PyArrow acceleration, vectorized transforms, optional JSON, and a heads-up for big merges.")
 
 uploaded_files = st.file_uploader(
     "Upload Bazaarvoice files (US / UK / EU, including RR_Export)",
@@ -253,145 +246,176 @@ if not uploaded_files:
     st.info("⬆️ Add one or more files to begin.")
     st.stop()
 
-# Read files
-frames = []
-for f in uploaded_files:
+# ---------- Big-file heads-up & Start button ----------
+def file_size_mb(f) -> float:
     try:
-        df = read_any(f, compat_mode=compat_mode)
-        df["_source_file"] = f.name  # provenance for Country rule
-        frames.append(df)
-    except Exception as e:
-        st.error(f"Failed to read {f.name}: {e}")
+        return getattr(f, "size", None) / (1024 * 1024)
+    except Exception:
+        # fallback to bytes length of buffer if size missing
+        try:
+            return len(f.getvalue()) / (1024 * 1024)
+        except Exception:
+            return 0.0
 
-if not frames:
-    st.error("No readable files were uploaded.")
+sizes = [(f.name, max(file_size_mb(f), 0.0)) for f in uploaded_files]
+total_mb = sum(mb for _, mb in sizes)
+
+st.write("**Selected files:**")
+for name, mb in sizes:
+    st.write(f"• {name} — ~{mb:,.1f} MB")
+
+if total_mb >= GIANT_MB:
+    st.warning(f"These look **HUGE** (~{total_mb:,.1f} MB total). Combining large files may take time. "
+               f"Tip: prefer CSV over Excel; turn off the JSON option for speed.")
+elif total_mb >= HEAVY_MB:
+    st.info(f"These look **large** (~{total_mb:,.1f} MB total). Merging may take a bit. "
+            f"Tip: prefer CSV; consider disabling the JSON option.")
+
+start = st.button("🚀 Merge files")
+if not start:
     st.stop()
 
-# Build union schema (order by first appearance)
-union_cols: List[str] = []
-for df in frames:
-    for col in map(str, df.columns):
-        if col not in union_cols:
-            union_cols.append(col)
-
-# Manual mapping (sidebar overrides)
-st.sidebar.header("Manual Mapping (optional)")
-all_cols_sorted = ["— auto —"] + sorted(union_cols, key=lambda x: canonicalize(x))
-
-def mapping_control(label: str, key_name: str, default_actual: Optional[str]):
-    idx = all_cols_sorted.index(default_actual) if default_actual in all_cols_sorted else 0
-    return st.sidebar.selectbox(label, options=all_cols_sorted, index=idx, key=key_name)
-
-fake_df_for_match = pd.DataFrame(columns=union_cols)
-auto_map = {k: get_col(fake_df_for_match, v) for k, v in CANDIDATES.items()}
-
-user_map = {}
-user_map["product_id"]      = mapping_control("Product ID → Model (SKU)", "map_product_id",      auto_map["product_id"])
-user_map["review_id"]       = mapping_control("Review ID → Verbatim Id", "map_review_id",        auto_map["review_id"])
-user_map["submission_time"] = mapping_control("Submission Date → Review Date", "map_submission", auto_map["submission_time"])
-user_map["review_text"]     = mapping_control("Review Text → Verbatim (Review)", "map_reviewtext", auto_map["review_text"])
-user_map["rating"]          = mapping_control("Rating → Star Rating", "map_rating",              auto_map["rating"])
-user_map["incentivized"]    = mapping_control("Incentivized → Seeded", "map_incent",             auto_map["incentivized"])
-
-# Resolve final mapping (manual override beats auto)
-final_map: Dict[str, Optional[str]] = {}
-for k, v in user_map.items():
-    final_map[k] = None if v == "— auto —" else v
-    if final_map[k] is None:
-        final_map[k] = auto_map.get(k)
-
-# Align and concat
-aligned = [df.reindex(columns=union_cols) for df in frames]
-merged = pd.concat(aligned, ignore_index=True)
-
-# Convert boolean-like columns to Yes/No (vectorized) where the entire column is boolean-like
-if bool_to_yesno:
-    for c in merged.columns:
+# ---------- Merge with live status ----------
+with st.status("Preparing to merge…", expanded=True) as status:
+    status.update(label="Reading files (1/5)…")
+    frames = []
+    errors = []
+    for f in uploaded_files:
         try:
-            if is_boolean_like(merged[c]):
-                merged[c] = yes_no_from_any(merged[c])
-        except Exception:
-            pass
+            df = read_any(f, compat_mode=compat_mode)
+            df["_source_file"] = f.name
+            frames.append(df)
+            st.write(f"✅ Read {f.name} — {df.shape[0]:,} rows, {df.shape[1]:,} cols")
+        except Exception as e:
+            errors.append(f"❌ {f.name}: {e}")
+    if errors:
+        st.error("\n".join(errors))
+        status.update(label="Aborted due to read errors.", state="error")
+        st.stop()
 
-# Debug mapping table
-if show_match_debug:
-    dbg = []
-    for std_key, candidates in CANDIDATES.items():
-        dbg.append({
-            "Target field": std_key,
-            "Auto-detected column": auto_map.get(std_key),
-            "Manual override": user_map.get(std_key),
-            "Using column": final_map.get(std_key),
-            "Candidates (subset)": ", ".join(candidates[:8]) + ("…" if len(candidates) > 8 else "")
-        })
-    st.expander("Detected column mapping").dataframe(pd.DataFrame(dbg))
+    status.update(label="Building union schema (2/5)…")
+    union_cols: List[str] = []
+    for df in frames:
+        for col in map(str, df.columns):
+            if col not in union_cols:
+                union_cols.append(col)
 
-# ----- Build outputs (vectorized) -----
+    status.update(label="Aligning & concatenating (3/5)…")
+    aligned = [df.reindex(columns=union_cols) for df in frames]
+    merged = pd.concat(aligned, ignore_index=True)
 
-def safe_col(name: Optional[str]) -> pd.Series:
-    if name is None or name not in merged.columns:
-        return pd.Series([None]*len(merged), dtype="object")
-    return merged[name]
+    status.update(label="Normalizing + formatting (4/5)…")
+    # Convert boolean-like columns to Yes/No (vectorized)
+    if bool_to_yesno:
+        for c in merged.columns:
+            try:
+                if is_boolean_like(merged[c]):
+                    merged[c] = yes_no_from_any(merged[c])
+            except Exception:
+                pass
 
-product_id_s  = safe_col(final_map["product_id"])
-review_id_s   = safe_col(final_map["review_id"])
-submission_s  = safe_col(final_map["submission_time"])
-review_text_s = safe_col(final_map["review_text"])
-rating_s      = safe_col(final_map["rating"])
-incent_s      = safe_col(final_map["incentivized"])
-source_file_s = merged.get("_source_file", pd.Series([None]*len(merged), dtype="object"))
+    # Mapping UI (now that we know schema)
+    st.sidebar.header("Manual Mapping (optional)")
+    all_cols_sorted = ["— auto —"] + sorted(union_cols, key=lambda x: canonicalize(x))
+    def mapping_control(label: str, key_name: str, default_actual: Optional[str]):
+        idx = all_cols_sorted.index(default_actual) if default_actual in all_cols_sorted else 0
+        return st.sidebar.selectbox(label, options=all_cols_sorted, index=idx, key=key_name)
 
-seeded_s = yes_no_from_any(incent_s) if bool_to_yesno else incent_s
-country_s = infer_country_series(product_id_s, source_file_s)
-new_review_s = pd.Series(["Yes" if force_yes_new_review else ""]*len(merged), dtype="object")
-review_date_s = parse_short_date_col(submission_s)
-source_s = pd.Series([constant_source or "DTC"]*len(merged), dtype="object")
+    # Auto-map against union schema
+    fake_df = pd.DataFrame(columns=union_cols)
+    def get_col_from_candidates(cands: List[str]) -> Optional[str]:
+        return get_col(fake_df, cands)
 
-formatted = pd.DataFrame({
-    "Source": source_s,
-    "Model (SKU)": product_id_s,
-    "Seeded": seeded_s,
-    "Country": country_s,
-    "New Review": new_review_s,
-    "Review Date": review_date_s,
-    "Verbatim Id": review_id_s,
-    "Verbatim (Review)": review_text_s,
-    "Star Rating": rating_s,
-})
+    auto_map = {
+        "product_id":      get_col_from_candidates(CANDIDATES["product_id"]),
+        "review_id":       get_col_from_candidates(CANDIDATES["review_id"]),
+        "submission_time": get_col_from_candidates(CANDIDATES["submission_time"]),
+        "review_text":     get_col_from_candidates(CANDIDATES["review_text"]),
+        "rating":          get_col_from_candidates(CANDIDATES["rating"]),
+        "incentivized":    get_col_from_candidates(CANDIDATES["incentivized"]),
+    }
+    user_map = {}
+    user_map["product_id"]      = mapping_control("Product ID → Model (SKU)", "map_product_id",      auto_map["product_id"])
+    user_map["review_id"]       = mapping_control("Review ID → Verbatim Id", "map_review_id",        auto_map["review_id"])
+    user_map["submission_time"] = mapping_control("Submission Date → Review Date", "map_submission", auto_map["submission_time"])
+    user_map["review_text"]     = mapping_control("Review Text → Verbatim (Review)", "map_reviewtext", auto_map["review_text"])
+    user_map["rating"]          = mapping_control("Rating → Star Rating", "map_rating",              auto_map["rating"])
+    user_map["incentivized"]    = mapping_control("Incentivized → Seeded", "map_incent",             auto_map["incentivized"])
 
-# Raw JSON column is optional for memory reasons
-if include_raw_json_download:
-    merged_with_raw = merged.copy()
-    merged_with_raw["Raw Data (JSON)"] = merged.apply(
-        lambda r: json.dumps({str(k): to_serializable(r[k]) for k in merged.columns}, ensure_ascii=False),
-        axis=1
-    )
-else:
-    merged_with_raw = merged
+    final_map: Dict[str, Optional[str]] = {}
+    for k, v in user_map.items():
+        final_map[k] = None if v == "— auto —" else v
+        if final_map[k] is None:
+            final_map[k] = auto_map.get(k)
 
-# ---------- Preview (first 200 rows for responsiveness) ----------
-st.subheader("Preview (first 200 rows)")
+    def safe_col(name: Optional[str]) -> pd.Series:
+        if name is None or name not in merged.columns:
+            return pd.Series([None]*len(merged), dtype="object")
+        return merged[name]
+
+    product_id_s  = safe_col(final_map["product_id"])
+    review_id_s   = safe_col(final_map["review_id"])
+    submission_s  = safe_col(final_map["submission_time"])
+    review_text_s = safe_col(final_map["review_text"])
+    rating_s      = safe_col(final_map["rating"])
+    incent_s      = safe_col(final_map["incentivized"])
+    source_file_s = merged.get("_source_file", pd.Series([None]*len(merged), dtype="object"))
+
+    seeded_s     = yes_no_from_any(incent_s) if bool_to_yesno else incent_s
+    country_s    = infer_country_series(product_id_s, source_file_s)
+    new_review_s = pd.Series(["Yes" if force_yes_new_review else ""]*len(merged), dtype="object")
+    review_date_s= parse_short_date_col(submission_s)
+    source_s     = pd.Series([constant_source or "DTC"]*len(merged), dtype="object")
+
+    formatted = pd.DataFrame({
+        "Source": source_s,
+        "Model (SKU)": product_id_s,
+        "Seeded": seeded_s,
+        "Country": country_s,
+        "New Review": new_review_s,
+        "Review Date": review_date_s,
+        "Verbatim Id": review_id_s,
+        "Verbatim (Review)": review_text_s,
+        "Star Rating": rating_s,
+    })
+
+    # Optional full JSON column (memory heavy)
+    if include_raw_json_download:
+        merged_with_raw = merged.copy()
+        merged_with_raw["Raw Data (JSON)"] = merged.apply(
+            lambda r: json.dumps({str(k): to_serializable(r[k]) for k in merged.columns}, ensure_ascii=False),
+            axis=1
+        )
+    else:
+        merged_with_raw = merged
+
+    status.update(label="Finalizing outputs (5/5)…", state="running")
+
+    status.update(label="Merge complete ✅", state="complete")
+
+# ---------- Preview ----------
+st.subheader(f"Preview (first {PREVIEW_N} rows)")
 t1, t2 = st.tabs(["Raw Merged", "Formatted Export"])
 with t1:
-    sample = merged.head(200).copy()
+    sample = merged.head(PREVIEW_N).copy()
+    # lightweight JSON preview (always safe)
     sample["Raw Data (JSON)"] = sample.apply(
         lambda r: json.dumps({str(k): to_serializable(r[k]) for k in sample.columns}, ensure_ascii=False),
         axis=1
     )
     st.dataframe(sample, use_container_width=True)
 with t2:
-    st.dataframe(formatted.head(200), use_container_width=True)
+    st.dataframe(formatted.head(PREVIEW_N), use_container_width=True)
 
 # ---------- Downloads ----------
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    # utf-8-sig to help Excel detect UTF-8
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31])  # Excel sheet name limit
+            df.to_excel(writer, index=False, sheet_name=name[:31])
     bio.seek(0)
     return bio.read()
 
@@ -424,12 +448,14 @@ with colB:
 
 with st.expander("Performance tips"):
     st.markdown(
+        f"- **Heads-up shown for files ≥ {HEAVY_MB} MB**; extra strong warning at {GIANT_MB} MB.\n"
         "- Prefer **CSV** over Excel for very large files.\n"
         "- Upload **unzipped CSVs** directly from Bazaarvoice when possible.\n"
         "- If installed, the app uses **Polars** or **PyArrow-backed pandas** for speed and lower memory.\n"
-        "- If you see dtype issues, flip **Compatibility mode** on.\n"
-        "- Turn **off** the 'Raw Data (JSON)' download if you hit memory limits."
+        "- Turn **off** the 'Raw Data (JSON)' option for big merges.\n"
+        "- Use **Compatibility mode** if you see dtype/date parsing quirks."
     )
+
 
 
 
