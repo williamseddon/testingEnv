@@ -1,7 +1,9 @@
 import io
 import json
 from typing import List, Optional, Dict
+from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -18,7 +20,7 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice File Merger", layout="wide")
+st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
 
 # ---------- Helpers ----------
 
@@ -56,22 +58,15 @@ def parse_short_date_col(series: pd.Series) -> pd.Series:
     Avoids AttributeError by only using .dt when truly datetimelike;
     otherwise falls back to safe per-value parsing.
     """
-    # Always coerce to a standalone Series of Python objects
     s = pd.Series(series).astype("object")
-
-    # Fast path: vectorized to_datetime
     dt = pd.to_datetime(s, errors="coerce", utc=False)
-
-    # Use .dt only if it exists (Series of datetime64) and we have it
     try:
         out = dt.dt.strftime("%m/%d/%Y")
         return out.where(~dt.isna(), None)
     except AttributeError:
-        # Fallback: per-value safe parse (slower, but robust)
         def fmt_one(x):
             if x is None:
                 return None
-            # Treat NaN/empty as None
             try:
                 if pd.isna(x) or (isinstance(x, str) and not x.strip()):
                     return None
@@ -81,9 +76,8 @@ def parse_short_date_col(series: pd.Series) -> pd.Series:
                 d = pd.to_datetime([x], errors="coerce", utc=False)[0]
                 if pd.isna(d):
                     return None
-                # Drop tz if present (some pandas versions attach tz to Timestamp)
                 try:
-                    return d.tz_localize(None).strftime("%m/%d/%Y")  # type: ignore[attr-defined]
+                    return d.tz_localize(None).strftime("%m/%d/%Y")  # drop tz if present
                 except Exception:
                     return d.strftime("%m/%d/%Y")
             except Exception:
@@ -103,17 +97,14 @@ def try_read_csv_fast(raw: bytes, compat_mode: bool) -> Optional[pd.DataFrame]:
                 continue
         return None
 
-    # 1) Polars (fastest)
     if HAS_POLARS:
         for sep in [None, ",", "\t", ";"]:
             try:
                 df_pl = pl.read_csv(io.BytesIO(raw), separator=sep, infer_schema_length=1000, ignore_errors=True)
-                # Use Arrow-backed pandas extension arrays where possible
                 return df_pl.to_pandas(use_pyarrow_extension_array=True)
             except Exception:
                 continue
 
-    # 2) pandas; try pyarrow engine first, then python engine with encoding fallbacks
     for enc in [None, "utf-8", "utf-16", "cp1252", "latin-1"]:
         try:
             df = pd.read_csv(
@@ -140,10 +131,9 @@ def try_read_csv_fast(raw: bytes, compat_mode: bool) -> Optional[pd.DataFrame]:
 def read_any(uploaded_file, compat_mode: bool) -> pd.DataFrame:
     """Read CSV/TSV/XLSX into a DataFrame (Arrow/Polars-backed when possible unless compat_mode is on)."""
     name = uploaded_file.name.lower()
-    raw = uploaded_file.getvalue()  # bytes
+    raw = uploaded_file.getvalue()
 
     if name.endswith((".xlsx", ".xls")):
-        # Excel is slower; CSV recommended for very large files
         return pd.read_excel(io.BytesIO(raw), dtype=object)
     elif name.endswith((".csv", ".tsv", ".txt")):
         out = try_read_csv_fast(raw, compat_mode=compat_mode)
@@ -202,6 +192,36 @@ CANDIDATES = {
     ],
     "title": ["Review title","Review Title","Title","Headline"]
 }
+
+# --- JSON safety ---
+
+def to_serializable(x):
+    """Make any scalar JSON-safe: handle pd.NA, NaN, Timestamp, numpy scalars, bytes, etc."""
+    # None / NA / empty string handling
+    try:
+        if x is None or pd.isna(x):
+            return None
+    except Exception:
+        pass
+    if isinstance(x, str):
+        return x
+    if isinstance(x, (bool, int, float)):
+        return x
+    if isinstance(x, (pd.Timestamp, datetime, date)):
+        return x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, date) or isinstance(x, datetime) else x.strftime("%Y-%m-%d")
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, (bytes, bytearray)):
+        try:
+            return x.decode("utf-8", "replace")
+        except Exception:
+            return str(x)
+    if isinstance(x, (list, tuple)):
+        return [to_serializable(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): to_serializable(v) for k, v in x.items()}
+    # Fallback
+    return str(x)
 
 # ---------- UI ----------
 
@@ -341,9 +361,11 @@ formatted = pd.DataFrame({
 
 # Raw JSON column is optional for memory reasons
 if include_raw_json_download:
-    json_col = merged.astype("object").apply(lambda r: json.dumps({k: r[k] for k in merged.columns}, ensure_ascii=False), axis=1)
     merged_with_raw = merged.copy()
-    merged_with_raw["Raw Data (JSON)"] = json_col
+    merged_with_raw["Raw Data (JSON)"] = merged.apply(
+        lambda r: json.dumps({str(k): to_serializable(r[k]) for k in merged.columns}, ensure_ascii=False),
+        axis=1
+    )
 else:
     merged_with_raw = merged
 
@@ -351,14 +373,12 @@ else:
 st.subheader("Preview (first 200 rows)")
 t1, t2 = st.tabs(["Raw Merged", "Formatted Export"])
 with t1:
-    if include_raw_json_download:
-        st.dataframe(merged_with_raw.head(200), use_container_width=True)
-    else:
-        sample = merged.head(200).copy()
-        sample["Raw Data (JSON)"] = sample.astype("object").apply(
-            lambda r: json.dumps({k: r[k] for k in sample.columns}, ensure_ascii=False), axis=1
-        )
-        st.dataframe(sample, use_container_width=True)
+    sample = merged.head(200).copy()
+    sample["Raw Data (JSON)"] = sample.apply(
+        lambda r: json.dumps({str(k): to_serializable(r[k]) for k in sample.columns}, ensure_ascii=False),
+        axis=1
+    )
+    st.dataframe(sample, use_container_width=True)
 with t2:
     st.dataframe(formatted.head(200), use_container_width=True)
 
@@ -410,6 +430,7 @@ with st.expander("Performance tips"):
         "- If you see dtype issues, flip **Compatibility mode** on.\n"
         "- Turn **off** the 'Raw Data (JSON)' download if you hit memory limits."
     )
+
 
 
 
