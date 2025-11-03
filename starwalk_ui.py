@@ -22,8 +22,8 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.3 (Evidence • Optimized)")
-st.title("✨ Review Symptomizer — v7.3 (Evidence • Optimized)")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.3")
+st.title("✨ Review Symptomizer — v7.3")
 st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Evidence-locked labeling • In-session cache")
 
 # ------------------- Global CSS -------------------
