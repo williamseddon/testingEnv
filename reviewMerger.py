@@ -18,7 +18,7 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice File Merger", layout="wide")
+st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
 
 # ---------- Helpers ----------
 
@@ -52,13 +52,43 @@ def is_boolean_like(series: pd.Series) -> bool:
 
 def parse_short_date_col(series: pd.Series) -> pd.Series:
     """
-    Robust vectorized parse to mm/dd/yyyy; invalids -> None.
-    IMPORTANT: cast to object first to avoid Arrow/Polars dtype .dt issues.
+    Robust parse to mm/dd/yyyy; invalids -> None.
+    Avoids AttributeError by only using .dt when truly datetimelike;
+    otherwise falls back to safe per-value parsing.
     """
-    obj = pd.Series(series).astype("object")
-    dt = pd.to_datetime(obj, errors="coerce", utc=False)
-    out = dt.dt.strftime("%m/%d/%Y")
-    return out.where(~dt.isna(), None)
+    # Always coerce to a standalone Series of Python objects
+    s = pd.Series(series).astype("object")
+
+    # Fast path: vectorized to_datetime
+    dt = pd.to_datetime(s, errors="coerce", utc=False)
+
+    # Use .dt only if it exists (Series of datetime64) and we have it
+    try:
+        out = dt.dt.strftime("%m/%d/%Y")
+        return out.where(~dt.isna(), None)
+    except AttributeError:
+        # Fallback: per-value safe parse (slower, but robust)
+        def fmt_one(x):
+            if x is None:
+                return None
+            # Treat NaN/empty as None
+            try:
+                if pd.isna(x) or (isinstance(x, str) and not x.strip()):
+                    return None
+            except Exception:
+                pass
+            try:
+                d = pd.to_datetime([x], errors="coerce", utc=False)[0]
+                if pd.isna(d):
+                    return None
+                # Drop tz if present (some pandas versions attach tz to Timestamp)
+                try:
+                    return d.tz_localize(None).strftime("%m/%d/%Y")  # type: ignore[attr-defined]
+                except Exception:
+                    return d.strftime("%m/%d/%Y")
+            except Exception:
+                return None
+        return s.map(fmt_one)
 
 def try_read_csv_fast(raw: bytes, compat_mode: bool) -> Optional[pd.DataFrame]:
     """
@@ -141,7 +171,7 @@ def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -
 
     country = pd.Series([None]*len(pid), dtype="object")
     country = country.mask(up_pid.str.contains("UK", na=False), "UK")
-    country = country.mask(up_pid.str_contains("EU", na=False), "EU") if hasattr(up_pid, "str_contains") else country.mask(up_pid.str.contains("EU", na=False), "EU")
+    country = country.mask(up_pid.str.contains("EU", na=False), "EU")
     country = country.mask(up_src.str.contains("US|USA", na=False), "USA")
     country = country.mask(up_src.str.contains("UK", na=False) & country.isna(), "UK")
     country = country.mask(up_src.str.contains("EU", na=False) & country.isna(), "EU")
@@ -380,6 +410,7 @@ with st.expander("Performance tips"):
         "- If you see dtype issues, flip **Compatibility mode** on.\n"
         "- Turn **off** the 'Raw Data (JSON)' download if you hit memory limits."
     )
+
 
 
 
