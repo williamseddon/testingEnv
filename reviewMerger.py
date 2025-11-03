@@ -1,7 +1,3 @@
-# Retry writing the performance-optimized Streamlit app and requirements.
-from pathlib import Path
-
-app_code = r'''
 import io
 import json
 from typing import List, Optional, Dict
@@ -9,21 +5,20 @@ from typing import List, Optional, Dict
 import pandas as pd
 import streamlit as st
 
-# Optional acceleration libraries
+# Optional acceleration libraries (used if installed)
 try:
-    import polars as pl  # super fast CSV reader if available
+    import polars as pl  # fastest CSV reader
     HAS_POLARS = True
 except Exception:
     HAS_POLARS = False
 
 try:
     import pyarrow as pa
-    import pyarrow.csv as pacsv
     HAS_ARROW = True
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice Merger (Fast)", layout="wide")
+st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
 
 # ---------- Helpers ----------
 
@@ -31,10 +26,12 @@ TRUE_SET  = {"true","t","1","yes","y"}
 FALSE_SET = {"false","f","0","no","n"}
 
 def canonicalize(name: str) -> str:
+    """Lowercase and strip non-alnum for robust header matching."""
     s = str(name).lower().strip()
     return "".join(ch for ch in s if ch.isalnum())
 
 def yes_no_from_any(series: pd.Series) -> pd.Series:
+    """Vectorized conversion of boolean-like values to Yes/No; non-boolean strings are left unchanged."""
     s = series.astype("string", copy=False)
     norm = s.str.strip().str.lower()
     yes_mask = norm.isin(TRUE_SET)
@@ -45,6 +42,7 @@ def yes_no_from_any(series: pd.Series) -> pd.Series:
     return out
 
 def is_boolean_like(series: pd.Series) -> bool:
+    """Check if a column contains only boolean-like values (ignoring NA)."""
     s = series.dropna()
     if s.empty:
         return False
@@ -53,25 +51,30 @@ def is_boolean_like(series: pd.Series) -> bool:
     return valset.issubset(allowed)
 
 def parse_short_date_col(series: pd.Series) -> pd.Series:
+    """Vectorized parse to mm/dd/yyyy; invalids -> None."""
     dt = pd.to_datetime(series, errors="coerce", utc=False)
     out = dt.dt.strftime("%m/%d/%Y")
     return out.where(~dt.isna(), None)
 
 def try_read_csv_fast(raw: bytes) -> Optional[pd.DataFrame]:
+    """Prefer Polars; else pandas with pyarrow engine; else robust pandas fallback."""
+    # 1) Polars (fastest)
     if HAS_POLARS:
         for sep in [None, ",", "\t", ";"]:
             try:
                 df_pl = pl.read_csv(io.BytesIO(raw), separator=sep, infer_schema_length=1000, ignore_errors=True)
+                # Use Arrow-backed pandas extension arrays where possible
                 return df_pl.to_pandas(use_pyarrow_extension_array=True)
             except Exception:
                 continue
+    # 2) pandas; try pyarrow engine first, then python engine with encoding fallbacks
     for enc in [None, "utf-8", "utf-16", "cp1252", "latin-1"]:
         try:
             df = pd.read_csv(
                 io.BytesIO(raw),
                 sep=None,
-                engine="pyarrow" if HAS_ARROW else "python",
-                dtype_backend="pyarrow" if HAS_ARROW else None
+                engine=("pyarrow" if HAS_ARROW else "python"),
+                dtype_backend=("pyarrow" if HAS_ARROW else None)
             )
             return df
         except Exception:
@@ -89,9 +92,12 @@ def try_read_csv_fast(raw: bytes) -> Optional[pd.DataFrame]:
     return None
 
 def read_any(uploaded_file) -> pd.DataFrame:
+    """Read CSV/TSV/XLSX into a DataFrame (Arrow/Polars-backed when possible)."""
     name = uploaded_file.name.lower()
-    raw = uploaded_file.getvalue()
+    raw = uploaded_file.getvalue()  # bytes
+
     if name.endswith((".xlsx", ".xls")):
+        # Excel is slower; CSV recommended for very large files
         return pd.read_excel(io.BytesIO(raw), dtype=object)
     elif name.endswith((".csv", ".tsv", ".txt")):
         out = try_read_csv_fast(raw)
@@ -102,6 +108,7 @@ def read_any(uploaded_file) -> pd.DataFrame:
         raise ValueError(f"Unsupported file type for {uploaded_file.name}")
 
 def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Return actual column name matching any candidate (punctuation/case-insensitive)."""
     lookup = {canonicalize(c): c for c in df.columns}
     for cand in candidates:
         key = canonicalize(cand)
@@ -110,10 +117,12 @@ def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -> pd.Series:
+    """Vectorized country inference based on product_id content or source filename hints."""
     pid = product_id.fillna("").astype("string")
     src = source_name_series.fillna("").astype("string")
     up_pid = pid.str.upper()
     up_src = src.str.upper()
+
     country = pd.Series([None]*len(pid), dtype="object")
     country = country.mask(up_pid.str.contains("UK", na=False), "UK")
     country = country.mask(up_pid.str.contains("EU", na=False), "EU")
@@ -122,6 +131,7 @@ def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -
     country = country.mask(up_src.str.contains("EU", na=False) & country.isna(), "EU")
     return country
 
+# Expanded synonyms to cover BV + RR_Export variants
 CANDIDATES = {
     "product_id": [
         "Product ID","ProductId","ProductID","ProductExternalId","SKU","ProductSKU","Model (SKU)","Model",
@@ -147,6 +157,8 @@ CANDIDATES = {
     "title": ["Review title","Review Title","Title","Headline"]
 }
 
+# ---------- UI ----------
+
 st.title("Bazaarvoice Review Merger — High-Performance")
 st.caption("Optimized for large files: Polars/PyArrow acceleration, vectorized transforms, and optional JSON.")
 st.markdown(
@@ -165,18 +177,21 @@ with st.expander("Options"):
     force_yes_new_review = st.checkbox("Set 'New Review' to Yes for all rows", value=True)
     constant_source = st.text_input("Source value", value="DTC")
     bool_to_yesno = st.checkbox("Convert boolean-like columns to Yes/No", value=True)
-    include_raw_json_download = st.checkbox("Include 'Raw Data (JSON)' in downloaded Raw CSV/Excel (memory heavy)", value=False)
+    include_raw_json_download = st.checkbox(
+        "Include 'Raw Data (JSON)' in downloaded Raw CSV/Excel (memory heavy)", value=False
+    )
     show_match_debug = st.checkbox("Show detected column matches", value=False)
 
 if not uploaded_files:
     st.info("⬆️ Add one or more files to begin.")
     st.stop()
 
+# Read files
 frames = []
 for f in uploaded_files:
     try:
         df = read_any(f)
-        df["_source_file"] = f.name
+        df["_source_file"] = f.name  # provenance for Country rule
         frames.append(df)
     except Exception as e:
         st.error(f"Failed to read {f.name}: {e}")
@@ -185,14 +200,17 @@ if not frames:
     st.error("No readable files were uploaded.")
     st.stop()
 
+# Build union schema (order by first appearance)
 union_cols: List[str] = []
 for df in frames:
     for col in map(str, df.columns):
         if col not in union_cols:
             union_cols.append(col)
 
+# Manual mapping (sidebar overrides)
 st.sidebar.header("Manual Mapping (optional)")
 all_cols_sorted = ["— auto —"] + sorted(union_cols, key=lambda x: canonicalize(x))
+
 def mapping_control(label: str, key_name: str, default_actual: Optional[str]):
     idx = all_cols_sorted.index(default_actual) if default_actual in all_cols_sorted else 0
     return st.sidebar.selectbox(label, options=all_cols_sorted, index=idx, key=key_name)
@@ -208,15 +226,18 @@ user_map["review_text"]     = mapping_control("Review Text → Verbatim (Review)
 user_map["rating"]          = mapping_control("Rating → Star Rating", "map_rating",              auto_map["rating"])
 user_map["incentivized"]    = mapping_control("Incentivized → Seeded", "map_incent",             auto_map["incentivized"])
 
+# Resolve final mapping (manual override beats auto)
 final_map: Dict[str, Optional[str]] = {}
 for k, v in user_map.items():
     final_map[k] = None if v == "— auto —" else v
     if final_map[k] is None:
         final_map[k] = auto_map.get(k)
 
+# Align and concat
 aligned = [df.reindex(columns=union_cols) for df in frames]
 merged = pd.concat(aligned, ignore_index=True)
 
+# Convert boolean-like columns to Yes/No (vectorized) where the entire column is boolean-like
 if bool_to_yesno:
     for c in merged.columns:
         try:
@@ -225,6 +246,7 @@ if bool_to_yesno:
         except Exception:
             pass
 
+# Debug mapping table
 if show_match_debug:
     dbg = []
     for std_key, candidates in CANDIDATES.items():
@@ -236,6 +258,8 @@ if show_match_debug:
             "Candidates (subset)": ", ".join(candidates[:8]) + ("…" if len(candidates) > 8 else "")
         })
     st.expander("Detected column mapping").dataframe(pd.DataFrame(dbg))
+
+# ----- Build outputs (vectorized) -----
 
 def safe_col(name: Optional[str]) -> pd.Series:
     if name is None or name not in merged.columns:
@@ -268,6 +292,7 @@ formatted = pd.DataFrame({
     "Star Rating": rating_s,
 })
 
+# Raw JSON column is optional for memory reasons
 if include_raw_json_download:
     json_col = merged.astype("object").apply(lambda r: json.dumps({k: r[k] for k in merged.columns}, ensure_ascii=False), axis=1)
     merged_with_raw = merged.copy()
@@ -275,6 +300,7 @@ if include_raw_json_download:
 else:
     merged_with_raw = merged
 
+# ---------- Preview (first 200 rows for responsiveness) ----------
 st.subheader("Preview (first 200 rows)")
 t1, t2 = st.tabs(["Raw Merged", "Formatted Export"])
 with t1:
@@ -282,19 +308,23 @@ with t1:
         st.dataframe(merged_with_raw.head(200), use_container_width=True)
     else:
         sample = merged.head(200).copy()
-        sample["Raw Data (JSON)"] = sample.astype("object").apply(lambda r: json.dumps({k: r[k] for k in sample.columns}, ensure_ascii=False), axis=1)
+        sample["Raw Data (JSON)"] = sample.astype("object").apply(
+            lambda r: json.dumps({k: r[k] for k in sample.columns}, ensure_ascii=False), axis=1
+        )
         st.dataframe(sample, use_container_width=True)
 with t2:
     st.dataframe(formatted.head(200), use_container_width=True)
 
+# ---------- Downloads ----------
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    # utf-8-sig to help Excel detect UTF-8
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31])
+            df.to_excel(writer, index=False, sheet_name=name[:31])  # Excel sheet name limit
     bio.seek(0)
     return bio.read()
 
@@ -328,26 +358,10 @@ with colB:
 with st.expander("Performance tips"):
     st.markdown(
         "- Prefer **CSV** over Excel for very large files.\n"
-        "- If possible, upload **unzipped CSVs** directly from Bazaarvoice.\n"
-        "- This app uses **Polars** (if installed) or **PyArrow-backed pandas** for speed and lower memory.\n"
+        "- Upload **unzipped CSVs** directly from Bazaarvoice when possible.\n"
+        "- If installed, the app uses **Polars** or **PyArrow-backed pandas** for speed and lower memory.\n"
         "- Turn **off** the 'Raw Data (JSON)' download if you hit memory limits."
     )
-'''
 
-reqs = """\
-streamlit>=1.38.0
-pandas>=2.2.0
-openpyxl>=3.1.2
-pyarrow>=15.0.0
-polars>=0.20.0
-"""
-
-app_path = Path("/mnt/data/bv_streamlit_app.py")
-app_path.write_text(app_code, encoding="utf-8")
-
-req_path = Path("/mnt/data/requirements_streamlit.txt")
-req_path.write_text(reqs, encoding="utf-8")
-
-(str(app_path), str(req_path))
 
 
