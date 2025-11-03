@@ -18,7 +18,7 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
+st.set_page_config(page_title="Bazaarvoice File Merger", layout="wide")
 
 # ---------- Helpers ----------
 
@@ -51,13 +51,28 @@ def is_boolean_like(series: pd.Series) -> bool:
     return valset.issubset(allowed)
 
 def parse_short_date_col(series: pd.Series) -> pd.Series:
-    """Vectorized parse to mm/dd/yyyy; invalids -> None."""
-    dt = pd.to_datetime(series, errors="coerce", utc=False)
+    """
+    Robust vectorized parse to mm/dd/yyyy; invalids -> None.
+    IMPORTANT: cast to object first to avoid Arrow/Polars dtype .dt issues.
+    """
+    obj = pd.Series(series).astype("object")
+    dt = pd.to_datetime(obj, errors="coerce", utc=False)
     out = dt.dt.strftime("%m/%d/%Y")
     return out.where(~dt.isna(), None)
 
-def try_read_csv_fast(raw: bytes) -> Optional[pd.DataFrame]:
-    """Prefer Polars; else pandas with pyarrow engine; else robust pandas fallback."""
+def try_read_csv_fast(raw: bytes, compat_mode: bool) -> Optional[pd.DataFrame]:
+    """
+    Prefer Polars; else pandas with pyarrow engine; else robust pandas fallback.
+    If compat_mode=True, force pandas python engine + dtype=object (most robust).
+    """
+    if compat_mode:
+        for enc in [None, "utf-8", "utf-16", "cp1252", "latin-1"]:
+            try:
+                return pd.read_csv(io.BytesIO(raw), sep=None, engine="python", dtype=object, encoding=enc)
+            except Exception:
+                continue
+        return None
+
     # 1) Polars (fastest)
     if HAS_POLARS:
         for sep in [None, ",", "\t", ";"]:
@@ -67,6 +82,7 @@ def try_read_csv_fast(raw: bytes) -> Optional[pd.DataFrame]:
                 return df_pl.to_pandas(use_pyarrow_extension_array=True)
             except Exception:
                 continue
+
     # 2) pandas; try pyarrow engine first, then python engine with encoding fallbacks
     for enc in [None, "utf-8", "utf-16", "cp1252", "latin-1"]:
         try:
@@ -91,8 +107,8 @@ def try_read_csv_fast(raw: bytes) -> Optional[pd.DataFrame]:
                 continue
     return None
 
-def read_any(uploaded_file) -> pd.DataFrame:
-    """Read CSV/TSV/XLSX into a DataFrame (Arrow/Polars-backed when possible)."""
+def read_any(uploaded_file, compat_mode: bool) -> pd.DataFrame:
+    """Read CSV/TSV/XLSX into a DataFrame (Arrow/Polars-backed when possible unless compat_mode is on)."""
     name = uploaded_file.name.lower()
     raw = uploaded_file.getvalue()  # bytes
 
@@ -100,7 +116,7 @@ def read_any(uploaded_file) -> pd.DataFrame:
         # Excel is slower; CSV recommended for very large files
         return pd.read_excel(io.BytesIO(raw), dtype=object)
     elif name.endswith((".csv", ".tsv", ".txt")):
-        out = try_read_csv_fast(raw)
+        out = try_read_csv_fast(raw, compat_mode=compat_mode)
         if out is None:
             raise ValueError(f"Could not read delimited file {uploaded_file.name}")
         return out
@@ -125,7 +141,7 @@ def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -
 
     country = pd.Series([None]*len(pid), dtype="object")
     country = country.mask(up_pid.str.contains("UK", na=False), "UK")
-    country = country.mask(up_pid.str.contains("EU", na=False), "EU")
+    country = country.mask(up_pid.str_contains("EU", na=False), "EU") if hasattr(up_pid, "str_contains") else country.mask(up_pid.str.contains("EU", na=False), "EU")
     country = country.mask(up_src.str.contains("US|USA", na=False), "USA")
     country = country.mask(up_src.str.contains("UK", na=False) & country.isna(), "UK")
     country = country.mask(up_src.str.contains("EU", na=False) & country.isna(), "EU")
@@ -181,6 +197,7 @@ with st.expander("Options"):
         "Include 'Raw Data (JSON)' in downloaded Raw CSV/Excel (memory heavy)", value=False
     )
     show_match_debug = st.checkbox("Show detected column matches", value=False)
+    compat_mode = st.checkbox("Compatibility mode (force classic pandas object dtypes)", value=False)
 
 if not uploaded_files:
     st.info("⬆️ Add one or more files to begin.")
@@ -190,7 +207,7 @@ if not uploaded_files:
 frames = []
 for f in uploaded_files:
     try:
-        df = read_any(f)
+        df = read_any(f, compat_mode=compat_mode)
         df["_source_file"] = f.name  # provenance for Country rule
         frames.append(df)
     except Exception as e:
@@ -360,8 +377,10 @@ with st.expander("Performance tips"):
         "- Prefer **CSV** over Excel for very large files.\n"
         "- Upload **unzipped CSVs** directly from Bazaarvoice when possible.\n"
         "- If installed, the app uses **Polars** or **PyArrow-backed pandas** for speed and lower memory.\n"
+        "- If you see dtype issues, flip **Compatibility mode** on.\n"
         "- Turn **off** the 'Raw Data (JSON)' download if you hit memory limits."
     )
+
 
 
 
