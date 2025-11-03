@@ -20,7 +20,7 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
+st.set_page_config(page_title="Bazaarvoice Merger — May take a few minutes if using large files", layout="wide")
 
 # ------------------ Tunables ------------------
 HEAVY_MB  = 80     # warn threshold
