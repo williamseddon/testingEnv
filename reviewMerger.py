@@ -18,7 +18,7 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice Merger — High-Performance", layout="wide")
+st.set_page_config(page_title="Bazaarvoice File Merger", layout="wide")
 
 # ---------- Helpers ----------
 
