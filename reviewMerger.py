@@ -1,13 +1,14 @@
 import io
 import json
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from datetime import date, datetime
+import time
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional acceleration libraries (used if installed)
+# Optional accelerators (used if installed; we still guard with switches)
 try:
     import polars as pl
     HAS_POLARS = True
@@ -20,19 +21,20 @@ try:
 except Exception:
     HAS_ARROW = False
 
-st.set_page_config(page_title="Bazaarvoice Merger — May take a few minutes if using large files", layout="wide")
+st.set_page_config(page_title="Bazaarvoice Merger — Ultra/Chunked + Pressure Test", layout="wide")
 
 # ------------------ Tunables ------------------
-HEAVY_MB  = 80     # warn threshold
-GIANT_MB  = 200    # strong warning threshold
-PREVIEW_N = 200    # preview rows
-CACHE_TTL = 60 * 30
+HEAVY_MB   = 80
+GIANT_MB   = 200
+PREVIEW_N  = 200
+CACHE_TTL  = 60 * 30
+DEFAULT_CHUNK = 200_000     # rows
 # ----------------------------------------------
-
-# ---------- Helpers ----------
 
 TRUE_SET  = {"true","t","1","yes","y"}
 FALSE_SET = {"false","f","0","no","n"}
+
+# -------------------------------- Utilities ----------------------------------
 
 def canonicalize(name: str) -> str:
     s = str(name).lower().strip()
@@ -57,10 +59,6 @@ def is_boolean_like(series: pd.Series) -> bool:
     return valset.issubset(allowed)
 
 def parse_short_date_col(series: pd.Series) -> pd.Series:
-    """
-    Robust parse to mm/dd/yyyy; invalids -> None.
-    Uses vectorized path if available, else safe per-value fallback.
-    """
     s = pd.Series(series).astype("object")
     dt = pd.to_datetime(s, errors="coerce", utc=False)
     try:
@@ -88,7 +86,6 @@ def parse_short_date_col(series: pd.Series) -> pd.Series:
         return s.map(fmt_one)
 
 def to_serializable(x):
-    """Make any scalar JSON-safe."""
     try:
         if x is None or pd.isna(x):
             return None
@@ -118,7 +115,6 @@ def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -
     src = source_name_series.fillna("").astype("string")
     up_pid = pid.str.upper()
     up_src = src.str.upper()
-
     country = pd.Series([None]*len(pid), dtype="object")
     country = country.mask(up_pid.str.contains("UK", na=False), "UK")
     country = country.mask(up_pid.str.contains("EU", na=False), "EU")
@@ -127,7 +123,7 @@ def infer_country_series(product_id: pd.Series, source_name_series: pd.Series) -
     country = country.mask(up_src.str.contains("EU", na=False) & country.isna(), "EU")
     return country
 
-# Expanded synonyms to cover BV + RR_Export variants
+# Bazaarvoice/RR header synonyms
 CANDIDATES = {
     "product_id": [
         "Product ID","ProductId","ProductID","ProductExternalId","SKU","ProductSKU","Model (SKU)","Model",
@@ -150,10 +146,21 @@ CANDIDATES = {
         "IncentivizedReview","Incentivized review","Incentivized","IsIncentivized","Seeded",
         "Incentivised review","IncentivisedReview","IsSeeded"
     ],
-    "title": ["Review title","Review Title","Title","Headline"]
 }
 
-# ---- Fast CSV readers (with caching) -----------------------------------------
+def get_col(df_or_cols, candidates: List[str]) -> Optional[str]:
+    if isinstance(df_or_cols, (list, tuple, pd.Index)):
+        cols = list(map(str, df_or_cols))
+    else:
+        cols = list(map(str, getattr(df_or_cols, "columns")))
+    lookup = {canonicalize(c): c for c in cols}
+    for cand in candidates:
+        key = canonicalize(cand)
+        if key in lookup:
+            return lookup[key]
+    return None
+
+# ---------- File reading ----------
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=16)
 def _read_with_python_engine(raw: bytes, encoding: Optional[str]) -> pd.DataFrame:
@@ -165,7 +172,7 @@ def _read_with_pyarrow_engine(raw: bytes) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=16)
 def _read_with_polars(raw: bytes, sep: Optional[str]) -> pd.DataFrame:
-    import polars as pl  # local import to respect env
+    import polars as pl  # reimport inside cache
     df_pl = pl.read_csv(io.BytesIO(raw), separator=sep, infer_schema_length=1000, ignore_errors=True)
     return df_pl.to_pandas(use_pyarrow_extension_array=True)
 
@@ -177,20 +184,17 @@ def try_read_csv_fast(raw: bytes, compat_mode: bool) -> Optional[pd.DataFrame]:
             except Exception:
                 continue
         return None
-
     if HAS_POLARS:
         for sep in [None, ",", "\t", ";"]:
             try:
                 return _read_with_polars(raw, sep)
             except Exception:
                 continue
-
     if HAS_ARROW:
         try:
             return _read_with_pyarrow_engine(raw)
         except Exception:
             pass
-
     for enc in [None, "utf-8", "utf-16", "cp1252", "latin-1"]:
         try:
             return _read_with_python_engine(raw, enc)
@@ -211,38 +215,6 @@ def read_any(uploaded_file, compat_mode: bool) -> pd.DataFrame:
     else:
         raise ValueError(f"Unsupported file type for {uploaded_file.name}")
 
-def get_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    lookup = {canonicalize(c): c for c in df.columns}
-    for cand in candidates:
-        key = canonicalize(cand)
-        if key in lookup:
-            return lookup[key]
-    return None
-
-# ---------- UI ----------
-
-st.title("Bazaarvoice Review Merger — High-Performance")
-st.caption("Fast reads, vectorized transforms, JSON-safe export, big-file heads-up, progress, and in-app error display.")
-
-uploaded_files = st.file_uploader(
-    "Upload Bazaarvoice files (US / UK / EU, including RR_Export)",
-    type=["csv","tsv","txt","xlsx","xls"],
-    accept_multiple_files=True
-)
-
-with st.expander("Options"):
-    force_yes_new_review = st.checkbox("Set 'New Review' to Yes for all rows", value=True)
-    constant_source = st.text_input("Source value", value="DTC")
-    bool_to_yesno = st.checkbox("Convert boolean-like columns to Yes/No", value=True)
-    include_raw_json_download = st.checkbox("Include 'Raw Data (JSON)' in downloaded Raw CSV/Excel (memory heavy)", value=False)
-    compat_mode = st.checkbox("Compatibility mode (force classic pandas object dtypes)", value=False)
-    debug_mode = st.checkbox("Debug mode (show exceptions and diagnostics)", value=False)
-
-if not uploaded_files:
-    st.info("⬆️ Add one or more files to begin.")
-    st.stop()
-
-# ---------- Big-file heads-up ----------
 def file_size_mb(f) -> float:
     try:
         return getattr(f, "size", None) / (1024 * 1024)
@@ -252,111 +224,220 @@ def file_size_mb(f) -> float:
         except Exception:
             return 0.0
 
-sizes = [(f.name, max(file_size_mb(f), 0.0)) for f in uploaded_files]
-total_mb = sum(mb for _, mb in sizes)
+# --------------------------- Ultra Streaming Mode -----------------------------
 
-st.write("**Selected files:**")
-for name, mb in sizes:
-    st.write(f"• {name} — ~{mb:,.1f} MB")
+def stream_formatted_csv_from_chunks(
+    uploaded_files,
+    constant_source: str,
+    force_yes_new_review: bool,
+    bool_to_yesno: bool,
+    compat_mode: bool,
+    chunk_rows: int
+) -> bytes:
+    """
+    CSV-only, streamed: build Formatted Export in chunks and write directly to a CSV buffer.
+    Never holds the entire dataset in memory.
+    """
+    buf = io.StringIO()
+    header_written = False
 
-if total_mb >= GIANT_MB:
-    st.warning(f"These look **HUGE** (~{total_mb:,.1f} MB total). Combining large files may take time. "
-               f"Tip: prefer CSV; turn off JSON option; enable Compatibility mode only if needed.")
-elif total_mb >= HEAVY_MB:
-    st.info(f"These look **large** (~{total_mb:,.1f} MB total). Merging may take a bit. "
-            f"Tip: prefer CSV; consider disabling the JSON option.")
+    def reader_for_file(f, chunksize):
+        raw = f.getvalue()
+        # try fast engines first unless compat_mode
+        if not compat_mode and HAS_ARROW:
+            try:
+                return pd.read_csv(io.BytesIO(raw), sep=None, engine="pyarrow", chunksize=chunksize)
+            except Exception:
+                pass
+        # python engine with auto sep detection + encoding fallbacks
+        for enc in [None, "utf-8", "utf-16", "cp1252", "latin-1"]:
+            try:
+                return pd.read_csv(io.BytesIO(raw), sep=None, engine="python", dtype=object, encoding=enc, chunksize=chunksize)
+            except Exception:
+                continue
+        raise ValueError(f"Could not stream-read CSV: {f.name}")
 
-start = st.button("🚀 Merge files")
-if not start:
-    st.stop()
+    for f in uploaded_files:
+        name = f.name.lower()
+        if not name.endswith((".csv", ".tsv", ".txt")):
+            raise ValueError("Ultra mode supports CSV/TSV only. Convert Excel to CSV to use Ultra.")
+        r = reader_for_file(f, chunk_rows)
+        for chunk in r:
+            chunk["_source_file"] = f.name
 
-# ---------- Merge with progress + robust error surfacing ----------
-try:
-    with st.status("Preparing to merge…", expanded=True) as status:
-        status.update(label="Reading files (1/6)…")
+            # Detect columns each chunk (robust to schema drift)
+            pid_col  = get_col(chunk, CANDIDATES["product_id"])
+            rid_col  = get_col(chunk, CANDIDATES["review_id"])
+            sub_col  = get_col(chunk, CANDIDATES["submission_time"])
+            txt_col  = get_col(chunk, CANDIDATES["review_text"])
+            rat_col  = get_col(chunk, CANDIDATES["rating"])
+            inc_col  = get_col(chunk, CANDIDATES["incentivized"])
+
+            def safe(name):
+                return chunk[name] if name in chunk.columns and name is not None else pd.Series([None]*len(chunk), dtype="object")
+
+            product_id_s  = safe(pid_col)
+            review_id_s   = safe(rid_col)
+            submission_s  = safe(sub_col)
+            review_text_s = safe(txt_col)
+            rating_s      = safe(rat_col)
+            incent_s      = safe(inc_col)
+            source_file_s = chunk["_source_file"]
+
+            seeded_s = yes_no_from_any(incent_s) if bool_to_yesno and inc_col is not None else incent_s
+            country_s = infer_country_series(product_id_s, source_file_s)
+            new_review_s = pd.Series(["Yes" if force_yes_new_review else ""]*len(chunk), dtype="object")
+            review_date_s = parse_short_date_col(submission_s)
+            source_s = pd.Series([constant_source or "DTC"]*len(chunk), dtype="object")
+
+            formatted_chunk = pd.DataFrame({
+                "Source": source_s,
+                "Model (SKU)": product_id_s,
+                "Seeded": seeded_s,
+                "Country": country_s,
+                "New Review": new_review_s,
+                "Review Date": review_date_s,
+                "Verbatim Id": review_id_s,
+                "Verbatim (Review)": review_text_s,
+                "Star Rating": rating_s,
+            })
+
+            buf.write(formatted_chunk.to_csv(index=False, header=(not header_written)))
+            header_written = True
+
+    return buf.getvalue().encode("utf-8-sig")  # BOM helps Excel
+
+# ------------------------------- UI: Tabs ------------------------------------
+
+tab_merge, tab_pressure = st.tabs(["🔀 Merge", "🧪 Pressure Test"])
+
+# =============================== MERGE TAB ===================================
+with tab_merge:
+    st.title("Bazaarvoice Merger — Ultra/Chunked")
+    uploaded_files = st.file_uploader(
+        "Upload Bazaarvoice files (US / UK / EU, including RR_Export)",
+        type=["csv","tsv","txt","xlsx","xls"],
+        accept_multiple_files=True
+    )
+
+    with st.expander("Options"):
+        force_yes_new_review = st.checkbox("Set 'New Review' to Yes for all rows", value=True)
+        constant_source = st.text_input("Source value", value="DTC")
+        bool_to_yesno = st.checkbox("Convert boolean-like columns to Yes/No", value=True)
+        include_raw_json_download = st.checkbox("Include 'Raw Data (JSON)' in downloaded Raw Excel (memory heavy)", value=False)
+        compat_mode = st.checkbox("Compatibility mode (force classic pandas object dtypes)", value=False)
+        skip_preview = st.checkbox("Skip preview tables (faster)", value=True)
+        use_ultra = st.checkbox("ULTRA mode (CSV-only, streamed formatted CSV)", value=True)
+        chunk_rows = st.number_input("Chunk size (rows per chunk, CSV-only)", min_value=50_000, max_value=1_000_000, step=50_000, value=DEFAULT_CHUNK)
+
+    if not uploaded_files:
+        st.info("⬆️ Add one or more files to begin.")
+        st.stop()
+
+    sizes = [(f.name, max(file_size_mb(f), 0.0)) for f in uploaded_files]
+    total_mb = sum(mb for _, mb in sizes)
+    st.write("**Selected files:**")
+    for name, mb in sizes:
+        st.write(f"• {name} — ~{mb:,.1f} MB")
+    if total_mb >= GIANT_MB:
+        st.warning(f"**HUGE total (~{total_mb:,.1f} MB)**. Ultra mode is recommended.")
+    elif total_mb >= HEAVY_MB:
+        st.info(f"**Large total (~{total_mb:,.1f} MB)**. Consider Ultra mode and skipping previews.")
+
+    start = st.button("🚀 Merge files")
+    if not start:
+        st.stop()
+
+    t0 = time.perf_counter()
+
+    if use_ultra:
+        with st.status("Streaming formatted CSV…", expanded=True) as status:
+            try:
+                data_bytes = stream_formatted_csv_from_chunks(
+                    uploaded_files=uploaded_files,
+                    constant_source=constant_source,
+                    force_yes_new_review=force_yes_new_review,
+                    bool_to_yesno=bool_to_yesno,
+                    compat_mode=compat_mode,
+                    chunk_rows=int(chunk_rows),
+                )
+                status.update(label="Done ✅", state="complete")
+            except Exception as e:
+                status.update(label="Failed", state="error")
+                st.exception(e)
+                st.stop()
+
+        elapsed = time.perf_counter() - t0
+        st.success(f"Formatted CSV built via streaming in {elapsed:,.2f}s")
+        st.download_button(
+            "Download CSV (Formatted, streamed)",
+            data=data_bytes,
+            file_name="bv_formatted_export.csv",
+            mime="text/csv",
+        )
+        st.info("Ultra mode skips Raw output for maximum speed & stability.")
+        st.stop()
+
+    # ---------- Non-ULTRA path (keeps DataFrames) ----------
+    with st.status("Reading & merging…", expanded=True) as status:
+        status.update(label="Reading files (1/5)…")
         frames = []
         for f in uploaded_files:
             try:
                 df = read_any(f, compat_mode=compat_mode)
                 df["_source_file"] = f.name
                 frames.append(df)
-                st.write(f"✅ Read {f.name} — {df.shape[0]:,} rows, {df.shape[1]:,} cols")
+                st.write(f"✅ {f.name}: {df.shape[0]:,} rows, {df.shape[1]:,} cols")
             except Exception as e:
                 st.error(f"❌ Failed to read {f.name}")
-                if debug_mode:
-                    st.exception(e)
-                raise
+                st.exception(e)
+                st.stop()
 
-        if not frames:
-            raise RuntimeError("No readable files after parsing step.")
-
-        status.update(label="Building union schema (2/6)…")
+        status.update(label="Union schema (2/5)…")
         union_cols: List[str] = []
         for df in frames:
             for col in map(str, df.columns):
                 if col not in union_cols:
                     union_cols.append(col)
 
-        status.update(label="Aligning & concatenating (3/6)…")
+        status.update(label="Align + concat (3/5)…")
         aligned = [df.reindex(columns=union_cols) for df in frames]
         merged = pd.concat(aligned, ignore_index=True)
 
-        status.update(label="Normalizing booleans (4/6)…")
+        status.update(label="Normalize booleans (4/5)…")
         if bool_to_yesno:
             for c in merged.columns:
                 try:
                     if is_boolean_like(merged[c]):
                         merged[c] = yes_no_from_any(merged[c])
-                except Exception as e:
-                    if debug_mode:
-                        st.write(f"Skipped boolean normalize on column: {c}")
-                        st.exception(e)
+                except Exception:
+                    pass
 
-        status.update(label="Mapping & formatting (5/6)…")
-        # Mapping UI (now that schema is known)
-        st.sidebar.header("Manual Mapping (optional)")
-        all_cols_sorted = ["— auto —"] + sorted(union_cols, key=lambda x: canonicalize(x))
-        def mapping_control(label: str, key_name: str, default_actual: Optional[str]):
-            idx = all_cols_sorted.index(default_actual) if default_actual in all_cols_sorted else 0
-            return st.sidebar.selectbox(label, options=all_cols_sorted, index=idx, key=key_name)
-
-        fake_df = pd.DataFrame(columns=union_cols)
+        status.update(label="Map + format (5/5)…")
+        # Auto-map on union schema
         auto_map = {
-            "product_id":      get_col(fake_df, CANDIDATES["product_id"]),
-            "review_id":       get_col(fake_df, CANDIDATES["review_id"]),
-            "submission_time": get_col(fake_df, CANDIDATES["submission_time"]),
-            "review_text":     get_col(fake_df, CANDIDATES["review_text"]),
-            "rating":          get_col(fake_df, CANDIDATES["rating"]),
-            "incentivized":    get_col(fake_df, CANDIDATES["incentivized"]),
+            "product_id":      get_col(union_cols, CANDIDATES["product_id"]),
+            "review_id":       get_col(union_cols, CANDIDATES["review_id"]),
+            "submission_time": get_col(union_cols, CANDIDATES["submission_time"]),
+            "review_text":     get_col(union_cols, CANDIDATES["review_text"]),
+            "rating":          get_col(union_cols, CANDIDATES["rating"]),
+            "incentivized":    get_col(union_cols, CANDIDATES["incentivized"]),
         }
-        user_map = {}
-        user_map["product_id"]      = mapping_control("Product ID → Model (SKU)", "map_product_id",      auto_map["product_id"])
-        user_map["review_id"]       = mapping_control("Review ID → Verbatim Id", "map_review_id",        auto_map["review_id"])
-        user_map["submission_time"] = mapping_control("Submission Date → Review Date", "map_submission", auto_map["submission_time"])
-        user_map["review_text"]     = mapping_control("Review Text → Verbatim (Review)", "map_reviewtext", auto_map["review_text"])
-        user_map["rating"]          = mapping_control("Rating → Star Rating", "map_rating",              auto_map["rating"])
-        user_map["incentivized"]    = mapping_control("Incentivized → Seeded", "map_incent",             auto_map["incentivized"])
-
-        final_map: Dict[str, Optional[str]] = {}
-        for k, v in user_map.items():
-            final_map[k] = None if v == "— auto —" else v
-            if final_map[k] is None:
-                final_map[k] = auto_map.get(k)
 
         def safe_col(name: Optional[str]) -> pd.Series:
             if name is None or name not in merged.columns:
                 return pd.Series([None]*len(merged), dtype="object")
             return merged[name]
 
-        product_id_s  = safe_col(final_map["product_id"])
-        review_id_s   = safe_col(final_map["review_id"])
-        submission_s  = safe_col(final_map["submission_time"])
-        review_text_s = safe_col(final_map["review_text"])
-        rating_s      = safe_col(final_map["rating"])
-        incent_s      = safe_col(final_map["incentivized"])
+        product_id_s  = safe_col(auto_map["product_id"])
+        review_id_s   = safe_col(auto_map["review_id"])
+        submission_s  = safe_col(auto_map["submission_time"])
+        review_text_s = safe_col(auto_map["review_text"])
+        rating_s      = safe_col(auto_map["rating"])
+        incent_s      = safe_col(auto_map["incentivized"])
         source_file_s = merged.get("_source_file", pd.Series([None]*len(merged), dtype="object"))
 
-        seeded_s     = yes_no_from_any(incent_s) if bool_to_yesno else incent_s
+        seeded_s     = yes_no_from_any(incent_s) if bool_to_yesno and auto_map["incentivized"] else incent_s
         country_s    = infer_country_series(product_id_s, source_file_s)
         new_review_s = pd.Series(["Yes" if force_yes_new_review else ""]*len(merged), dtype="object")
         review_date_s= parse_short_date_col(submission_s)
@@ -374,7 +455,21 @@ try:
             "Star Rating": rating_s,
         })
 
-        status.update(label="Finalizing outputs (6/6)…", state="running")
+        status.update(label="Done ✅", state="complete")
+
+    if not skip_preview:
+        st.subheader(f"Preview (first {PREVIEW_N} rows)")
+        t1, t2 = st.tabs(["Raw (head)", "Formatted (head)"])
+        with t1:
+            st.dataframe(merged.head(PREVIEW_N), use_container_width=True)
+        with t2:
+            st.dataframe(formatted.head(PREVIEW_N), use_container_width=True)
+
+    st.markdown("---")
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown("### Download Raw + Formatted (Excel)")
         if include_raw_json_download:
             merged_with_raw = merged.copy()
             merged_with_raw["Raw Data (JSON)"] = merged.apply(
@@ -384,83 +479,85 @@ try:
         else:
             merged_with_raw = merged
 
-        status.update(label="Merge complete ✅", state="complete")
+        def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
+            bio = io.BytesIO()
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, index=False, sheet_name=name[:31])
+            bio.seek(0)
+            return bio.read()
 
-except Exception as e:
-    st.error("The app hit an error while merging.")
-    if debug_mode:
-        st.exception(e)
-        # quick diagnostics
-        try:
-            st.write("**Diagnostics**")
-            for i, f in enumerate(uploaded_files, 1):
-                st.write(f"File {i}: {f.name}")
-        except Exception:
-            pass
-    st.stop()
+        st.download_button(
+            label="Download Excel (Raw + Formatted)",
+            data=to_excel_bytes({"Raw": merged_with_raw, "Formatted": formatted}),
+            file_name="bv_merged_outputs.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-# ---------- Preview ----------
-st.subheader(f"Preview (first {PREVIEW_N} rows)")
-t1, t2 = st.tabs(["Raw Merged", "Formatted Export"])
-with t1:
-    sample = merged.head(PREVIEW_N).copy()
-    sample["Raw Data (JSON)"] = sample.apply(
-        lambda r: json.dumps({str(k): to_serializable(r[k]) for k in sample.columns}, ensure_ascii=False),
-        axis=1
-    )
-    st.dataframe(sample, use_container_width=True)
-with t2:
-    st.dataframe(formatted.head(PREVIEW_N), use_container_width=True)
+    with colB:
+        st.markdown("### Download Formatted CSV")
+        st.download_button(
+            label="Download CSV (Formatted)",
+            data=formatted.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name="bv_formatted_export.csv",
+            mime="text/csv"
+        )
 
-# ---------- Downloads ----------
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+# ============================ PRESSURE TEST TAB ===============================
+with tab_pressure:
+    st.title("Pressure Test (Synthetic)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        files_n = st.number_input("# synthetic files", 1, 5, 3, 1)
+        rows_n  = st.number_input("rows per file", 50_000, 1_500_000, 300_000, 50_000)
+    with c2:
+        chunk_rows = st.number_input("chunk size (Ultra)", 50_000, 1_000_000, DEFAULT_CHUNK, 50_000)
+        use_ultra_bench = st.checkbox("Benchmark Ultra (streamed CSV)", value=True)
+    with c3:
+        bool_to_yesno = st.checkbox("Normalize booleans", value=True)
+        parse_dates_pt = st.checkbox("Parse dates", value=True)
 
-def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31])
-    bio.seek(0)
-    return bio.read()
+    def make_synth_df(n: int, i: int) -> pd.DataFrame:
+        rng = np.random.default_rng(seed=1234 + i)
+        df = pd.DataFrame({
+            "Product ID": [f"SKU{i}-{j}{'UK' if j%11==0 else ('EU' if j%17==0 else '')}" for j in range(n)],
+            "Review ID": [f"R{i}-{j}" for j in range(n)],
+            "Review text": ["lorem ipsum dolor sit amet " + str(j) for j in range(n)],
+            "Rating": rng.integers(1, 6, size=n),
+            "IncentivizedReview": rng.choice(["true","false","yes","no","0","1"], size=n),
+            "Submission date": pd.to_datetime("2024-01-01") + pd.to_timedelta(rng.integers(0, 365, size=n), unit="D"),
+        })
+        return df
 
-st.markdown("---")
-colA, colB = st.columns(2)
+    if st.button("Run pressure test"):
+        # Build synthetic CSV files in-memory (we won’t write to disk)
+        synth_files = []
+        for i in range(int(files_n)):
+            df = make_synth_df(int(rows_n), i)
+            bio = io.BytesIO()
+            df.to_csv(bio, index=False)
+            bio.seek(0)
+            class _FakeFile:
+                def __init__(self, name, data): self.name=name; self._data=data
+                def getvalue(self): return self._data.getvalue()
+            synth_files.append(_FakeFile(f"Synth_{i}.csv", bio))
 
-with colA:
-    st.markdown("### Download Raw Merged")
-    st.download_button(
-        label="Download CSV (Raw)",
-        data=to_csv_bytes(merged_with_raw),
-        file_name="bv_merged_raw.csv",
-        mime="text/csv"
-    )
-    st.download_button(
-        label="Download Excel (Raw + Formatted)",
-        data=to_excel_bytes({"Raw": merged_with_raw, "Formatted": formatted}),
-        file_name="bv_merged_outputs.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        if use_ultra_bench:
+            t0 = time.perf_counter()
+            data_bytes = stream_formatted_csv_from_chunks(
+                uploaded_files=synth_files,
+                constant_source="DTC",
+                force_yes_new_review=True,
+                bool_to_yesno=bool_to_yesno,
+                compat_mode=False,
+                chunk_rows=int(chunk_rows),
+            )
+            t1 = time.perf_counter()
+            st.success(f"Ultra streamed CSV size = {len(data_bytes)/1_000_000:,.2f} MB, time = {t1-t0:,.2f}s")
+            st.download_button("Download Ultra output (CSV)", data=data_bytes, file_name="pressure_ultra.csv", mime="text/csv")
+        else:
+            st.info("Enable Ultra to benchmark the streamed path.")
 
-with colB:
-    st.markdown("### Download Formatted Export")
-    st.download_button(
-        label="Download CSV (Formatted)",
-        data=to_csv_bytes(formatted),
-        file_name="bv_formatted_export.csv",
-        mime="text/csv"
-    )
-
-with st.expander("Performance tips"):
-    st.markdown(
-        f"- Heads-up shown for files ≥ {HEAVY_MB} MB (and stronger at {GIANT_MB} MB).\n"
-        "- Prefer **CSV** over Excel for very large files.\n"
-        "- Upload **unzipped CSVs** directly from Bazaarvoice when possible.\n"
-        "- If installed, the app uses **Polars** or **PyArrow-backed pandas**.\n"
-        "- Turn **off** the JSON option for big merges.\n"
-        "- Enable **Compatibility mode** if you see dtype/date quirks.\n"
-        "- Turn **Debug mode** on to see the exact stack trace in-app instead of Streamlit’s generic page."
-    )
 
 
 
