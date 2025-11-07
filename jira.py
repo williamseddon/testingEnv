@@ -1,7 +1,3 @@
-# Write the fully updated Streamlit app to a file for easy download
-from pathlib import Path
-
-code = r'''
 # app_pro_v8.py — Jira Issues Pro Explorer (v8)
 # • Minimal required fields auto-map: Date Identified, Symptom, Disposition, Description(=Zoom Summary)
 # • Mapping profiles (save/load), uniqueness checks, clear diagnostics
@@ -173,7 +169,7 @@ def optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
 
 def ensure_arrow_safe(df: pd.DataFrame, max_str_len: int = 10000) -> pd.DataFrame:
     out = df.copy()
-    out.columns = [str(c) for c in out.columns]
+    out.columns = [str(c) for c in df.columns]
     for c in out.columns:
         s = out[c]
         if pd.api.types.is_period_dtype(s):
@@ -726,9 +722,6 @@ with exp3:
     st.download_button("💾 Save current mapping (.json)",
         data=json.dumps(auto_map, indent=2).encode("utf-8"),
         file_name="mapping_profile.json", mime="application/json", key="v8_dl_map2")
-'''
-out = Path('/mnt/data/app_pro_v8.py')
-out.write_text(code, encoding='utf-8')
-print(str(out))
+
 
 
