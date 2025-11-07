@@ -1,14 +1,8 @@
-# Write a cleaned, auto-mapping Streamlit app that defaults to your Zendesk-style export.
-# It auto-maps minimal required fields (Date, Symptom, Disposition, Description) without asking,
-# but includes an optional "Advanced remap" expander. It keeps Arrow-safe preview and
-# includes the disposition-by-symptom timeline with smoothing options.
-from pathlib import Path
-
-code = r'''
-# app_automap_v5.py — Jira Issues Flexible Explorer (auto-maps your export)
-# Main-page upload • Auto-map minimal fields for Zendesk-style export • Arrow-safe preview
-# Disposition-by-Symptom timeline (single & small multiples, share %, smoothing)
-# Heatmaps • Top-N • Deltas • Descriptions • Optional advanced remap
+# app.py — Jira Issues Flexible Explorer (clean automap)
+# • Auto-maps minimal fields for your Zendesk-style export
+# • Main-page upload • Arrow-safe preview • Trends • Deltas • Heatmaps
+# • Disposition-by-Symptom timeline (share %, smoothing, small multiples)
+# • No runtime file writes
 
 import io
 import json
@@ -23,10 +17,12 @@ import plotly.express as px
 import streamlit as st
 
 # -------------------- Page & Styles --------------------
-st.set_page_config(page_title="Jira Issues — Flexible Explorer",
-                   page_icon="🧭",
-                   layout="wide",
-                   initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Jira Issues — Flexible Explorer",
+    page_icon="🧭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown(
     """
@@ -44,7 +40,7 @@ st.markdown(
       .stPlotlyChart {background:white;border-radius:12px;padding:8px;}
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 st.title("🧭 Jira Issues — Flexible Explorer")
@@ -55,22 +51,23 @@ REQUIRED_FIELDS = [
     "Date Identified", "SKU(s)", "Base SKU", "Region",
     "Symptom", "Disposition", "Description", "Serial Number",
 ]
+# Minimal fields required to run (everything else optional)
 MIN_REQUIRED = ["Date Identified", "Symptom", "Disposition", "Description"]
 
-# Known profile for your export (mapping canonical -> source header)
+# Known profile (canonical -> source header) for your export
 KNOWN_PROFILE: Dict[str, Optional[str]] = {
     "Date Identified": "Start Time (Date/Time)",
     "Symptom": "Symptom",
     "Disposition": "Disposition Tag",
     "Description": "Zoom Summary",
-    # optional nice-to-haves:
+    # Optional for richer filters/KPIs:
     "SKU(s)": "Zendesk SKU",
     "Base SKU": "Product Brand",
     "Region": "Queue Country",
     "Serial Number": None,
 }
 
-# Synonyms for fallback guessing
+# Synonyms used if headers shift
 SYNONYMS: Dict[str, List[str]] = {
     "Date Identified": ["date identified","start time (date/time)","start time","created","created date","opened","report date"],
     "SKU(s)": ["zendesk sku","sku(s)","skus","sku","product sku","model"],
@@ -85,52 +82,43 @@ SYNONYMS: Dict[str, List[str]] = {
 # -------------------- IO helpers --------------------
 @st.cache_data(show_spinner=False)
 def read_excel_sheet_bytes(content: bytes, sheet: Optional[str] = None) -> pd.DataFrame:
+    # openpyxl is used under the hood
     return pd.read_excel(io.BytesIO(content), sheet_name=sheet)
 
 @st.cache_data(show_spinner=False)
 def read_csv_bytes(content: bytes) -> pd.DataFrame:
-    return pd.read_csv(io.BytesIO(content))
+    # low_memory=False for safer type inference on big files
+    return pd.read_csv(io.BytesIO(content), low_memory=False)
 
 # -------------------- Mapping helpers --------------------
-def norm(s: str) -> str:
-    return re.sub(r'\W+', '', str(s).strip().lower())
+def _norm(s: str) -> str:
+    return re.sub(r"\W+", "", str(s).strip().lower())
 
-def build_norm_index(columns: List[str]) -> Dict[str, str]:
-    # returns normalized -> original
-    idx = {}
-    for c in columns:
-        idx[norm(c)] = c
-    return idx
+def _build_norm_index(columns: List[str]) -> Dict[str, str]:
+    return {_norm(c): c for c in columns}
 
 def auto_map_known_profile(columns: List[str]) -> Dict[str, Optional[str]]:
-    idx = build_norm_index(columns)
+    idx = _build_norm_index(columns)
     mapping: Dict[str, Optional[str]] = {}
     for canon, src in KNOWN_PROFILE.items():
-        if src is None:
-            mapping[canon] = None
-            continue
-        mapping[canon] = idx.get(norm(src), None)
+        mapping[canon] = None if src is None else idx.get(_norm(src), None)
     return mapping
 
 def guess_mapping(columns: List[str]) -> Dict[str, Optional[str]]:
-    # heuristic fallback using synonyms
     mapping: Dict[str, Optional[str]] = {}
-    cols_norm = [(c, norm(c)) for c in columns]
+    cols_norm = [(c, _norm(c)) for c in columns]
     for canon, syns in SYNONYMS.items():
-        best = None
-        best_score = 0.0
+        best, best_score = None, 0.0
+        wanted = [_norm(canon)] + [_norm(s) for s in syns]
         for c, cn in cols_norm:
-            # exact norm match priority
-            if cn == norm(canon) or cn in [norm(s) for s in syns]:
-                mapping[canon] = c
-                best = c; best_score = 1.0
+            if cn in wanted:
+                best, best_score = c, 1.0
                 break
-            # fuzzy
-            for s in [canon] + syns:
-                score = difflib.SequenceMatcher(None, cn, norm(s)).ratio()
-                if score > best_score:
-                    best, best_score = c, score
-        mapping[canon] = best if (best and best_score >= 0.6) else mapping.get(canon, None)
+            for s in wanted:
+                sc = difflib.SequenceMatcher(None, cn, s).ratio()
+                if sc > best_score:
+                    best, best_score = c, sc
+        mapping[canon] = best if (best and best_score >= 0.6) else None
     return mapping
 
 def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
@@ -140,7 +128,6 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.Dat
         if col not in out.columns:
             out[col] = pd.NA
     out["Date Identified"] = pd.to_datetime(out["Date Identified"], errors="coerce")
-    # Normalize string columns
     if "SKU(s)" in out.columns:
         out["SKU(s)"] = pd.Series(out["SKU(s)"], dtype="string").str.upper().str.strip()
     if "Base SKU" in out.columns:
@@ -175,7 +162,7 @@ def ensure_arrow_safe(df: pd.DataFrame, max_str_len: int = 10000) -> pd.DataFram
             out[c] = s.astype(str).map(lambda z: z if len(z)<=max_str_len else z[:max_str_len]+"…")
     return out
 
-# -------------------- UI helpers --------------------
+# -------------------- Filters & helpers --------------------
 def kpi(label: str, value):
     st.markdown(f"<div class='kpi'><h3>{label}</h3><p>{value}</p></div>", unsafe_allow_html=True)
 
@@ -228,7 +215,6 @@ try:
     if kind == "xlsx":
         xls = pd.ExcelFile(io.BytesIO(content))
         sheets = xls.sheet_names
-        # If known sheet name exists, pick it; else default first
         sel = st.selectbox("Select sheet", sheets, index=0)
         df_raw = read_excel_sheet_bytes(content, sheet=sel)
     else:
@@ -237,40 +223,34 @@ except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-# -------------------- 3) Auto-map to your profile (no prompts) --------------------
+# -------------------- 3) Auto-map (no prompts) --------------------
 columns = [str(c) for c in df_raw.columns]
 auto_map = auto_map_known_profile(columns)
 
-# if any minimal field missing, try heuristic guess
+# Backfill missing minimal fields with guesses
 needs_guess = [f for f in MIN_REQUIRED if not auto_map.get(f)]
 if needs_guess:
     guessed = guess_mapping(columns)
-    # fill missing from guess
     for k in MIN_REQUIRED:
         if not auto_map.get(k) and guessed.get(k):
             auto_map[k] = guessed[k]
 
-# Show quick info if still missing minimal fields
 missing_final = [f for f in MIN_REQUIRED if not auto_map.get(f)]
 if missing_final:
-    st.error("Could not auto-map required fields for this file. "
-             "Please use **Advanced remap** below to set the fields.\n\n"
-             f"Missing: {', '.join(missing_final)}")
+    st.error("Could not auto-map required fields for this file. Expand **Advanced remap** to fix:\n"
+             + ", ".join(missing_final))
 
-# Optional: Advanced remap (only if user needs/wants it)
-with st.expander("⚙️ Advanced: Remap columns (optional)"):
+with st.expander("⚙️ Advanced remap (optional)"):
     cols = st.columns(2)
-    new_map: Dict[str, Optional[str]] = {}
+    override: Dict[str, Optional[str]] = {}
     for i, field in enumerate(REQUIRED_FIELDS):
         with cols[i % 2]:
             candidates = [None] + columns
             default_idx = (candidates.index(auto_map.get(field)) if auto_map.get(field) in candidates else 0)
-            new_map[field] = st.selectbox(field, candidates, index=default_idx, key=f"map_{field}")
-    # Apply user's overrides
+            override[field] = st.selectbox(field, candidates, index=default_idx, key=f"map_{field}")
     for k in REQUIRED_FIELDS:
-        auto_map[k] = new_map.get(k, auto_map.get(k))
+        auto_map[k] = override.get(k, auto_map.get(k))
 
-# Final minimal check before proceeding
 missing_final = [f for f in MIN_REQUIRED if not auto_map.get(f)]
 if missing_final:
     st.stop()
@@ -426,7 +406,7 @@ rank_disp["Delta"] = rank_disp["Delta"].apply(_fmt_delta)
 rank_disp["Delta %"] = rank_disp["Delta %"].apply(_fmt_pct)
 st.markdown(f"<div class='scrollable-table'>{rank_disp.to_html(escape=False, index=False)}</div>", unsafe_allow_html=True)
 
-# -------------------- 7) Disposition mix over time — by Symptom (with smoothing) --------------------
+# -------------------- 7) Disposition mix over time — by Symptom --------------------
 st.markdown("### 7) Disposition mix over time — by Symptom")
 
 colA, colB, colC, colD, colE = st.columns([2,1,1,1,1])
@@ -458,10 +438,8 @@ def disposition_mix(df_in: pd.DataFrame, symptom: Optional[str], freq_code: str,
 
     g = d.groupby(["Bucket", "Disposition"]).size().reset_index(name="Count")
 
-    # smoothing on counts per disposition series
     if smooth_opt != "None" and not g.empty:
-        win = 4 if smooth_opt == "4w roll" else 7  # window in buckets (approx for W/M)
-        # pivot -> rolling -> melt back
+        win = 4 if smooth_opt == "4w roll" else 7
         pv = g.pivot(index="Bucket", columns="Disposition", values="Count").sort_index().fillna(0)
         pv = pv.rolling(window=win, min_periods=1).mean()
         g = pv.reset_index().melt(id_vars="Bucket", var_name="Disposition", value_name="Count")
@@ -497,10 +475,10 @@ with st.expander("Small multiples: Top-N symptoms — disposition mix over time"
     with colN2:
         normalize_sm = st.checkbox("Normalize to share (%) (small multiples)", value=True)
 
-    top_symptoms = (df_filtered["Symptom"].value_counts().nlargest(topN).index.tolist()
-                    if "Symptom" in df_filtered.columns else [])
+    top_syms = (df_filtered["Symptom"].value_counts().nlargest(topN).index.tolist()
+                if "Symptom" in df_filtered.columns else [])
     d2 = scope.copy()
-    d2 = d2[d2["Symptom"].isin(top_symptoms)].dropna(subset=["Date Identified"]).copy()
+    d2 = d2[d2["Symptom"].isin(top_syms)].dropna(subset=["Date Identified"]).copy()
     if not d2.empty:
         code = {"Week":"W","Month":"M"}[mix_agg]
         d2["Bucket"] = d2["Date Identified"].dt.to_period(code).apply(lambda r: r.start_time)
@@ -515,6 +493,12 @@ with st.expander("Small multiples: Top-N symptoms — disposition mix over time"
                          template="plotly_white")
         fig_sm.update_layout(margin=dict(t=60))
         st.plotly_chart(fig_sm, use_container_width=True)
+        st.download_button(
+            "Download small-multiples dataset (CSV)",
+            data=gm.to_csv(index=False).encode("utf-8"),
+            file_name="disposition_mix_small_multiples.csv",
+            mime="text/csv",
+        )
     else:
         st.info("No data available for small multiples with current filters/time window.")
 
@@ -554,27 +538,17 @@ else:
         )
     st.caption(f"Showing {start+1}–{end} of {total}")
 
-# -------------------- Sidebar downloads (in-memory only) --------------------
+# -------------------- Downloads (in-memory only) --------------------
 st.sidebar.download_button(
     label="⬇️ Download filtered CSV",
     data=df_filtered.to_csv(index=False).encode("utf-8"),
     file_name="jira_filtered.csv",
     mime="text/csv",
 )
-state = {
-    "date_range_graph": date_range_graph,
-    "table_days": int(table_days),
-}
+state = {"date_range_graph": date_range_graph, "table_days": int(table_days)}
 st.sidebar.download_button(
     label="💾 Save current view (.json)",
     data=json.dumps(state, indent=2).encode("utf-8"),
     file_name="jira_view.json",
     mime="application/json",
 )
-'''
-
-out = Path('/mnt/data/app_automap_v5.py')
-out.write_text(code, encoding='utf-8')
-str(out)
-
-
