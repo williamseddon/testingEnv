@@ -1,4 +1,8 @@
-# app.py — Jira Issues Flexible Explorer (hardened for Arrow + mapping validator)
+# Retry: wrap the embedded code in triple *single* quotes to avoid premature string termination.
+from pathlib import Path
+
+code = r'''
+# app_v3.py — Jira Issues Flexible Explorer (lenient mapping + warnings)
 import io
 import json
 import difflib
@@ -43,6 +47,9 @@ REQUIRED_FIELDS = [
     "Date Identified", "SKU(s)", "Base SKU", "Region",
     "Symptom", "Disposition", "Description", "Serial Number",
 ]
+
+# Minimal fields required to run charts/tables
+MIN_REQUIRED = ["Date Identified", "Symptom", "Disposition", "Description"]  # allow SKU/Base optional
 
 SYNONYMS: Dict[str, List[str]] = {
     "Date Identified": ["date identified","identified","date","created","created date","created_on","opened","report date","start time (date/time)","start time"],
@@ -97,7 +104,7 @@ def best_sheet_for_schema(xls_bytes: bytes, sheet_names: List[str]) -> Optional[
             best_hits, best_sheet = hits, name
     return best_sheet
 
-def apply_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
     reverse = {v: k for k, v in mapping.items() if v}
     out = df.rename(columns=reverse).copy()
     for col in REQUIRED_FIELDS:
@@ -151,31 +158,25 @@ def combine_top_n(series: pd.Series, n: int = 10, label: str = "Other") -> pd.Se
 def kpi(label: str, value):
     st.markdown(f"<div class='kpi'><h3>{label}</h3><p>{value}</p></div>", unsafe_allow_html=True)
 
-# ---------- NEW: make a preview Arrow-safe (no nested/mixed objects, no tz-aware dts) ----------
 def _is_scalar_for_arrow(x: Any) -> bool:
     return not isinstance(x, (list, dict, set, tuple, bytes, bytearray))
 
 def ensure_arrow_safe(df: pd.DataFrame, max_str_len: int = 10000) -> pd.DataFrame:
     out = df.copy()
-    # Normalize column names
     out.columns = [str(c) for c in out.columns]
     for c in out.columns:
         s = out[c]
-        # Period dtype -> timestamps
         if pd.api.types.is_period_dtype(s):
             out[c] = s.astype("datetime64[ns]")
             continue
-        # Datetime with tz -> drop tz (Arrow sometimes balks on mixed tz)
         if pd.api.types.is_datetime64tz_dtype(s):
             out[c] = pd.to_datetime(s, utc=True).dt.tz_convert(None)
             continue
-        # Object with nested types -> stringify
         if pd.api.types.is_object_dtype(s):
             if not s.dropna().map(_is_scalar_for_arrow).all():
                 out[c] = s.map(lambda v: json.dumps(v) if isinstance(v, (dict, list)) else str(v))
             else:
                 out[c] = s.astype(str)
-            # clip very long values to keep render snappy
             out[c] = out[c].map(lambda z: z if isinstance(z, str) and len(z) <= max_str_len else (z[:max_str_len] + "…") if isinstance(z, str) else z)
     return out
 
@@ -212,7 +213,6 @@ st.markdown("### 2) Map columns (auto-guessed, editable)")
 columns = [str(c) for c in df_raw.columns]
 defaults = guess_mapping(columns)
 
-# Persist last mapping in session to aid re-uploads with same schema
 st.session_state.setdefault("last_mapping_key", None)
 st.session_state.setdefault("last_mapping", {})
 key_now = "|".join(columns)
@@ -226,23 +226,28 @@ for i, field in enumerate(REQUIRED_FIELDS):
     with cols[i % 2]:
         mapping[field] = st.selectbox(field, [None] + columns, index=(columns.index(default)+1) if default in columns else 0, key=f"map_{field}")
 
-# NEW: block obvious duplicate mappings and guide the user
+# Duplicate mapping warning (not blocking)
 selected_vals = [v for v in mapping.values() if v]
-dupes = {v for v in selected_vals if selected_vals.count(v) > 1}
+dupes = sorted({v for v in selected_vals if selected_vals.count(v) > 1})
 if dupes:
-    st.error(f"Each canonical field must map to a different source column. Duplicate selection(s): {', '.join(sorted(dupes))}. "
-             f"Example: don’t map both ‘SKU(s)’ and ‘Base SKU’ to ‘Product Brand’.")
+    st.warning(f"Duplicate source columns selected: {', '.join(dupes)}. "
+               "Allowed, but consider mapping each canonical field to its best column.")
+
+# Ensure minimal required fields are mapped
+MIN_REQUIRED = ["Date Identified", "Symptom", "Disposition", "Description"]
+missing_min = [f for f in MIN_REQUIRED if not mapping.get(f)]
+if missing_min:
+    st.error(f"Please map the minimal required fields: {', '.join(MIN_REQUIRED)}.")
     st.stop()
 
-if not all(mapping.get(f) for f in REQUIRED_FIELDS):
-    missing = [f for f in REQUIRED_FIELDS if not mapping.get(f)]
-    st.warning(f"Select a column for all required fields to proceed. Missing: {', '.join(missing)}")
-    st.stop()
+# Encourage at least one SKU identifier
+if not mapping.get("SKU(s)") and not mapping.get("Base SKU"):
+    st.info("Tip: Map at least one of 'SKU(s)' or 'Base SKU' for better product-level analysis. Proceeding without it.")
 
 st.session_state["last_mapping_key"] = key_now
 st.session_state["last_mapping"] = mapping.copy()
 
-# -------------------- 3) Standardize & optimize (optional) --------------------
+# -------------------- 3) Standardize & optimize --------------------
 df = apply_mapping(df_raw, mapping)
 with st.expander("⚙️ Options"):
     do_opt = st.checkbox("Optimize memory (downcast + categorize likely dimensions)", value=True)
@@ -260,11 +265,11 @@ with st.sidebar:
     tsf_only = st.checkbox("TSF only (disposition contains _ts_failed / _replaced / tsf)", value=False)
     combine_other = st.checkbox("Combine lesser categories into 'Other' (charts only)", value=False)
     search_text = st.text_input("Search 'Description' contains…", value="")
-    st.markdown("---")
+    st.markdown('---')
     st.header("Date Windows")
     date_range_graph = st.selectbox("Chart range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3)
     table_days = st.number_input("Delta window (table): days", min_value=7, value=30, step=1)
-    st.markdown("---")
+    st.markdown('---')
     st.header("Views")
     view_to_load = st.file_uploader("Load saved view (.json)", type=["json"], key="view_loader")
     if view_to_load is not None:
@@ -284,8 +289,8 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to load view: {e}")
 
-# -------------------- Field inspector to validate mapping --------------------
-with st.expander("🔎 Field Inspector (quick validation of your mapping)"):
+# -------------------- Field inspector --------------------
+with st.expander("🔎 Field Inspector (validate mapping quickly)"):
     for col in REQUIRED_FIELDS:
         if col not in df.columns:
             continue
@@ -352,40 +357,6 @@ fig_disp = px.bar(disp_trend, x="Date Identified", y="Count", color="Disposition
 fig_disp.update_layout(barmode="stack", margin=dict(t=40))
 st.plotly_chart(fig_disp, use_container_width=True)
 
-st.markdown("#### Heatmaps")
-def weekly_heatmap(df_in: pd.DataFrame, label: str):
-    d = df_in.dropna(subset=["Date Identified"]).copy()
-    if d.empty:
-        st.info("No dates to plot.")
-        return
-    d["Week"] = d["Date Identified"].dt.to_period("W").apply(lambda r: r.start_time)
-    mat = d.groupby(["Week", label]).size().reset_index(name="Count")
-    top_labels = mat.groupby(label)["Count"].sum().nlargest(12).index
-    mat[label] = mat[label].apply(lambda x: x if x in top_labels else "Other")
-    mat = mat.groupby(["Week", label])["Count"].sum().reset_index()
-    pv = mat.pivot(index=label, columns="Week", values="Count").fillna(0)
-    fig = px.imshow(pv, aspect="auto", color_continuous_scale="Blues", origin="lower", title=f"Weekly Heatmap — {label}")
-    st.plotly_chart(fig, use_container_width=True)
-
-cH1, cH2 = st.columns(2)
-with cH1: weekly_heatmap(df_filtered, "Symptom")
-with cH2: weekly_heatmap(df_filtered, "Disposition")
-
-st.markdown("#### Top-N")
-def topn_bars(df_in: pd.DataFrame, col: str, n: int = 15, title: Optional[str] = None):
-    if df_in.empty:
-        st.info("No data for Top-N.")
-        return
-    vc = df_in[col].value_counts().nlargest(n).reset_index()
-    vc.columns = [col, "Count"]
-    fig = px.bar(vc, x="Count", y=col, orientation="h", title=title or f"Top {n}: {col}", template="plotly_white")
-    fig.update_layout(yaxis={"categoryorder": "total ascending"}, margin=dict(t=40))
-    st.plotly_chart(fig, use_container_width=True)
-
-cT1, cT2 = st.columns(2)
-with cT1: topn_bars(df_filtered, "Symptom", 15, "Top 15 Symptoms")
-with cT2: topn_bars(df_filtered, "Disposition", 15, "Top 15 Dispositions")
-
 # -------------------- Ranked Symptoms with Δ --------------------
 st.markdown("### 5) Ranked Symptoms (Δ over equal windows)")
 cur = df_filtered[df_filtered["Date Identified"] >= start_table]
@@ -401,6 +372,7 @@ rank["Delta"] = rank[f"Last {table_days}d"] - rank[f"Prev {table_days}d"]
 rank["Delta %"] = np.where(rank[f"Prev {table_days}d"]>0,
                            (rank["Delta"]/rank[f"Prev {table_days}d"]*100.0).round(2),
                            np.nan)
+rank = rank.sort_values(["Total", f"Last {table_days}d"], ascending=False).head(10)
 
 def _fmt_delta(v):
     try: v = int(v)
@@ -416,7 +388,6 @@ def _fmt_pct(v):
     if v<0: return f"<span class='delta-neg'>{v:.2f}%</span>"
     return "—"
 
-rank = rank.sort_values(["Total", f"Last {table_days}d"], ascending=False).head(10)
 rank_disp = rank.copy()
 rank_disp["Delta"] = rank_disp["Delta"].apply(_fmt_delta)
 rank_disp["Delta %"] = rank_disp["Delta %"].apply(_fmt_pct)
@@ -477,3 +448,8 @@ st.sidebar.download_button(
     file_name="jira_view.json",
     mime="application/json",
 )
+'''
+
+out = Path('/mnt/data/app_v3.py')
+out.write_text(code, encoding='utf-8')
+str(out)
