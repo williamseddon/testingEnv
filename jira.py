@@ -1,9 +1,18 @@
-# app.py — Jira Issues Flexible Explorer (v4)
-# Main-page upload • Flexible schema mapping • Arrow-safe preview
-# Disposition-by-Symptom timeline (single & small multiples) • Heatmaps • Top-N • Deltas
+# Write a cleaned, auto-mapping Streamlit app that defaults to your Zendesk-style export.
+# It auto-maps minimal required fields (Date, Symptom, Disposition, Description) without asking,
+# but includes an optional "Advanced remap" expander. It keeps Arrow-safe preview and
+# includes the disposition-by-symptom timeline with smoothing options.
+from pathlib import Path
+
+code = r'''
+# app_automap_v5.py — Jira Issues Flexible Explorer (auto-maps your export)
+# Main-page upload • Auto-map minimal fields for Zendesk-style export • Arrow-safe preview
+# Disposition-by-Symptom timeline (single & small multiples, share %, smoothing)
+# Heatmaps • Top-N • Deltas • Descriptions • Optional advanced remap
 
 import io
 import json
+import re
 import difflib
 from datetime import timedelta
 from typing import Dict, List, Optional, Any
@@ -12,7 +21,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-
 
 # -------------------- Page & Styles --------------------
 st.set_page_config(page_title="Jira Issues — Flexible Explorer",
@@ -40,74 +48,90 @@ st.markdown(
 )
 
 st.title("🧭 Jira Issues — Flexible Explorer")
-st.caption("Main-page upload • Flexible schema mapping • Arrow-safe preview • Trend charts • Deltas • Heatmaps")
-
+st.caption("Auto-maps your Zendesk-style export • Main-page upload • Arrow-safe preview • Trends • Deltas • Heatmaps")
 
 # -------------------- Canonical schema --------------------
 REQUIRED_FIELDS = [
     "Date Identified", "SKU(s)", "Base SKU", "Region",
     "Symptom", "Disposition", "Description", "Serial Number",
 ]
-
-# Minimal fields to run analysis
 MIN_REQUIRED = ["Date Identified", "Symptom", "Disposition", "Description"]
 
-# Synonyms to help auto-map (lowercased matching)
-SYNONYMS: Dict[str, List[str]] = {
-    "Date Identified": ["date identified","identified","date","created","created date","created_on","opened",
-                        "report date","start time (date/time)","start time","start_time"],
-    "SKU(s)": ["sku(s)","sku","skus","product sku","product","model sku","model","zendesk sku","zendesk_sku"],
-    "Base SKU": ["base sku","base","base_sku","base sku(s)","base product","family sku","platform","product brand","brand"],
-    "Region": ["region","market","country","geo","territory","locale","queue country"],
-    "Symptom": ["symptom","issue","category","failure mode","problem","defect","tag"],
-    "Disposition": ["disposition","status","resolution","outcome","result","action","disposition tag"],
-    "Description": ["description","details","summary","comments","issue description","text","notes","zoom summary"],
-    "Serial Number": ["serial number","sn","s/n","serial","unit sn","serial_no","serial no","serialnumber"],
+# Known profile for your export (mapping canonical -> source header)
+KNOWN_PROFILE: Dict[str, Optional[str]] = {
+    "Date Identified": "Start Time (Date/Time)",
+    "Symptom": "Symptom",
+    "Disposition": "Disposition Tag",
+    "Description": "Zoom Summary",
+    # optional nice-to-haves:
+    "SKU(s)": "Zendesk SKU",
+    "Base SKU": "Product Brand",
+    "Region": "Queue Country",
+    "Serial Number": None,
 }
 
+# Synonyms for fallback guessing
+SYNONYMS: Dict[str, List[str]] = {
+    "Date Identified": ["date identified","start time (date/time)","start time","created","created date","opened","report date"],
+    "SKU(s)": ["zendesk sku","sku(s)","skus","sku","product sku","model"],
+    "Base SKU": ["product brand","brand","base sku","base product","family sku","platform"],
+    "Region": ["queue country","region","market","country","geo","territory","locale"],
+    "Symptom": ["symptom","issue","category","failure mode","problem","defect","tag"],
+    "Disposition": ["disposition tag","disposition","status","resolution","outcome","result","action"],
+    "Description": ["zoom summary","description","details","summary","comments","issue description","text","notes"],
+    "Serial Number": ["serial number","sn","s/n","serial","serial no","serial_no"],
+}
 
-# -------------------- Cache helpers --------------------
+# -------------------- IO helpers --------------------
 @st.cache_data(show_spinner=False)
 def read_excel_sheet_bytes(content: bytes, sheet: Optional[str] = None) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(content), sheet_name=sheet)  # openpyxl under the hood
+    return pd.read_excel(io.BytesIO(content), sheet_name=sheet)
 
 @st.cache_data(show_spinner=False)
 def read_csv_bytes(content: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(content))
 
+# -------------------- Mapping helpers --------------------
+def norm(s: str) -> str:
+    return re.sub(r'\W+', '', str(s).strip().lower())
 
-# -------------------- Utility functions --------------------
-def score_column_for_field(col: str, field: str) -> float:
-    col_l = col.strip().lower()
-    cands = [field.lower()] + SYNONYMS.get(field, [])
-    scores = [difflib.SequenceMatcher(None, col_l, cand).ratio() for cand in cands]
-    for cand in cands:
-        if cand in col_l:
-            scores.append(1.0 - 0.02 * abs(len(col_l) - len(cand)))
-    return max(scores) if scores else 0.0
+def build_norm_index(columns: List[str]) -> Dict[str, str]:
+    # returns normalized -> original
+    idx = {}
+    for c in columns:
+        idx[norm(c)] = c
+    return idx
 
-def guess_mapping(columns: List[str]) -> Dict[str, Optional[str]]:
+def auto_map_known_profile(columns: List[str]) -> Dict[str, Optional[str]]:
+    idx = build_norm_index(columns)
     mapping: Dict[str, Optional[str]] = {}
-    for field in REQUIRED_FIELDS:
-        best_col, best_score = None, 0.0
-        for col in columns:
-            s = score_column_for_field(col, field)
-            if s > best_score:
-                best_col, best_score = col, s
-        mapping[field] = best_col if (best_col and best_score >= 0.55) else None
+    for canon, src in KNOWN_PROFILE.items():
+        if src is None:
+            mapping[canon] = None
+            continue
+        mapping[canon] = idx.get(norm(src), None)
     return mapping
 
-def best_sheet_for_schema(xls_bytes: bytes, sheet_names: List[str]) -> Optional[str]:
-    best_sheet, best_hits = None, -1
-    for name in sheet_names:
-        try:
-            df = read_excel_sheet_bytes(xls_bytes, sheet=name)
-        except Exception:
-            continue
-        hits = sum(1 for v in guess_mapping([str(c) for c in df.columns]).values() if v)
-        if hits > best_hits:
-            best_hits, best_sheet = hits, name
-    return best_sheet
+def guess_mapping(columns: List[str]) -> Dict[str, Optional[str]]:
+    # heuristic fallback using synonyms
+    mapping: Dict[str, Optional[str]] = {}
+    cols_norm = [(c, norm(c)) for c in columns]
+    for canon, syns in SYNONYMS.items():
+        best = None
+        best_score = 0.0
+        for c, cn in cols_norm:
+            # exact norm match priority
+            if cn == norm(canon) or cn in [norm(s) for s in syns]:
+                mapping[canon] = c
+                best = c; best_score = 1.0
+                break
+            # fuzzy
+            for s in [canon] + syns:
+                score = difflib.SequenceMatcher(None, cn, norm(s)).ratio()
+                if score > best_score:
+                    best, best_score = c, score
+        mapping[canon] = best if (best and best_score >= 0.6) else mapping.get(canon, None)
+    return mapping
 
 def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
     reverse = {v: k for k, v in mapping.items() if v}
@@ -116,12 +140,14 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.Dat
         if col not in out.columns:
             out[col] = pd.NA
     out["Date Identified"] = pd.to_datetime(out["Date Identified"], errors="coerce")
-    for c in ("SKU(s)", "Base SKU"):
-        if c in out.columns:
-            out[c] = out[c].astype("string").str.upper().str.strip()
+    # Normalize string columns
+    if "SKU(s)" in out.columns:
+        out["SKU(s)"] = pd.Series(out["SKU(s)"], dtype="string").str.upper().str.strip()
+    if "Base SKU" in out.columns:
+        out["Base SKU"] = pd.Series(out["Base SKU"], dtype="string").str.upper().str.strip()
     for c in ("Region","Symptom","Disposition","Description","Serial Number"):
         if c in out.columns:
-            out[c] = out[c].astype("string")
+            out[c] = pd.Series(out[c], dtype="string")
     return out
 
 def optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
@@ -136,8 +162,33 @@ def optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
             out[c] = out[c].astype("category")
     return out
 
+def ensure_arrow_safe(df: pd.DataFrame, max_str_len: int = 10000) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c) for c in out.columns]
+    for c in out.columns:
+        s = out[c]
+        if pd.api.types.is_period_dtype(s):
+            out[c] = s.astype("datetime64[ns]"); continue
+        if pd.api.types.is_datetime64tz_dtype(s):
+            out[c] = pd.to_datetime(s, utc=True).dt.tz_convert(None); continue
+        if pd.api.types.is_object_dtype(s):
+            out[c] = s.astype(str).map(lambda z: z if len(z)<=max_str_len else z[:max_str_len]+"…")
+    return out
+
+# -------------------- UI helpers --------------------
+def kpi(label: str, value):
+    st.markdown(f"<div class='kpi'><h3>{label}</h3><p>{value}</p></div>", unsafe_allow_html=True)
+
+def combine_top_n(series: pd.Series, n: int = 10, label: str = "Other") -> pd.Series:
+    s = series.fillna("(NA)")
+    counts = s.value_counts(dropna=False)
+    if len(counts) <= n:
+        return s
+    top = set(counts.nlargest(n).index.tolist())
+    return s.apply(lambda x: x if x in top else label)
+
 def build_filter_mask(df: pd.DataFrame, *, sku=None, base=None, region=None, symptom=None, disp=None,
-                      tsf_only=False, search_text: str = "", regex_search: bool = False) -> pd.Series:
+                      tsf_only=False, search_text: str = "", regex_search: bool=False) -> pd.Series:
     mask = pd.Series(True, index=df.index, dtype=bool)
     def _apply_in(col, values):
         nonlocal mask
@@ -148,55 +199,17 @@ def build_filter_mask(df: pd.DataFrame, *, sku=None, base=None, region=None, sym
     if tsf_only and "Disposition" in df.columns:
         mask &= df["Disposition"].fillna("").str.contains(r"_ts_failed|_replaced|tsf", case=False, regex=True)
     if search_text:
-        s = str(search_text)
         if regex_search:
             try:
-                mask &= df["Description"].fillna("").str.contains(s, case=False, regex=True)
+                mask &= df["Description"].fillna("").str.contains(search_text, case=False, regex=True)
             except Exception:
-                st.warning("Invalid regex; falling back to plain text search.")
-                mask &= df["Description"].fillna("").str.lower().str.contains(s.lower(), na=False)
+                st.warning("Invalid regex; falling back to plain search.")
+                mask &= df["Description"].fillna("").str.lower().str.contains(search_text.lower(), na=False)
         else:
-            mask &= df["Description"].fillna("").str.lower().str.contains(s.lower(), na=False)
+            mask &= df["Description"].fillna("").str.lower().str.contains(search_text.lower(), na=False)
     return mask
 
-def combine_top_n(series: pd.Series, n: int = 10, label: str = "Other") -> pd.Series:
-    s = series.fillna("(NA)")
-    counts = s.value_counts(dropna=False)
-    if len(counts) <= n:
-        return s
-    top = set(counts.nlargest(n).index.tolist())
-    return s.apply(lambda x: x if x in top else label)
-
-def kpi(label: str, value):
-    st.markdown(f"<div class='kpi'><h3>{label}</h3><p>{value}</p></div>", unsafe_allow_html=True)
-
-def _is_scalar_for_arrow(x: Any) -> bool:
-    return not isinstance(x, (list, dict, set, tuple, bytes, bytearray))
-
-def ensure_arrow_safe(df: pd.DataFrame, max_str_len: int = 10000) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [str(c) for c in out.columns]
-    for c in out.columns:
-        s = out[c]
-        if pd.api.types.is_period_dtype(s):
-            out[c] = s.astype("datetime64[ns]")
-            continue
-        if pd.api.types.is_datetime64tz_dtype(s):
-            out[c] = pd.to_datetime(s, utc=True).dt.tz_convert(None)
-            continue
-        if pd.api.types.is_object_dtype(s):
-            if not s.dropna().map(_is_scalar_for_arrow).all():
-                out[c] = s.map(lambda v: json.dumps(v) if isinstance(v, (dict, list)) else str(v))
-            else:
-                out[c] = s.astype(str)
-            out[c] = out[c].map(
-                lambda z: z if isinstance(z, str) and len(z) <= max_str_len
-                else (z[:max_str_len] + "…") if isinstance(z, str) else z
-            )
-    return out
-
-
-# -------------------- 1) Upload (MAIN PAGE) --------------------
+# -------------------- 1) Upload --------------------
 st.markdown("### 1) Upload file")
 col_u1, col_u2 = st.columns([3,1])
 with col_u1:
@@ -208,16 +221,15 @@ if uploaded is None:
     st.info("Upload a file to continue.")
     st.stop()
 
-
-# -------------------- Read file --------------------
+# -------------------- 2) Read --------------------
 kind = "csv" if uploaded.name.lower().endswith(".csv") else "xlsx"
 try:
     content = uploaded.getvalue()
     if kind == "xlsx":
         xls = pd.ExcelFile(io.BytesIO(content))
         sheets = xls.sheet_names
-        candidate = best_sheet_for_schema(content, sheets) or (sheets[0] if sheets else None)
-        sel = st.selectbox("Select sheet", sheets, index=(sheets.index(candidate) if candidate in sheets else 0))
+        # If known sheet name exists, pick it; else default first
+        sel = st.selectbox("Select sheet", sheets, index=0)
         df_raw = read_excel_sheet_bytes(content, sheet=sel)
     else:
         df_raw = read_csv_bytes(content)
@@ -225,108 +237,68 @@ except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-
-# -------------------- 2) Map columns --------------------
-st.markdown("### 2) Map columns (auto-guessed, editable)")
+# -------------------- 3) Auto-map to your profile (no prompts) --------------------
 columns = [str(c) for c in df_raw.columns]
-defaults = guess_mapping(columns)
+auto_map = auto_map_known_profile(columns)
 
-st.session_state.setdefault("last_mapping_key", None)
-st.session_state.setdefault("last_mapping", {})
-key_now = "|".join(columns)
-if st.session_state["last_mapping_key"] == key_now:
-    defaults = {k: st.session_state["last_mapping"].get(k, v) for k, v in defaults.items()}
+# if any minimal field missing, try heuristic guess
+needs_guess = [f for f in MIN_REQUIRED if not auto_map.get(f)]
+if needs_guess:
+    guessed = guess_mapping(columns)
+    # fill missing from guess
+    for k in MIN_REQUIRED:
+        if not auto_map.get(k) and guessed.get(k):
+            auto_map[k] = guessed[k]
 
-mapping: Dict[str, Optional[str]] = {}
-cols = st.columns(2)
-for i, field in enumerate(REQUIRED_FIELDS):
-    default = defaults.get(field)
-    with cols[i % 2]:
-        mapping[field] = st.selectbox(field, [None] + columns,
-                                      index=(columns.index(default)+1) if default in columns else 0,
-                                      key=f"map_{field}")
+# Show quick info if still missing minimal fields
+missing_final = [f for f in MIN_REQUIRED if not auto_map.get(f)]
+if missing_final:
+    st.error("Could not auto-map required fields for this file. "
+             "Please use **Advanced remap** below to set the fields.\n\n"
+             f"Missing: {', '.join(missing_final)}")
 
-# Warn on duplicate mappings (but don’t block)
-selected_vals = [v for v in mapping.values() if v]
-dupes = sorted({v for v in selected_vals if selected_vals.count(v) > 1})
-if dupes:
-    st.warning("Duplicate source columns selected: " + ", ".join(dupes) +
-               ". Allowed, but consider mapping each canonical field to its best column.")
+# Optional: Advanced remap (only if user needs/wants it)
+with st.expander("⚙️ Advanced: Remap columns (optional)"):
+    cols = st.columns(2)
+    new_map: Dict[str, Optional[str]] = {}
+    for i, field in enumerate(REQUIRED_FIELDS):
+        with cols[i % 2]:
+            candidates = [None] + columns
+            default_idx = (candidates.index(auto_map.get(field)) if auto_map.get(field) in candidates else 0)
+            new_map[field] = st.selectbox(field, candidates, index=default_idx, key=f"map_{field}")
+    # Apply user's overrides
+    for k in REQUIRED_FIELDS:
+        auto_map[k] = new_map.get(k, auto_map.get(k))
 
-# Ensure minimal required fields are mapped
-missing_min = [f for f in MIN_REQUIRED if not mapping.get(f)]
-if missing_min:
-    st.error(f"Please map the minimal required fields: {', '.join(MIN_REQUIRED)}.")
+# Final minimal check before proceeding
+missing_final = [f for f in MIN_REQUIRED if not auto_map.get(f)]
+if missing_final:
     st.stop()
 
-# Encourage at least one SKU identifier
-if not mapping.get("SKU(s)") and not mapping.get("Base SKU"):
-    st.info("Tip: Map at least one of 'SKU(s)' or 'Base SKU' for better product-level analysis. Proceeding without it.")
+# -------------------- 4) Standardize & Options --------------------
+df = apply_mapping(df_raw, auto_map)
 
-st.session_state["last_mapping_key"] = key_now
-st.session_state["last_mapping"] = mapping.copy()
-
-
-# -------------------- 3) Standardize & Options --------------------
-df = apply_mapping(df_raw, mapping)
-
-with st.expander("⚙️ Options"):
-    do_opt = st.checkbox("Optimize memory (downcast + categorize likely dimensions)", value=True)
+with st.expander("Options"):
+    do_opt = st.checkbox("Optimize memory (downcast + categorize)", value=True)
     regex_search = st.checkbox("Use regex for Description search (advanced)", value=False)
 if do_opt:
     df = optimize_memory(df)
 
-
 # -------------------- Sidebar filters --------------------
 with st.sidebar:
     st.header("Filters")
-    sku_filter = st.multiselect("SKU(s)", options=["ALL"] + sorted(df["SKU(s)"].dropna().unique().tolist()), default=["ALL"])
-    base_filter = st.multiselect("Base SKU", options=["ALL"] + sorted(df["Base SKU"].dropna().unique().tolist()), default=["ALL"])
-    region_filter = st.multiselect("Region", options=["ALL"] + sorted(df["Region"].dropna().unique().tolist()), default=["ALL"])
+    sku_filter = st.multiselect("SKU(s)", options=["ALL"] + sorted(pd.Series(df["SKU(s)"], dtype="string").dropna().unique().tolist()), default=["ALL"])
+    base_filter = st.multiselect("Base SKU", options=["ALL"] + sorted(pd.Series(df["Base SKU"], dtype="string").dropna().unique().tolist()), default=["ALL"])
+    region_filter = st.multiselect("Region", options=["ALL"] + sorted(pd.Series(df["Region"], dtype="string").dropna().unique().tolist()), default=["ALL"])
     symptom_filter = st.multiselect("Symptom", options=["ALL"] + sorted(pd.Series(df["Symptom"], dtype="string").dropna().unique().tolist()), default=["ALL"])
     disposition_filter = st.multiselect("Disposition", options=["ALL"] + sorted(pd.Series(df["Disposition"], dtype="string").dropna().unique().tolist()), default=["ALL"])
-
-    tsf_only = st.checkbox("TSF only (disposition contains _ts_failed / _replaced / tsf)", value=False)
+    tsf_only = st.checkbox("TSF only (_ts_failed / _replaced / tsf)", value=False)
     combine_other = st.checkbox("Combine lesser categories into 'Other' (charts only)", value=False)
     search_text = st.text_input("Search 'Description'…", value="")
     st.markdown("---")
     st.header("Date Windows")
     date_range_graph = st.selectbox("Chart range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3)
     table_days = st.number_input("Delta window (table): days", min_value=7, value=30, step=1)
-    st.markdown("---")
-    st.header("Views")
-    view_to_load = st.file_uploader("Load saved view (.json)", type=["json"], key="view_loader")
-    if view_to_load is not None:
-        try:
-            view_cfg = json.loads(view_to_load.getvalue().decode("utf-8"))
-            sku_filter = view_cfg.get("sku_filter", sku_filter)
-            base_filter = view_cfg.get("base_filter", base_filter)
-            region_filter = view_cfg.get("region_filter", region_filter)
-            symptom_filter = view_cfg.get("symptom_filter", symptom_filter)
-            disposition_filter = view_cfg.get("disposition_filter", disposition_filter)
-            tsf_only = view_cfg.get("tsf_only", tsf_only)
-            combine_other = view_cfg.get("combine_other", combine_other)
-            search_text = view_cfg.get("search_text", search_text)
-            date_range_graph = view_cfg.get("date_range_graph", date_range_graph)
-            table_days = int(view_cfg.get("table_days", table_days))
-            st.success("View loaded. Filters updated above.")
-        except Exception as e:
-            st.error(f"Failed to load view: {e}")
-
-
-# -------------------- Field Inspector --------------------
-with st.expander("🔎 Field Inspector (validate mapping quickly)"):
-    for col in REQUIRED_FIELDS:
-        if col not in df.columns:
-            continue
-        s = df[col]
-        st.write(f"**{col}** — non-null: {int(s.notna().sum()):,}, unique: {s.nunique(dropna=True):,}")
-        if pd.api.types.is_datetime64_any_dtype(s):
-            st.write(f"• min: {pd.to_datetime(s, errors='coerce').min()}  |  max: {pd.to_datetime(s, errors='coerce').max()}")
-        else:
-            top = s.value_counts(dropna=True).head(10)
-            st.dataframe(top.rename("count"))
-
 
 # -------------------- Time windows --------------------
 now = pd.Timestamp.now()
@@ -343,7 +315,6 @@ table_days = int(table_days)
 start_table = now - timedelta(days=table_days)
 prev_start_table = start_table - timedelta(days=table_days)
 
-
 # -------------------- Filtering --------------------
 mask = build_filter_mask(
     df, sku=sku_filter, base=base_filter, region=region_filter,
@@ -351,7 +322,6 @@ mask = build_filter_mask(
     tsf_only=tsf_only, search_text=search_text, regex_search=regex_search
 )
 df_filtered = df.loc[mask].copy()
-
 
 # -------------------- KPIs & Preview --------------------
 st.markdown("### 3) Overview")
@@ -363,11 +333,9 @@ with c4: kpi("Regions", df_filtered["Region"].nunique())
 with c5: kpi("Symptoms", df_filtered["Symptom"].nunique())
 
 with st.expander("🔍 Preview filtered data"):
-    preview = ensure_arrow_safe(df_filtered.head(1000))
-    st.dataframe(preview, use_container_width=True, height=320)
+    st.dataframe(ensure_arrow_safe(df_filtered.head(1000)), use_container_width=True, height=320)
 
-
-# -------------------- 4) Trends (Symptom & Disposition stacks) --------------------
+# -------------------- 4) Trends --------------------
 st.markdown("### 4) Trends")
 agg_choice = st.selectbox("Aggregate by", ["Day", "Week", "Month"], index=1)
 freq = {"Day":"D","Week":"W","Month":"M"}[agg_choice]
@@ -388,14 +356,12 @@ fig_disp = px.bar(disp_trend, x="Date Identified", y="Count", color="Disposition
 fig_disp.update_layout(barmode="stack", margin=dict(t=40))
 st.plotly_chart(fig_disp, use_container_width=True)
 
-
 # -------------------- 5) Heatmaps & Top-N --------------------
 st.markdown("#### Heatmaps")
 def weekly_heatmap(df_in: pd.DataFrame, label: str):
     d = df_in.dropna(subset=["Date Identified"]).copy()
     if d.empty:
-        st.info("No dates to plot.")
-        return
+        st.info("No dates to plot."); return
     d["Week"] = d["Date Identified"].dt.to_period("W").apply(lambda r: r.start_time)
     mat = d.groupby(["Week", label]).size().reset_index(name="Count")
     top_labels = mat.groupby(label)["Count"].sum().nlargest(12).index
@@ -413,8 +379,7 @@ with cH2: weekly_heatmap(df_filtered, "Disposition")
 st.markdown("#### Top-N")
 def topn_bars(df_in: pd.DataFrame, col: str, n: int = 15, title: Optional[str] = None):
     if df_in.empty:
-        st.info("No data for Top-N.")
-        return
+        st.info("No data for Top-N."); return
     vc = df_in[col].value_counts().nlargest(n).reset_index()
     vc.columns = [col, "Count"]
     fig = px.bar(vc, x="Count", y=col, orientation="h", title=title or f"Top {n}: {col}", template="plotly_white")
@@ -424,7 +389,6 @@ def topn_bars(df_in: pd.DataFrame, col: str, n: int = 15, title: Optional[str] =
 cT1, cT2 = st.columns(2)
 with cT1: topn_bars(df_filtered, "Symptom", 15, "Top 15 Symptoms")
 with cT2: topn_bars(df_filtered, "Disposition", 15, "Top 15 Dispositions")
-
 
 # -------------------- 6) Ranked Symptoms with Δ --------------------
 st.markdown("### 6) Ranked Symptoms (Δ over equal windows)")
@@ -462,105 +426,99 @@ rank_disp["Delta"] = rank_disp["Delta"].apply(_fmt_delta)
 rank_disp["Delta %"] = rank_disp["Delta %"].apply(_fmt_pct)
 st.markdown(f"<div class='scrollable-table'>{rank_disp.to_html(escape=False, index=False)}</div>", unsafe_allow_html=True)
 
-
-# -------------------- 7) NEW: Disposition mix over time by Symptom --------------------
+# -------------------- 7) Disposition mix over time — by Symptom (with smoothing) --------------------
 st.markdown("### 7) Disposition mix over time — by Symptom")
 
-with st.container():
-    colA, colB, colC, colD = st.columns([2,1,1,1])
-    with colA:
-        symptom_focus = st.selectbox(
-            "Focus on a single symptom (for detailed view)",
-            options=["(Choose)"] + sorted(pd.Series(df_filtered["Symptom"], dtype="string").dropna().unique().tolist()),
-            index=0
-        )
-    with colB:
-        mix_agg = st.selectbox("Aggregate by", ["Week","Month"], index=0)
-    with colC:
-        mix_chart = st.selectbox("Chart type", ["Stacked area","Stacked bar"], index=0)
-    with colD:
-        normalize_share = st.checkbox("Normalize to share (%)", value=True)
+colA, colB, colC, colD, colE = st.columns([2,1,1,1,1])
+with colA:
+    symptom_focus = st.selectbox(
+        "Focus on a single symptom (optional)",
+        options=["(All symptoms)"] + sorted(pd.Series(df_filtered["Symptom"], dtype="string").dropna().unique().tolist()),
+        index=0
+    )
+with colB:
+    mix_agg = st.selectbox("Aggregate by", ["Week","Month"], index=0)
+with colC:
+    mix_chart = st.selectbox("Chart type", ["Stacked area","Stacked bar"], index=0)
+with colD:
+    normalize_share = st.checkbox("Normalize to share (%)", value=True)
+with colE:
+    smooth = st.selectbox("Smoothing", ["None","7d roll","4w roll"], index=0)
 
-    # Prepare function
-    def disposition_mix(df_in: pd.DataFrame, symptom: Optional[str], freq_code: str, normalize: bool):
-        d = df_in.dropna(subset=["Date Identified"]).copy()
-        if symptom and symptom != "(Choose)":
-            d = d[d["Symptom"] == symptom]
-        if d.empty:
-            return pd.DataFrame()
+def disposition_mix(df_in: pd.DataFrame, symptom: Optional[str], freq_code: str, normalize: bool, smooth_opt: str):
+    d = df_in.dropna(subset=["Date Identified"]).copy()
+    if symptom and symptom != "(All symptoms)":
+        d = d[d["Symptom"] == symptom]
+    if d.empty:
+        return pd.DataFrame()
 
-        # Time bucketing
-        freq_map = {"Week": "W", "Month": "M"}
-        code = freq_map.get(freq_code, "W")
-        d["Bucket"] = d["Date Identified"].dt.to_period(code).apply(lambda r: r.start_time)
+    freq_map = {"Week":"W", "Month":"M"}
+    code = freq_map.get(freq_code, "W")
+    d["Bucket"] = d["Date Identified"].dt.to_period(code).apply(lambda r: r.start_time)
 
-        g = d.groupby(["Bucket", "Disposition"]).size().reset_index(name="Count")
-        if normalize:
-            g["Total"] = g.groupby("Bucket")["Count"].transform("sum")
-            g["Share %"] = (g["Count"] / g["Total"] * 100).round(2)
-        return g
+    g = d.groupby(["Bucket", "Disposition"]).size().reset_index(name="Count")
 
-    # Single-symptom detail
-    data_mix = disposition_mix(df_filtered[df_filtered["Date Identified"] >= start_graph] if pd.notna(start_graph) else df_filtered,
-                               symptom_focus, mix_agg, normalize_share)
+    # smoothing on counts per disposition series
+    if smooth_opt != "None" and not g.empty:
+        win = 4 if smooth_opt == "4w roll" else 7  # window in buckets (approx for W/M)
+        # pivot -> rolling -> melt back
+        pv = g.pivot(index="Bucket", columns="Disposition", values="Count").sort_index().fillna(0)
+        pv = pv.rolling(window=win, min_periods=1).mean()
+        g = pv.reset_index().melt(id_vars="Bucket", var_name="Disposition", value_name="Count")
 
-    if data_mix.empty and symptom_focus != "(Choose)":
-        st.info("No data for the chosen symptom with current filters/time window.")
+    if normalize and not g.empty:
+        g["Total"] = g.groupby("Bucket")["Count"].transform("sum")
+        g["Share %"] = np.where(g["Total"]>0, (g["Count"]/g["Total"]*100), 0.0).round(2)
+    return g
+
+scope = df_filtered[df_filtered["Date Identified"] >= start_graph] if pd.notna(start_graph) else df_filtered
+data_mix = disposition_mix(scope, symptom_focus, mix_agg, normalize_share, smooth)
+
+if data_mix.empty and symptom_focus != "(All symptoms)":
+    st.info("No data for the chosen symptom with current filters/time window.")
+else:
+    y_col = "Share %" if normalize_share else "Count"
+    title_suffix = f"{'share %' if normalize_share else 'count'} by disposition over time"
+    title_prefix = "Disposition mix" if symptom_focus == "(All symptoms)" else f"Disposition mix — {symptom_focus}"
+    if mix_chart == "Stacked area":
+        fig_mix = px.area(data_mix, x="Bucket", y=y_col, color="Disposition",
+                          title=f"{title_prefix} ({title_suffix})", template="plotly_white")
     else:
-        y_col = "Share %" if normalize_share else "Count"
-        title_suffix = f"{'share %' if normalize_share else 'count'} by disposition over time"
-        if mix_chart == "Stacked area":
-            fig_mix = px.area(data_mix, x="Bucket", y=y_col, color="Disposition",
-                              title=f"{'Disposition mix' if symptom_focus=='(Choose)' else f'Disposition mix — {symptom_focus}'} ({title_suffix})",
-                              template="plotly_white")
-        else:
-            fig_mix = px.bar(data_mix, x="Bucket", y=y_col, color="Disposition",
-                             title=f"{'Disposition mix' if symptom_focus=='(Choose)' else f'Disposition mix — {symptom_focus}'} ({title_suffix})",
-                             template="plotly_white")
-            fig_mix.update_layout(barmode="stack")
-        fig_mix.update_layout(margin=dict(t=50))
-        st.plotly_chart(fig_mix, use_container_width=True)
+        fig_mix = px.bar(data_mix, x="Bucket", y=y_col, color="Disposition",
+                         title=f"{title_prefix} ({title_suffix})", template="plotly_white")
+        fig_mix.update_layout(barmode="stack")
+    fig_mix.update_layout(margin=dict(t=50))
+    st.plotly_chart(fig_mix, use_container_width=True)
 
-    # Small multiples: top-N symptoms by volume
-    with st.expander("Small multiples: Top-N symptoms — disposition mix over time"):
-        colN1, colN2 = st.columns([1,1])
-        with colN1:
-            topN = st.slider("Top-N symptoms by volume", min_value=3, max_value=12, value=6, step=1)
-        with colN2:
-            normalize_sm = st.checkbox("Normalize to share (%) (small multiples)", value=True)
+with st.expander("Small multiples: Top-N symptoms — disposition mix over time"):
+    colN1, colN2 = st.columns([1,1])
+    with colN1:
+        topN = st.slider("Top-N symptoms by volume", min_value=3, max_value=12, value=6, step=1)
+    with colN2:
+        normalize_sm = st.checkbox("Normalize to share (%) (small multiples)", value=True)
 
-        # Prep top symptoms in filtered scope
-        top_symptoms = (df_filtered["Symptom"].value_counts().nlargest(topN).index.tolist()
-                        if "Symptom" in df_filtered.columns else [])
-        d2 = df_filtered[df_filtered["Date Identified"] >= start_graph] if pd.notna(start_graph) else df_filtered
-        d2 = d2[d2["Symptom"].isin(top_symptoms)].dropna(subset=["Date Identified"]).copy()
-        if not d2.empty:
-            code = {"Week":"W", "Month":"M"}[mix_agg]
-            d2["Bucket"] = d2["Date Identified"].dt.to_period(code).apply(lambda r: r.start_time)
-            gm = d2.groupby(["Symptom","Bucket","Disposition"]).size().reset_index(name="Count")
-            if normalize_sm:
-                gm["Total"] = gm.groupby(["Symptom","Bucket"])["Count"].transform("sum")
-                gm["Share %"] = (gm["Count"]/gm["Total"]*100).round(2)
-            y2 = "Share %" if normalize_sm else "Count"
-            fig_sm = px.area(gm, x="Bucket", y=y2, color="Disposition",
-                             facet_col="Symptom", facet_col_wrap=3,
-                             title=f"Disposition mix over time — top {topN} symptoms",
-                             template="plotly_white")
-            fig_sm.update_layout(margin=dict(t=60))
-            st.plotly_chart(fig_sm, use_container_width=True)
-        else:
-            st.info("No data available for small multiples with current filters/time window.")
+    top_symptoms = (df_filtered["Symptom"].value_counts().nlargest(topN).index.tolist()
+                    if "Symptom" in df_filtered.columns else [])
+    d2 = scope.copy()
+    d2 = d2[d2["Symptom"].isin(top_symptoms)].dropna(subset=["Date Identified"]).copy()
+    if not d2.empty:
+        code = {"Week":"W","Month":"M"}[mix_agg]
+        d2["Bucket"] = d2["Date Identified"].dt.to_period(code).apply(lambda r: r.start_time)
+        gm = d2.groupby(["Symptom","Bucket","Disposition"]).size().reset_index(name="Count")
+        if normalize_sm:
+            gm["Total"] = gm.groupby(["Symptom","Bucket"])["Count"].transform("sum")
+            gm["Share %"] = np.where(gm["Total"]>0, (gm["Count"]/gm["Total"]*100), 0.0).round(2)
+        y2 = "Share %" if normalize_sm else "Count"
+        fig_sm = px.area(gm, x="Bucket", y=y2, color="Disposition",
+                         facet_col="Symptom", facet_col_wrap=3,
+                         title=f"Disposition mix over time — top {topN} symptoms",
+                         template="plotly_white")
+        fig_sm.update_layout(margin=dict(t=60))
+        st.plotly_chart(fig_sm, use_container_width=True)
+    else:
+        st.info("No data available for small multiples with current filters/time window.")
 
-        st.download_button(
-            "Download small-multiples dataset (CSV)",
-            data=(gm.to_csv(index=False).encode("utf-8") if 'gm' in locals() and not gm.empty else b""),
-            file_name="disposition_mix_small_multiples.csv",
-            mime="text/csv",
-            disabled=('gm' not in locals() or gm.empty)
-        )
-
-
-# -------------------- 8) Descriptions (Paginated) --------------------
+# -------------------- 8) Descriptions --------------------
 st.markdown("### 8) Descriptions")
 descs = (df_filtered[["Description","SKU(s)","Base SKU","Region","Disposition","Symptom","Date Identified","Serial Number"]]
          .dropna(subset=["Description"])
@@ -596,24 +554,27 @@ else:
         )
     st.caption(f"Showing {start+1}–{end} of {total}")
 
-
-# -------------------- Downloads (in-memory) --------------------
+# -------------------- Sidebar downloads (in-memory only) --------------------
 st.sidebar.download_button(
     label="⬇️ Download filtered CSV",
     data=df_filtered.to_csv(index=False).encode("utf-8"),
     file_name="jira_filtered.csv",
     mime="text/csv",
 )
-view_state = {
-    "sku_filter": sku_filter, "base_filter": base_filter, "region_filter": region_filter,
-    "symptom_filter": symptom_filter, "disposition_filter": disposition_filter,
-    "tsf_only": tsf_only, "combine_other": combine_other, "search_text": search_text,
-    "date_range_graph": date_range_graph, "table_days": int(table_days),
+state = {
+    "date_range_graph": date_range_graph,
+    "table_days": int(table_days),
 }
 st.sidebar.download_button(
     label="💾 Save current view (.json)",
-    data=json.dumps(view_state, indent=2).encode("utf-8"),
+    data=json.dumps(state, indent=2).encode("utf-8"),
     file_name="jira_view.json",
     mime="application/json",
 )
+'''
+
+out = Path('/mnt/data/app_automap_v5.py')
+out.write_text(code, encoding='utf-8')
+str(out)
+
 
