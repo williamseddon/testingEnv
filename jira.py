@@ -1,15 +1,15 @@
-# app.py — Jira Issues Explorer (automap + robust charts + diagnostics)
-# ✔ Auto-maps your Zendesk-style export to the minimal required fields
-# ✔ Clear diagnostics if charts can't render (mapping / date / filter issues)
-# ✔ Timezone-safe dates, Arrow-safe preview, reset filters, disposition-by-symptom timeline
-# ✔ No runtime file writes
+# app.py — Jira Issues Explorer (auto-map + robust charts + diagnostics)
+# • Description is HARD-MAPPED to "Zoom Summary"
+# • No duplicate widget keys, no runtime file writes
+# • Arrow-safe preview, chart diagnostics, reset filters
+# • Disposition-by-Symptom timeline (share %, smoothing, small multiples)
 
 import io
 import json
 import re
 import difflib
 from datetime import timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -43,12 +43,14 @@ REQUIRED_FIELDS = [
 ]
 MIN_REQUIRED = ["Date Identified", "Symptom", "Disposition", "Description"]
 
+# Known profile (canonical -> source header) for your export.
+# NOTE: Description is **hard-mapped** to "Zoom Summary".
 KNOWN_PROFILE: Dict[str, Optional[str]] = {
     "Date Identified": "Start Time (Date/Time)",
     "Symptom": "Symptom",
     "Disposition": "Disposition Tag",
-    "Description": "Zoom Summary",
-    # optional enrichers:
+    "Description": "Zoom Summary",      # <- required mapping
+    # Optional enrichers:
     "SKU(s)": "Zendesk SKU",
     "Base SKU": "Product Brand",
     "Region": "Queue Country",
@@ -62,6 +64,7 @@ SYNONYMS: Dict[str, List[str]] = {
     "Region": ["queue country","region","market","country","geo","territory","locale"],
     "Symptom": ["symptom","issue","category","failure mode","problem","defect","tag"],
     "Disposition": ["disposition tag","disposition","status","resolution","outcome","result","action"],
+    # we keep Description synonyms but will **prefer Zoom Summary** when present
     "Description": ["zoom summary","description","details","summary","comments","issue description","text","notes"],
     "Serial Number": ["serial number","sn","s/n","serial","serial no","serial_no"],
 }
@@ -105,8 +108,13 @@ def guess_mapping(columns: List[str]) -> Dict[str, Optional[str]]:
     return mapping
 
 def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
+    # force Description -> "Zoom Summary" when present
+    if "Zoom Summary" in df.columns:
+        mapping["Description"] = "Zoom Summary"
+
     reverse = {v: k for k, v in mapping.items() if v}
     out = df.rename(columns=reverse).copy()
+
     for col in REQUIRED_FIELDS:
         if col not in out.columns:
             out[col] = pd.NA
@@ -188,7 +196,7 @@ def nonnull_count(df: pd.DataFrame, col: str) -> int:
 st.subheader("1) Upload file")
 c1, c2 = st.columns([3,1])
 with c1:
-    uploaded = st.file_uploader("Upload Excel (.xlsx) or CSV (.csv)", type=["xlsx","csv"])
+    uploaded = st.file_uploader("Upload Excel (.xlsx) or CSV (.csv)", type=["xlsx","csv"], key="u_main")
 with c2:
     st.caption("Tip: CSV loads fastest for very large exports.")
 
@@ -201,10 +209,11 @@ try:
     content = uploaded.getvalue()
     if uploaded.name.lower().endswith(".csv"):
         df_raw = read_csv_bytes(content)
+        sheet_name = None
     else:
         xls = pd.ExcelFile(io.BytesIO(content))
-        sheet = st.selectbox("Select sheet", xls.sheet_names, index=0)
-        df_raw = read_excel_sheet_bytes(content, sheet=sheet)
+        sheet_name = st.selectbox("Select sheet", xls.sheet_names, index=0, key="sheet_pick")
+        df_raw = read_excel_sheet_bytes(content, sheet=sheet_name)
 except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
@@ -212,14 +221,19 @@ except Exception as e:
 # ============== 3) Auto-map (no prompts) ==============
 columns = [str(c) for c in df_raw.columns]
 auto_map = auto_map_known_profile(columns)
+
+# Backfill missing minimal fields with guesses (but keep Description->Zoom Summary if present)
 needs_guess = [f for f in MIN_REQUIRED if not auto_map.get(f)]
 if needs_guess:
     guessed = guess_mapping(columns)
     for k in MIN_REQUIRED:
-        if not auto_map.get(k) and guessed.get(k):
+        if k == "Description" and "Zoom Summary" in columns:
+            auto_map[k] = "Zoom Summary"
+        elif not auto_map.get(k) and guessed.get(k):
             auto_map[k] = guessed[k]
 
 missing_final = [f for f in MIN_REQUIRED if not auto_map.get(f)]
+
 with st.expander("Mapping health (read-only unless using Advanced remap)"):
     st.write("**Detected mapping:**")
     st.json(auto_map)
@@ -227,7 +241,7 @@ with st.expander("Mapping health (read-only unless using Advanced remap)"):
         ok = "✅" if auto_map.get(fld) else "❌"
         st.write(f"{ok} {fld} → {auto_map.get(fld)}")
 
-# Optional: Advanced remap
+# Optional: Advanced remap (unique keys prefixed with adv_)
 with st.expander("⚙️ Advanced remap (optional)"):
     cols2 = st.columns(2)
     override: Dict[str, Optional[str]] = {}
@@ -235,7 +249,7 @@ with st.expander("⚙️ Advanced remap (optional)"):
         with cols2[i % 2]:
             options = [None] + columns
             idx = (options.index(auto_map.get(field)) if auto_map.get(field) in options else 0)
-            override[field] = st.selectbox(field, options, index=idx, key=f"map_{field}")
+            override[field] = st.selectbox(field, options, index=idx, key=f"adv_map_{field}")
     for k in REQUIRED_FIELDS:
         auto_map[k] = override.get(k, auto_map.get(k))
 
@@ -248,15 +262,15 @@ if missing_final:
 df = apply_mapping(df_raw, auto_map)
 
 with st.expander("Options"):
-    do_opt = st.checkbox("Optimize memory (downcast + categorize)", value=True)
-    regex_search = st.checkbox("Use regex for Description search (advanced)", value=False)
+    do_opt = st.checkbox("Optimize memory (downcast + categorize)", value=True, key="opt_mem")
+    regex_search = st.checkbox("Use regex for Description search (advanced)", value=False, key="opt_regex")
 if do_opt:
     df = optimize_memory(df)
 
 # ============== Sidebar filters + Reset ==============
 FILTER_KEYS = [
-    "sku_filter","base_filter","region_filter","symptom_filter","disposition_filter",
-    "tsf_only","combine_other","search_text","date_range_graph","table_days"
+    "f_sku","f_base","f_region","f_symptom","f_disposition",
+    "f_tsf_only","f_combine_other","f_search","f_date_range","f_table_days"
 ]
 
 def reset_filters():
@@ -266,19 +280,19 @@ def reset_filters():
 
 with st.sidebar:
     st.header("Filters")
-    st.button("Reset filters", on_click=reset_filters)
-    sku_filter = st.multiselect("SKU(s)", options=["ALL"] + sorted(pd.Series(df["SKU(s)"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="sku_filter")
-    base_filter = st.multiselect("Base SKU", options=["ALL"] + sorted(pd.Series(df["Base SKU"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="base_filter")
-    region_filter = st.multiselect("Region", options=["ALL"] + sorted(pd.Series(df["Region"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="region_filter")
-    symptom_filter = st.multiselect("Symptom", options=["ALL"] + sorted(pd.Series(df["Symptom"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="symptom_filter")
-    disposition_filter = st.multiselect("Disposition", options=["ALL"] + sorted(pd.Series(df["Disposition"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="disposition_filter")
-    tsf_only = st.checkbox("TSF only (_ts_failed / _replaced / tsf)", value=False, key="tsf_only")
-    combine_other = st.checkbox("Combine lesser categories into 'Other' (charts only)", value=False, key="combine_other")
-    search_text = st.text_input("Search 'Description'…", value="", key="search_text")
+    st.button("Reset filters", on_click=reset_filters, key="btn_reset")
+    sku_filter = st.multiselect("SKU(s)", options=["ALL"] + sorted(pd.Series(df["SKU(s)"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="f_sku")
+    base_filter = st.multiselect("Base SKU", options=["ALL"] + sorted(pd.Series(df["Base SKU"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="f_base")
+    region_filter = st.multiselect("Region", options=["ALL"] + sorted(pd.Series(df["Region"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="f_region")
+    symptom_filter = st.multiselect("Symptom", options=["ALL"] + sorted(pd.Series(df["Symptom"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="f_symptom")
+    disposition_filter = st.multiselect("Disposition", options=["ALL"] + sorted(pd.Series(df["Disposition"], dtype="string").dropna().unique().tolist()), default=["ALL"], key="f_disposition")
+    tsf_only = st.checkbox("TSF only (_ts_failed / _replaced / tsf)", value=False, key="f_tsf_only")
+    combine_other = st.checkbox("Combine lesser categories into 'Other' (charts only)", value=False, key="f_combine_other")
+    search_text = st.text_input("Search 'Description'…", value="", key="f_search")
     st.markdown("---")
     st.header("Date Windows")
-    date_range_graph = st.selectbox("Chart range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3, key="date_range_graph")
-    table_days = st.number_input("Delta window (table): days", min_value=7, value=30, step=1, key="table_days")
+    date_range_graph = st.selectbox("Chart range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3, key="f_date_range")
+    table_days = st.number_input("Delta window (table): days", min_value=7, value=30, step=1, key="f_table_days")
 
 # ============== Time windows ==============
 now = pd.Timestamp.now()
@@ -289,7 +303,6 @@ elif date_range_graph == "Last Month":
 elif date_range_graph == "Last Year":
     start_graph, period_label_graph = now - timedelta(days=365), "Last 365 Days"
 else:
-    # Use min non-null date; if none -> use now - 365d as a safe fallback
     dmin = pd.to_datetime(df["Date Identified"], errors="coerce").dropna()
     start_graph, period_label_graph = (dmin.min() if not dmin.empty else now - timedelta(days=365), "All Time")
 
@@ -332,7 +345,7 @@ with st.expander("🔍 Preview filtered data"):
 
 # ============== 3) Trends (guarded) ==============
 st.subheader("3) Trends")
-agg_choice = st.selectbox("Aggregate by", ["Day", "Week", "Month"], index=1)
+agg_choice = st.selectbox("Aggregate by", ["Day", "Week", "Month"], index=1, key="agg_choice")
 freq = {"Day":"D","Week":"W","Month":"M"}[agg_choice]
 
 def safe_trend_chart(df_in: pd.DataFrame, key_col: str, title: str):
@@ -348,8 +361,6 @@ def safe_trend_chart(df_in: pd.DataFrame, key_col: str, title: str):
     fig.update_layout(barmode="stack", margin=dict(t=40))
     st.plotly_chart(fig, use_container_width=True)
 
-# Optionally combine minor categories to "Other"
-combine_other = st.sidebar.checkbox("Combine lesser categories into 'Other' (charts only)", value=st.session_state.get("combine_other", False), key="combine_other")
 df_sym = df_time.copy()
 df_disp = df_time.copy()
 if combine_other:
@@ -444,16 +455,16 @@ with cA:
     symptom_focus = st.selectbox(
         "Focus on a single symptom (optional)",
         options=["(All symptoms)"] + sorted(pd.Series(df_filtered["Symptom"], dtype="string").dropna().unique().tolist()),
-        index=0
+        index=0, key="mix_sym_focus"
     )
 with cB:
-    mix_agg = st.selectbox("Aggregate by", ["Week","Month"], index=0)
+    mix_agg = st.selectbox("Aggregate by", ["Week","Month"], index=0, key="mix_agg")
 with cC:
-    mix_chart = st.selectbox("Chart type", ["Stacked area","Stacked bar"], index=0)
+    mix_chart = st.selectbox("Chart type", ["Stacked area","Stacked bar"], index=0, key="mix_type")
 with cD:
-    normalize_share = st.checkbox("Normalize to share (%)", value=True)
+    normalize_share = st.checkbox("Normalize to share (%)", value=True, key="mix_norm")
 with cE:
-    smooth = st.selectbox("Smoothing", ["None","7d roll","4w roll"], index=0)
+    smooth = st.selectbox("Smoothing", ["None","7d roll","4w roll"], index=0, key="mix_smooth")
 
 def disposition_mix(df_in: pd.DataFrame, symptom: Optional[str], freq_code: str, normalize: bool, smooth_opt: str):
     d = df_in.dropna(subset=["Date Identified"]).copy()
@@ -503,9 +514,9 @@ else:
 with st.expander("Small multiples: Top-N symptoms — disposition mix over time"):
     cN1, cN2 = st.columns([1,1])
     with cN1:
-        topN = st.slider("Top-N symptoms by volume", min_value=3, max_value=12, value=6, step=1)
+        topN = st.slider("Top-N symptoms by volume", min_value=3, max_value=12, value=6, step=1, key="sm_topn")
     with cN2:
-        normalize_sm = st.checkbox("Normalize to share (%) (small multiples)", value=True)
+        normalize_sm = st.checkbox("Normalize to share (%) (small multiples)", value=True, key="sm_norm")
 
     if df_time.empty:
         st.info("No dated rows to build small multiples.")
@@ -529,7 +540,8 @@ with st.expander("Small multiples: Top-N symptoms — disposition mix over time"
             st.download_button("Download small-multiples dataset (CSV)",
                                data=gm.to_csv(index=False).encode("utf-8"),
                                file_name="disposition_mix_small_multiples.csv",
-                               mime="text/csv")
+                               mime="text/csv",
+                               key="sm_dl")
         else:
             st.info("No data available for small multiples in this scope.")
 
@@ -540,9 +552,9 @@ descs = (df_filtered[["Description","SKU(s)","Base SKU","Region","Disposition","
          .sort_values("Date Identified", ascending=False)
          .reset_index(drop=True))
 total = len(descs)
-items_per = st.selectbox("Items per page", [10,25,50,100], index=0)
+items_per = st.selectbox("Items per page", [10,25,50,100], index=0, key="desc_page_size")
 pages = max(1, (total + items_per - 1)//items_per)
-page = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
+page = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key="desc_page")
 start_idx, end_idx = (page-1)*items_per, min((page-1)*items_per + items_per, total)
 
 if total == 0:
@@ -570,9 +582,10 @@ else:
 st.sidebar.download_button("⬇️ Download filtered CSV",
     data=df_filtered.to_csv(index=False).encode("utf-8"),
     file_name="jira_filtered.csv",
-    mime="text/csv")
+    mime="text/csv",
+    key="dl_csv")
 st.sidebar.download_button("💾 Save view (.json)",
     data=json.dumps({"date_range_graph": date_range_graph, "table_days": int(table_days)}, indent=2).encode("utf-8"),
     file_name="jira_view.json",
-    mime="application/json")
-
+    mime="application/json",
+    key="dl_view")
