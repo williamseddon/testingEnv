@@ -1,480 +1,446 @@
+# Create a production-ready Streamlit app with robust filtering and charting for large Excel files.
+# We'll save it as /mnt/data/streamlit_app.py and also include a minimal README with run instructions.
+import os, json, hashlib, io, textwrap, sys, traceback
+from pathlib import Path
+
+app_code = r'''
 import streamlit as st
 import pandas as pd
+import numpy as np
+import io, hashlib, os, textwrap
+from datetime import datetime, date
+from typing import Dict, List, Tuple, Optional
+
+# Optional: Plotly for interactive charts
 import plotly.express as px
-from datetime import datetime, timedelta
-import plotly.io as pio
+import plotly.graph_objects as go
 
-# Page Config
-st.set_page_config(page_title="Jira Issues Dashboard", layout="wide", page_icon="📊")
-
-# Title with Styling
-st.markdown(
-    """
-    <style>
-    h1 {
-        color: #4CAF50;
-        text-align: center;
-        font-family: Arial, sans-serif;
-    }
-    .scrollable-table {
-        overflow-y: auto;
-        max-height: 400px;
-        border: 1px solid #ddd;
-        padding: 10px;
-        border-radius: 8px;
-        background-color: #f9f9f9;
-    }
-    .description-box {
-        background-color: #ffffff;
-        padding: 20px;
-        margin: 15px 0;
-        border-left: 5px solid #4CAF50;
-        border-radius: 10px;
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        line-height: 1.6;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-        transition: transform 0.2s, box-shadow 0.2s;
-    }
-    .description-box:hover {
-        transform: scale(1.02);
-        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
-    }
-    .description-box h4 {
-        color: #4CAF50;
-        margin-bottom: 10px;
-    }
-    .description-field {
-        margin-bottom: 8px;
-    }
-    .description-field strong {
-        color: #333;
-    }
-    .pagination {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin: 20px 0;
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    }
-    .pagination span {
-        font-size: 14px;
-        color: #555;
-    }
-    .delta-positive {
-        color: green;
-        font-weight: bold;
-    }
-    .delta-negative {
-        color: red;
-        font-weight: bold;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.set_page_config(
+    page_title="Best-in-Class Data Explorer",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("📊 Jira Issues Dashboard")
+# ---- Minimal theming tweaks ----
+CUSTOM_CSS = """
+<style>
+/* Softer look */
+.reportview-container .markdown-text-container {
+  font-size: 0.95rem;
+}
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+.sidebar .sidebar-content {padding-top: 1rem;}
+.css-1kyxreq {padding-top: 1rem;}
+hr { margin: 0.5rem 0 1rem 0; }
+.kpi-card {
+  border-radius: 16px; padding: 16px; border: 1px solid rgba(0,0,0,0.08);
+  box-shadow: 0 3px 16px rgba(0,0,0,0.06); background: white;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# File Upload with Custom Message
-uploaded_file = st.file_uploader(
-    "Upload your Excel file (must contain 'Your Jira Issues' tab)", type=['xlsx']
-)
+# ---- Utilities ----
+def file_bytes_and_hash(file) -> Tuple[bytes, str]:
+    data = file.read() if hasattr(file, "read") else file
+    if isinstance(data, bytes):
+        b = data
+    else:
+        b = data.getvalue()
+    h = hashlib.md5(b).hexdigest()
+    return b, h
 
-# Text for required columns with a modern download button and additional instructions
-if not uploaded_file:
-    st.markdown(
-        """
-        ### Required Column Format:
-        To use this dashboard, please upload an Excel file containing the following columns:
-        
-        - **Date Identified**: The date the issue was identified (e.g., 2024-01-01).
-        - **SKU(s)**: The SKU(s) related to the issue.
-        - **Base SKU**: The base SKU category.
-        - **Region**: The region where the issue occurred.
-        - **Symptom**: The reported symptom or issue.
-        - **Disposition**: The resolution or status of the issue.
-        - **Description**: A detailed description of the issue.
-        - **Serial Number**: The serial number of the affected unit.
-
-        Make sure your file has a tab named **'Your Jira Issues'**.
-        """,
-        unsafe_allow_html=True
-    )
-
-    # Add a modern, animated button to download the template
-    st.markdown(
-        """
-        <style>
-        .modern-button {
-            display: inline-block;
-            background-color: #4CAF50;
-            color: white; /* Font color set to white */
-            font-size: 16px;
-            font-weight: bold;
-            padding: 10px 25px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            text-align: center;
-            text-decoration: none;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        .modern-button:hover {
-            transform: scale(1.05);
-            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3);
-        }
-        </style>
-        <a href="https://sharkninja.atlassian.net/issues/?filter=19767" target="_blank" class="modern-button">
-            View Template Here
-        </a>
-        """,
-        unsafe_allow_html=True
-    )
-
-    # Add instructions below the button
-    st.markdown(
-        """
-        **After visiting the webpage:**
-        1. Change Base SKU or adjust filters accordingly.
-        2. Press **Apps** in the top bar.
-        3. Choose **Open in Microsoft Excel** to get your download file.
-        """,
-        unsafe_allow_html=True
-    )
-
-
-
-if uploaded_file:
+@st.cache_data(show_spinner=False)
+def read_excel_cached(content: bytes, sheet: Optional[str] = None) -> pd.DataFrame:
+    buffer = io.BytesIO(content)
     try:
-        # Load data
-        data = pd.read_excel(uploaded_file, sheet_name='Your Jira Issues')
-        
-        # Validate required columns
-        required_columns = ['Date Identified', 'SKU(s)', 'Base SKU', 'Region', 'Symptom', 'Disposition', 'Description', 'Serial Number']
-        missing_columns = [col for col in required_columns if col not in data.columns]
-        
-        if missing_columns:
-            st.error(f"The following required columns are missing: {', '.join(missing_columns)}")
-        else:
-            # Preprocess date
-            data['Date Identified'] = pd.to_datetime(data['Date Identified'], errors='coerce')
-        
-            # Standardize SKU(s) and Base SKU to uppercase
-            data['SKU(s)'] = data['SKU(s)'].str.upper().str.strip()
-            data['Base SKU'] = data['Base SKU'].str.upper().str.strip()
-        
-            # Proceed with filtering and dashboard logic
-
-
-            # Sidebar Filters
-            st.sidebar.header("Filters")
-            sku_filter = st.sidebar.multiselect(
-                "Filter by SKU", options=['ALL'] + list(data['SKU(s)'].dropna().unique()), default=['ALL']
-            )
-            base_sku_filter = st.sidebar.multiselect(
-                "Filter by Base SKU", options=['ALL'] + list(data['Base SKU'].dropna().unique()), default=['ALL']
-            )
-            region_filter = st.sidebar.multiselect(
-                "Filter by Region", options=['ALL'] + list(data['Region'].dropna().unique()), default=['ALL']
-            )
-            symptom_filter = st.sidebar.multiselect(
-                "Filter by Symptom", options=['ALL'] + list(data['Symptom'].dropna().unique()), default=['ALL']
-            )
-            disposition_filter = st.sidebar.multiselect(
-                "Filter by Disposition", options=['ALL'] + list(data['Disposition'].dropna().unique()), default=['ALL']
-            )
-            tsf_only_filter = st.sidebar.checkbox("TSF Only", value=True)
-            top_10_symptoms_filter = st.sidebar.checkbox("Top 10 Symptoms Only", value=False)
-            top_10_dispositions_filter = st.sidebar.checkbox("Top 10 Dispositions Only", value=False)
-            date_filter = st.sidebar.selectbox(
-                "Date Range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3
-            )
-
-            # Input for setting periods for table
-            period_days_table = st.sidebar.number_input("Set Table Period Length (days)", min_value=1, value=30, step=1)
-
-            search_query = st.sidebar.text_input("Search Descriptions")
-
-            # Adjust start_date for graphs and table
-            if date_filter == "Last Week":
-                start_date_graph = datetime.now() - timedelta(weeks=1)
-                period_label_graph = "Last 7 Days"
-            elif date_filter == "Last Month":
-                start_date_graph = datetime.now() - timedelta(days=30)
-                period_label_graph = "Last 30 Days"
-            elif date_filter == "Last Year":
-                start_date_graph = datetime.now() - timedelta(days=365)
-                period_label_graph = "Last 365 Days"
-            else:
-                start_date_graph = data['Date Identified'].min()
-                period_label_graph = "All Time"
-
-            start_date_table = datetime.now() - timedelta(days=period_days_table)
-            previous_start_date_table = start_date_table - timedelta(days=period_days_table)
-            period_label_table = f"Last {period_days_table} Days"
-
-            # Standardize SKU(s) and Base SKU to uppercase
-            data['SKU(s)'] = data['SKU(s)'].str.upper().str.strip()
-            data['Base SKU'] = data['Base SKU'].str.upper().str.strip()
-
-
-            if 'ALL' not in region_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
-            if 'ALL' not in symptom_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
-            if 'ALL' not in disposition_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
-            # Initialize filtered_data_table with the complete dataset
-            filtered_data_table = data.copy()
-            
-            # Apply "TSF Only" filter
-            if tsf_only_filter:
-                filtered_data_table = filtered_data_table[
-                    filtered_data_table['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
-                ]
-            
-            # Apply "Top 10 Symptoms Only" filter
-            if top_10_symptoms_filter:
-                top_symptoms = filtered_data_table['Symptom'].value_counts().nlargest(10).index
-                filtered_data_table['Symptom'] = filtered_data_table['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
-            
-            # Apply "Top 10 Dispositions Only" filter
-            if top_10_dispositions_filter:
-                top_dispositions = filtered_data_table['Disposition'].value_counts().nlargest(10).index
-                filtered_data_table['Disposition'] = filtered_data_table['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
-
-            
-            # Apply keyword search filter separately from table period logic
-            if search_query:
-                search_query = search_query.strip().lower()
-                keyword_filtered_data = data[
-                    data['Description']
-                    .fillna('')
-                    .str.lower()
-                    .str.contains(search_query, na=False)
-                ]
-            else:
-                keyword_filtered_data = data.copy()
-            
-            # Apply additional filters to the keyword-filtered data
-            filtered_data_table = keyword_filtered_data.copy()
-            if 'ALL' not in sku_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['SKU(s)'].isin(sku_filter)]
-            if 'ALL' not in base_sku_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Base SKU'].isin(base_sku_filter)]
-            if 'ALL' not in region_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Region'].isin(region_filter)]
-            if 'ALL' not in symptom_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Symptom'].isin(symptom_filter)]
-            if 'ALL' not in disposition_filter:
-                filtered_data_table = filtered_data_table[filtered_data_table['Disposition'].isin(disposition_filter)]
-            
-            # Apply the date filter for tables and graphs separately
-            date_filtered_data = filtered_data_table[
-                filtered_data_table['Date Identified'] >= start_date_table
-            ]
-            
-            # Use keyword-filtered data directly for descriptions
-            descriptions = keyword_filtered_data[
-                ['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']
-            ].dropna(subset=['Description']).reset_index(drop=True)
-            
-                        
-            filtered_data_graph = data.copy()
-            filtered_data_graph = filtered_data_graph[filtered_data_graph['Date Identified'] >= start_date_graph]
-            if tsf_only_filter:
-                filtered_data_graph = filtered_data_graph[
-                    filtered_data_graph['Disposition'].str.contains('_ts_failed|_replaced', case=False, na=False)
-                ]
-            if top_10_symptoms_filter:
-                top_symptoms = filtered_data_graph['Symptom'].value_counts().nlargest(10).index
-                filtered_data_graph['Symptom'] = filtered_data_graph['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
-            if top_10_dispositions_filter:
-                top_dispositions = filtered_data_graph['Disposition'].value_counts().nlargest(10).index
-                filtered_data_graph['Disposition'] = filtered_data_graph['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
-            if search_query:
-                filtered_data_graph = filtered_data_graph[
-                    filtered_data_graph['Description']
-                    .fillna('')
-                    .str.lower()
-                    .str.contains(search_query, na=False)
-                ]
-
-            # Summary Section
-            st.header("🔍 Summary")
-            total_issues = len(filtered_data_graph)
-            unique_skus = filtered_data_graph['SKU(s)'].nunique()
-            unique_base_skus = filtered_data_graph['Base SKU'].nunique()
-            unique_regions = filtered_data_graph['Region'].nunique()
-            unique_symptoms = filtered_data_graph['Symptom'].nunique()
-            st.write(f"**Total Issues:** {total_issues}")
-            st.write(f"**Unique SKUs:** {unique_skus}")
-            st.write(f"**Unique Base SKUs:** {unique_base_skus}")
-            st.write(f"**Unique Regions:** {unique_regions}")
-            st.write(f"**Unique Symptoms:** {unique_symptoms}")
-
-            # Toggle for combining lesser symptoms into "Other"
-            combine_other = st.checkbox("Combine lesser symptoms into 'Other'")
-
-            # Symptom Issues Over Time (Graph)
-            st.header("📅 Symptom Issues Over Time (Graph)")
-            aggregation = st.selectbox("Aggregate By", ["Day", "Week", "Month"], index=1)
-            aggregation_mapping = {"Day": 'D', "Week": 'W', "Month": 'M'}
-            agg_freq = aggregation_mapping[aggregation]
-
-            symptom_time_data_graph = filtered_data_graph.groupby([pd.Grouper(key='Date Identified', freq=agg_freq), 'Symptom']).size().reset_index(name='Count')
-
-            if combine_other:
-                # Combine lesser symptoms into "Other"
-                top_symptoms = symptom_time_data_graph.groupby('Symptom')['Count'].sum().nlargest(10).index
-                symptom_time_data_graph['Symptom'] = symptom_time_data_graph['Symptom'].apply(lambda x: x if x in top_symptoms else 'Other')
-                symptom_time_data_graph = symptom_time_data_graph.groupby(['Date Identified', 'Symptom']).sum().reset_index()
-
-            # Interactive Plot for Symptom Issues (Graph)
-            st.subheader(f"Symptom Trends ({period_label_graph})")
-            fig = px.bar(
-                symptom_time_data_graph,
-                x='Date Identified',
-                y='Count',
-                color='Symptom',
-                title=f"Symptom Trends Over Time ({period_label_graph})",
-                labels={'Count': 'Number of Issues', 'Date Identified': 'Date'},
-                template="plotly_white",
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            fig.update_layout(barmode='stack', 
-                              xaxis_title=dict(text='Date', font=dict(size=14, weight='bold')),
-                              yaxis_title=dict(text='Count', font=dict(size=14, weight='bold')),
-                              margin=dict(t=40))
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Dispositions Over Time (Graph)
-            st.header("📅 Dispositions Over Time (Graph)")
-            disposition_time_data_graph = filtered_data_graph.groupby([pd.Grouper(key='Date Identified', freq=agg_freq), 'Disposition']).size().reset_index(name='Count')
-
-            if combine_other:
-                # Combine lesser dispositions into "Other"
-                top_dispositions = disposition_time_data_graph.groupby('Disposition')['Count'].sum().nlargest(10).index
-                disposition_time_data_graph['Disposition'] = disposition_time_data_graph['Disposition'].apply(lambda x: x if x in top_dispositions else 'Other')
-                disposition_time_data_graph = disposition_time_data_graph.groupby(['Date Identified', 'Disposition']).sum().reset_index()
-
-            # Interactive Plot for Dispositions (Graph)
-            st.subheader(f"Disposition Trends ({period_label_graph})")
-            fig = px.bar(
-                disposition_time_data_graph,
-                x='Date Identified',
-                y='Count',
-                color='Disposition',
-                title=f"Disposition Trends Over Time ({period_label_graph})",
-                labels={'Count': 'Number of Issues', 'Date Identified': 'Date'},
-                template="plotly_white",
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            fig.update_layout(barmode='stack', 
-                              xaxis_title=dict(text='Date', font=dict(size=14, weight='bold')),
-                              yaxis_title=dict(text='Count', font=dict(size=14, weight='bold')),
-                              margin=dict(t=40))
-            st.plotly_chart(fig, use_container_width=True)
-
-           # Ranked Symptoms with Metrics (Table)
-            st.header("📊 Ranked Symptoms (Table)")
-            symptom_rank = filtered_data_table['Symptom'].value_counts().reset_index()
-            symptom_rank.columns = ['Symptom', 'Count']
-            
-            # Calculate additional metrics
-            current_period = filtered_data_table[filtered_data_table['Date Identified'] >= start_date_table]
-            previous_period = filtered_data_table[(filtered_data_table['Date Identified'] < start_date_table) &
-                                                  (filtered_data_table['Date Identified'] >= previous_start_date_table)]
-            
-            current_counts = current_period['Symptom'].value_counts()
-            previous_counts = previous_period['Symptom'].value_counts()
-            
-            symptom_rank[f"Last {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: current_counts.get(x, 0))
-            symptom_rank[f"Previous {period_days_table} Days"] = symptom_rank['Symptom'].apply(lambda x: previous_counts.get(x, 0))
-            
-            symptom_rank['Delta'] = symptom_rank[f"Last {period_days_table} Days"] - symptom_rank[f"Previous {period_days_table} Days"]
-            symptom_rank['Delta (%)'] = symptom_rank.apply(
-                lambda row: round((row['Delta'] / row[f"Previous {period_days_table} Days"]) * 100, 2)
-                if row[f"Previous {period_days_table} Days"] > 0 else None, axis=1
-            )
-            
-            # Add Trend Column with Green Arrow for Down Only
-            symptom_rank['Trend'] = symptom_rank['Delta'].apply(
-                lambda x: "🔺 Up" if x > 0
-                else ("<span class='delta-negative' style='color:green'>🔻 Down</span>" if x < 0
-                      else "➖ No Change")
-            )
-
-            
-            # Limit to Top 10 Rows
-            symptom_rank = symptom_rank.head(10)
-            
-            # Display Ranked Symptoms Table in Scrollable Box
-            st.subheader("Ranked Symptoms Table")
-            st.markdown(
-                f"""
-                <div class="scrollable-table">
-                    {symptom_rank.to_html(escape=False, index=False)}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-
-            # Paginated Descriptions
-            st.header("🗒 Descriptions")
-            descriptions = filtered_data_table[['Description', 'SKU(s)', 'Base SKU', 'Region', 'Disposition', 'Symptom', 'Date Identified', 'Serial Number']].dropna().reset_index(drop=True)
-
-            # Handle empty descriptions
-            total_items = len(descriptions)
-            items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100], index=0)
-            total_pages = max(1, -(-total_items // items_per_page))  # Ensure at least one page exists
-            current_page = st.number_input("Page:", min_value=1, max_value=total_pages, value=1, step=1)
-
-            # Calculate start and end indices for pagination
-            start_idx = (current_page - 1) * items_per_page
-            end_idx = start_idx + items_per_page
-
-            if total_items == 0:
-                st.warning("No descriptions match your search criteria.")
-            else:
-                st.write("### Descriptions (Filtered)")
-                for idx, row in descriptions.iloc[start_idx:end_idx].iterrows():
-                    st.markdown(
-                        f"""
-                        <div class='description-box'>
-                            <h4>Issue Details</h4>
-                            <div class='description-field'><strong>SKU:</strong> {row['SKU(s)']}</div>
-                            <div class='description-field'><strong>Base SKU:</strong> {row['Base SKU']}</div>
-                            <div class='description-field'><strong>Region:</strong> {row['Region']}</div>
-                            <div class='description-field'><strong>Disposition:</strong> {row['Disposition']}</div>
-                            <div class='description-field'><strong>Symptom:</strong> {row['Symptom']}</div>
-                            <div class='description-field'><strong>Date Identified:</strong> {row['Date Identified'].strftime('%Y-%m-%d') if pd.notnull(row['Date Identified']) else 'N/A'}</div>
-                            <div class='description-field'><strong>Serial Number:</strong> {row['Serial Number']}</div>
-                            <div class='description-field'><strong>Description:</strong> {row['Description']}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-                # Pagination Controls
-                st.markdown(
-                    f"""
-                    <div class='pagination'>
-                        <span>Total Items: {total_items}</span>
-                        <span>Page {current_page} of {total_pages}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-            # Add Download Option
-            st.sidebar.download_button(
-                label="Download Filtered Data",
-                data=filtered_data_table.to_csv(index=False),
-                file_name="filtered_jira_issues.csv",
-                mime="text/csv"
-            )
+        df = pd.read_excel(buffer, sheet_name=sheet)  # openpyxl engine
     except Exception as e:
-        st.error(f"An error occurred while processing the file: {str(e)}")
+        raise RuntimeError(f"Failed to read Excel: {e}")
+    return df
+
+def optimize_memory(df: pd.DataFrame, cat_unique_threshold: int = 1000, cat_ratio_threshold: float = 0.5) -> pd.DataFrame:
+    """Downcast numerics; convert low-cardinality object columns to category."""
+    out = df.copy()
+    for col in out.select_dtypes(include=["float64"]).columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce", downcast="float")
+    for col in out.select_dtypes(include=["int64"]).columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce", downcast="integer")
+    # Try to parse datetimes if they look like dates
+    for col in out.columns:
+        if out[col].dtype == "object":
+            # Heuristic: if >80% parseable to datetime and at least 10 unique
+            sample = out[col].dropna().astype(str).head(500)
+            parse_hits = 0
+            for s in sample:
+                try:
+                    _ = pd.to_datetime(s)
+                    parse_hits += 1
+                except Exception:
+                    pass
+            if len(sample) >= 10 and parse_hits / max(len(sample),1) > 0.8:
+                try:
+                    out[col] = pd.to_datetime(out[col], errors="coerce")
+                    continue
+                except Exception:
+                    pass
+    # Categorical conversion
+    obj_cols = out.select_dtypes(include=["object"]).columns
+    n = len(out)
+    for col in obj_cols:
+        uniq = out[col].nunique(dropna=True)
+        if n == 0:
+            continue
+        ratio = uniq / max(n,1)
+        if uniq <= cat_unique_threshold and ratio <= cat_ratio_threshold:
+            out[col] = out[col].astype("category")
+    return out
+
+def infer_types(df: pd.DataFrame) -> Dict[str, List[str]]:
+    types = {"numeric": [], "categorical": [], "datetime": [], "boolean": []}
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_bool_dtype(s):
+            types["boolean"].append(c)
+        elif pd.api.types.is_numeric_dtype(s):
+            types["numeric"].append(c)
+        elif pd.api.types.is_datetime64_any_dtype(s):
+            types["datetime"].append(c)
+        else:
+            types["categorical"].append(c)
+    return types
+
+def build_filters(types: Dict[str, List[str]], df: pd.DataFrame) -> Dict[str, dict]:
+    st.sidebar.header("🔎 Filters")
+    st.sidebar.caption("Choose filters to slice the dataset. Use **Reset filters** to clear.")
+    applied = {}
+
+    if st.sidebar.button("Reset filters", type="secondary"):
+        st.session_state.pop("filters", None)
+
+    # Free text search across all categorical columns
+    with st.sidebar.expander("🔤 Global text search", expanded=False):
+        q = st.text_input("Contains text (applies to all categorical columns)", key="global_text_query")
+        if q:
+            applied["__global_text__"] = {"query": q}
+
+    # Categorical filters (limit to manageable cardinality)
+    with st.sidebar.expander("🏷️ Categorical filters", expanded=True):
+        for col in types["categorical"]:
+            nunique = df[col].nunique(dropna=True)
+            if nunique <= 200:
+                options = list(df[col].dropna().value_counts().head(500).index)
+                sel = st.multiselect(f"{col} (choose values)", options=options, key=f"cat_{col}")
+                if sel:
+                    applied[col] = {"type": "categorical", "values": sel}
+            else:
+                # Provide a text contains control for high-cardinality columns
+                txt = st.text_input(f"{col} contains…", key=f"cat_text_{col}")
+                if txt:
+                    applied[col] = {"type": "text_contains", "value": txt}
+
+    # Numeric filters
+    with st.sidebar.expander("🔢 Numeric filters", expanded=True):
+        for col in types["numeric"]:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            if s.empty:
+                continue
+            q1, q3 = s.quantile(0.25), s.quantile(0.75)
+            iqr = q3 - q1
+            lower = float(q1 - 1.5 * iqr)
+            upper = float(q3 + 1.5 * iqr)
+            vmin, vmax = float(s.min()), float(s.max())
+            use_iqr = st.checkbox(f"{col}: clip to IQR range [{lower:.3g}, {upper:.3g}]", value=False, key=f"num_clip_{col}")
+            rmin, rmax = (lower, upper) if use_iqr else (vmin, vmax)
+            sel = st.slider(f"{col} range", min_value=float(vmin), max_value=float(vmax), value=(float(rmin), float(rmax)))
+            applied[col] = {"type": "numeric", "min": sel[0], "max": sel[1]}
+
+    # Datetime filters
+    with st.sidebar.expander("📅 Datetime filters", expanded=True):
+        for col in types["datetime"]:
+            s = pd.to_datetime(df[col], errors="coerce").dropna()
+            if s.empty:
+                continue
+            dmin, dmax = s.min(), s.max()
+            # Use dates if range > 2 days, else datetimes
+            if (dmax - dmin).days >= 2:
+                start = st.date_input(f"{col} start", value=dmin.date())
+                end = st.date_input(f"{col} end", value=dmax.date())
+                applied[col] = {"type": "date", "start": pd.to_datetime(start), "end": pd.to_datetime(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)}
+            else:
+                start = st.datetime_input(f"{col} start", value=dmin.to_pydatetime())
+                end = st.datetime_input(f"{col} end", value=dmax.to_pydatetime())
+                applied[col] = {"type": "datetime", "start": pd.to_datetime(start), "end": pd.to_datetime(end)}
+    return applied
+
+def apply_filters(df: pd.DataFrame, filters: Dict[str, dict]) -> pd.DataFrame:
+    if not filters:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for col, cfg in filters.items():
+        if col == "__global_text__":
+            q = str(cfg["query"]).lower()
+            cat_cols = df.select_dtypes(include=["object", "string", "category"]).columns
+            if len(cat_cols) == 0:
+                continue
+            cat_mask = pd.Series(False, index=df.index)
+            for c in cat_cols:
+                cat_mask = cat_mask | df[c].astype(str).str.lower().str.contains(q, na=False)
+            mask = mask & cat_mask
+            continue
+
+        if cfg.get("type") == "categorical":
+            mask = mask & df[col].isin(cfg["values"])
+        elif cfg.get("type") == "text_contains":
+            val = str(cfg["value"]).lower()
+            mask = mask & df[col].astype(str).str.lower().str.contains(val, na=False)
+        elif cfg.get("type") == "numeric":
+            s = pd.to_numeric(df[col], errors="coerce")
+            mask = mask & s.ge(cfg["min"]) & s.le(cfg["max"])
+        elif cfg.get("type") in ("date", "datetime"):
+            s = pd.to_datetime(df[col], errors="coerce")
+            mask = mask & s.ge(cfg["start"]) & s.le(cfg["end"])
+    return df[mask]
+
+def kpi(label: str, value, help_text: Optional[str] = None, cols=None):
+    col = cols if cols else st
+    with col.container():
+        st.markdown(f"<div class='kpi-card'><div style='font-size:14px;color:#666;'>{label}</div><div style='font-size:28px;font-weight:700'>{value}</div></div>", unsafe_allow_html=True)
+        if help_text:
+            st.caption(help_text)
+
+def chart_builder(df: pd.DataFrame, types: Dict[str, List[str]]):
+    st.subheader("📊 Chart Builder")
+    if df.empty:
+        st.info("No data after filters.")
+        return
+
+    chart_type = st.selectbox("Chart type", ["Line", "Bar", "Area", "Scatter", "Histogram", "Box", "Heatmap"], index=0, help="Choose how to visualize your data.")
+    x_col = st.selectbox("X-axis", options=list(df.columns))
+    y_col = None
+    color = st.selectbox("Color (optional)", options=["(none)"] + list(df.columns), index=0)
+    color = None if color == "(none)" else color
+
+    if chart_type in ["Line", "Bar", "Area", "Scatter", "Box"]:
+        y_col = st.selectbox("Y-axis / numeric", options=types["numeric"] or list(df.columns))
+        if y_col is None:
+            st.warning("Pick a numeric column for Y.")
+            return
+
+    # Resample if datetime x
+    if pd.api.types.is_datetime64_any_dtype(df[x_col]):
+        freq = st.selectbox("Resample frequency (if datetime X)", ["(none)", "D", "W", "M", "Q", "Y"], index=0,
+                            help="Aggregate to daily/weekly/monthly/etc. when the X-axis is datetime.")
+        agg = st.selectbox("Aggregate function", ["sum", "mean", "median", "min", "max", "count"], index=1)
+        if freq != "(none)":
+            if chart_type in ["Histogram", "Box", "Heatmap"]:
+                st.info("Resampling applies to numeric summaries; choose line/bar/area/scatter for resampled series.")
+            if y_col:
+                grp = df[[x_col, y_col] + ([color] if color else [])].dropna()
+                if grp.empty:
+                    st.info("No rows to plot after dropping NaNs.")
+                    return
+                if color:
+                    grp = grp.groupby([pd.Grouper(key=x_col, freq=freq), color]).agg({y_col: agg}).reset_index()
+                else:
+                    grp = grp.groupby(pd.Grouper(key=x_col, freq=freq)).agg({y_col: agg}).reset_index()
+                df_plot = grp
+            else:
+                df_plot = df.copy()
+        else:
+            df_plot = df.copy()
+    else:
+        df_plot = df.copy()
+
+    # Build chart
+    if chart_type == "Line":
+        fig = px.line(df_plot, x=x_col, y=y_col, color=color)
+    elif chart_type == "Bar":
+        fig = px.bar(df_plot, x=x_col, y=y_col, color=color, barmode="group")
+    elif chart_type == "Area":
+        fig = px.area(df_plot, x=x_col, y=y_col, color=color, groupnorm=None)
+    elif chart_type == "Scatter":
+        trend = st.checkbox("Add trendline (OLS)", value=False)
+        tl = "ols" if trend else None
+        fig = px.scatter(df_plot, x=x_col, y=y_col, color=color, trendline=tl)
+    elif chart_type == "Histogram":
+        nbins = st.slider("Number of bins", 5, 100, 40)
+        fig = px.histogram(df_plot, x=x_col, color=color, nbins=nbins, barmode="overlay")
+    elif chart_type == "Box":
+        fig = px.box(df_plot, x=x_col, y=y_col, color=color, points="outliers")
+    else:  # Heatmap
+        st.info("Select two numeric columns to visualize a correlation heatmap.")
+        cols = st.multiselect("Pick numeric columns", options=types["numeric"], default=types["numeric"][:5] if types["numeric"] else [])
+        if len(cols) >= 2:
+            corr = df_plot[cols].corr(numeric_only=True)
+            fig = px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu", origin="lower")
+        else:
+            st.warning("Choose at least two numeric columns.")
+            return
+
+    st.plotly_chart(fig, use_container_width=True)
+
+def aggregation_builder(df: pd.DataFrame, types: Dict[str, List[str]]):
+    st.subheader("📐 Group & Aggregate")
+    if df.empty:
+        st.info("No data after filters.")
+        return
+
+    dims = st.multiselect("Group by (dimensions)", options=types["categorical"] + types["datetime"])
+    metrics = st.multiselect("Metrics (numeric)", options=types["numeric"])
+    aggs = st.multiselect("Aggregations", options=["sum", "mean", "median", "min", "max", "count", "nunique"], default=["sum","mean","count"])
+
+    if not dims or not metrics or not aggs:
+        st.caption("Pick dimensions, metrics and aggregations.")
+        return
+
+    gb = df.groupby(dims, dropna=False)
+    agg_dict = {m: aggs for m in metrics}
+    out = gb.agg(agg_dict)
+    out.columns = ["_".join([c for c in col if c]) if isinstance(col, tuple) else str(col) for col in out.columns.values]
+    out = out.reset_index()
+    st.dataframe(out.head(500), use_container_width=True)
+    st.download_button("⬇️ Download aggregated CSV", out.to_csv(index=False).encode("utf-8"), file_name="aggregated.csv", mime="text/csv")
+
+def pivot_builder(df: pd.DataFrame, types: Dict[str, List[str]]):
+    st.subheader("🧮 Pivot Table")
+    if df.empty:
+        st.info("No data after filters.")
+        return
+
+    rows = st.multiselect("Rows", options=list(df.columns))
+    cols = st.multiselect("Columns", options=list(df.columns))
+    vals = st.multiselect("Values (numeric preferred)", options=list(df.columns))
+    aggfunc = st.selectbox("Aggregation", ["sum","mean","median","min","max","count","nunique"], index=0)
+
+    if not rows or not vals:
+        st.caption("Pick at least rows and values.")
+        return
+    try:
+        pv = pd.pivot_table(df, index=rows, columns=cols if cols else None, values=vals, aggfunc=aggfunc)
+        st.dataframe(pv.head(500), use_container_width=True)
+        st.download_button("⬇️ Download pivot CSV", pv.reset_index().to_csv(index=False).encode("utf-8"), file_name="pivot.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"Pivot failed: {e}")
+
+def profile_view(df: pd.DataFrame):
+    st.subheader("🧭 Data Profile")
+    n_rows, n_cols = df.shape
+    c1, c2, c3, c4 = st.columns(4)
+    kpi("Rows", f"{n_rows:,}", cols=c1)
+    kpi("Columns", f"{n_cols:,}", cols=c2)
+    kpi("Missing cells %", f"{(df.isna().sum().sum() / max(n_rows*n_cols,1) * 100):.2f}%", cols=c3)
+    kpi("Duplicate rows", f"{df.duplicated().sum():,}", cols=c4)
+
+    st.markdown("#### Column Overview")
+    ov = pd.DataFrame({
+        "column": df.columns,
+        "dtype": df.dtypes.astype(str).values,
+        "non_null": df.notna().sum().values,
+        "missing": df.isna().sum().values,
+        "unique": [df[c].nunique(dropna=True) for c in df.columns],
+    })
+    st.dataframe(ov, use_container_width=True, height=300)
+
+    with st.expander("📈 Quick histograms (top numeric)", expanded=False):
+        num_cols = df.select_dtypes(include=np.number).columns.tolist()[:6]
+        for c in num_cols:
+            fig = px.histogram(df, x=c, nbins=40, title=c)
+            st.plotly_chart(fig, use_container_width=True)
+
+# ---- App body ----
+st.title("📈 Best-in-Class Data Explorer")
+st.caption("Fast filtering • Powerful grouping • Interactive charts • Exportable results")
+
+# Inlined small helper to load default sample if present
+DEFAULT_SAMPLE_PATH = "/mnt/data/data (31).xlsx"
+
+with st.sidebar:
+    st.markdown("### 1) Load data")
+    upl = st.file_uploader("Upload an Excel file (.xlsx)", type=["xlsx"])
+    use_sample = st.checkbox("Use included sample (if present)", value=os.path.exists(DEFAULT_SAMPLE_PATH))
+    sheet_choice = st.text_input("Sheet name (optional)", value="")
+    st.markdown("---")
+    st.markdown("### 2) Options")
+    do_opt = st.checkbox("Optimize memory (downcast + categorical)", value=True)
+    st.markdown("---")
+    st.markdown("### 3) Export")
+    st.caption("Use the Download buttons in each section to export filtered or aggregated data.")
+
+# Load data
+df = None
+load_err = None
+if upl is not None:
+    try:
+        b, h = file_bytes_and_hash(upl)
+        df = read_excel_cached(b, sheet=sheet_choice or None)
+    except Exception as e:
+        load_err = str(e)
+elif use_sample and os.path.exists(DEFAULT_SAMPLE_PATH):
+    try:
+        with open(DEFAULT_SAMPLE_PATH, "rb") as f:
+            b = f.read()
+        df = read_excel_cached(b, sheet=sheet_choice or None)
+    except Exception as e:
+        load_err = str(e)
+
+if load_err:
+    st.error(f"Failed to load Excel: {load_err}")
+
+if df is None:
+    st.info("Upload an Excel file (or tick 'Use included sample') to begin.")
+    st.stop()
+
+# Optimize memory & infer types
+if do_opt:
+    df = optimize_memory(df)
+types = infer_types(df)
+
+# Sidebar: show quick info
+st.sidebar.markdown("### Dataset snapshot")
+st.sidebar.write(f"**Rows:** {len(df):,}  \n**Columns:** {df.shape[1]:,}")
+st.sidebar.write(f"**Numeric:** {len(types['numeric'])}  \n**Categorical:** {len(types['categorical'])}  \n**Datetime:** {len(types['datetime'])}  \n**Boolean:** {len(types['boolean'])}")
+
+# Build & apply filters
+filters = build_filters(types, df)
+filtered = apply_filters(df, filters)
+
+# Top summary
+st.markdown("### Overview")
+c1, c2, c3, c4 = st.columns(4)
+kpi("Rows (filtered)", f"{len(filtered):,}", cols=c1)
+kpi("Columns", f"{filtered.shape[1]:,}", cols=c2)
+kpi("Numeric columns", f"{len(types['numeric'])}", cols=c3)
+kpi("Categorical columns", f"{len(types['categorical'])}", cols=c4)
+
+with st.expander("🔍 Preview filtered data"):
+    st.dataframe(filtered.head(1000), use_container_width=True, height=320)
+    st.download_button("⬇️ Download filtered CSV", filtered.to_csv(index=False).encode("utf-8"), file_name="filtered.csv", mime="text/csv")
+
+# Tabs for deeper work
+tab1, tab2, tab3, tab4 = st.tabs(["📐 Group & Aggregate", "🧮 Pivot", "📊 Charts", "🧭 Profile"])
+
+with tab1:
+    aggregation_builder(filtered, types)
+
+with tab2:
+    pivot_builder(filtered, types)
+
+with tab3:
+    chart_builder(filtered, types)
+
+with tab4:
+    profile_view(filtered)
+
+st.success("Ready. Use the controls to mine trends and find upticks across your dataset.")
+'''
+
+readme = r'''# Best-in-Class Data Explorer (Streamlit)
+
+A fast, flexible Streamlit app for exploring large Excel datasets with powerful filters, grouping, pivots, and interactive charts.
+
+## Run locally
+```bash
+pip install streamlit pandas plotly openpyxl
+streamlit run streamlit_app.py
