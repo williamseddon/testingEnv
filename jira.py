@@ -1,9 +1,9 @@
-# app.py — Jira Issues Flexible Explorer (no filesystem writes)
+# app.py — Jira Issues Flexible Explorer (hardened for Arrow + mapping validator)
 import io
 import json
 import difflib
 from datetime import timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -29,9 +29,6 @@ st.markdown(
             border-radius:10px;box-shadow:0 4px 10px rgba(0,0,0,.06);}
       .delta-pos {color:#0a0;font-weight:700;}
       .delta-neg {color:#d00;font-weight:700;}
-      .chip {display:inline-block;padding:6px 10px;margin:0 6px 6px 0;border-radius:999px;
-             background:#f0f0f0;cursor:pointer;font-size:12px;}
-      .chip-active {background:#4CAF50;color:white;}
       .stPlotlyChart {background:white;border-radius:12px;padding:8px;}
     </style>
     """,
@@ -48,26 +45,24 @@ REQUIRED_FIELDS = [
 ]
 
 SYNONYMS: Dict[str, List[str]] = {
-    "Date Identified": ["date identified","identified","date","created","created date","created_on","opened","report date"],
-    "SKU(s)": ["sku(s)","sku","skus","product sku","product","model sku","model"],
-    "Base SKU": ["base sku","base","base_sku","base sku(s)","base product","family sku","platform"],
-    "Region": ["region","market","country","geo","territory","locale"],
+    "Date Identified": ["date identified","identified","date","created","created date","created_on","opened","report date","start time (date/time)","start time"],
+    "SKU(s)": ["sku(s)","sku","skus","product sku","product","model sku","model","zendesk sku","zendesk_sku"],
+    "Base SKU": ["base sku","base","base_sku","base sku(s)","base product","family sku","platform","product brand","brand"],
+    "Region": ["region","market","country","geo","territory","locale","queue country"],
     "Symptom": ["symptom","issue","category","failure mode","problem","defect","tag"],
-    "Disposition": ["disposition","status","resolution","outcome","result","action"],
-    "Description": ["description","details","summary","comments","issue description","text","notes"],
+    "Disposition": ["disposition","status","resolution","outcome","result","action","disposition tag"],
+    "Description": ["description","details","summary","comments","issue description","text","notes","zoom summary"],
     "Serial Number": ["serial number","sn","s/n","serial","unit sn","serial_no","serial no","serialnumber"],
 }
 
 # -------------------- Cache helpers --------------------
 @st.cache_data(show_spinner=False)
 def read_excel_sheet_bytes(content: bytes, sheet: Optional[str] = None) -> pd.DataFrame:
-    buf = io.BytesIO(content)
-    return pd.read_excel(buf, sheet_name=sheet)
+    return pd.read_excel(io.BytesIO(content), sheet_name=sheet)
 
 @st.cache_data(show_spinner=False)
 def read_csv_bytes(content: bytes) -> pd.DataFrame:
-    buf = io.BytesIO(content)
-    return pd.read_csv(buf)
+    return pd.read_csv(io.BytesIO(content))
 
 # -------------------- Utility functions --------------------
 def score_column_for_field(col: str, field: str) -> float:
@@ -109,11 +104,9 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = pd.NA
     out["Date Identified"] = pd.to_datetime(out["Date Identified"], errors="coerce")
-    # normalize SKUs
     for c in ("SKU(s)", "Base SKU"):
         if c in out.columns:
             out[c] = out[c].astype("string").str.upper().str.strip()
-    # keep others as strings
     for c in ("Region","Symptom","Disposition","Description","Serial Number"):
         if c in out.columns:
             out[c] = out[c].astype("string")
@@ -121,12 +114,10 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
 
 def optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # downcast numerics
     for col in out.select_dtypes(include=["float64"]).columns:
         out[col] = pd.to_numeric(out[col], errors="coerce", downcast="float")
     for col in out.select_dtypes(include=["int64"]).columns:
         out[col] = pd.to_numeric(out[col], errors="coerce", downcast="integer")
-    # categorize likely dimensions
     dim_cols = ["SKU(s)","Base SKU","Region","Symptom","Disposition"]
     for c in dim_cols:
         if c in out.columns and out[c].nunique(dropna=True) <= max(200, len(out)//2):
@@ -160,43 +151,33 @@ def combine_top_n(series: pd.Series, n: int = 10, label: str = "Other") -> pd.Se
 def kpi(label: str, value):
     st.markdown(f"<div class='kpi'><h3>{label}</h3><p>{value}</p></div>", unsafe_allow_html=True)
 
-def safe_bar(df: pd.DataFrame, x: str, y: str, color: str, title: str):
-    if df.empty:
-        st.info("No data to plot for current filters/time window.")
-        return
-    fig = px.bar(df, x=x, y=y, color=color, title=title, labels={y:"Count", x:"Date"}, template="plotly_white")
-    fig.update_layout(barmode="stack", margin=dict(t=40))
-    st.plotly_chart(fig, use_container_width=True)
+# ---------- NEW: make a preview Arrow-safe (no nested/mixed objects, no tz-aware dts) ----------
+def _is_scalar_for_arrow(x: Any) -> bool:
+    return not isinstance(x, (list, dict, set, tuple, bytes, bytearray))
 
-def weekly_heatmap(df: pd.DataFrame, value_col: str, label: str):
-    d = df.dropna(subset=["Date Identified"]).copy()
-    if d.empty:
-        st.info("No dates to plot.")
-        return
-    d["Week"] = d["Date Identified"].dt.to_period("W").apply(lambda r: r.start_time)
-    mat = d.groupby(["Week", label]).size().reset_index(name=value_col)
-    top_labels = mat.groupby(label)[value_col].sum().nlargest(12).index
-    mat[label] = mat[label].apply(lambda x: x if x in top_labels else "Other")
-    mat = mat.groupby(["Week", label])[value_col].sum().reset_index()
-    pv = mat.pivot(index=label, columns="Week", values=value_col).fillna(0)
-    fig = px.imshow(pv, aspect="auto", color_continuous_scale="Blues", origin="lower", title=f"Weekly Heatmap — {label}")
-    st.plotly_chart(fig, use_container_width=True)
-
-def topn_bars(df: pd.DataFrame, col: str, n: int = 15, title: Optional[str] = None):
-    if df.empty:
-        st.info("No data for Top-N.")
-        return
-    vc = df[col].value_counts().nlargest(n).reset_index()
-    vc.columns = [col, "Count"]
-    fig = px.bar(vc, x="Count", y=col, orientation="h", title=title or f"Top {n}: {col}", template="plotly_white")
-    fig.update_layout(yaxis={"categoryorder": "total ascending"}, margin=dict(t=40))
-    st.plotly_chart(fig, use_container_width=True)
-
-def serialize_view(state: dict) -> bytes:
-    return json.dumps(state, default=str, indent=2).encode("utf-8")
-
-def parse_view(b: bytes) -> dict:
-    return json.loads(b.decode("utf-8"))
+def ensure_arrow_safe(df: pd.DataFrame, max_str_len: int = 10000) -> pd.DataFrame:
+    out = df.copy()
+    # Normalize column names
+    out.columns = [str(c) for c in out.columns]
+    for c in out.columns:
+        s = out[c]
+        # Period dtype -> timestamps
+        if pd.api.types.is_period_dtype(s):
+            out[c] = s.astype("datetime64[ns]")
+            continue
+        # Datetime with tz -> drop tz (Arrow sometimes balks on mixed tz)
+        if pd.api.types.is_datetime64tz_dtype(s):
+            out[c] = pd.to_datetime(s, utc=True).dt.tz_convert(None)
+            continue
+        # Object with nested types -> stringify
+        if pd.api.types.is_object_dtype(s):
+            if not s.dropna().map(_is_scalar_for_arrow).all():
+                out[c] = s.map(lambda v: json.dumps(v) if isinstance(v, (dict, list)) else str(v))
+            else:
+                out[c] = s.astype(str)
+            # clip very long values to keep render snappy
+            out[c] = out[c].map(lambda z: z if isinstance(z, str) and len(z) <= max_str_len else (z[:max_str_len] + "…") if isinstance(z, str) else z)
+    return out
 
 # -------------------- 1) Upload (MAIN PAGE) --------------------
 st.markdown("### 1) Upload file")
@@ -217,11 +198,7 @@ try:
     if kind == "xlsx":
         xls = pd.ExcelFile(io.BytesIO(content))
         sheets = xls.sheet_names
-        # best sheet guess
-        try:
-            candidate = best_sheet_for_schema(content, sheets)
-        except Exception:
-            candidate = None
+        candidate = best_sheet_for_schema(content, sheets) or (sheets[0] if sheets else None)
         sel = st.selectbox("Select sheet", sheets, index=(sheets.index(candidate) if candidate in sheets else 0))
         df_raw = read_excel_sheet_bytes(content, sheet=sel)
     else:
@@ -235,10 +212,9 @@ st.markdown("### 2) Map columns (auto-guessed, editable)")
 columns = [str(c) for c in df_raw.columns]
 defaults = guess_mapping(columns)
 
-# remember mapping in session if the same column set appears again
+# Persist last mapping in session to aid re-uploads with same schema
 st.session_state.setdefault("last_mapping_key", None)
 st.session_state.setdefault("last_mapping", {})
-
 key_now = "|".join(columns)
 if st.session_state["last_mapping_key"] == key_now:
     defaults = {k: st.session_state["last_mapping"].get(k, v) for k, v in defaults.items()}
@@ -250,6 +226,14 @@ for i, field in enumerate(REQUIRED_FIELDS):
     with cols[i % 2]:
         mapping[field] = st.selectbox(field, [None] + columns, index=(columns.index(default)+1) if default in columns else 0, key=f"map_{field}")
 
+# NEW: block obvious duplicate mappings and guide the user
+selected_vals = [v for v in mapping.values() if v]
+dupes = {v for v in selected_vals if selected_vals.count(v) > 1}
+if dupes:
+    st.error(f"Each canonical field must map to a different source column. Duplicate selection(s): {', '.join(sorted(dupes))}. "
+             f"Example: don’t map both ‘SKU(s)’ and ‘Base SKU’ to ‘Product Brand’.")
+    st.stop()
+
 if not all(mapping.get(f) for f in REQUIRED_FIELDS):
     missing = [f for f in REQUIRED_FIELDS if not mapping.get(f)]
     st.warning(f"Select a column for all required fields to proceed. Missing: {', '.join(missing)}")
@@ -258,11 +242,10 @@ if not all(mapping.get(f) for f in REQUIRED_FIELDS):
 st.session_state["last_mapping_key"] = key_now
 st.session_state["last_mapping"] = mapping.copy()
 
-# -------------------- 3) Standardize & (optional) optimize --------------------
+# -------------------- 3) Standardize & optimize (optional) --------------------
 df = apply_mapping(df_raw, mapping)
-
 with st.expander("⚙️ Options"):
-    do_opt = st.checkbox("Optimize memory (downcast and categorize likely dimensions)", value=True)
+    do_opt = st.checkbox("Optimize memory (downcast + categorize likely dimensions)", value=True)
 if do_opt:
     df = optimize_memory(df)
 
@@ -274,27 +257,19 @@ with st.sidebar:
     region_filter = st.multiselect("Region", options=["ALL"] + sorted(df["Region"].dropna().unique().tolist()), default=["ALL"])
     symptom_filter = st.multiselect("Symptom", options=["ALL"] + sorted(df["Symptom"].dropna().unique().tolist()), default=["ALL"])
     disposition_filter = st.multiselect("Disposition", options=["ALL"] + sorted(df["Disposition"].dropna().unique().tolist()), default=["ALL"])
-
-    st.markdown("**Quick chips**")
-    chip_sym = st.multiselect("Top symptom chips", options=df["Symptom"].value_counts().nlargest(6).index.tolist(), default=[])
-    chip_disp = st.multiselect("Top disposition chips", options=df["Disposition"].value_counts().nlargest(6).index.tolist(), default=[])
-
     tsf_only = st.checkbox("TSF only (disposition contains _ts_failed / _replaced / tsf)", value=False)
     combine_other = st.checkbox("Combine lesser categories into 'Other' (charts only)", value=False)
     search_text = st.text_input("Search 'Description' contains…", value="")
-
     st.markdown("---")
     st.header("Date Windows")
     date_range_graph = st.selectbox("Chart range", ["Last Week", "Last Month", "Last Year", "All Time"], index=3)
     table_days = st.number_input("Delta window (table): days", min_value=7, value=30, step=1)
-
     st.markdown("---")
     st.header("Views")
-    # Save/load in memory only (no writes to disk)
     view_to_load = st.file_uploader("Load saved view (.json)", type=["json"], key="view_loader")
     if view_to_load is not None:
         try:
-            view_cfg = parse_view(view_to_load.getvalue())
+            view_cfg = json.loads(view_to_load.getvalue().decode("utf-8"))
             sku_filter = view_cfg.get("sku_filter", sku_filter)
             base_filter = view_cfg.get("base_filter", base_filter)
             region_filter = view_cfg.get("region_filter", region_filter)
@@ -309,9 +284,18 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to load view: {e}")
 
-# Apply chips
-if chip_sym: symptom_filter = list(set((symptom_filter or []) + chip_sym))
-if chip_disp: disposition_filter = list(set((disposition_filter or []) + chip_disp))
+# -------------------- Field inspector to validate mapping --------------------
+with st.expander("🔎 Field Inspector (quick validation of your mapping)"):
+    for col in REQUIRED_FIELDS:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        st.write(f"**{col}** — non-null: {int(s.notna().sum()):,}, unique: {s.nunique(dropna=True):,}")
+        if pd.api.types.is_datetime64_any_dtype(s):
+            st.write(f"• min: {pd.to_datetime(s, errors='coerce').min()}  |  max: {pd.to_datetime(s, errors='coerce').max()}")
+        else:
+            top = s.value_counts(dropna=True).head(10)
+            st.dataframe(top.rename("count"))
 
 # -------------------- Time windows --------------------
 now = pd.Timestamp.now()
@@ -336,7 +320,7 @@ mask = build_filter_mask(
 )
 df_filtered = df.loc[mask].copy()
 
-# -------------------- KPIs & Preview --------------------
+# -------------------- KPIs & Preview (Arrow-safe) --------------------
 st.markdown("### 3) Overview")
 c1, c2, c3, c4, c5 = st.columns(5)
 with c1: kpi("Rows (filtered)", f"{len(df_filtered):,}")
@@ -346,7 +330,8 @@ with c4: kpi("Regions", df_filtered["Region"].nunique())
 with c5: kpi("Symptoms", df_filtered["Symptom"].nunique())
 
 with st.expander("🔍 Preview filtered data"):
-    st.dataframe(df_filtered.head(1000), use_container_width=True, height=320)
+    preview = ensure_arrow_safe(df_filtered.head(1000))
+    st.dataframe(preview, use_container_width=True, height=320)
 
 # -------------------- Trends --------------------
 st.markdown("### 4) Trends")
@@ -356,19 +341,47 @@ freq = {"Day":"D","Week":"W","Month":"M"}[agg_choice]
 sym_df = df_filtered[df_filtered["Date Identified"] >= start_graph] if pd.notna(start_graph) else df_filtered.copy()
 if combine_other: sym_df = sym_df.assign(Symptom=combine_top_n(sym_df["Symptom"], 10, "Other"))
 sym_trend = sym_df.groupby([pd.Grouper(key="Date Identified", freq=freq), "Symptom"], dropna=False).size().reset_index(name="Count")
-safe_bar(sym_trend, "Date Identified", "Count", "Symptom", f"Symptom Trends Over Time ({period_label_graph})")
+fig_sym = px.bar(sym_trend, x="Date Identified", y="Count", color="Symptom", title=f"Symptom Trends Over Time ({period_label_graph})", template="plotly_white")
+fig_sym.update_layout(barmode="stack", margin=dict(t=40))
+st.plotly_chart(fig_sym, use_container_width=True)
 
 disp_df = df_filtered[df_filtered["Date Identified"] >= start_graph] if pd.notna(start_graph) else df_filtered.copy()
 if combine_other: disp_df = disp_df.assign(Disposition=combine_top_n(disp_df["Disposition"], 10, "Other"))
 disp_trend = disp_df.groupby([pd.Grouper(key="Date Identified", freq=freq), "Disposition"], dropna=False).size().reset_index(name="Count")
-safe_bar(disp_trend, "Date Identified", "Count", "Disposition", f"Disposition Trends Over Time ({period_label_graph})")
+fig_disp = px.bar(disp_trend, x="Date Identified", y="Count", color="Disposition", title=f"Disposition Trends Over Time ({period_label_graph})", template="plotly_white")
+fig_disp.update_layout(barmode="stack", margin=dict(t=40))
+st.plotly_chart(fig_disp, use_container_width=True)
 
 st.markdown("#### Heatmaps")
+def weekly_heatmap(df_in: pd.DataFrame, label: str):
+    d = df_in.dropna(subset=["Date Identified"]).copy()
+    if d.empty:
+        st.info("No dates to plot.")
+        return
+    d["Week"] = d["Date Identified"].dt.to_period("W").apply(lambda r: r.start_time)
+    mat = d.groupby(["Week", label]).size().reset_index(name="Count")
+    top_labels = mat.groupby(label)["Count"].sum().nlargest(12).index
+    mat[label] = mat[label].apply(lambda x: x if x in top_labels else "Other")
+    mat = mat.groupby(["Week", label])["Count"].sum().reset_index()
+    pv = mat.pivot(index=label, columns="Week", values="Count").fillna(0)
+    fig = px.imshow(pv, aspect="auto", color_continuous_scale="Blues", origin="lower", title=f"Weekly Heatmap — {label}")
+    st.plotly_chart(fig, use_container_width=True)
+
 cH1, cH2 = st.columns(2)
-with cH1: weekly_heatmap(df_filtered, "Count", "Symptom")
-with cH2: weekly_heatmap(df_filtered, "Count", "Disposition")
+with cH1: weekly_heatmap(df_filtered, "Symptom")
+with cH2: weekly_heatmap(df_filtered, "Disposition")
 
 st.markdown("#### Top-N")
+def topn_bars(df_in: pd.DataFrame, col: str, n: int = 15, title: Optional[str] = None):
+    if df_in.empty:
+        st.info("No data for Top-N.")
+        return
+    vc = df_in[col].value_counts().nlargest(n).reset_index()
+    vc.columns = [col, "Count"]
+    fig = px.bar(vc, x="Count", y=col, orientation="h", title=title or f"Top {n}: {col}", template="plotly_white")
+    fig.update_layout(yaxis={"categoryorder": "total ascending"}, margin=dict(t=40))
+    st.plotly_chart(fig, use_container_width=True)
+
 cT1, cT2 = st.columns(2)
 with cT1: topn_bars(df_filtered, "Symptom", 15, "Top 15 Symptoms")
 with cT2: topn_bars(df_filtered, "Disposition", 15, "Top 15 Dispositions")
@@ -388,7 +401,6 @@ rank["Delta"] = rank[f"Last {table_days}d"] - rank[f"Prev {table_days}d"]
 rank["Delta %"] = np.where(rank[f"Prev {table_days}d"]>0,
                            (rank["Delta"]/rank[f"Prev {table_days}d"]*100.0).round(2),
                            np.nan)
-rank = rank.sort_values(["Total", f"Last {table_days}d"], ascending=False).head(10)
 
 def _fmt_delta(v):
     try: v = int(v)
@@ -404,6 +416,7 @@ def _fmt_pct(v):
     if v<0: return f"<span class='delta-neg'>{v:.2f}%</span>"
     return "—"
 
+rank = rank.sort_values(["Total", f"Last {table_days}d"], ascending=False).head(10)
 rank_disp = rank.copy()
 rank_disp["Delta"] = rank_disp["Delta"].apply(_fmt_delta)
 rank_disp["Delta %"] = rank_disp["Delta %"].apply(_fmt_pct)
@@ -445,7 +458,7 @@ else:
         )
     st.caption(f"Showing {start+1}–{end} of {total}")
 
-# -------------------- Downloads (in-memory; no writes) --------------------
+# -------------------- Downloads (in-memory) --------------------
 st.sidebar.download_button(
     label="⬇️ Download filtered CSV",
     data=df_filtered.to_csv(index=False).encode("utf-8"),
@@ -460,7 +473,7 @@ view_state = {
 }
 st.sidebar.download_button(
     label="💾 Save current view (.json)",
-    data=serialize_view(view_state),
+    data=json.dumps(view_state, indent=2).encode("utf-8"),
     file_name="jira_view.json",
     mime="application/json",
 )
