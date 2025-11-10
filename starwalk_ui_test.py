@@ -1,902 +1,1229 @@
-# starwalk_ui.py
-# Streamlit 1.38+
+# starwalk_ui_v7_5_vector_index.py
+# Evidence-Locked Labeling + Overflow Tag + Optional Review Skim (Embeddings)
+# Exports: Detractors K–T, Delighters U–AD, Meta AE/AF/AG, Overflow AH
+# Requirements: streamlit>=1.28, pandas, openpyxl, numpy, openai>=1.0.0 (optional)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-from wordcloud import STOPWORDS  # keep for stopword set; not rendering WC
-import re
-import html as _html
-import os
-import json
-import textwrap
-import warnings
-import smtplib
-from email.message import EmailMessage
-from streamlit.components.v1 import html as st_html  # for custom HTML blocks
+import io, os, json, difflib, time, re, html, random
+from typing import List, Dict, Tuple, Optional, Set, Any
 
-warnings.filterwarnings(
-    "ignore",
-    message="Data Validation extension is not supported and will be removed",
-    module="openpyxl",
-)
-
-# ---------- Optional text fixer ----------
-try:
-    from ftfy import fix_text as _ftfy_fix
-    _HAS_FTFY = True
-except Exception:
-    _HAS_FTFY = False
-    _ftfy_fix = None
-
-# ---------- OpenAI SDK ----------
+# -------- Optional: OpenAI --------
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
 except Exception:
-    _HAS_OPENAI = False
     OpenAI = None  # type: ignore
+    _HAS_OPENAI = False
 
-# Optional FAISS for fast vector similarity
-try:
-    import faiss  # type: ignore
-    _HAS_FAISS = True
-except Exception:
-    _HAS_FAISS = False
+# -------- Excel handling ----------
+from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.styles import PatternFill
+from openpyxl.utils import column_index_from_string, get_column_letter
 
-NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
+# ------------------- Page Setup -------------------
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.5 (Evidence • Overflow • Skim)")
+st.title("✨ Review Symptomizer — v7.5 (Evidence • Overflow • Skim)")
+st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Evidence-locked labeling • Overflow tag → AH • Optional review skim via embeddings")
 
-def model_supports_temperature(model_id: str) -> bool:
-    return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
-
-# ---------- Page config ----------
-st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
-
-# ---------- Force Light Mode ----------
-st_html("""
-<script>
-(function () {
-  function setLight() {
-    try {
-      document.documentElement.setAttribute('data-theme','light');
-      document.body && document.body.setAttribute('data-theme','light');
-      window.localStorage.setItem('theme','light');
-    } catch (e) {}
-  }
-  setLight();
-  new MutationObserver(setLight).observe(
-    document.documentElement,
-    { attributes: true, attributeFilter: ['data-theme'] }
-  );
-})();
-</script>
-""", height=0)
-
-# ---------- Global CSS ----------
-GLOBAL_CSS = """
-<style>
-  /* =====================
-     Global CSS — Light-first
-     ===================== */
-  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
-  *, ::before, ::after { box-sizing: border-box; }
-  @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
-
-  /* ---- Design tokens (light) ---- */
-  :root{
-    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
-    --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-    --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
-  }
-
-  /* ---- Dark tokens (kept for safety; app forced light) ---- */
-  html[data-theme="dark"], body[data-theme="dark"]{
-    --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
-    --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
-    --bg-app:#0b0e14; --bg-card:rgba(255,255,255,.06); --bg-tile:rgba(255,255,255,.04);
-    --ring:#60a5fa; --ok:#34d399; --bad:#f87171;
-  }
-
-  html, body, .stApp {
-    background: var(--bg-app);
-    font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
-    color: var(--text);
-  }
-  .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
-  section[data-testid="stSidebar"] .block-container { padding-top:.6rem; }
-  mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
-
-  /* ---- Metric Cards ---- */
-  .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
-  @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
-  .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
-  .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
-  .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-  .metric-box{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:12px; padding:12px; text-align:center; color:var(--text); }
-  .metric-label{ color:var(--muted); font-size:.85rem; }
-  .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
-
-  /* ---- Review Cards ---- */
-  .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
-  .review-card p{ margin:.25rem 0; line-height:1.5; }
-
-    /* ---- Review Cards ---- */
-  .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
-  .review-card p{ margin:.25rem 0; line-height:1.5; }
-
-  /* ---- Symptom badges (green = delighters, red = detractors) ---- */
-  .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-  .badge{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.85rem; border:1.5px solid transparent; }
-  .badge.pos{ background:#ecfdf5; border-color:#86efac; color:#065f46; }  /* green */
-  .badge.neg{ background:#fef2f2; border-color:#fca5a5; color:#7f1d1d; }  /* red */
-
-
-  /* ---- Hero ---- */
-  .hero-wrap{
-    position:relative; overflow:hidden; border-radius:14px; min-height:150px; margin:.25rem 0 1rem 0;
-    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
-    background:linear-gradient(90deg, var(--bg-card) 0% 55%, transparent 55% 100%);
-  }
-  #hero-canvas{ position:absolute; left:0; top:0; width:55%; height:100%; display:block; }
-  .hero-inner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:space-between; padding:0 18px; color:var(--text); }
-  .hero-title{ font-size:clamp(22px,3.3vw,42px); font-weight:800; margin:0; font-family:inherit; }
-  .hero-sub{ margin:4px 0 0 0; color:var(--muted); font-size:clamp(12px,1.1vw,16px); font-family:inherit; }
-  .hero-right{ display:flex; align-items:center; justify-content:flex-end; width:40%; }
-  .sn-logo{ height:48px; width:auto; display:block; }
-
-  [data-testid="stPlotlyChart"]{ margin-top:18px !important; margin-bottom:30px !important; }
-</style>
-"""
-
-st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
-
-
-# ---------- Utilities ----------
-def clean_text(x: str, keep_na: bool = False) -> str:
-    if pd.isna(x): return pd.NA if keep_na else ""
-    s = str(x)
-    if _HAS_FTFY:
-        try: s = _ftfy_fix(s)
-        except Exception: pass
-    if any(ch in s for ch in ("Ã","Â","â","ï","€","™")):
-        try:
-            repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-            if repaired.strip(): s = repaired
-        except Exception: pass
-    for bad, good in {"â€™":"'", "â€˜":"‘", "â€œ":"“", "â€\x9d":"”", "â€“":"–", "â€”":"—", "Â":""}.items():
-        s = s.replace(bad, good)
-    s = s.strip()
-    if s.upper() in {"<NA>","NA","N/A","NULL","NONE"}:
-        return pd.NA if keep_na else ""
-    return s
-
-def esc(x) -> str:
-    """HTML-escape any dynamic value used inside unsafe_allow_html blocks."""
-    return _html.escape("" if pd.isna(x) else str(x))
-
-def apply_filter(df: pd.DataFrame, column_name: str, label: str, key: str | None = None):
-    options = ["ALL"]
-    if column_name in df.columns:
-        col = df[column_name].astype("string")
-        options += sorted([x for x in col.dropna().unique().tolist() if str(x).strip() != ""])
-    selected = st.multiselect(f"Select {label}", options=options, default=["ALL"], key=key)
-    if "ALL" not in selected and column_name in df.columns:
-        return df[df[column_name].astype("string").isin(selected)], selected
-    return df, ["ALL"]
-
-def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
-    vals, seen = [], set()
-    for c in cols:
-        if c in df.columns:
-            s = df[c].astype("string").str.strip().dropna()
-            for v in pd.unique(s.to_numpy()):
-                v = str(v).strip()
-                if v and v not in seen:
-                    seen.add(v); vals.append(v)
-    return vals
-
-def is_valid_symptom_value(x) -> bool:
-    if pd.isna(x): return False
-    s = str(x).strip()
-    if not s or s.upper() in {"<NA>","NA","N/A","NULL","NONE"}: return False
-    return not bool(re.fullmatch(r"[\W_]+", s))
-
-def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
-    cols = [c for c in symptom_columns if c in filtered_df.columns]
-    if not cols: return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
-    s = (filtered_df[cols].stack(dropna=True)
-         .map(lambda v: clean_text(v, keep_na=True)).dropna()
-         .astype("string").str.strip())
-    s = s[s.map(is_valid_symptom_value)]
-    if s.empty: return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
-    unique_items = pd.unique(s.to_numpy())
-    results, total_rows = [], len(filtered_df)
-    for item in unique_items:
-        item_str = str(item).strip()
-        mask = filtered_df[cols].isin([item]).any(axis=1)
-        count = int(mask.sum())
-        if count == 0: continue
-        avg_star = filtered_df.loc[mask, "Star Rating"].mean() if "Star Rating" in filtered_df.columns else np.nan
-        pct = (count / total_rows * 100) if total_rows else 0
-        results.append({"Item": item_str.title(),
-                        "Avg Star": round(avg_star,1) if pd.notna(avg_star) else None,
-                        "Mentions": count,
-                        "% Total": f"{round(pct,1)}%"})
-    if not results: return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
-    return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
-
-def highlight_html(text: str, keyword: str | None) -> str:
-    safe = _html.escape(text or "")
-    if keyword:
-        try:
-            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-            safe = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", safe)
-        except re.error:
-            pass
-    return safe
-
-
-# LLM helpers ---------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
-    if not _HAS_OPENAI or not texts:
-        return None
-    client = OpenAI(api_key=api_key)
-    embs = []
-    batch = 512
-    for i in range(0, len(texts), batch):
-        chunk = texts[i:i+batch]
-        resp = client.embeddings.create(model=model, input=chunk)
-        embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
-    if not embs: return None
-    mat = np.vstack(embs).astype(np.float32)
-    norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
-    mat_norm = mat / norms
-    if _HAS_FAISS:
-        index = faiss.IndexFlatIP(mat_norm.shape[1])
-        index.add(mat_norm)
-        return {"backend":"faiss","index":index,"texts":texts}
-    return (mat, norms, texts)
-
-def vector_search(query: str, index, api_key: str, top_k: int = 8):
-    if not _HAS_OPENAI or index is None: return []
-    client = OpenAI(api_key=api_key)
-    qemb = client.embeddings.create(model="text-embedding-3-small", input=[query]).data[0].embedding
-    q = np.array(qemb, dtype=np.float32)
-    qn = np.linalg.norm(q) + 1e-8
-    qn_vec = q / qn
-    if isinstance(index, dict) and index.get("backend") == "faiss":
-        D, I = index["index"].search(qn_vec.reshape(1,-1), top_k)
-        sims = D[0].tolist(); idxs = I[0].tolist(); texts = index["texts"]
-        return [(texts[i], float(sims[j])) for j, i in enumerate(idxs) if i != -1]
-    mat, norms, texts = index
-    sims = (mat @ q) / (norms.flatten() * qn)
-    idx = np.argsort(-sims)[:top_k]
-    return [(texts[i], float(sims[i])) for i in idx]
-
-# ---------- Anchors ----------
-def anchor(id_: str):
-    st.markdown(f"<div id='{id_}'></div>", unsafe_allow_html=True)
-
-def scroll_to(id_: str):
-    st.markdown(
-        f"""
-        <script>
-        (function(id){{
-          function jump(){{
-            const el = document.getElementById(id);
-            if(el) {{
-              el.scrollIntoView({{behavior:'smooth', block:'start'}});
-              window.location.hash = id;
-            }}
-          }}
-          setTimeout(jump, 0); setTimeout(jump, 150); setTimeout(jump, 300); setTimeout(jump, 600);
-        }})('{id_}');
-        </script>
-        """,
-        unsafe_allow_html=True
-    )
-
-# ---------- File Upload ----------
-st.markdown("### 📁 File Upload")
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
-
-if uploaded_file and st.session_state.get("last_uploaded_name") != uploaded_file.name:
-    st.session_state["last_uploaded_name"] = uploaded_file.name
-    st.session_state["force_scroll_top_once"] = True
-
-if not uploaded_file:
-    st.info("Please upload an Excel file to get started.")
-    st.stop()
-
-# ---------- Load & clean ----------
-try:
-    st.markdown("---")
-    try:
-        df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
-    except ValueError:
-        # Fallback to first sheet if the named sheet doesn't exist
-        df = pd.read_excel(uploaded_file)
-
-    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-        if col in df.columns:
-            df[col] = df[col].astype("string").str.upper()
-    if "Star Rating" in df.columns:
-        df["Star Rating"] = pd.to_numeric(df["Star Rating"], errors="coerce")
-
-    all_symptom_cols = [c for c in df.columns if c.startswith("Symptom")]
-    for c in all_symptom_cols:
-        df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
-
-    if "Verbatim" in df.columns:
-        df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
-    if "Review Date" in df.columns:
-        df["Review Date"] = pd.to_datetime(df["Review Date"], errors="coerce")
-except Exception as e:
-    st.error(f"An error occurred: {e}")
-    st.stop()
-
-# ---------- Sidebar filters ----------
-st.sidebar.header("🔍 Filters")
-
-with st.sidebar.expander("🗓️ Timeframe", expanded=False):
-    timeframe = st.selectbox("Select Timeframe",
-                             options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
-                             key="tf")
-    today = datetime.today().date()
-    start_date, end_date = None, None
-    if timeframe == "Custom Range":
-        start_date, end_date = st.date_input(
-            label="Date Range",
-            value=(today - timedelta(days=30), today),
-            min_value=datetime(2000, 1, 1).date(),
-            max_value=today,
-            label_visibility="collapsed"
-        )
-    elif timeframe == "Last Week":  start_date, end_date = today - timedelta(days=7), today
-    elif timeframe == "Last Month": start_date, end_date = today - timedelta(days=30), today
-    elif timeframe == "Last Year":  start_date, end_date = today - timedelta(days=365), today
-
-filtered = df.copy()
-if start_date and end_date and "Review Date" in filtered.columns:
-    filtered = filtered[
-        (filtered["Review Date"] >= pd.Timestamp(start_date)) &
-        (filtered["Review Date"] <= pd.Timestamp(end_date))
-    ]
-
-with st.sidebar.expander("🌟 Star Rating", expanded=False):
-    selected_ratings = st.multiselect("Select Star Ratings", options=["All"] + [1,2,3,4,5],
-                                      default=["All"], key="sr")
-if "All" not in selected_ratings and "Star Rating" in filtered.columns:
-    filtered = filtered[filtered["Star Rating"].isin(selected_ratings)]
-
-with st.sidebar.expander("🌍 Standard Filters", expanded=False):
-    filtered, _ = apply_filter(filtered, "Country", "Country", key="f_Country")
-    filtered, _ = apply_filter(filtered, "Source", "Source", key="f_Source")
-    filtered, _ = apply_filter(filtered, "Model (SKU)", "Model (SKU)", key="f_Model (SKU)")
-    filtered, _ = apply_filter(filtered, "Seeded", "Seeded", key="f_Seeded")
-    filtered, _ = apply_filter(filtered, "New Review", "New Review", key="f_New Review")
-
-detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
-delighter_columns = [f"Symptom {i}" for i in range(11, 21)]
-existing_detractor_columns = [c for c in detractor_columns if c in filtered.columns]
-existing_delighter_columns = [c for c in delighter_columns if c in filtered.columns]
-detractor_symptoms = collect_unique_symptoms(filtered, existing_detractor_columns)
-delighter_symptoms = collect_unique_symptoms(filtered, existing_delighter_columns)
-
-with st.sidebar.expander("🩺 Review Symptoms", expanded=False):
-    selected_delighter = st.multiselect("Select Delighter Symptoms",
-                                        options=["All"] + sorted(delighter_symptoms),
-                                        default=["All"], key="delight")
-    selected_detractor = st.multiselect("Select Detractor Symptoms",
-                                        options=["All"] + sorted(detractor_symptoms),
-                                        default=["All"], key="detract")
-if "All" not in selected_delighter and existing_delighter_columns:
-    filtered = filtered[filtered[existing_delighter_columns].isin(selected_delighter).any(axis=1)]
-if "All" not in selected_detractor and existing_detractor_columns:
-    filtered = filtered[filtered[existing_detractor_columns].isin(selected_detractor).any(axis=1)]
-
-with st.sidebar.expander("🔎 Keyword", expanded=False):
-    keyword = st.text_input("Keyword to search (in review text)", value="", key="kw",
-                            help="Case-insensitive match in review text. Cleans â€™ → '")
-    if keyword and "Verbatim" in filtered.columns:
-        mask_kw = filtered["Verbatim"].astype("string").fillna("").str.contains(keyword.strip(), case=False, na=False)
-        filtered = filtered[mask_kw]
-
-core_cols = {"Country","Source","Model (SKU)","Seeded","New Review","Star Rating","Review Date","Verbatim"}
-symptom_cols = set([f"Symptom {i}" for i in range(1,21)])
-with st.sidebar.expander("📋 Additional Filters", expanded=False):
-    additional_columns = [c for c in df.columns if c not in (core_cols | symptom_cols)]
-    if additional_columns:
-        for column in additional_columns:
-            filtered, _ = apply_filter(filtered, column, column, key=f"f_{column}")
-    else:
-        st.info("No additional filters available.")
-
-with st.sidebar.expander("📄 Review List", expanded=False):
-    rpp_options = [10, 20, 50, 100]
-    default_rpp = st.session_state.get("reviews_per_page", 10)
-    rpp_index = rpp_options.index(default_rpp) if default_rpp in rpp_options else 0
-    rpp = st.selectbox("Reviews per page", options=rpp_options, index=rpp_index, key="rpp")
-    if rpp != default_rpp:
-        st.session_state["reviews_per_page"] = rpp
-        st.session_state["review_page"] = 0
-
-# Clear filters
-if st.sidebar.button("🧹 Clear all filters"):
-    for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] + \
-             [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
-        if k in st.session_state: del st.session_state[k]
-    st.rerun()
-
-# Spacer + divider before LLM assistant
-st.sidebar.write("")
-st.sidebar.markdown("---")
-
-# ---------- LLM settings ----------
-with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
-    _model_choices = [
-        ("Fast & economical – 4o-mini", "gpt-4o-mini"),
-        ("Balanced – 4o", "gpt-4o"),
-        ("Advanced – 4.1", "gpt-4.1"),
-        ("Most advanced – GPT-5", "gpt-5"),
-        ("GPT-5 (Chat latest)", "gpt-5-chat-latest"),
-    ]
-    _default_model = st.session_state.get("llm_model", "gpt-4o-mini")
-    _default_idx = next((i for i, (_, mid) in enumerate(_model_choices) if mid == _default_model), 0)
-    _label = st.selectbox("Model", options=[l for (l, _) in _model_choices], index=_default_idx,
-                          key="llm_model_label")
-    st.session_state["llm_model"] = dict(_model_choices)[_label]
-
-    temp_supported = model_supports_temperature(st.session_state["llm_model"])
-    st.session_state["llm_temp"] = st.slider(
-        "Creativity (temperature)",
-        min_value=0.0, max_value=1.0,
-        value=float(st.session_state.get("llm_temp", 0.2)),
-        step=0.1,
-        disabled=not temp_supported,
-        help=("Lower = more deterministic, higher = more creative. Some models ignore this.")
-    )
-    if not temp_supported:
-        st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
-
-# ---------- Ask your data (LLM) — moved up, with disclaimer ----------
-anchor("askdata-anchor")
-st.markdown("## 🤖 Ask your data")
+# ------------------- Global CSS -------------------
 st.markdown(
-    '<div class="callout warn">⚠️ AI can make mistakes. Numbers are computed from the filtered data via tools, '
-    'but always double-check important conclusions.</div>',
-    unsafe_allow_html=True
-)
-
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-if not _HAS_OPENAI:
-    st.info("To enable this panel, add `openai` to your requirements and redeploy. Then set `OPENAI_API_KEY`.")
-elif not api_key:
-    st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
-else:
-    verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-    index = build_vector_index(verb_series.tolist(), api_key)
-
-    # Ask form; no state is kept after this run
-    with st.form("ask_ai_form", clear_on_submit=True):
-        q = st.text_area("Ask a question", value="", height=80)
-        send = st.form_submit_button("Send")
-
-    if send and q.strip():
-        q = q.strip()
-        # retrieval
-        retrieved = vector_search(q, index, api_key, top_k=8) if index else []
-        quotes = []
-        for txt, sim in retrieved[:5]:
-            s = (txt or "").strip()
-            if len(s) > 0:
-                if len(s) > 320: s = s[:317] + "…"
-                quotes.append(f"• “{s}”")
-        quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
-
-        # ------ Safe helpers for pandas.query ------
-        def _safe_query(qs: str) -> bool:
-            if not qs or len(qs) > 200: return False
-            bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`"]
-            if any(t in qs.lower() for t in bad): return False
-            return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
-
-        # tools
-        def pandas_count(query: str) -> dict:
-            try:
-                if not _safe_query(query): return {"error":"unsafe query"}
-                res = filtered.query(query)  # default engine (numexpr where possible)
-                return {"count": int(len(res))}
-            except Exception as e:
-                return {"error": str(e)}
-
-        def pandas_mean(column: str, query: str | None = None) -> dict:
-            try:
-                if column not in filtered.columns: return {"error": f"Unknown column {column}"}
-                d = filtered if not query else (filtered.query(query) if _safe_query(query) else None)
-                if d is None: return {"error":"unsafe query"}
-                return {"mean": float(pd.to_numeric(d[column], errors='coerce').mean())}
-            except Exception as e:
-                return {"error": str(e)}
-
-        def symptom_stats(symptom: str) -> dict:
-            cols = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in filtered.columns]
-            if not cols: return {"count":0,"avg_star":None}
-            mask = filtered[cols].isin([symptom]).any(axis=1)
-            d = filtered[mask]
-            return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) and "Star Rating" in d.columns else None}
-
-        def keyword_stats(term: str) -> dict:
-            if "Verbatim" not in filtered.columns: return {"count": 0, "pct": 0.0}
-            ser = filtered["Verbatim"].astype("string").fillna("")
-            cnt = int(ser.str.contains(term, case=False, na=False).sum())
-            pct = (cnt / max(1,len(filtered))) * 100.0
-            return {"count": cnt, "pct": pct}
-
-        def get_metrics_snapshot():
-            try:
-                return {
-                    "total_reviews": int(len(filtered)),
-                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
-                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
-                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered.columns else {},
-                }
-            except Exception as e:
-                return {"error": str(e)}
-
-        # local fallback
-        def _local_answer_fallback() -> str:
-            try:
-                parts = []
-                total = int(len(filtered))
-                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total and "Star Rating" in filtered.columns else 0.0
-                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total and "Star Rating" in filtered.columns else 0.0
-                parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
-
-                detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
-                deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
-                def fmt(df):
-                    if df.empty: return "None"
-                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
-                parts.append("**Top detractors:** " + fmt(detr))
-                parts.append("**Top delighters:** " + fmt(deli))
-                return "\n\n".join(parts)
-            except Exception as e:
-                return f"(Fallback summary error: {e})"
-
-        # compose single-turn request
-        selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
-        llm_temp = float(st.session_state.get("llm_temp", 0.2))
-        tools = [
-            {"type":"function","function":{
-                "name":"pandas_count","description":"Count rows matching a pandas query over the CURRENT filtered dataset.",
-                "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-            {"type":"function","function":{
-                "name":"pandas_mean","description":"Mean of a numeric column (optional pandas query).",
-                "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}}},
-            {"type":"function","function":{
-                "name":"symptom_stats","description":"Mentions + avg star for a symptom across Symptom 1–20.",
-                "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}}},
-            {"type":"function","function":{
-                "name":"keyword_stats","description":"Count + % of reviews with term in Verbatim.",
-                "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}}},
-            {"type":"function","function":{
-                "name":"get_metrics_snapshot","description":"Return current page metrics.",
-                "parameters":{"type":"object","properties":{}}}},
-        ]
-        sys_ctx = (
-            "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
-            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
-            "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
-        )
-
-        try:
-            client = OpenAI(api_key=api_key)
-            req = {"model": selected_model,
-                   "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
-                   "tools": tools}
-            if model_supports_temperature(selected_model): req["temperature"] = llm_temp
-            with st.spinner("Thinking..."):
-                first = client.chat.completions.create(**req)
-            msg = first.choices[0].message
-            tool_msgs = []
-            if msg.tool_calls:
-                for call in msg.tool_calls:
-                    name = call.function.name
-                    args = json.loads(call.function.arguments or "{}")
-                    out = {"error":"unknown tool"}
-                    if name == "pandas_count": out = pandas_count(args.get("query",""))
-                    if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                    if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
-                    if name == "keyword_stats": out = keyword_stats(args.get("term",""))
-                    if name == "get_metrics_snapshot": out = get_metrics_snapshot()
-                    tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
-            if tool_msgs:
-                follow = {"model": selected_model,
-                          "messages":[
-                              {"role":"system","content":sys_ctx},
-                              {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                              *tool_msgs
-                          ]}
-                if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
-                res2 = client.chat.completions.create(**follow)
-                final_text = res2.choices[0].message.content
-            else:
-                final_text = msg.content
-        except Exception:
-            final_text = _local_answer_fallback()
-
-        # show the single Q/A (not stored)
-        st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-
-st.markdown("---")
-
-# ---------- Metrics ----------
-st.markdown("## ⭐ Star Rating Metrics")
-st.caption("All metrics below reflect the **currently filtered** dataset.")
-
-def pct_12(series: pd.Series) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    return float((s <= 2).mean() * 100) if not s.empty else 0.0
-
-def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
-    cnt = len(sub)
-    if cnt == 0 or "Star Rating" not in sub.columns:
-        return 0, 0.0, 0.0
-    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
-    pct = pct_12(sub["Star Rating"])
-    return cnt, avg, pct
-
-# Robust Seeded split (handles missing column)
-if "Seeded" in filtered.columns:
-    seed_mask = filtered["Seeded"].astype("string").str.upper().eq("YES")
-else:
-    seed_mask = pd.Series(False, index=filtered.index)
-
-all_cnt, all_avg, all_low = section_stats(filtered)
-org = filtered[~seed_mask]
-seed = filtered[seed_mask]
-org_cnt, org_avg, org_low = section_stats(org)
-seed_cnt, seed_avg, seed_low = section_stats(seed)
-
-def card_html(title, count, avg, pct):
-    return textwrap.dedent(f"""
-    <div class="metric-card">
-      <h4>{_html.escape(title)}</h4>
-      <div class="metric-row">
-        <div class="metric-box">
-          <div class="metric-label">Count</div>
-          <div class="metric-kpi">{count:,}</div>
-        </div>
-        <div class="metric-box">
-          <div class="metric-label">Avg ★</div>
-          <div class="metric-kpi">{avg:.1f}</div>
-        </div>
-        <div class="metric-box">
-          <div class="metric-label">% 1–2★</div>
-          <div class="metric-kpi">{pct:.1f}%</div>
-        </div>
-      </div>
-    </div>
-    """).strip()
-
-st.markdown(
-    (
-        '<div class="metrics-grid">'
-        f'{card_html("All Reviews", all_cnt, all_avg, all_low)}'
-        f'{card_html("Organic (non-Seeded)", org_cnt, org_avg, org_low)}'
-        f'{card_html("Seeded", seed_cnt, seed_avg, seed_low)}'
-        '</div>'
-    ),
+    """
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+      :root { --brand:#7c3aed; --brand2:#06b6d4; --ok:#16a34a; --bad:#dc2626; --muted:#6b7280; }
+      html, body, .stApp { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+      .stApp { background:
+        radial-gradient(1200px 500px at 10% -20%, rgba(124,58,237,.18), transparent 60%),
+        radial-gradient(1200px 500px at 100% 0%, rgba(6,182,212,.16), transparent 60%);
+      }
+      .hero { border-radius: 20px; padding: 18px 22px; color: #0b1020;
+        background: linear-gradient(180deg, rgba(255,255,255,.95), rgba(255,255,255,.86));
+        border: 1px solid rgba(226,232,240,.9);
+        box-shadow: 0 10px 30px rgba(16,24,40,.08), 0 2px 6px rgba(16,24,40,.06) inset; }
+      .hero-stats { display:flex; gap:14px; flex-wrap:wrap; margin-top: 6px; }
+      .stat { background:#fff; border:1px solid #e6eaf0; border-radius:16px; padding:12px 16px; min-width:160px;
+        box-shadow: 0 2px 8px rgba(16,24,40,.05); }
+      .stat.accent { border-color: rgba(124,58,237,.35); box-shadow: 0 4px 12px rgba(124,58,237,.15); }
+      .stat .label{ font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#64748b; }
+      .stat .value{ font-size:28px; font-weight:800; }
+      .chip-wrap {display:flex; flex-wrap:wrap; gap:8px;}
+      .chip { padding:6px 10px; border-radius:999px; font-size:12.5px; border:1px solid #e6eaf0; background:#fff; box-shadow: 0 1px 2px rgba(16,24,40,.06); }
+      .chip.red { background: #fff1f2; border-color:#fecdd3; }
+      .chip.green { background: #ecfdf3; border-color:#bbf7d0; }
+      .chip.blue { background: #e0f2fe; border-color:#bae6fd; }
+      .chip.yellow { background: #fff7ed; border-color:#fed7aa; }
+      .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
+      .muted{ color:#64748b; font-size:12px; }
+      .chips-block { margin-bottom: 16px; }
+      .stButton > button { height: 40px; border-radius: 10px; font-weight: 600;
+        background: linear-gradient(180deg, #ffffff, #f7f8fb);
+        border: 1px solid #e6eaf0; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+      .stButton > button:hover { border-color: rgba(124,58,237,.35); box-shadow: 0 2px 6px rgba(124,58,237,.15); }
+      div.batch-row .stNumberInput input { height: 40px; font-weight: 700; }
+      div.batch-row .stButton > button { border-radius: 999px; height: 36px; font-weight: 700; min-width: 72px;
+        background: #fff; border: 1px solid rgba(6,182,212,.45); }
+      div.batch-row .stButton > button:hover { background: #f0fdff; border-color: var(--brand2); }
+      mark.hl { background: #fde68a; padding: 0 .15em; border-radius: .25em; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-# Distribution chart (guard for missing column)
-if "Star Rating" in filtered.columns:
-    star_counts = pd.to_numeric(filtered["Star Rating"], errors="coerce").dropna().value_counts().sort_index()
-else:
-    star_counts = pd.Series([], dtype="int")
-total_reviews = len(filtered)
-percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
-star_labels = [f"{int(star)} stars" for star in star_counts.index]
+# ------------------- Utilities -------------------
+NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
-fig_bar_horizontal = go.Figure(go.Bar(
-    x=star_counts.values, y=star_labels, orientation="h",
-    text=[f"{value} reviews ({percentages.get(idx, 0)}%)"
-          for idx, value in zip(star_counts.index, star_counts.values)],
-    textposition="auto",
-    marker=dict(color=["#EF4444", "#F59E0B", "#EAB308", "#10B981", "#22C55E"]),
-    hoverinfo="y+x+text"
-))
-fig_bar_horizontal.update_layout(
-    title="<b>Star Rating Distribution</b>",
-    xaxis=dict(title="Number of Reviews", showgrid=False),
-    yaxis=dict(title="Star Ratings", showgrid=False),
-    plot_bgcolor="white",
-    template="plotly_white",
-    margin=dict(l=40, r=40, t=45, b=40)
-)
-st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-
-
-# ---------- Symptom Tables ----------
-st.markdown("### 🩺 Symptom Tables")
-detractors_results = analyze_delighters_detractors(filtered, existing_detractor_columns).head(20)
-delighters_results = analyze_delighters_detractors(filtered, existing_delighter_columns).head(20)
-
-view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
-
-def _styled_table(df_in: pd.DataFrame):
-    if df_in.empty: return df_in
-    def colstyle(v):
-        if pd.isna(v): return ""
-        try:
-            v = float(v)
-            if v >= 4.5: return "color:#065F46;font-weight:600;"
-            if v < 4.5:  return "color:#7F1D1D;font-weight:600;"
-        except: pass
+def clean_text(x):
+    if pd.isna(x):
         return ""
-    return df_in.style.applymap(colstyle, subset=["Avg Star"]) \
-                      .format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})
+    return str(x).strip()
 
-if view_mode == "Split":
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.subheader("All Detractors")
-        st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
-                     use_container_width=True, hide_index=True)
-    with c2:
-        st.subheader("All Delighters")
-        st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
-                     use_container_width=True, hide_index=True)
-else:
-    tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
-    with tab1:
-        st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results,
-                     use_container_width=True, hide_index=True)
-    with tab2:
-        st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results,
-                     use_container_width=True, hide_index=True)
+def is_filled(val) -> bool:
+    if pd.isna(val):
+        return False
+    s = str(val).strip()
+    return (s != "") and (s.upper() not in NON_VALUES)
 
-st.markdown("---")
+@st.cache_data(show_spinner=False)
+def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
+    bio = io.BytesIO(file_bytes)
+    try:
+        df_sym = pd.read_excel(bio, sheet_name="Symptoms")
+    except Exception:
+        return [], [], {}
+    if df_sym is None or df_sym.empty:
+        return [], [], {}
 
-# ---------- Reviews ----------
-st.markdown("### 📝 All Reviews")
+    df_sym.columns = [str(c).strip() for c in df_sym.columns]
+    lowcols = {c.lower(): c for c in df_sym.columns}
 
-if not filtered.empty:
-    csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Download ALL filtered reviews (CSV)", csv_bytes,
-                       file_name="filtered_reviews.csv", mime="text/csv")
+    alias_col = next((lowcols.get(c) for c in ["aliases", "alias"] if c in lowcols), None)
+    label_col = next((lowcols.get(c) for c in ["symptom", "label", "name", "item"] if c in lowcols), None)
+    type_col  = next((lowcols.get(c) for c in ["type", "polarity", "category", "side"] if c in lowcols), None)
 
-if "review_page" not in st.session_state: st.session_state["review_page"] = 0
-reviews_per_page = st.session_state.get("reviews_per_page", 10)
-total_reviews_count = len(filtered)
-total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
-current_page = min(max(st.session_state["review_page"], 0), total_pages - 1)
-start_index = current_page * reviews_per_page
-end_index = start_index + reviews_per_page
-paginated = filtered.iloc[start_index:end_index]
+    POS_TAGS = {"delighter", "delighters", "positive", "pos", "pros"}
+    NEG_TAGS = {"detractor", "detractors", "negative", "neg", "cons"}
 
-if paginated.empty:
-    st.warning("No reviews match the selected criteria.")
-else:
-    for _, row in paginated.iterrows():
-        review_text = row.get("Verbatim", pd.NA)
-        review_text = "" if pd.isna(review_text) else clean_text(review_text)
-        display_review_html = highlight_html(review_text, st.session_state.get("kw", ""))
+    def _clean(series: pd.Series) -> List[str]:
+        vals = series.dropna().astype(str).map(str.strip)
+        out, seen = [], set()
+        for v in vals:
+            if v and v not in seen:
+                seen.add(v); out.append(v)
+        return out
 
-        date_val = row.get("Review Date", pd.NaT)
-        if pd.isna(date_val): date_str = "-"
+    delighters, detractors, alias_map = [], [], {}
+
+    if label_col and type_col:
+        df_sym[type_col] = df_sym[type_col].astype(str).str.lower().str.strip()
+        delighters = _clean(df_sym.loc[df_sym[type_col].isin(POS_TAGS), label_col])
+        detractors = _clean(df_sym.loc[df_sym[type_col].isin(NEG_TAGS), label_col])
+        if alias_col:
+            for _, r in df_sym.iterrows():
+                lbl = str(r.get(label_col, "")).strip()
+                als = str(r.get(alias_col, "")).strip()
+                if lbl and als:
+                    als_norm = als.replace(",", "|")
+                    alias_map[lbl] = [p.strip() for p in als_norm.split("|") if p.strip()]
+    else:
+        for lc, orig in lowcols.items():
+            if ("delight" in lc) or ("positive" in lc) or lc in {"pros"}:
+                delighters.extend(_clean(df_sym[orig]))
+            if ("detract" in lc) or ("negative" in lc) or lc in {"cons"}:
+                detractors.extend(_clean(df_sym[orig]))
+        delighters = list(dict.fromkeys(delighters))
+        detractors = list(dict.fromkeys(detractors))
+
+    return delighters, detractors, alias_map
+
+# Canonicalization helpers
+def _canon(s: str) -> str:
+    return " ".join(str(s).split()).lower().strip()
+def _canon_simple(s: str) -> str:
+    return "".join(ch for ch in _canon(s) if ch.isalnum())
+
+# Evidence highlighting
+def highlight_text(text: str, terms: List[str]) -> str:
+    safe = html.escape(str(text))
+    terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
+    if not terms: return safe
+    uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
+    try:
+        pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
+    except Exception:
+        return safe
+    return pattern.sub(lambda m: f"<mark class='hl'>{html.escape(m.group(0))}</mark>", safe)
+
+# Schema detection
+def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
+    cols = [str(c).strip() for c in df.columns]
+    man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
+    man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in cols]
+    ai_det  = [c for c in cols if c.startswith("AI Symptom Detractor ")]
+    ai_del  = [c for c in cols if c.startswith("AI Symptom Delighter ")]
+    return {
+        "manual_detractors": man_det,
+        "manual_delighters": man_del,
+        "ai_detractors": ai_det,
+        "ai_delighters": ai_del,
+    }
+
+def row_has_any(row: pd.Series, columns: List[str]) -> bool:
+    if not columns: return False
+    for c in columns:
+        if c in row and is_filled(row[c]): return True
+    return False
+
+def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFrame:
+    det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
+    del_cols = colmap["manual_delighters"] + colmap["ai_delighters"]
+    out = df.copy()
+    out["Has_Detractors"] = out.apply(lambda r: row_has_any(r, det_cols), axis=1)
+    out["Has_Delighters"] = out.apply(lambda r: row_has_any(r, del_cols), axis=1)
+    out["Needs_Detractors"] = ~out["Has_Detractors"]
+    out["Needs_Delighters"] = ~out["Has_Delighters"]
+    out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
+    return out
+
+# ------------------- Fixed template mapping -------------------
+DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]
+DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
+DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
+DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
+
+# Meta columns after AD (headers only if blank)
+# NEW: add "Label Overflow" at AH (data column in df is "AI Label Overflow")
+META_ORDER = [("Safety", "AE"), ("Reliability", "AF"), ("# of Sessions", "AG"), ("Label Overflow", "AH")]
+META_INDEXES = {name: column_index_from_string(col) for name, col in META_ORDER}
+
+AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
+AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
+AI_META_HEADERS = ["AI Safety", "AI Reliability", "AI # of Sessions", "AI Label Overflow"]  # <- NEW
+
+def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    for h in AI_DET_HEADERS + AI_DEL_HEADERS + AI_META_HEADERS:
+        if h not in df_in.columns:
+            df_in[h] = None
+    return df_in
+
+def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
+    del_map = {_canon(x): x for x in delighters}
+    det_map = {_canon(x): x for x in detractors}
+    alias_to_label: Dict[str, str] = {}
+    for label, aliases in (alias_map or {}).items():
+        for a in aliases:
+            alias_to_label[_canon(a)] = label
+    return del_map, det_map, alias_to_label
+
+# ---------- LLM helpers ----------
+SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
+RELIABILITY_ENUM = ["Not Mentioned", "Negative", "Neutral", "Positive"]
+SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
+
+def _symptom_list_version(delighters: List[str], detractors: List[str], aliases: Dict[str, List[str]]) -> str:
+    payload = json.dumps({"del": delighters, "det": detractors, "ali": aliases}, sort_keys=True, ensure_ascii=False)
+    try:
+        import hashlib
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        return f"{len(delighters)}_{len(detractors)}"
+
+def _ensure_label_cache():
+    if "_label_cache" not in st.session_state:
+        st.session_state["_label_cache"] = {}
+    return st.session_state["_label_cache"]
+
+def _openai_labeler(
+    verbatim: str,
+    client,
+    model: str,
+    temperature: float,
+    delighters: List[str],
+    detractors: List[str],
+    alias_map: Dict[str, List[str]],
+    del_map: Dict[str, str],
+    det_map: Dict[str, str],
+    alias_to_label: Dict[str, str],
+    max_ev_per_label: int = 2,
+    max_ev_chars: int = 120,
+) -> Tuple[List[str], List[str], List[str], List[str], Dict[str, List[str]], Dict[str, List[str]]]:
+    """
+    Evidence-locked version with in-session cache.
+    Returns:
+      dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map
+    """
+    if (client is None) or (not verbatim or not verbatim.strip()):
+        return [], [], [], [], {}, {}
+
+    v = _symptom_list_version(delighters, detractors, alias_map)
+    key = ("lab", _canon(verbatim), model, f"{temperature:.2f}", v, max_ev_per_label, max_ev_chars)
+    cache = _ensure_label_cache()
+    if key in cache:
+        return cache[key]
+
+    sys = "\n".join([
+        "You label consumer reviews with predefined symptom lists.",
+        "Return STRICT JSON with this schema:",
+        '{"detractors":[{"label":"<one from allowed detractors or close alias>","evidence":["<exact substring from review>", "..."]}],',
+        ' "delighters":[{"label":"<one from allowed delighters or close alias>","evidence":["<exact substring>", "..."]}],',
+        ' "unlisted_detractors":["..."], "unlisted_delighters":["..."]}',
+        "",
+        "Rules:",
+        f"- Evidence MUST be exact substrings from the review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
+        "- Only include a label if there is clear textual support in the review.",
+        "- Use the allowed lists; if close wording appears, pick the closest allowed label or list it under unlisted_*.",
+        "- Cap to maximum 10 detractors and 10 delighters.",
+    ])
+    user_payload = {
+        "review": verbatim.strip(),
+        "allowed_delighters": delighters,
+        "allowed_detractors": detractors
+    }
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=float(temperature),
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": json.dumps(user_payload)}],
+            response_format={"type": "json_object"}
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+    except Exception:
+        return [], [], [], [], {}, {}
+
+    # Normalize structure
+    raw_dels = data.get("delighters", []) or []
+    raw_dets = data.get("detractors", []) or []
+    unl_dels = [x for x in (data.get("unlisted_delighters", []) or [])][:10]
+    unl_dets = [x for x in (data.get("unlisted_detractors", []) or [])][:10]
+
+    def _canon_map_item(obj: Any, side: str) -> Tuple[Optional[str], List[str]]:
+        try:
+            lbl_raw = str(obj.get("label", "")).strip()
+            evs = [str(e)[:max_ev_chars] for e in (obj.get("evidence", []) or []) if isinstance(e, str) and e.strip()]
+        except Exception:
+            lbl_raw, evs = "", []
+        key2 = _canon(lbl_raw)
+        if side == "del":
+            label = del_map.get(key2) or alias_to_label.get(key2)
+            if label and (label in delighters):
+                return label, evs[:max_ev_per_label]
         else:
-            try: date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
-            except Exception: date_str = "-"
+            label = det_map.get(key2) or alias_to_label.get(key2)
+            if label and (label in detractors):
+                return label, evs[:max_ev_per_label]
+        return None, []
 
-        def chips(row, columns, css_class):
-            items = []
-            for c in columns:
-                val = row.get(c, pd.NA)
-                if pd.isna(val): continue
-                s = str(val).strip()
-                if not s or s.upper() in {"<NA>","NA","N/A","-"}: continue
-                items.append(f'<span class="badge {css_class}">{_html.escape(s)}</span>')
-            return f'<div class="badges">{"".join(items)}</div>' if items else "<i>None</i>"
+    dels: List[str] = []
+    dets: List[str] = []
+    ev_del_map: Dict[str, List[str]] = {}
+    ev_det_map: Dict[str, List[str]] = {}
 
-        delighter_message = chips(row, existing_delighter_columns, "pos")
-        detractor_message = chips(row, existing_detractor_columns, "neg")
+    for obj in raw_dels:
+        label, evs = _canon_map_item(obj, side="del")
+        if label and (label not in dels):
+            dels.append(label)
+            ev_del_map[label] = evs
+        if len(dels) >= 10: break
 
-        star_val = row.get("Star Rating", 0)
-        try: star_int = int(star_val) if pd.notna(star_val) else 0
-        except Exception: star_int = 0
+    for obj in raw_dets:
+        label, evs = _canon_map_item(obj, side="det")
+        if label and (label not in dets):
+            dets.append(label)
+            ev_det_map[label] = evs
+        if len(dets) >= 10: break
 
-        st.markdown(
-            f"""
-            <div class="review-card">
-                <p><strong>Source:</strong> {esc(row.get('Source'))} | <strong>Model:</strong> {esc(row.get('Model (SKU)'))}</p>
-                <p><strong>Country:</strong> {esc(row.get('Country'))} | <strong>Date:</strong> {esc(date_str)}</p>
-                <p><strong>Rating:</strong> {'⭐' * star_int} ({esc(row.get('Star Rating'))}/5)</p>
-                <p><strong>Review:</strong> {display_review_html}</p>
-                <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
-                <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
+    out = (dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map)
+    cache[key] = out
+    return out
+
+def _openai_meta_extractor(verbatim: str, client, model: str, temperature: float) -> Tuple[str, str, str]:
+    if (client is None) or (not verbatim or not verbatim.strip()):
+        return "Not Mentioned", "Not Mentioned", "Unknown"
+    sys = "\n".join([
+        "Extract three fields from this consumer review. Use ONLY the allowed values.",
+        "SAFETY one of: ['Not Mentioned','Concern','Positive']",
+        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
+        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
+        'Return strict JSON {"safety":"…","reliability":"…","sessions":"…"}',
+    ])
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=float(temperature),
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": f'Review:\n"""{verbatim.strip()}"""'}],
+            response_format={"type": "json_object"}
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        s = str(data.get("safety", "Not Mentioned")).strip()
+        r = str(data.get("reliability", "Not Mentioned")).strip()
+        n = str(data.get("sessions", "Unknown")).strip()
+        s = s if s in SAFETY_ENUM else "Not Mentioned"
+        r = r if r in RELIABILITY_ENUM else "Not Mentioned"
+        n = n if n in SESSIONS_ENUM else "Unknown"
+        return s, r, n
+    except Exception:
+        return "Not Mentioned", "Not Mentioned", "Unknown"
+
+# ---------------- Embeddings-based skim (robust) ----------------
+EMBED_MODEL = st.secrets.get("OPENAI_EMBED_MODEL",
+                             os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
+
+def _chunk_text(t: str, max_chars: int = 5000, overlap: int = 200) -> List[str]:
+    t = (t or "").strip()
+    if not t:
+        return []
+    chunks = []
+    i, n = 0, len(t)
+    while i < n:
+        j = min(i + max_chars, n)
+        chunks.append(t[i:j])
+        if j >= n: break
+        i = max(0, j - overlap)
+    return chunks
+
+@st.cache_data(show_spinner=False)
+def build_vector_index(texts: List[str], api_key: Optional[str], batch_size: int = 128) -> Dict[str, Any]:
+    """
+    Returns: {"vectors": np.ndarray, "chunks": list[str], "index_map": list[tuple[row_idx, chunk_idx]]}
+    """
+    if not (_HAS_OPENAI and api_key):
+        return {"vectors": None, "chunks": [], "index_map": []}
+
+    client = OpenAI(api_key=api_key)
+
+    # Clean & chunk
+    cleaned: List[Tuple[int, str]] = []
+    for row_idx, t in enumerate(texts or []):
+        if isinstance(t, str) and t.strip():
+            for c in _chunk_text(t, max_chars=3000, overlap=150):
+                cleaned.append((row_idx, c))
+    if not cleaned:
+        return {"vectors": None, "chunks": [], "index_map": []}
+
+    # Build chunks + index map [(row_idx, local_chunk_idx)]
+    index_map: List[Tuple[int, int]] = []
+    chunks: List[str] = []
+    current_parent = -1
+    local_idx = -1
+    for row_idx, c in cleaned:
+        if row_idx != current_parent:
+            current_parent = row_idx
+            local_idx = 0
+        else:
+            local_idx += 1
+        index_map.append((row_idx, local_idx))
+        chunks.append(c)
+
+    # Embed in batches
+    vectors: List[List[float]] = []
+    try:
+        for i in range(0, len(chunks), batch_size):
+            batch = [b for b in chunks[i:i+batch_size] if isinstance(b, str) and b.strip()]
+            if not batch: continue
+            resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+            vectors.extend([d.embedding for d in resp.data])
+    except Exception:
+        # Re-raise to put details in logs; Streamlit UI shows guidance below
+        raise
+
+    if not vectors:
+        return {"vectors": None, "chunks": [], "index_map": []}
+
+    return {
+        "vectors": np.array(vectors, dtype=float),
+        "chunks": chunks,
+        "index_map": index_map,
+    }
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    na = np.linalg.norm(a); nb = np.linalg.norm(b)
+    if na == 0 or nb == 0: return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+def embed_query(text: str, api_key: Optional[str]) -> Optional[np.ndarray]:
+    if not (_HAS_OPENAI and api_key and text and text.strip()):
+        return None
+    client = OpenAI(api_key=api_key)
+    resp = client.embeddings.create(model=EMBED_MODEL, input=[text.strip()])
+    return np.array(resp.data[0].embedding, dtype=float)
+
+def top_k_chunks(query_vec: np.ndarray, index: Dict[str, Any], k: int = 12) -> List[Tuple[int, float, str]]:
+    V = index.get("vectors"); chunks = index.get("chunks", [])
+    if V is None or V.shape[0] == 0: return []
+    sims = [(_cosine_sim(query_vec, V[i]), i) for i in range(V.shape[0])]
+    sims.sort(reverse=True)
+    out = []
+    for s, i in sims[:k]:
+        out.append((i, s, chunks[i]))
+    return out
+
+def _sample_diverse_chunks(index: Dict[str, Any], n: int = 24, seed: int = 7) -> List[str]:
+    chunks = index.get("chunks", [])
+    if not chunks: return []
+    random.seed(seed)
+    if len(chunks) <= n:
+        return chunks
+    # light “diversity”: sort by length buckets and sample
+    chunks_sorted = sorted(chunks, key=len)
+    step = max(1, len(chunks_sorted) // n)
+    picks = [chunks_sorted[i] for i in range(0, len(chunks_sorted), step)]
+    if len(picks) > n:
+        picks = random.sample(picks, n)
+    return picks
+
+def summarize_product(chunks: List[str], client: Optional[OpenAI], model: str, temperature: float) -> str:
+    if not (client and chunks):
+        return ""
+    # cap total tokens by limiting number and size
+    snippets = [c[:400] for c in chunks[:24]]
+    prompt = {
+        "role": "user",
+        "content": json.dumps({
+            "task": "Summarize product understanding to aid mass classification.",
+            "instructions": [
+                "Use only the provided snippets (may be noisy).",
+                "Return short bullet points under these headings:",
+                "1) Top Detractor Themes",
+                "2) Top Delighter Themes",
+                "3) Likely Vocabulary / Aliases",
+                "4) Ambiguities / Edge Cases to watch",
+                "5) Quick Tagging Heuristics (succinct rules)",
+            ],
+            "snippets": snippets
+        })
+    }
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=float(temperature),
+            messages=[
+                {"role": "system", "content": "You are a rigorous QA analyst for consumer reviews. Be concise and concrete."},
+                prompt
+            ]
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+# ------------------- File Upload -------------------
+uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
+if not uploaded_file: st.stop()
+
+uploaded_bytes = uploaded_file.read(); uploaded_file.seek(0)
+try:
+    df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
+except ValueError:
+    uploaded_file.seek(0); df = pd.read_excel(uploaded_file)
+
+if "Verbatim" not in df.columns:
+    st.error("Missing 'Verbatim' column."); st.stop()
+
+# Normalize
+df.columns = [str(c).strip() for c in df.columns]
+df["Verbatim"] = df["Verbatim"].map(clean_text)
+
+# Load Symptoms
+DELIGHTERS, DETRACTORS, ALIASES = get_symptom_whitelists(uploaded_bytes)
+if not DELIGHTERS and not DETRACTORS:
+    st.warning("⚠️ No Symptoms found in 'Symptoms' tab.")
+else:
+    st.success(f"Loaded {len(DELIGHTERS)} Delighters, {len(DETRACTORS)} Detractors from Symptoms tab.")
+
+# Canonical maps
+DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
+
+# ------------------- Detection & KPIs -------------------
+colmap = detect_symptom_columns(df)
+work = detect_missing(df, colmap)
+
+total = len(work)
+need_del = int(work["Needs_Delighters"].sum())
+need_det = int(work["Needs_Detractors"].sum())
+need_both = int(work["Needs_Symptomization"].sum())
+
+st.markdown(f"""
+<div class="hero">
+  <div class="hero-stats">
+    <div class="stat"><div class="label">Total Reviews</div><div class="value">{total:,}</div></div>
+    <div class="stat"><div class="label">Need Delighters</div><div class="value">{need_del:,}</div></div>
+    <div class="stat"><div class="label">Need Detractors</div><div class="value">{need_det:,}</div></div>
+    <div class="stat accent"><div class="label">Missing Both</div><div class="value">{need_both:,}</div></div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ------------------- LLM & Similarity Settings -------------------
+st.sidebar.header("🤖 LLM Settings")
+MODEL_CHOICES = {
+    "Fast – GPT-4o-mini": "gpt-4o-mini",
+    "Balanced – GPT-4o": "gpt-4o",
+    "Advanced – GPT-4.1": "gpt-4.1",
+    "Most Advanced – GPT-5": "gpt-5",
+}
+model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=1)
+selected_model = MODEL_CHOICES[model_label]
+temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
+
+# API Client
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
+if client is None:
+    st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai' (>=1.0.0).")
+
+# Similarity guard for new-symptom proposals
+sim_threshold = st.sidebar.slider("New-symptom similarity guard", 0.80, 0.99, 0.94, 0.01,
+                                  help="Raise to suppress near-duplicates; lower to see more proposals.")
+
+# ----- Evidence settings -----
+require_evidence = st.sidebar.checkbox(
+    "Require evidence to write labels",
+    value=True,
+    help="If ON, a label must include ≥1 exact snippet from the review to be written."
+)
+max_ev_per_label = st.sidebar.slider("Max evidence per label", 1, 3, 2)
+max_ev_chars = st.sidebar.slider("Max evidence length (chars)", 40, 200, 120, 10)
+
+# ----- Optional Review Skim (Embeddings) -----
+st.subheader("📚 Optional Review Skim (Embeddings)")
+col_a, col_b, col_c = st.columns([1.2, 1.2, 2.2])
+with col_a:
+    do_build = st.button("🔎 Build/Refresh Embedding Index")
+with col_b:
+    do_skim = st.button("🧭 Generate Product Skim Summary")
+
+if do_build:
+    try:
+        with st.spinner(f"Embedding {len(df)} reviews with {EMBED_MODEL}..."):
+            VINDEX = build_vector_index(df["Verbatim"].astype(str).tolist(), api_key)
+            st.session_state["VINDEX"] = VINDEX
+        st.success("Embedding index built.")
+    except Exception:
+        st.error(
+            "Embedding request failed. Common causes:\n"
+            "• Using a chat model instead of an embedding model\n"
+            "• Empty/invalid inputs\n"
+            "• Batch too large or text too long\n\n"
+            f"Model used: {EMBED_MODEL}"
         )
 
-# Pager
-p1, p2, p3, p4, p5 = st.columns([1,1,2,1,1])
-with p1:
-    if st.button("⏮ First", disabled=current_page == 0):
-        st.session_state["review_page"] = 0; st.rerun()
-with p2:
-    if st.button("⬅ Prev", disabled=current_page == 0):
-        st.session_state["review_page"] = max(current_page - 1, 0); st.rerun()
-with p3:
-    showing_from = 0 if total_reviews_count == 0 else start_index + 1
-    showing_to = min(end_index, total_reviews_count)
-    st.markdown(
-        f"<div style='text-align:center;font-weight:700;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
-        unsafe_allow_html=True,
-    )
-with p4:
-    if st.button("Next ➡", disabled=current_page >= total_pages - 1):
-        st.session_state["review_page"] = min(current_page + 1, total_pages - 1); st.rerun()
-with p5:
-    if st.button("Last ⏭", disabled=current_page >= total_pages - 1):
-        st.session_state["review_page"] = total_pages - 1; st.rerun()
-
-st.markdown("---")
-
-# ---------- Feedback (anchor fallback) ----------
-anchor("feedback-anchor")
-st.markdown("## 💬 Submit Feedback")
-st.caption("Tell us what to improve. We care about making this tool user-centric.")
-
-def send_feedback_via_email(subject: str, body: str) -> bool:
-    try:
-        host = st.secrets.get("SMTP_HOST")
-        port = int(st.secrets.get("SMTP_PORT", 587))
-        user = st.secrets.get("SMTP_USER")
-        pwd  = st.secrets.get("SMTP_PASS")
-        sender = st.secrets.get("SMTP_FROM", user or "")
-        to = st.secrets.get("SMTP_TO", "wseddon@sharkninja.com")
-        if not (host and port and sender and to):
-            return False
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = to
-        msg.set_content(body)
-        with smtplib.SMTP(host, port) as s:
-            s.starttls()
-            if user and pwd: s.login(user, pwd)
-            s.send_message(msg)
-        return True
-    except Exception:
-        return False
-
-with st.form("feedback_form", clear_on_submit=True):
-    name = st.text_input("Your name (optional)")
-    email = st.text_input("Your email (optional)")
-    message = st.text_area("Feedback / feature request", placeholder="Type your feedback here…", height=140)
-    submitted = st.form_submit_button("Submit feedback")
-if submitted:
-    if not message.strip():
-        st.warning("Please enter some feedback before submitting.")
+if do_skim:
+    VINDEX = st.session_state.get("VINDEX", {"vectors": None, "chunks": []})
+    if VINDEX.get("vectors") is None or not VINDEX.get("chunks"):
+        st.info("No embedding index yet. Click **Build/Refresh Embedding Index** first.")
     else:
-        body = f"Name: {name or '-'}\nEmail: {email or '-'}\n\nFeedback:\n{message}"
-        ok = send_feedback_via_email("Star Walk — Feedback", body)
-        if ok: st.success("Thanks! Your feedback was sent.")
+        with st.spinner("Summarizing..."):
+            picks = _sample_diverse_chunks(VINDEX, n=24, seed=13)
+            summary = summarize_product(picks, client, selected_model, temperature)
+        if summary:
+            st.markdown("#### 📌 Product Skim Summary")
+            st.write(summary)
         else:
-            st.link_button("Open email to wseddon@sharkninja.com",
-                           url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={_html.escape(message)}")
+            st.info("No summary produced (check API settings).")
 
-# one-time scroll on fresh upload
-if st.session_state.get("force_scroll_top_once"):
-    st.session_state["force_scroll_top_once"] = False
-    st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+# ------------------- Scope & Preview -------------------
+st.subheader("🧪 Symptomize")
+scope = st.selectbox(
+    "Choose scope",
+    ["Missing both", "Any missing", "Missing delighters only", "Missing detractors only"],
+    index=0,
+)
+
+if scope == "Missing both":
+    target = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+elif scope == "Missing delighters only":
+    target = work[(work["Needs_Delighters"]) & (~work["Needs_Detractors"])]
+elif scope == "Missing detractors only":
+    target = work[(~work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+else:
+    target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
+
+st.write(f"🔎 **{len(target):,} reviews** match the selected scope.")
+with st.expander("Preview in-scope rows", expanded=False):
+    preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
+    extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
+    st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
+
+# ------------------- Controls -------------------
+processed_rows: List[Dict] = []
+processed_idx_set: Set[int] = set()
+if "undo_stack" not in st.session_state:
+    st.session_state["undo_stack"] = []
+
+# Row 1: actions
+r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
+with r1a: run_n_btn = st.button("▶️ Symptomize N", use_container_width=True)
+with r1b: run_all_btn = st.button("🚀 Symptomize All", use_container_width=True)
+with r1c: overwrite_btn = st.button("♻️ Overwrite & Re-symptomize", use_container_width=True)
+with r1d: run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
+with r1e: undo_btn = st.button("↩️ Undo last run", use_container_width=True)
+
+# Small spacer
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+# Row 2: batch size + presets
+st.markdown("<div class='batch-row'></div>", unsafe_allow_html=True)
+cA, cB, cC, cD, cE = st.columns([1.0, 0.5, 0.5, 0.5, 0.5])
+
+with cA:
+    bound_min = 1
+    bound_max = max(1, len(target))
+    if "n_to_process" not in st.session_state:
+        st.session_state["n_to_process"] = min(10, bound_max)
+    cur = int(st.session_state.get("n_to_process", 1))
+    if cur < bound_min:
+        st.session_state["n_to_process"] = bound_min
+    elif cur > bound_max:
+        st.session_state["n_to_process"] = bound_max
+
+    n_to_process = st.number_input(
+        "How many to symptomize (from top of scope)",
+        min_value=bound_min,
+        max_value=bound_max,
+        step=1,
+        key="n_to_process",
+    )
+
+def _set_n(v: int):
+    st.session_state["n_to_process"] = min(max(int(v), 1), max(1, len(target)))
+    st.rerun()
+
+with cB: st.button("10",  use_container_width=True, on_click=_set_n, args=(10,))
+with cC: st.button("25",  use_container_width=True, on_click=_set_n, args=(25,))
+with cD: st.button("50",  use_container_width=True, on_click=_set_n, args=(50,))
+with cE: st.button("100", use_container_width=True, on_click=_set_n, args=(100,))
+
+# --- Core runner ---
+def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
+    global df
+    prog = st.progress(0.0)
+
+    def _fmt_secs(sec: float) -> str:
+        m = int(sec // 60); s = int(round(sec - m*60)); return f"{m}:{s:02d}"
+
+    t0 = time.perf_counter(); eta_box = st.empty()
+
+    snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
+
+    if overwrite_mode:
+        df = ensure_ai_columns(df)
+        idxs = rows_df.index.tolist()
+        for idx_clear in idxs:
+            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
+            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
+            old_vals.update({"AI Safety": df.loc[idx_clear, "AI Safety"] if "AI Safety" in df.columns else None,
+                             "AI Reliability": df.loc[idx_clear, "AI Reliability"] if "AI Reliability" in df.columns else None,
+                             "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None,
+                             "AI Label Overflow": df.loc[idx_clear, "AI Label Overflow"] if "AI Label Overflow" in df.columns else None})
+            snapshot.append((int(idx_clear), old_vals))
+            for j in range(1, 11):
+                df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
+                df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
+            df.loc[idx_clear, "AI Safety"] = None
+            df.loc[idx_clear, "AI Reliability"] = None
+            df.loc[idx_clear, "AI # of Sessions"] = None
+            df.loc[idx_clear, "AI Label Overflow"] = None
+
+    total_n = max(1, len(rows_df))
+    for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
+        vb = row.get("Verbatim", "")
+        needs_deli = bool(row.get("Needs_Delighters", False))
+        needs_detr = bool(row.get("Needs_Detractors", False))
+
+        if not overwrite_mode:
+            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
+            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
+            old_vals.update({"AI Safety": df.loc[idx, "AI Safety"] if "AI Safety" in df.columns else None,
+                             "AI Reliability": df.loc[idx, "AI Reliability"] if "AI Reliability" in df.columns else None,
+                             "AI # of Sessions": df.loc[idx, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None,
+                             "AI Label Overflow": df.loc[idx, "AI Label Overflow"] if "AI Label Overflow" in df.columns else None})
+            snapshot.append((int(idx), old_vals))
+
+        try:
+            dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map = _openai_labeler(
+                vb, client, selected_model, temperature,
+                DELIGHTERS, DETRACTORS, ALIASES,
+                DEL_MAP, DET_MAP, ALIAS_TO_LABEL,
+                max_ev_per_label=max_ev_per_label,
+                max_ev_chars=max_ev_chars
+            ) if client else ([], [], [], [], {}, {})
+        except Exception:
+            dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map = [], [], [], [], {}, {}
+
+        try:
+            safety, reliability, sessions = _openai_meta_extractor(vb, client, selected_model, temperature) if client else ("Not Mentioned","Not Mentioned","Unknown")
+        except Exception:
+            safety, reliability, sessions = "Not Mentioned","Not Mentioned","Unknown"
+
+        df = ensure_ai_columns(df)
+        wrote_dets, wrote_dels = [], []
+        ev_written_det: Dict[str, List[str]] = {}
+        ev_written_del: Dict[str, List[str]] = {}
+
+        def _label_allowed(label: str, side: str) -> bool:
+            if not require_evidence:
+                return True
+            evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
+            return len(evs) > 0
+
+        if needs_detr and dets:
+            dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
+            for j, lab in enumerate(dets_to_write):
+                col = f"AI Symptom Detractor {j+1}"
+                if col not in df.columns: df[col] = None
+                df.loc[idx, col] = lab
+                ev_written_det[lab] = ev_det_map.get(lab, [])
+            wrote_dets = dets_to_write
+
+        if needs_deli and dels:
+            dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
+            for j, lab in enumerate(dels_to_write):
+                col = f"AI Symptom Delighter {j+1}"
+                if col not in df.columns: df[col] = None
+                df.loc[idx, col] = lab
+                ev_written_del[lab] = ev_del_map.get(lab, [])
+            wrote_dels = dels_to_write
+
+        # Set meta in df
+        df.loc[idx, "AI Safety"] = safety
+        df.loc[idx, "AI Reliability"] = reliability
+        df.loc[idx, "AI # of Sessions"] = sessions
+
+        # Overflow tag: evaluate against DETECTED sets (before trimming)
+        more_than_10_dets = len(dets) > 10
+        more_than_10_dels = len(dels) > 10
+        if more_than_10_dets and more_than_10_dels:
+            overflow_tag = "Both>10"
+        elif more_than_10_dets:
+            overflow_tag = "Detractors>10"
+        elif more_than_10_dels:
+            overflow_tag = "Delighters>10"
+        else:
+            overflow_tag = ""
+        df.loc[idx, "AI Label Overflow"] = overflow_tag or None
+
+        # Evidence coverage for this row
+        total_labels = len(wrote_dets) + len(wrote_dels)
+        labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, []))>0) + \
+                         sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, []))>0)
+        row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
+
+        processed_rows.append({
+            "Index": int(idx),
+            "Verbatim": str(vb),
+            "Added_Detractors": wrote_dets,
+            "Added_Delighters": wrote_dels,
+            "Evidence_Detractors": ev_written_det,
+            "Evidence_Delighters": ev_written_del,
+            "Unlisted_Detractors": unl_dets,
+            "Unlisted_Delighters": unl_dels,
+            ">10 Detractors Detected": more_than_10_dets,
+            ">10 Delighters Detected": more_than_10_dels,
+            "Overflow Tag": overflow_tag,
+            "Safety": safety,
+            "Reliability": reliability,
+            "Sessions": sessions,
+            "Evidence_Coverage": row_ev_cov,
+        })
+        processed_idx_set.add(int(idx))
+
+        prog.progress(k/total_n)
+        elapsed = time.perf_counter() - t0
+        rate = (k / elapsed) if elapsed > 0 else 0.0
+        rem = total_n - k
+        eta_sec = (rem / rate) if rate > 0 else 0.0
+        eta_box.markdown(f"**Progress:** {k}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min")
+
+    st.session_state["undo_stack"].append({"rows": snapshot})
+
+# Execute by buttons
+if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
+    if run_missing_both_btn:
+        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+        _run_symptomize(rows_iter, overwrite_mode=False)
+    elif overwrite_btn:
+        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
+        _run_symptomize(rows_iter, overwrite_mode=True)
+    else:
+        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
+        _run_symptomize(rows_iter, overwrite_mode=False)
+    st.success(f"Symptomized {len(processed_rows)} review(s).")
+
+# Undo last run
+def _undo_last_run():
+    global df
+    if not st.session_state["undo_stack"]:
+        st.info("Nothing to undo."); return
+    snap = st.session_state["undo_stack"].pop()
+    for idx, old_vals in snap.get("rows", []):
+        for col, val in old_vals.items():
+            if col not in df.columns:
+                df[col] = None
+            df.loc[idx, col] = val
+    st.success("Reverted last run.")
+
+if undo_btn:
+    _undo_last_run()
+
+# ------------------- Processed Reviews (chips + highlighted evidence) -------------------
+if processed_rows:
+    st.subheader("🧾 Processed Reviews (this run)")
+    ev_cov_vals = [float(r.get("Evidence_Coverage", 0.0)) for r in processed_rows]
+    overall_cov = (sum(ev_cov_vals)/len(ev_cov_vals)) if ev_cov_vals else 0.0
+    st.caption(f"**Evidence Coverage (this run):** {overall_cov*100:.1f}% of written labels include ≥1 snippet.")
+
+    def _esc(s: str) -> str:
+        return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+
+    for rec in processed_rows:
+        head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}"
+        if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
+            head += " • ⚠︎ >10 detected (trimmed to 10)"
+        with st.expander(head):
+            # Highlight with evidence snippets
+            evidence_terms: List[str] = []
+            for _, evs in (rec.get("Evidence_Detractors", {}) or {}).items(): evidence_terms.extend(evs or [])
+            for _, evs in (rec.get("Evidence_Delighters", {}) or {}).items(): evidence_terms.extend(evs or [])
+
+            st.markdown("**Verbatim (evidence highlighted)**")
+            st.markdown(highlight_text(rec["Verbatim"], evidence_terms), unsafe_allow_html=True)
+
+            # Meta + overflow chips
+            overflow_chip = ""
+            if rec.get("Overflow Tag"):
+                overflow_chip = f"<span class='chip'>Overflow: {_esc(rec['Overflow Tag'])}</span>"
+            meta_html = (
+                "<div class='chips-block chip-wrap'>"
+                f"<span class='chip yellow'>Safety: {_esc(rec.get('Safety','Not Mentioned'))}</span>"
+                f"<span class='chip blue'>Reliability: {_esc(rec.get('Reliability','Not Mentioned'))}</span>"
+                f"<span class='chip purple'># Sessions: {_esc(rec.get('Sessions','Unknown'))}</span>"
+                f"{overflow_chip}"
+                "</div>"
+            )
+            st.markdown(meta_html, unsafe_allow_html=True)
+
+            st.markdown("**Detractors added**")
+            det_html = "<div class='chip-wrap'>"
+            for lab in rec["Added_Detractors"]:
+                k = len((rec.get("Evidence_Detractors", {}) or {}).get(lab, []))
+                det_html += f"<span class='chip red'>{html.escape(lab)} · Evidence: {k}</span>"
+            det_html += "</div>"
+            st.markdown(det_html, unsafe_allow_html=True)
+
+            st.markdown("**Delighters added**")
+            del_html = "<div class='chip-wrap'>"
+            for lab in rec["Added_Delighters"]:
+                k = len((rec.get("Evidence_Delighters", {}) or {}).get(lab, []))
+                del_html += f"<span class='chip green'>{html.escape(lab)} · Evidence: {k}</span>"
+            del_html += "</div>"
+            st.markdown(del_html, unsafe_allow_html=True)
+
+            with st.expander("See evidence snippets", expanded=False):
+                if rec.get("Evidence_Detractors"):
+                    st.markdown("**Detractor evidence**")
+                    for lab, evs in rec["Evidence_Detractors"].items():
+                        for e in evs: st.write(f"- {e}")
+                if rec.get("Evidence_Delighters"):
+                    st.markdown("**Delighter evidence**")
+                    for lab, evs in rec["Evidence_Delighters"].items():
+                        for e in evs: st.write(f"- {e}")
+
+# ------------------- New Symptom Candidates (Approval form) -------------------
+cand_del: Dict[str, List[int]] = {}
+cand_det: Dict[str, List[int]] = {}
+for rec in processed_rows:
+    for u in rec.get("Unlisted_Delighters", []) or []:
+        cand_del.setdefault(u, []).append(rec["Index"])
+    for u in rec.get("Unlisted_Detractors", []) or []:
+        cand_det.setdefault(u, []).append(rec["Index"])
+
+whitelist_all = set(DELIGHTERS + DETRACTORS)
+alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
+wl_canon = {_canon_simple(x) for x in whitelist_all}
+ali_canon = {_canon_simple(x) for x in alias_all}
+
+def _filter_near_dupes(cmap: Dict[str, List[int]], cutoff: float = 0.94) -> Dict[str, List[int]]:
+    filtered: Dict[str, List[int]] = {}
+    seen_key: Dict[str, str] = {}
+    for sym, refs in cmap.items():
+        c = _canon_simple(sym)
+        if c in wl_canon or c in ali_canon:
+            continue
+        try:
+            m = difflib.get_close_matches(sym, list(whitelist_all), n=1, cutoff=cutoff)
+            if m: continue
+        except Exception:
+            pass
+        if c in seen_key:
+            filtered[seen_key[c]].extend(refs)
+        else:
+            filtered[sym] = list(refs); seen_key[c] = sym
+    return filtered
+
+cand_del = _filter_near_dupes(cand_del, cutoff=sim_threshold)
+cand_det = _filter_near_dupes(cand_det, cutoff=sim_threshold)
+
+if cand_del or cand_det:
+    st.subheader("🟡 New Symptom Inbox — Review & Approve")
+
+    def _mk_table(cmap: Dict[str, List[int]], side_label: str) -> pd.DataFrame:
+        if not cmap:
+            return pd.DataFrame({
+                "Add": pd.Series(dtype=bool),
+                "Label": pd.Series(dtype=str),
+                "Side": pd.Series(dtype=str),
+                "Count": pd.Series(dtype=int),
+                "Examples": pd.Series(dtype=str),
+            })
+        rows_tbl = []
+        for sym, refs in sorted(cmap.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            examples = []
+            for ridx in refs[:3]:
+                try:
+                    examples.append(str(df.loc[ridx, "Verbatim"]))
+                except Exception:
+                    pass
+            rows_tbl.append({
+                "Add": False,
+                "Label": sym,
+                "Side": side_label,
+                "Count": int(len(refs)),
+                "Examples": " | ".join(["— "+e[:200] for e in examples])
+            })
+        tbl = pd.DataFrame(rows_tbl)
+        return tbl.astype({"Add": bool, "Label": str, "Side": str, "Count": int, "Examples": str})
+
+    tbl_del = _mk_table(cand_del, "Delighter")
+    tbl_det = _mk_table(cand_det, "Detractor")
+
+    with st.form("new_symptom_candidates_form", clear_on_submit=False):
+        cA, cB = st.columns(2)
+        with cA:
+            st.markdown("**Delighter candidates**")
+            editor_del = st.data_editor(
+                tbl_del,
+                num_rows="fixed",
+                use_container_width=True,
+                column_config={
+                    "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
+                    "Label": st.column_config.TextColumn(),
+                    "Side": st.column_config.SelectboxColumn(options=["Delighter","Detractor"]),
+                    "Count": st.column_config.NumberColumn(format="%d"),
+                    "Examples": st.column_config.TextColumn(width="large"),
+                },
+                key="cand_del_editor",
+            )
+        with cB:
+            st.markdown("**Detractor candidates**")
+            editor_det = st.data_editor(
+                tbl_det,
+                num_rows="fixed",
+                use_container_width=True,
+                column_config={
+                    "Add": st.column_config.CheckboxColumn(help="Check to add to the Symptoms sheet"),
+                    "Label": st.column_config.TextColumn(),
+                    "Side": st.column_config.SelectboxColumn(options=["Detractor","Delighter"]),
+                    "Count": st.column_config.NumberColumn(format="%d"),
+                    "Examples": st.column_config.TextColumn(width="large"),
+                },
+                key="cand_det_editor",
+            )
+        add_btn = st.form_submit_button("✅ Add selected to Symptoms & Download updated workbook")
+
+    if add_btn:
+        selections: List[Tuple[str, str]] = []
+        try:
+            if isinstance(editor_del, pd.DataFrame) and not editor_del.empty:
+                for _, r_ in editor_del.iterrows():
+                    if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
+                        side_val = str(r_.get("Side","Delighter")).strip() or "Delighter"
+                        selections.append((str(r_["Label"]).strip(), side_val))
+        except Exception:
+            pass
+        try:
+            if isinstance(editor_det, pd.DataFrame) and not editor_det.empty:
+                for _, r_ in editor_det.iterrows():
+                    if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
+                        side_val = str(r_.get("Side","Detractor")).strip() or "Detractor"
+                        selections.append((str(r_["Label"]).strip(), side_val))
+        except Exception:
+            pass
+
+        if selections:
+            updated_bytes = add_new_symptoms_to_workbook(uploaded_file, selections)
+            st.download_button(
+                "⬇️ Download 'Symptoms' (updated)",
+                data=updated_bytes,
+                file_name="Symptoms_Updated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.success(f"Queued {len(selections)} new label(s) into the Symptoms tab.")
+        else:
+            st.info("No candidates selected.")
+
+# ------------------- Download Symptomized Workbook -------------------
+st.subheader("📦 Download Symptomized Workbook")
+try:
+    file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
+except Exception:
+    file_base = 'Reviews'
+
+def generate_template_workbook_bytes(
+    original_file,
+    updated_df: pd.DataFrame,
+    processed_idx: Optional[Set[int]] = None,
+    overwrite_processed_slots: bool = False,
+) -> bytes:
+    """Return workbook bytes with K–T (dets), U–AD (dels), and AE/AF/AG meta (+ AH Label Overflow, headers preserved)."""
+    original_file.seek(0)
+    wb = load_workbook(original_file)
+    sheet_name = "Star Walk scrubbed verbatims"
+    if sheet_name not in wb.sheetnames:
+        sheet_name = wb.sheetnames[0]
+    ws: Worksheet = wb[sheet_name]
+
+    df2 = ensure_ai_columns(updated_df.copy())
+
+    for name, col in META_ORDER:
+        col_idx = column_index_from_string(col)
+        if not ws.cell(row=1, column=col_idx).value:
+            ws.cell(row=1, column=col_idx, value=name)
+
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    fill_yel   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    fill_blu   = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
+    fill_pur   = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")
+
+    pset = set(processed_idx or [])
+
+    def _clear_template_slots(row_i: int):
+        for col_idx in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
+            ws.cell(row=row_i, column=col_idx, value=None)
+
+    for i, (rid, r) in enumerate(df2.iterrows(), start=2):
+        if overwrite_processed_slots and (int(rid) in pset):
+            _clear_template_slots(i)
+        for j, col_idx in enumerate(DET_INDEXES, start=1):
+            val = r.get(f"AI Symptom Detractor {j}")
+            cv = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cv)
+            if cv is not None: cell.fill = fill_red
+        for j, col_idx in enumerate(DEL_INDEXES, start=1):
+            val = r.get(f"AI Symptom Delighter {j}")
+            cv = None if (pd.isna(val) or str(val).strip() == "") else val
+            cell = ws.cell(row=i, column=col_idx, value=cv)
+            if cv is not None: cell.fill = fill_green
+        safety = r.get("AI Safety"); reliab = r.get("AI Reliability"); sess = r.get("AI # of Sessions")
+        overflow = r.get("AI Label Overflow")
+        if is_filled(safety):
+            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety)); c.fill = fill_yel
+        if is_filled(reliab):
+            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab)); c.fill = fill_blu
+        if is_filled(sess):
+            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess)); c.fill = fill_pur
+        if is_filled(overflow):
+            c = ws.cell(row=i, column=META_INDEXES["Label Overflow"], value=str(overflow)); c.fill = fill_yel
+
+    for c in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
+        try: ws.column_dimensions[get_column_letter(c)].width = 28
+        except Exception: pass
+
+    out = io.BytesIO(); wb.save(out)
+    return out.getvalue()
+
+export_bytes = generate_template_workbook_bytes(
+    uploaded_file,
+    df,
+    processed_idx=processed_idx_set if processed_idx_set else None,
+    overwrite_processed_slots=False,
+)
+
+st.download_button(
+    "⬇️ Download symptomized workbook (XLSX)",
+    data=export_bytes,
+    file_name=f"{file_base}_Symptomized.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+# ------------------- Symptoms Catalog quick export -------------------
+st.subheader("🗂️ Download Symptoms Catalog")
+sym_df = pd.DataFrame({
+    "Symptom": (DELIGHTERS + DETRACTORS),
+    "Type":    ["Delighter"]*len(DELIGHTERS) + ["Detractor"]*len(DETRACTORS)
+})
+if ALIASES:
+    alias_rows = [{"Symptom": k, "Aliases": " | ".join(v)} for k, v in ALIASES.items()]
+    alias_df = pd.DataFrame(alias_rows)
+    sym_df = sym_df.merge(alias_df, how="left", on="Symptom")
+
+sym_bytes = io.BytesIO()
+with pd.ExcelWriter(sym_bytes, engine="openpyxl") as xw:
+    sym_df.to_excel(xw, index=False, sheet_name="Symptoms")
+sym_bytes.seek(0)
+st.download_button("⬇️ Download Symptoms Catalog (XLSX)", sym_bytes.getvalue(),
+                   file_name=f"{file_base}_Symptoms_Catalog.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ------------------- View Symptoms from Excel Workbook (expander) -------------------
+st.subheader("📘 View Symptoms from Excel Workbook")
+with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
+    st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox below to propose additions.")
+
+    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta"])
+
+    def _esc(s: str) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _chips(items, color: str):
+        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
+        if not items_sorted:
+            st.write("(none)")
+        else:
+            htmlchips = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc(x)}</span>" for x in items_sorted]) + "</div>"
+            st.markdown(htmlchips, unsafe_allow_html=True)
+
+    with tabs[0]:
+        st.markdown("**Delighter labels from workbook**"); _chips(DELIGHTERS, "green")
+    with tabs[1]:
+        st.markdown("**Detractor labels from workbook**"); _chips(DETRACTORS, "red")
+    with tabs[2]:
+        st.markdown("**Aliases (if present)**")
+        if ALIASES:
+            alias_rows = [{"Label": k, "Aliases": " | ".join(v)} for k, v in sorted(ALIASES.items())]
+            st.dataframe(pd.DataFrame(alias_rows), use_container_width=True, hide_index=True)
+        else:
+            st.write("(no aliases defined)")
+    with tabs[3]:
+        st.markdown("**Meta fields usage (from this dataset)**")
+        df_meta = ensure_ai_columns(df.copy())
+
+        def _count(col: str, order: List[str]) -> pd.DataFrame:
+            if col not in df_meta.columns:
+                return pd.DataFrame({"Value": order, "Count": [0] * len(order)})
+            vc = df_meta[col].fillna("Not Mentioned").astype(str).value_counts().reindex(order, fill_value=0)
+            return vc.rename_axis("Value").reset_index(name="Count")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Safety**")
+            df_s = _count("AI Safety", SAFETY_ENUM)
+            st.bar_chart(df_s.set_index("Value")["Count"])
+        with c2:
+            st.markdown("**Reliability**")
+            df_r = _count("AI Reliability", RELIABILITY_ENUM)
+            st.bar_chart(df_r.set_index("Value")["Count"])
+        with c3:
+            st.markdown("**# of Sessions**")
+            df_n = _count("AI # of Sessions", SESSIONS_ENUM)
+            st.bar_chart(df_n.set_index("Value")["Count"])
+
+# Footer
+st.divider()
+st.caption("v7.5 — Evidence-locked labeling + Overflow Tag + Embedding Skim. Exports: K–T/U–AD; meta: AE/AF/AG; overflow: AH. No header relabeling.")
