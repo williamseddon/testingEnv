@@ -17,6 +17,14 @@ import smtplib
 from email.message import EmailMessage
 from streamlit.components.v1 import html as st_html  # for custom HTML blocks
 
+# New/updated imports
+import time
+import random
+import hashlib
+import threading
+from typing import List
+from urllib.parse import quote
+
 warnings.filterwarnings(
     "ignore",
     message="Data Validation extension is not supported and will be removed",
@@ -124,16 +132,11 @@ GLOBAL_CSS = """
   .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
   .review-card p{ margin:.25rem 0; line-height:1.5; }
 
-    /* ---- Review Cards ---- */
-  .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
-  .review-card p{ margin:.25rem 0; line-height:1.5; }
-
   /* ---- Symptom badges (green = delighters, red = detractors) ---- */
   .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
   .badge{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.85rem; border:1.5px solid transparent; }
   .badge.pos{ background:#ecfdf5; border-color:#86efac; color:#065f46; }  /* green */
   .badge.neg{ background:#fef2f2; border-color:#fca5a5; color:#7f1d1d; }  /* red */
-
 
   /* ---- Hero ---- */
   .hero-wrap{
@@ -151,14 +154,18 @@ GLOBAL_CSS = """
   [data-testid="stPlotlyChart"]{ margin-top:18px !important; margin-bottom:30px !important; }
 </style>
 """
-
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
-
 
 # ---------- Utilities ----------
 def clean_text(x: str, keep_na: bool = False) -> str:
     if pd.isna(x): return pd.NA if keep_na else ""
     s = str(x)
+    # quick bail for pure ASCII
+    if s.isascii():
+        s = s.strip()
+        if s.upper() in {"<NA>","NA","N/A","NULL","NONE"}:
+            return pd.NA if keep_na else ""
+        return s
     if _HAS_FTFY:
         try: s = _ftfy_fix(s)
         except Exception: pass
@@ -239,20 +246,48 @@ def highlight_html(text: str, keyword: str | None) -> str:
             pass
     return safe
 
+# ---------- Embedding helpers with backoff, hashing & caching ----------
+_EMBED_LOCK = threading.Lock()
 
-# LLM helpers ---------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
+def _embed_with_backoff(client, model: str, inputs: List[str], max_attempts: int = 6):
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.embeddings.create(model=model, input=inputs)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            msg = str(e).lower()
+            is_rate = status == 429 or "rate" in msg or "quota" in msg
+            if not is_rate or attempt == max_attempts:
+                raise
+            sleep_s = delay * (1.5 ** (attempt - 1)) + random.uniform(0, 0.5)
+            time.sleep(sleep_s)
+
+def _hash_texts(texts: list[str]) -> str:
+    h = hashlib.sha256()
+    for t in texts:
+        h.update(((t or "") + "\x00").encode("utf-8"))
+    return h.hexdigest()
+
+def _build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
     if not _HAS_OPENAI or not texts:
         return None
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=60, max_retries=0)
     embs = []
-    batch = 512
-    for i in range(0, len(texts), batch):
-        chunk = texts[i:i+batch]
-        resp = client.embeddings.create(model=model, input=chunk)
-        embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
-    if not embs: return None
+    batch = 128  # smaller batches reduce 429s
+
+    # Serialize within this process to reduce burst to API
+    with _EMBED_LOCK:
+        for i in range(0, len(texts), batch):
+            chunk = texts[i:i+batch]
+            # truncate long reviews to cut token usage/cost
+            safe_chunk = [(t or "")[:2000] for t in chunk]
+            resp = _embed_with_backoff(client, model, safe_chunk)
+            embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
+            time.sleep(0.05 + random.uniform(0, 0.05))
+
+    if not embs:
+        return None
     mat = np.vstack(embs).astype(np.float32)
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
     mat_norm = mat / norms
@@ -261,6 +296,11 @@ def build_vector_index(texts: list[str], api_key: str, model: str = "text-embedd
         index.add(mat_norm)
         return {"backend":"faiss","index":index,"texts":texts}
     return (mat, norms, texts)
+
+@st.cache_resource(show_spinner=False)
+def build_vector_index_cached(model: str, content_hash: str, texts: list[str], api_key: str):
+    # Cached by (model, content_hash)
+    return _build_vector_index(texts, api_key=api_key, model=model)
 
 def vector_search(query: str, index, api_key: str, top_k: int = 8):
     if not _HAS_OPENAI or index is None: return []
@@ -350,22 +390,28 @@ with st.sidebar.expander("🗓️ Timeframe", expanded=False):
     today = datetime.today().date()
     start_date, end_date = None, None
     if timeframe == "Custom Range":
-        start_date, end_date = st.date_input(
+        sel = st.date_input(
             label="Date Range",
             value=(today - timedelta(days=30), today),
             min_value=datetime(2000, 1, 1).date(),
             max_value=today,
             label_visibility="collapsed"
         )
+        if isinstance(sel, tuple) and len(sel) == 2:
+            start_date, end_date = sel
+        else:
+            start_date = end_date = sel
     elif timeframe == "Last Week":  start_date, end_date = today - timedelta(days=7), today
     elif timeframe == "Last Month": start_date, end_date = today - timedelta(days=30), today
     elif timeframe == "Last Year":  start_date, end_date = today - timedelta(days=365), today
 
 filtered = df.copy()
 if start_date and end_date and "Review Date" in filtered.columns:
+    dt = pd.to_datetime(filtered["Review Date"], errors="coerce")
+    end_inclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
     filtered = filtered[
-        (filtered["Review Date"] >= pd.Timestamp(start_date)) &
-        (filtered["Review Date"] <= pd.Timestamp(end_date))
+        (dt >= pd.Timestamp(start_date)) &
+        (dt <= end_inclusive)
     ]
 
 with st.sidebar.expander("🌟 Star Rating", expanded=False):
@@ -464,7 +510,7 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     if not temp_supported:
         st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
 
-# ---------- Ask your data (LLM) — moved up, with disclaimer ----------
+# ---------- Ask your data (LLM) ----------
 anchor("askdata-anchor")
 st.markdown("## 🤖 Ask your data")
 st.markdown(
@@ -480,7 +526,18 @@ elif not api_key:
     st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
 else:
     verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-    index = build_vector_index(verb_series.tolist(), api_key)
+
+    # Hash-cached index build (handles rate limits + avoids recompute)
+    try:
+        emb_model = "text-embedding-3-small"
+        content_hash = _hash_texts(verb_series.tolist())
+        index = build_vector_index_cached(emb_model, content_hash, verb_series.tolist(), api_key)
+    except Exception as e:
+        if "rate" in str(e).lower() or getattr(e, "status_code", None) == 429:
+            st.warning("We’re temporarily hitting the embeddings rate limit or quota. Falling back to local analysis.")
+            index = None
+        else:
+            raise
 
     # Ask form; no state is kept after this run
     with st.form("ask_ai_form", clear_on_submit=True):
@@ -489,7 +546,6 @@ else:
 
     if send and q.strip():
         q = q.strip()
-        # retrieval
         retrieved = vector_search(q, index, api_key, top_k=8) if index else []
         quotes = []
         for txt, sim in retrieved[:5]:
@@ -510,7 +566,7 @@ else:
         def pandas_count(query: str) -> dict:
             try:
                 if not _safe_query(query): return {"error":"unsafe query"}
-                res = filtered.query(query)  # default engine (numexpr where possible)
+                res = filtered.query(query)  # default engine
                 return {"count": int(len(res))}
             except Exception as e:
                 return {"error": str(e)}
@@ -569,7 +625,6 @@ else:
             except Exception as e:
                 return f"(Fallback summary error: {e})"
 
-        # compose single-turn request
         selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
         llm_temp = float(st.session_state.get("llm_temp", 0.2))
         tools = [
@@ -607,8 +662,13 @@ else:
             tool_msgs = []
             if msg.tool_calls:
                 for call in msg.tool_calls:
+                    try:
+                        args = json.loads(call.function.arguments or "{}")
+                        if not isinstance(args, dict):
+                            args = {}
+                    except Exception:
+                        args = {}
                     name = call.function.name
-                    args = json.loads(call.function.arguments or "{}")
                     out = {"error":"unknown tool"}
                     if name == "pandas_count": out = pandas_count(args.get("query",""))
                     if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
@@ -631,7 +691,6 @@ else:
         except Exception:
             final_text = _local_answer_fallback()
 
-        # show the single Q/A (not stored)
         st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
 
@@ -653,7 +712,7 @@ def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
     pct = pct_12(sub["Star Rating"])
     return cnt, avg, pct
 
-# Robust Seeded split (handles missing column)
+# Robust Seeded split
 if "Seeded" in filtered.columns:
     seed_mask = filtered["Seeded"].astype("string").str.upper().eq("YES")
 else:
@@ -706,12 +765,16 @@ total_reviews = len(filtered)
 percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
 star_labels = [f"{int(star)} stars" for star in star_counts.index]
 
+# Color-safe mapping by star value
+color_map = {1:"#EF4444", 2:"#F59E0B", 3:"#EAB308", 4:"#10B981", 5:"#22C55E"}
+bar_colors = [color_map.get(int(s), "#CBD5E1") for s in star_counts.index]
+
 fig_bar_horizontal = go.Figure(go.Bar(
     x=star_counts.values, y=star_labels, orientation="h",
     text=[f"{value} reviews ({percentages.get(idx, 0)}%)"
           for idx, value in zip(star_counts.index, star_counts.values)],
     textposition="auto",
-    marker=dict(color=["#EF4444", "#F59E0B", "#EAB308", "#10B981", "#22C55E"]),
+    marker=dict(color=bar_colors),
     hoverinfo="y+x+text"
 ))
 fig_bar_horizontal.update_layout(
@@ -723,7 +786,6 @@ fig_bar_horizontal.update_layout(
     margin=dict(l=40, r=40, t=45, b=40)
 )
 st.plotly_chart(fig_bar_horizontal, use_container_width=True)
-
 
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
@@ -872,12 +934,14 @@ def send_feedback_via_email(subject: str, body: str) -> bool:
         msg["From"] = sender
         msg["To"] = to
         msg.set_content(body)
-        with smtplib.SMTP(host, port) as s:
+        with smtplib.SMTP(host, port, timeout=15) as s:
             s.starttls()
             if user and pwd: s.login(user, pwd)
             s.send_message(msg)
         return True
-    except Exception:
+    except Exception as e:
+        # surface non-sensitive context; secrets aren't logged
+        st.info(f"Could not send via SMTP: {e}")
         return False
 
 with st.form("feedback_form", clear_on_submit=True):
@@ -891,10 +955,15 @@ if submitted:
     else:
         body = f"Name: {name or '-'}\nEmail: {email or '-'}\n\nFeedback:\n{message}"
         ok = send_feedback_via_email("Star Walk — Feedback", body)
-        if ok: st.success("Thanks! Your feedback was sent.")
+        if ok:
+            st.success("Thanks! Your feedback was sent.")
         else:
-            st.link_button("Open email to wseddon@sharkninja.com",
-                           url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={_html.escape(message)}")
+            # Use proper URL encoding for mailto body
+            quoted = quote(message or "", safe="")
+            st.link_button(
+                "Open email to wseddon@sharkninja.com",
+                url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={quoted}"
+            )
 
 # one-time scroll on fresh upload
 if st.session_state.get("force_scroll_top_once"):
