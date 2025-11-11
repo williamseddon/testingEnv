@@ -22,8 +22,15 @@ import time
 import random
 import hashlib
 import threading
-from typing import List
+from typing import List, Tuple, Optional
 from urllib.parse import quote
+
+# Timezone
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+    _NY_TZ = ZoneInfo("America/New_York")
+except Exception:
+    _NY_TZ = None
 
 warnings.filterwarnings(
     "ignore",
@@ -57,7 +64,11 @@ except Exception:
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
 
 def model_supports_temperature(model_id: str) -> bool:
-    return model_id not in NO_TEMP_MODELS and not model_id.startswith("gpt-5")
+    if not model_id:
+        return True
+    if model_id in NO_TEMP_MODELS:
+        return False
+    return not model_id.startswith("gpt-5")
 
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
@@ -85,14 +96,10 @@ st_html("""
 # ---------- Global CSS ----------
 GLOBAL_CSS = """
 <style>
-  /* =====================
-     Global CSS — Light-first
-     ===================== */
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
   @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
 
-  /* ---- Design tokens (light) ---- */
   :root{
     --text:#0f172a; --muted:#475569; --muted-2:#64748b;
     --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
@@ -100,8 +107,6 @@ GLOBAL_CSS = """
     --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
-
-  /* ---- Dark tokens (kept for safety; app forced light) ---- */
   html[data-theme="dark"], body[data-theme="dark"]{
     --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
     --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
@@ -118,7 +123,6 @@ GLOBAL_CSS = """
   section[data-testid="stSidebar"] .block-container { padding-top:.6rem; }
   mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
-  /* ---- Metric Cards ---- */
   .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
   @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
   .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
@@ -128,17 +132,13 @@ GLOBAL_CSS = """
   .metric-label{ color:var(--muted); font-size:.85rem; }
   .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
 
-  /* ---- Review Cards ---- */
   .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
   .review-card p{ margin:.25rem 0; line-height:1.5; }
-
-  /* ---- Symptom badges (green = delighters, red = detractors) ---- */
   .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
   .badge{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.85rem; border:1.5px solid transparent; }
-  .badge.pos{ background:#ecfdf5; border-color:#86efac; color:#065f46; }  /* green */
-  .badge.neg{ background:#fef2f2; border-color:#fca5a5; color:#7f1d1d; }  /* red */
+  .badge.pos{ background:#ecfdf5; border-color:#86efac; color:#065f46; }
+  .badge.neg{ background:#fef2f2; border-color:#fca5a5; color:#7f1d1d; }
 
-  /* ---- Hero ---- */
   .hero-wrap{
     position:relative; overflow:hidden; border-radius:14px; min-height:150px; margin:.25rem 0 1rem 0;
     box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
@@ -157,10 +157,11 @@ GLOBAL_CSS = """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 # ---------- Utilities ----------
+_BAD_CHARS_REGEX = re.compile(r"[ÃÂâï€™€™]")
+
 def clean_text(x: str, keep_na: bool = False) -> str:
     if pd.isna(x): return pd.NA if keep_na else ""
     s = str(x)
-    # quick bail for pure ASCII
     if s.isascii():
         s = s.strip()
         if s.upper() in {"<NA>","NA","N/A","NULL","NONE"}:
@@ -169,7 +170,7 @@ def clean_text(x: str, keep_na: bool = False) -> str:
     if _HAS_FTFY:
         try: s = _ftfy_fix(s)
         except Exception: pass
-    if any(ch in s for ch in ("Ã","Â","â","ï","€","™")):
+    if _BAD_CHARS_REGEX.search(s):
         try:
             repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
             if repaired.strip(): s = repaired
@@ -182,7 +183,6 @@ def clean_text(x: str, keep_na: bool = False) -> str:
     return s
 
 def esc(x) -> str:
-    """HTML-escape any dynamic value used inside unsafe_allow_html blocks."""
     return _html.escape("" if pd.isna(x) else str(x))
 
 def apply_filter(df: pd.DataFrame, column_name: str, label: str, key: str | None = None):
@@ -213,28 +213,38 @@ def is_valid_symptom_value(x) -> bool:
     return not bool(re.fullmatch(r"[\W_]+", s))
 
 def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
+    # Vectorized & fast
     cols = [c for c in symptom_columns if c in filtered_df.columns]
-    if not cols: return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
-    s = (filtered_df[cols].stack(dropna=True)
-         .map(lambda v: clean_text(v, keep_na=True)).dropna()
-         .astype("string").str.strip())
-    s = s[s.map(is_valid_symptom_value)]
-    if s.empty: return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
-    unique_items = pd.unique(s.to_numpy())
-    results, total_rows = [], len(filtered_df)
-    for item in unique_items:
-        item_str = str(item).strip()
-        mask = filtered_df[cols].isin([item]).any(axis=1)
-        count = int(mask.sum())
-        if count == 0: continue
-        avg_star = filtered_df.loc[mask, "Star Rating"].mean() if "Star Rating" in filtered_df.columns else np.nan
-        pct = (count / total_rows * 100) if total_rows else 0
-        results.append({"Item": item_str.title(),
-                        "Avg Star": round(avg_star,1) if pd.notna(avg_star) else None,
-                        "Mentions": count,
-                        "% Total": f"{round(pct,1)}%"})
-    if not results: return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
-    return pd.DataFrame(results).sort_values(by="Mentions", ascending=False, ignore_index=True)
+    if not cols:
+        return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
+    m = (filtered_df[cols]
+         .melt(value_name="symptom", var_name="col")
+         .drop(columns=["col"]))
+    m["symptom"] = (m["symptom"]
+                    .map(lambda v: clean_text(v, keep_na=True))
+                    .astype("string").str.strip())
+    m = m[m["symptom"].map(is_valid_symptom_value)]
+    if m.empty:
+        return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
+    counts = m["symptom"].value_counts()
+
+    if "Star Rating" in filtered_df.columns:
+        stars = pd.to_numeric(filtered_df["Star Rating"], errors="coerce")
+        avg_map = {}
+        for s_val in counts.index:
+            rows = filtered_df[cols].isin([s_val]).any(axis=1)
+            avg_map[s_val] = round(float(stars[rows].mean()), 1) if rows.any() else None
+    else:
+        avg_map = {s_val: None for s_val in counts.index}
+
+    total_rows = len(filtered_df) or 1
+    out = pd.DataFrame({
+        "Item": counts.index.str.title(),
+        "Avg Star": [avg_map[s_val] for s_val in counts.index],
+        "Mentions": counts.values,
+        "% Total": (counts.values / total_rows * 100).round(1).astype(str) + "%"
+    })
+    return out.sort_values("Mentions", ascending=False, ignore_index=True)
 
 def highlight_html(text: str, keyword: str | None) -> str:
     safe = _html.escape(text or "")
@@ -274,13 +284,11 @@ def _build_vector_index(texts: list[str], api_key: str, model: str = "text-embed
         return None
     client = OpenAI(api_key=api_key, timeout=60, max_retries=0)
     embs = []
-    batch = 128  # smaller batches reduce 429s
+    batch = 128
 
-    # Serialize within this process to reduce burst to API
     with _EMBED_LOCK:
         for i in range(0, len(texts), batch):
             chunk = texts[i:i+batch]
-            # truncate long reviews to cut token usage/cost
             safe_chunk = [(t or "")[:2000] for t in chunk]
             resp = _embed_with_backoff(client, model, safe_chunk)
             embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
@@ -298,9 +306,18 @@ def _build_vector_index(texts: list[str], api_key: str, model: str = "text-embed
     return (mat, norms, texts)
 
 @st.cache_resource(show_spinner=False)
-def build_vector_index_cached(model: str, content_hash: str, texts: list[str], api_key: str):
-    # Cached by (model, content_hash)
-    return _build_vector_index(texts, api_key=api_key, model=model)
+def _ensure_cache_slot(model: str, content_hash: str, api_key: str):
+    # Dummy cache entry to memoize the (model, hash) tuple without serializing big data
+    return {"ok": True}
+
+def _get_or_build_index(content_hash: str, raw_texts: list[str], api_key: str, model: str) -> Optional[object]:
+    # Session memo layer to avoid recompute within a session
+    memo = st.session_state.setdefault("_vec_idx", {})
+    if content_hash in memo:
+        return memo[content_hash]
+    idx = _build_vector_index(raw_texts, api_key=api_key, model=model)
+    memo[content_hash] = idx
+    return idx
 
 def vector_search(query: str, index, api_key: str, top_k: int = 8):
     if not _HAS_OPENAI or index is None: return []
@@ -353,41 +370,51 @@ if not uploaded_file:
     st.info("Please upload an Excel file to get started.")
     st.stop()
 
-# ---------- Load & clean ----------
-try:
-    st.markdown("---")
+# ---------- Load & clean (cached) ----------
+@st.cache_data(show_spinner=False)
+def _load_clean_excel(file_bytes: bytes) -> pd.DataFrame:
     try:
-        df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
-    except ValueError:
-        # Fallback to first sheet if the named sheet doesn't exist
-        df = pd.read_excel(uploaded_file)
+        try:
+            df_local = pd.read_excel(file_bytes, sheet_name="Star Walk scrubbed verbatims")
+        except ValueError:
+            df_local = pd.read_excel(file_bytes)
+    except Exception as e:
+        raise RuntimeError(f"Could not read Excel: {e}")
 
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-        if col in df.columns:
-            df[col] = df[col].astype("string").str.upper()
-    if "Star Rating" in df.columns:
-        df["Star Rating"] = pd.to_numeric(df["Star Rating"], errors="coerce")
+        if col in df_local.columns:
+            df_local[col] = df_local[col].astype("string").str.upper()
 
-    all_symptom_cols = [c for c in df.columns if c.startswith("Symptom")]
+    if "Star Rating" in df_local.columns:
+        df_local["Star Rating"] = pd.to_numeric(df_local["Star Rating"], errors="coerce")
+
+    all_symptom_cols = [c for c in df_local.columns if c.startswith("Symptom")]
     for c in all_symptom_cols:
-        df[c] = df[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
+        df_local[c] = df_local[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
 
-    if "Verbatim" in df.columns:
-        df["Verbatim"] = df["Verbatim"].astype("string").map(clean_text)
-    if "Review Date" in df.columns:
-        df["Review Date"] = pd.to_datetime(df["Review Date"], errors="coerce")
+    if "Verbatim" in df_local.columns:
+        df_local["Verbatim"] = df_local["Verbatim"].astype("string").map(clean_text)
+
+    if "Review Date" in df_local.columns:
+        df_local["Review Date"] = pd.to_datetime(df_local["Review Date"], errors="coerce")
+
+    return df_local
+
+try:
+    df = _load_clean_excel(uploaded_file)
 except Exception as e:
-    st.error(f"An error occurred: {e}")
+    st.error(str(e))
     st.stop()
 
 # ---------- Sidebar filters ----------
 st.sidebar.header("🔍 Filters")
 
 with st.sidebar.expander("🗓️ Timeframe", expanded=False):
+    tz_today = datetime.now(_NY_TZ).date() if _NY_TZ else datetime.today().date()
     timeframe = st.selectbox("Select Timeframe",
                              options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
                              key="tf")
-    today = datetime.today().date()
+    today = tz_today
     start_date, end_date = None, None
     if timeframe == "Custom Range":
         sel = st.date_input(
@@ -409,10 +436,7 @@ filtered = df.copy()
 if start_date and end_date and "Review Date" in filtered.columns:
     dt = pd.to_datetime(filtered["Review Date"], errors="coerce")
     end_inclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-    filtered = filtered[
-        (dt >= pd.Timestamp(start_date)) &
-        (dt <= end_inclusive)
-    ]
+    filtered = filtered[(dt >= pd.Timestamp(start_date)) & (dt <= end_inclusive)]
 
 with st.sidebar.expander("🌟 Star Rating", expanded=False):
     selected_ratings = st.multiselect("Select Star Ratings", options=["All"] + [1,2,3,4,5],
@@ -474,16 +498,12 @@ with st.sidebar.expander("📄 Review List", expanded=False):
 
 # Clear filters
 if st.sidebar.button("🧹 Clear all filters"):
-    for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp"] + \
+    for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp","ai_enabled","ai_cap"] + \
              [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
         if k in st.session_state: del st.session_state[k]
     st.rerun()
 
-# Spacer + divider before LLM assistant
-st.sidebar.write("")
-st.sidebar.markdown("---")
-
-# ---------- LLM settings ----------
+# ---------- AI / Privacy controls ----------
 with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     _model_choices = [
         ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -510,6 +530,13 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     if not temp_supported:
         st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
 
+with st.sidebar.expander("🔒 Privacy & AI", expanded=True):
+    ai_enabled = st.toggle("Enable AI (send filtered text to OpenAI)", value=False, key="ai_enabled",
+                           help="When on and you ask a question, short masked snippets and embeddings are sent to OpenAI.")
+    # Hard cap to reduce costs/429s; you can raise this later
+    ai_cap = st.number_input("Max reviews to embed per Q", min_value=200, max_value=5000, value=int(st.session_state.get("ai_cap", 1500)), step=100, key="ai_cap")
+    st.caption("Emails/phone numbers are masked before embedding. Data never embeds automatically—only when you submit a question.")
+
 # ---------- Ask your data (LLM) ----------
 anchor("askdata-anchor")
 st.markdown("## 🤖 Ask your data")
@@ -525,40 +552,22 @@ if not _HAS_OPENAI:
 elif not api_key:
     st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
 else:
-    verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-
-    # Hash-cached index build (handles rate limits + avoids recompute)
-    try:
-        emb_model = "text-embedding-3-small"
-        content_hash = _hash_texts(verb_series.tolist())
-        index = build_vector_index_cached(emb_model, content_hash, verb_series.tolist(), api_key)
-    except Exception as e:
-        if "rate" in str(e).lower() or getattr(e, "status_code", None) == 429:
-            st.warning("We’re temporarily hitting the embeddings rate limit or quota. Falling back to local analysis.")
-            index = None
-        else:
-            raise
-
-    # Ask form; no state is kept after this run
+    # Ask form; no index built until user actually asks
     with st.form("ask_ai_form", clear_on_submit=True):
         q = st.text_area("Ask a question", value="", height=80)
         send = st.form_submit_button("Send")
 
     if send and q.strip():
         q = q.strip()
-        retrieved = vector_search(q, index, api_key, top_k=8) if index else []
-        quotes = []
-        for txt, sim in retrieved[:5]:
-            s = (txt or "").strip()
-            if len(s) > 0:
-                if len(s) > 320: s = s[:317] + "…"
-                quotes.append(f"• “{s}”")
-        quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
 
-        # ------ Safe helpers for pandas.query ------
+        # Build quotes and vector index LAZILY & ONLY IF ai_enabled
+        quotes_text = "• (AI disabled — using local analysis.)"
+        retrieved = []
+
+        # Safe helpers for pandas.query
         def _safe_query(qs: str) -> bool:
             if not qs or len(qs) > 200: return False
-            bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`"]
+            bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`", ";", "\n"]
             if any(t in qs.lower() for t in bad): return False
             return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
 
@@ -605,7 +614,6 @@ else:
             except Exception as e:
                 return {"error": str(e)}
 
-        # local fallback
         def _local_answer_fallback() -> str:
             try:
                 parts = []
@@ -616,9 +624,9 @@ else:
 
                 detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
                 deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
-                def fmt(df):
-                    if df.empty: return "None"
-                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df.iterrows()])
+                def fmt(df_in):
+                    if df_in.empty: return "None"
+                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df_in.iterrows()])
                 parts.append("**Top detractors:** " + fmt(detr))
                 parts.append("**Top delighters:** " + fmt(deli))
                 return "\n\n".join(parts)
@@ -644,51 +652,103 @@ else:
                 "name":"get_metrics_snapshot","description":"Return current page metrics.",
                 "parameters":{"type":"object","properties":{}}}},
         ]
+
+        # Default: local-only unless toggled on
         sys_ctx = (
             "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
             "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
             "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
         )
+        final_text = None
 
-        try:
-            client = OpenAI(api_key=api_key)
-            req = {"model": selected_model,
-                   "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
-                   "tools": tools}
-            if model_supports_temperature(selected_model): req["temperature"] = llm_temp
-            with st.spinner("Thinking..."):
-                first = client.chat.completions.create(**req)
-            msg = first.choices[0].message
-            tool_msgs = []
-            if msg.tool_calls:
-                for call in msg.tool_calls:
-                    try:
-                        args = json.loads(call.function.arguments or "{}")
-                        if not isinstance(args, dict):
+        if ai_enabled:
+            try:
+                # Prepare masked texts and cap for embedding
+                verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
+                PII_PAT = re.compile(r'[\w\.-]+@[\w\.-]+|\+?\d[\d\-\s]{6,}\d')
+                raw_texts_all = [PII_PAT.sub("[redacted]", t) for t in verb_series.tolist()]
+
+                # Cap (deterministic subset by hashing to keep stability)
+                # Stable selection: sort by hash and take top ai_cap
+                def _stable_top_k(texts: list[str], k: int) -> list[str]:
+                    if k >= len(texts): return texts
+                    keyed = [ (hashlib.md5((t or "").encode()).hexdigest(), t) for t in texts ]
+                    keyed.sort(key=lambda x: x[0])
+                    return [t for _, t in keyed[:k]]
+
+                raw_texts = _stable_top_k(raw_texts_all, int(ai_cap))
+
+                emb_model = "text-embedding-3-small"
+                content_hash = _hash_texts(raw_texts)
+
+                # create cache slot (no heavy args)
+                _ = _ensure_cache_slot(emb_model, content_hash, api_key)
+                # Build or fetch index LAZILY here
+                index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
+
+                # Retrieve a few quotes for context
+                retrieved = vector_search(q, index, api_key, top_k=8) if index else []
+                quotes = []
+                for txt, sim in retrieved[:5]:
+                    s = (txt or "").strip()
+                    if len(s) > 0:
+                        if len(s) > 320: s = s[:317] + "…"
+                        quotes.append(f"• “{s}”")
+                quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
+
+                sys_ctx = (
+                    "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
+                    "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
+                    "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
+                )
+
+                client = OpenAI(api_key=api_key)
+                req = {"model": selected_model,
+                       "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
+                       "tools": tools}
+                if model_supports_temperature(selected_model): req["temperature"] = llm_temp
+                with st.spinner("Thinking..."):
+                    first = client.chat.completions.create(**req)
+
+                msg = first.choices[0].message
+                tool_calls = getattr(msg, "tool_calls", []) or []
+                tool_msgs = []
+                if tool_calls:
+                    for call in tool_calls:
+                        try:
+                            args = json.loads(call.function.arguments or "{}")
+                            if not isinstance(args, dict):
+                                args = {}
+                        except Exception:
                             args = {}
-                    except Exception:
-                        args = {}
-                    name = call.function.name
-                    out = {"error":"unknown tool"}
-                    if name == "pandas_count": out = pandas_count(args.get("query",""))
-                    if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                    if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
-                    if name == "keyword_stats": out = keyword_stats(args.get("term",""))
-                    if name == "get_metrics_snapshot": out = get_metrics_snapshot()
-                    tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
-            if tool_msgs:
-                follow = {"model": selected_model,
-                          "messages":[
-                              {"role":"system","content":sys_ctx},
-                              {"role":"assistant","tool_calls": msg.tool_calls, "content": None},
-                              *tool_msgs
-                          ]}
-                if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
-                res2 = client.chat.completions.create(**follow)
-                final_text = res2.choices[0].message.content
-            else:
-                final_text = msg.content
-        except Exception:
+                        name = call.function.name
+                        out = {"error":"unknown tool"}
+                        if name == "pandas_count": out = pandas_count(args.get("query",""))
+                        if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                        if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
+                        if name == "keyword_stats": out = keyword_stats(args.get("term",""))
+                        if name == "get_metrics_snapshot": out = get_metrics_snapshot()
+                        tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
+
+                if tool_msgs:
+                    follow = {"model": selected_model,
+                              "messages":[
+                                  {"role":"system","content":sys_ctx},
+                                  {"role":"assistant","tool_calls": tool_calls, "content": None},
+                                  *tool_msgs
+                              ]}
+                    if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
+                    res2 = client.chat.completions.create(**follow)
+                    final_text = res2.choices[0].message.content
+                else:
+                    final_text = msg.content
+
+            except Exception as e:
+                # Hard fallback: local
+                st.info("AI is currently unavailable or rate-limited. Showing local analysis instead.")
+                final_text = _local_answer_fallback()
+        else:
+            # AI disabled → local analysis only
             final_text = _local_answer_fallback()
 
         st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
@@ -840,7 +900,11 @@ if "review_page" not in st.session_state: st.session_state["review_page"] = 0
 reviews_per_page = st.session_state.get("reviews_per_page", 10)
 total_reviews_count = len(filtered)
 total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
-current_page = min(max(st.session_state["review_page"], 0), total_pages - 1)
+
+# Clamp page after any filter changes
+st.session_state["review_page"] = min(st.session_state.get("review_page", 0), max(total_pages - 1, 0))
+
+current_page = st.session_state["review_page"]
 start_index = current_page * reviews_per_page
 end_index = start_index + reviews_per_page
 paginated = filtered.iloc[start_index:end_index]
@@ -859,10 +923,10 @@ else:
             try: date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
             except Exception: date_str = "-"
 
-        def chips(row, columns, css_class):
+        def chips(row_i, columns, css_class):
             items = []
             for c in columns:
-                val = row.get(c, pd.NA)
+                val = row_i.get(c, pd.NA)
                 if pd.isna(val): continue
                 s = str(val).strip()
                 if not s or s.upper() in {"<NA>","NA","N/A","-"}: continue
@@ -940,7 +1004,6 @@ def send_feedback_via_email(subject: str, body: str) -> bool:
             s.send_message(msg)
         return True
     except Exception as e:
-        # surface non-sensitive context; secrets aren't logged
         st.info(f"Could not send via SMTP: {e}")
         return False
 
@@ -958,7 +1021,6 @@ if submitted:
         if ok:
             st.success("Thanks! Your feedback was sent.")
         else:
-            # Use proper URL encoding for mailto body
             quoted = quote(message or "", safe="")
             st.link_button(
                 "Open email to wseddon@sharkninja.com",
@@ -969,3 +1031,4 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+
