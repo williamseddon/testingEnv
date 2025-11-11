@@ -22,7 +22,7 @@ import time
 import random
 import hashlib
 import threading
-from typing import List, Tuple, Optional
+from typing import List, Optional
 from urllib.parse import quote
 
 # Timezone
@@ -60,6 +60,21 @@ try:
     _HAS_FAISS = True
 except Exception:
     _HAS_FAISS = False
+
+# ---------- Local semantic search (fast, offline) ----------
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+try:
+    from rank_bm25 import BM25Okapi
+    _HAS_BM25 = True
+except Exception:
+    _HAS_BM25 = False
+
+try:
+    from sentence_transformers import CrossEncoder
+    _HAS_RERANKER = True
+except Exception:
+    _HAS_RERANKER = False
 
 NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
 
@@ -157,7 +172,7 @@ GLOBAL_CSS = """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 # ---------- Utilities ----------
-_BAD_CHARS_REGEX = re.compile(r"[ÃÂâï€™€™]")
+_BAD_CHARS_REGEX = re.compile(r"[ÃÂâï€™]")
 
 def clean_text(x: str, keep_na: bool = False) -> str:
     if pd.isna(x): return pd.NA if keep_na else ""
@@ -280,6 +295,7 @@ def _hash_texts(texts: list[str]) -> str:
     return h.hexdigest()
 
 def _build_vector_index(texts: list[str], api_key: str, model: str = "text-embedding-3-small"):
+    # Builds ONLY on demand (when user asks a question + AI toggle on)
     if not _HAS_OPENAI or not texts:
         return None
     client = OpenAI(api_key=api_key, timeout=60, max_retries=0)
@@ -307,11 +323,10 @@ def _build_vector_index(texts: list[str], api_key: str, model: str = "text-embed
 
 @st.cache_resource(show_spinner=False)
 def _ensure_cache_slot(model: str, content_hash: str, api_key: str):
-    # Dummy cache entry to memoize the (model, hash) tuple without serializing big data
+    # Dummy cache entry to memoize (model, hash) without serializing big data
     return {"ok": True}
 
 def _get_or_build_index(content_hash: str, raw_texts: list[str], api_key: str, model: str) -> Optional[object]:
-    # Session memo layer to avoid recompute within a session
     memo = st.session_state.setdefault("_vec_idx", {})
     if content_hash in memo:
         return memo[content_hash]
@@ -334,6 +349,179 @@ def vector_search(query: str, index, api_key: str, top_k: int = 8):
     sims = (mat @ q) / (norms.flatten() * qn)
     idx = np.argsort(-sims)[:top_k]
     return [(texts[i], float(sims[i])) for i in idx]
+
+# ---------- Local retrieval (TF-IDF + optional BM25 + optional reranker) ----------
+def _get_or_build_local_text_index(texts: list[str], content_hash: str):
+    memo = st.session_state.setdefault("_local_text_idx", {})
+    if content_hash in memo:
+        return memo[content_hash]
+
+    corpus = [(t or "").strip() for t in texts]
+    tfidf = TfidfVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        ngram_range=(1,2),
+        min_df=2,
+        max_df=0.95
+    )
+    tfidf_mat = tfidf.fit_transform(corpus)
+
+    bm25 = None
+    tokenized = None
+    if _HAS_BM25 and st.session_state.get("use_bm25", False):
+        tokenized = [t.lower().split() for t in corpus]
+        bm25 = BM25Okapi(tokenized)
+
+    memo[content_hash] = {
+        "tfidf": tfidf,
+        "tfidf_mat": tfidf_mat,
+        "bm25": bm25,
+        "tokenized": tokenized,
+        "texts": corpus,
+    }
+    return memo[content_hash]
+
+def _local_search(query: str, index: dict, top_k: int = 8):
+    if not index: return []
+    q = (query or "").strip()
+    if not q: return []
+    # TF-IDF cosine
+    qvec = index["tfidf"].transform([q])
+    scores = linear_kernel(qvec, index["tfidf_mat"]).ravel()
+    tfidf_top = np.argsort(-scores)[:max(top_k*3, 20)]
+
+    top = tfidf_top
+    # Optional BM25 blend
+    if index.get("bm25") is not None:
+        bm_scores = index["bm25"].get_scores(q.lower().split())
+        # Normalize and blend
+        bm = (bm_scores - np.min(bm_scores)) / (np.ptp(bm_scores) + 1e-9)
+        tf = (scores - np.min(scores)) / (np.ptp(scores) + 1e-9)
+        hybrid = 0.6*tf + 0.4*bm
+        top = np.argsort(-hybrid)[:top_k*3]
+
+    top_idx = list(top[:top_k])
+
+    # Optional cross-encoder rerank (local; may download model)
+    if _HAS_RERANKER and st.session_state.get("use_reranker", False):
+        try:
+            ce = st.session_state.get("_cross_encoder")
+            if ce is None:
+                with st.spinner("Loading local reranker…"):
+                    ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+                st.session_state["_cross_encoder"] = ce
+            cand = [index["texts"][i] for i in top]
+            pairs = [[q, c] for c in cand]
+            rr = ce.predict(pairs)
+            reranked = np.argsort(-rr)[:top_k]
+            top_idx = [top[i] for i in reranked]
+        except Exception:
+            top_idx = list(top[:top_k])
+
+    return [(index["texts"][i], float(i)) for i in top_idx]
+
+# ---------- Local Q&A router ----------
+_SYNONYMS = {
+    "low_star": ["low star", "1-2", "1–2", "1 and 2", "one and two", "detractor"],
+    "avg_star": ["average", "avg", "mean rating"],
+    "trend": ["trend", "over time", "by month", "monthly", "week", "weekly"],
+    "compare": ["vs", "compare", "difference", "gap"],
+    "top": ["top", "biggest", "most common", "leading"],
+    "delighters": ["delighter", "delight"],
+    "detractors": ["detractor", "complaint", "issue"]
+}
+
+def _has_any(q, keys):
+    ql = q.lower()
+    return any(any(tok in ql for tok in _SYNONYMS.get(k, [])) for k in keys)
+
+def _month_trend(df: pd.DataFrame, col="Star Rating"):
+    if "Review Date" not in df.columns or col not in df.columns:
+        return pd.DataFrame()
+    d = df.copy()
+    d["__month"] = pd.to_datetime(d["Review Date"], errors="coerce").dt.to_period("M").astype(str)
+    s = pd.to_numeric(d[col], errors="coerce")
+    return (pd.DataFrame({"__month": d["__month"], col: s})
+              .dropna()
+              .groupby("__month")[col].agg(["count","mean"])
+              .reset_index()
+              .sort_values("__month"))
+
+def _cohort_compare(df: pd.DataFrame):
+    if "Seeded" not in df.columns or "Star Rating" not in df.columns:
+        return None
+    d = df.copy()
+    d["Seeded"] = d["Seeded"].astype("string").str.upper().fillna("NO")
+    s = pd.to_numeric(d["Star Rating"], errors="coerce")
+    grp = pd.DataFrame({"Seeded": d["Seeded"], "Star": s}).dropna().groupby("Seeded")["Star"].agg(["count","mean"])
+    org = grp.loc["NO"] if "NO" in grp.index else None
+    sed = grp.loc["YES"] if "YES" in grp.index else None
+    return grp, org, sed
+
+def _top_symptoms(df: pd.DataFrame, which="detractors", k=5):
+    cols = [f"Symptom {i}" for i in (range(1,11) if which=="detractors" else range(11,21))]
+    data = analyze_delighters_detractors(df, cols)
+    return data.head(k)
+
+def _keyword_prevalence(df: pd.DataFrame, term: str):
+    if "Verbatim" not in df.columns or not term: return 0, 0.0
+    ser = df["Verbatim"].astype("string").fillna("")
+    cnt = int(ser.str.contains(term, case=False, na=False).sum())
+    pct = (cnt / max(1,len(df))) * 100.0
+    return cnt, pct
+
+def _route_and_answer_locally(q: str, df: pd.DataFrame, quotes: list[str]) -> str:
+    parts = []
+    # Trend questions
+    if _has_any(q, ["trend"]):
+        t = _month_trend(df)
+        if not t.empty:
+            last = t.tail(2)
+            if len(last) == 2:
+                delta = last["mean"].iloc[1] - last["mean"].iloc[0]
+                parts.append(f"**Monthly trend (avg ★):** last → {last['mean'].iloc[1]:.2f} ({delta:+.2f} vs prev month).")
+            parts.append("Top months by avg ★: " + ", ".join(
+                [f"{r['__month']} ({r['mean']:.2f})" for _, r in t.sort_values('mean', ascending=False).head(3).iterrows()]
+            ))
+    # Compare seeded vs organic
+    if _has_any(q, ["compare"]) or "seeded" in q.lower():
+        res = _cohort_compare(df)
+        if res:
+            grp, org, sed = res
+            if org is not None and sed is not None:
+                gap = sed["mean"] - org["mean"]
+                parts.append(f"**Seeded vs Organic (avg ★):** Seeded {sed['mean']:.2f} vs Organic {org['mean']:.2f} (gap {gap:+.2f}). Counts — Seeded {int(sed['count'])}, Organic {int(org['count'])}.")
+    # Top symptoms
+    if _has_any(q, ["top","detractors"]):
+        det = _top_symptoms(df, "detractors", 5)
+        if not det.empty:
+            parts.append("**Top detractors:** " + "; ".join([f"{r['Item']} (★ {r['Avg Star']}, {int(r['Mentions'])})" for _, r in det.iterrows()]))
+    if _has_any(q, ["top","delighters"]):
+        delit = _top_symptoms(df, "delighters", 5)
+        if not delit.empty:
+            parts.append("**Top delighters:** " + "; ".join([f"{r['Item']} (★ {r['Avg Star']}, {int(r['Mentions'])})" for _, r in delit.iterrows()]))
+
+    # Keyword prevalence
+    m = re.search(r"(?:mentions of|frequency of|how many.*mention)\s+\"([^\"]+)\"", q, re.I)
+    if not m:
+        m = re.search(r"mentions of ([\w\- ]+)", q, re.I)
+    if m:
+        term = m.group(1).strip()
+        cnt, pct = _keyword_prevalence(df, term)
+        parts.append(f"**Mentions of “{term}”:** {cnt} reviews ({pct:.1f}%).")
+
+    # Fallback snapshot if nothing matched
+    if not parts:
+        total = int(len(df))
+        avg = float(pd.to_numeric(df.get("Star Rating"), errors="coerce").mean()) if total and "Star Rating" in df.columns else 0.0
+        low = float((pd.to_numeric(df.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total and "Star Rating" in df.columns else 0.0
+        parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low:.1f}%.")
+
+    # Add quotes (evidence)
+    if quotes:
+        parts.append("**Representative quotes:**\n" + "\n".join([f"• “{q}”" for q in quotes[:5]]))
+
+    return "\n\n".join(parts)
 
 # ---------- Anchors ----------
 def anchor(id_: str):
@@ -401,7 +589,7 @@ def _load_clean_excel(file_bytes: bytes) -> pd.DataFrame:
     return df_local
 
 try:
-    df = _load_clean_excel(uploaded_file)
+    df = _load_clean_excel(uploaded_file.getvalue())
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -498,12 +686,14 @@ with st.sidebar.expander("📄 Review List", expanded=False):
 
 # Clear filters
 if st.sidebar.button("🧹 Clear all filters"):
-    for k in ["tf","sr","kw","delight","detract","rpp","review_page","llm_model","llm_model_label","llm_temp","ai_enabled","ai_cap"] + \
+    for k in ["tf","sr","kw","delight","detract","rpp","review_page",
+              "llm_model","llm_model_label","llm_temp",
+              "ai_enabled","ai_cap","use_bm25","use_reranker"] + \
              [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
         if k in st.session_state: del st.session_state[k]
     st.rerun()
 
-# ---------- AI / Privacy controls ----------
+# ---------- AI / Privacy & Local Intelligence ----------
 with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
     _model_choices = [
         ("Fast & economical – 4o-mini", "gpt-4o-mini"),
@@ -533,9 +723,12 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
 with st.sidebar.expander("🔒 Privacy & AI", expanded=True):
     ai_enabled = st.toggle("Enable AI (send filtered text to OpenAI)", value=False, key="ai_enabled",
                            help="When on and you ask a question, short masked snippets and embeddings are sent to OpenAI.")
-    # Hard cap to reduce costs/429s; you can raise this later
     ai_cap = st.number_input("Max reviews to embed per Q", min_value=200, max_value=5000, value=int(st.session_state.get("ai_cap", 1500)), step=100, key="ai_cap")
-    st.caption("Emails/phone numbers are masked before embedding. Data never embeds automatically—only when you submit a question.")
+    st.caption("Emails/phone numbers are masked before embedding. No remote calls happen until you press Send.")
+
+with st.sidebar.expander("🧠 Local Intelligence", expanded=False):
+    st.toggle("Use BM25 blend (local, fast)", value=st.session_state.get("use_bm25", False), key="use_bm25")
+    st.toggle("Use cross-encoder reranker (local, slower)", value=st.session_state.get("use_reranker", False), key="use_reranker")
 
 # ---------- Ask your data (LLM) ----------
 anchor("askdata-anchor")
@@ -548,211 +741,199 @@ st.markdown(
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not _HAS_OPENAI:
-    st.info("To enable this panel, add `openai` to your requirements and redeploy. Then set `OPENAI_API_KEY`.")
+    st.info("To enable remote LLM, add `openai` to requirements and set `OPENAI_API_KEY`. Local Q&A still works.")
 elif not api_key:
-    st.info("Set your `OPENAI_API_KEY` (in env or .streamlit/secrets.toml) to chat with the filtered data.")
-else:
-    # Ask form; no index built until user actually asks
-    with st.form("ask_ai_form", clear_on_submit=True):
-        q = st.text_area("Ask a question", value="", height=80)
-        send = st.form_submit_button("Send")
+    st.info("Set `OPENAI_API_KEY` (env or .streamlit/secrets.toml) for remote LLM. Local Q&A still works.")
 
-    if send and q.strip():
-        q = q.strip()
+# Ask form
+with st.form("ask_ai_form", clear_on_submit=True):
+    q = st.text_area("Ask a question", value="", height=80)
+    send = st.form_submit_button("Send")
 
-        # Build quotes and vector index LAZILY & ONLY IF ai_enabled
-        quotes_text = "• (AI disabled — using local analysis.)"
-        retrieved = []
+if send and q.strip():
+    q = q.strip()
 
-        # Safe helpers for pandas.query
-        def _safe_query(qs: str) -> bool:
-            if not qs or len(qs) > 200: return False
-            bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`", ";", "\n"]
-            if any(t in qs.lower() for t in bad): return False
-            return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
+    # Build local search index ON DEMAND (no remote calls)
+    verb_series_all = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
+    local_texts = verb_series_all.tolist()
+    content_hash_local = _hash_texts(local_texts)
+    local_index = _get_or_build_local_text_index(local_texts, content_hash_local)
 
-        # tools
-        def pandas_count(query: str) -> dict:
-            try:
-                if not _safe_query(query): return {"error":"unsafe query"}
-                res = filtered.query(query)  # default engine
-                return {"count": int(len(res))}
-            except Exception as e:
-                return {"error": str(e)}
+    def _get_local_quotes(question: str):
+        hits = _local_search(question, local_index, top_k=8)
+        quotes = []
+        for txt, _ in hits[:5]:
+            s = (txt or "").strip()
+            if len(s) > 320: s = s[:317] + "…"
+            if s: quotes.append(s)
+        return quotes
 
-        def pandas_mean(column: str, query: str | None = None) -> dict:
-            try:
-                if column not in filtered.columns: return {"error": f"Unknown column {column}"}
-                d = filtered if not query else (filtered.query(query) if _safe_query(query) else None)
-                if d is None: return {"error":"unsafe query"}
-                return {"mean": float(pd.to_numeric(d[column], errors='coerce').mean())}
-            except Exception as e:
-                return {"error": str(e)}
+    final_text = None
 
-        def symptom_stats(symptom: str) -> dict:
-            cols = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in filtered.columns]
-            if not cols: return {"count":0,"avg_star":None}
-            mask = filtered[cols].isin([symptom]).any(axis=1)
-            d = filtered[mask]
-            return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) and "Star Rating" in d.columns else None}
+    # Safe helpers for pandas.query
+    def _safe_query(qs: str) -> bool:
+        if not qs or len(qs) > 200: return False
+        bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`", ";", "\n"]
+        if any(t in qs.lower() for t in bad): return False
+        return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
 
-        def keyword_stats(term: str) -> dict:
-            if "Verbatim" not in filtered.columns: return {"count": 0, "pct": 0.0}
-            ser = filtered["Verbatim"].astype("string").fillna("")
-            cnt = int(ser.str.contains(term, case=False, na=False).sum())
-            pct = (cnt / max(1,len(filtered))) * 100.0
-            return {"count": cnt, "pct": pct}
+    # tool functions
+    def pandas_count(query: str) -> dict:
+        try:
+            if not _safe_query(query): return {"error":"unsafe query"}
+            res = filtered.query(query)
+            return {"count": int(len(res))}
+        except Exception as e:
+            return {"error": str(e)}
 
-        def get_metrics_snapshot():
-            try:
-                return {
-                    "total_reviews": int(len(filtered)),
-                    "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
-                    "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
-                    "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered.columns else {},
-                }
-            except Exception as e:
-                return {"error": str(e)}
+    def pandas_mean(column: str, query: str | None = None) -> dict:
+        try:
+            if column not in filtered.columns: return {"error": f"Unknown column {column}"}
+            d = filtered if not query else (filtered.query(query) if _safe_query(query) else None)
+            if d is None: return {"error":"unsafe query"}
+            return {"mean": float(pd.to_numeric(d[column], errors='coerce').mean())}
+        except Exception as e:
+            return {"error": str(e)}
 
-        def _local_answer_fallback() -> str:
-            try:
-                parts = []
-                total = int(len(filtered))
-                avg = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if total and "Star Rating" in filtered.columns else 0.0
-                low_pct = float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if total and "Star Rating" in filtered.columns else 0.0
-                parts.append(f"**Snapshot** — {total} reviews; avg ★ {avg:.1f}; % 1–2★ {low_pct:.1f}%.")
+    def symptom_stats(symptom: str) -> dict:
+        cols = [c for c in [f"Symptom {i}" for i in range(1,21)] if c in filtered.columns]
+        if not cols: return {"count":0,"avg_star":None}
+        mask = filtered[cols].isin([symptom]).any(axis=1)
+        d = filtered[mask]
+        return {"count": int(len(d)), "avg_star": float(pd.to_numeric(d["Star Rating"], errors="coerce").mean()) if len(d) and "Star Rating" in d.columns else None}
 
-                detr = analyze_delighters_detractors(filtered, [c for c in existing_detractor_columns]).head(5)
-                deli = analyze_delighters_detractors(filtered, [c for c in existing_delighter_columns]).head(5)
-                def fmt(df_in):
-                    if df_in.empty: return "None"
-                    return "; ".join([f"{r['Item']} (avg ★ {r['Avg Star']}, {int(r['Mentions'])} mentions)" for _, r in df_in.iterrows()])
-                parts.append("**Top detractors:** " + fmt(detr))
-                parts.append("**Top delighters:** " + fmt(deli))
-                return "\n\n".join(parts)
-            except Exception as e:
-                return f"(Fallback summary error: {e})"
+    def keyword_stats(term: str) -> dict:
+        if "Verbatim" not in filtered.columns: return {"count": 0, "pct": 0.0}
+        ser = filtered["Verbatim"].astype("string").fillna("")
+        cnt = int(ser.str.contains(term, case=False, na=False).sum())
+        pct = (cnt / max(1,len(filtered))) * 100.0
+        return {"count": cnt, "pct": pct}
 
-        selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
-        llm_temp = float(st.session_state.get("llm_temp", 0.2))
-        tools = [
-            {"type":"function","function":{
-                "name":"pandas_count","description":"Count rows matching a pandas query over the CURRENT filtered dataset.",
-                "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-            {"type":"function","function":{
-                "name":"pandas_mean","description":"Mean of a numeric column (optional pandas query).",
-                "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}}},
-            {"type":"function","function":{
-                "name":"symptom_stats","description":"Mentions + avg star for a symptom across Symptom 1–20.",
-                "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}}},
-            {"type":"function","function":{
-                "name":"keyword_stats","description":"Count + % of reviews with term in Verbatim.",
-                "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}}},
-            {"type":"function","function":{
-                "name":"get_metrics_snapshot","description":"Return current page metrics.",
-                "parameters":{"type":"object","properties":{}}}},
-        ]
+    def get_metrics_snapshot():
+        try:
+            return {
+                "total_reviews": int(len(filtered)),
+                "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
+                "low_star_pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
+                "star_counts": pd.to_numeric(filtered.get("Star Rating"), errors="coerce").value_counts().sort_index().to_dict() if "Star Rating" in filtered.columns else {},
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
-        # Default: local-only unless toggled on
-        sys_ctx = (
-            "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
-            "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
-            "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
-        )
-        final_text = None
+    # Default: high-quality local answer + quotes
+    local_quotes = _get_local_quotes(q)
+    local_answer = _route_and_answer_locally(q, filtered, local_quotes)
 
-        if ai_enabled:
-            try:
-                # Prepare masked texts and cap for embedding
-                verb_series = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-                PII_PAT = re.compile(r'[\w\.-]+@[\w\.-]+|\+?\d[\d\-\s]{6,}\d')
-                raw_texts_all = [PII_PAT.sub("[redacted]", t) for t in verb_series.tolist()]
+    # If AI disabled or no key/client, just show local
+    if not ai_enabled or (not _HAS_OPENAI) or (not api_key):
+        final_text = local_answer
+    else:
+        # Remote LLM path (tools-first), ONLY after we have retrieval & numbers ready
+        try:
+            # Prepare masked texts and cap for embedding
+            PII_PAT = re.compile(r'[\w\.-]+@[\w\.-]+|\+?\d[\d\-\s]{6,}\d')
+            raw_texts_all = [PII_PAT.sub("[redacted]", t) for t in local_texts]
 
-                # Cap (deterministic subset by hashing to keep stability)
-                # Stable selection: sort by hash and take top ai_cap
-                def _stable_top_k(texts: list[str], k: int) -> list[str]:
-                    if k >= len(texts): return texts
-                    keyed = [ (hashlib.md5((t or "").encode()).hexdigest(), t) for t in texts ]
-                    keyed.sort(key=lambda x: x[0])
-                    return [t for _, t in keyed[:k]]
+            # Cap deterministically: sort by MD5 and take first ai_cap
+            def _stable_top_k(texts: list[str], k: int) -> list[str]:
+                if k >= len(texts): return texts
+                keyed = [ (hashlib.md5((t or "").encode()).hexdigest(), t) for t in texts ]
+                keyed.sort(key=lambda x: x[0])
+                return [t for _, t in keyed[:k]]
 
-                raw_texts = _stable_top_k(raw_texts_all, int(ai_cap))
+            cap_n = int(ai_cap)
+            raw_texts = _stable_top_k(raw_texts_all, cap_n)
+            emb_model = "text-embedding-3-small"
+            content_hash = _hash_texts(raw_texts)
 
-                emb_model = "text-embedding-3-small"
-                content_hash = _hash_texts(raw_texts)
+            _ = _ensure_cache_slot(emb_model, content_hash, api_key)  # dummy cached marker
+            index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
 
-                # create cache slot (no heavy args)
-                _ = _ensure_cache_slot(emb_model, content_hash, api_key)
-                # Build or fetch index LAZILY here
-                index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
+            retrieved = vector_search(q, index, api_key, top_k=8) if index else []
+            quotes = []
+            for txt, sim in retrieved[:5]:
+                s = (txt or "").strip()
+                if len(s) > 320: s = s[:317] + "…"
+                if s: quotes.append(f"• “{s}”")
+            quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
 
-                # Retrieve a few quotes for context
-                retrieved = vector_search(q, index, api_key, top_k=8) if index else []
-                quotes = []
-                for txt, sim in retrieved[:5]:
-                    s = (txt or "").strip()
-                    if len(s) > 0:
-                        if len(s) > 320: s = s[:317] + "…"
-                        quotes.append(f"• “{s}”")
-                quotes_text = "\n".join(quotes) if quotes else "• (No close review snippets retrieved.)"
+            selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
+            llm_temp = float(st.session_state.get("llm_temp", 0.2))
+            tools = [
+                {"type":"function","function":{
+                    "name":"pandas_count","description":"Count rows matching a pandas query over the CURRENT filtered dataset.",
+                    "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+                {"type":"function","function":{
+                    "name":"pandas_mean","description":"Mean of a numeric column (optional pandas query).",
+                    "parameters":{"type":"object","properties":{"column":{"type":"string"},"query":{"type":"string"}},"required":["column"]}}},
+                {"type":"function","function":{
+                    "name":"symptom_stats","description":"Mentions + avg star for a symptom across Symptom 1–20.",
+                    "parameters":{"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"]}}}
+                ,
+                {"type":"function","function":{
+                    "name":"keyword_stats","description":"Count + % of reviews with term in Verbatim.",
+                    "parameters":{"type":"object","properties":{"term":{"type":"string"}},"required":["term"]}}}
+                ,
+                {"type":"function","function":{
+                    "name":"get_metrics_snapshot","description":"Return current page metrics.",
+                    "parameters":{"type":"object","properties":{}}}},
+            ]
 
-                sys_ctx = (
-                    "You are a helpful analyst for customer reviews. Use ONLY the provided context and tool results.\n"
-                    "Include short quotes from retrieved snippets when illustrative. Prefer tools for exact numbers.\n\n"
-                    "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
-                )
+            sys_ctx = (
+                "You are a helpful analyst for customer reviews.\n"
+                "Use ONLY tool outputs for any numbers/statistics; DO NOT invent numeric values.\n"
+                "Cite 2–5 short quotes from RETRIEVED_SNIPPETS to illustrate points.\n\n"
+                "RETRIEVED_SNIPPETS:\n" + (quotes_text or "(none)") + f"\n\nROW_COUNT={len(filtered)}"
+            )
 
-                client = OpenAI(api_key=api_key)
-                req = {"model": selected_model,
-                       "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
-                       "tools": tools}
-                if model_supports_temperature(selected_model): req["temperature"] = llm_temp
-                with st.spinner("Thinking..."):
-                    first = client.chat.completions.create(**req)
+            client = OpenAI(api_key=api_key)
+            req = {"model": selected_model,
+                   "messages":[{"role":"system","content":sys_ctx},{"role":"user","content":q}],
+                   "tools": tools}
+            if model_supports_temperature(selected_model): req["temperature"] = llm_temp
+            with st.spinner("Thinking..."):
+                first = client.chat.completions.create(**req)
 
-                msg = first.choices[0].message
-                tool_calls = getattr(msg, "tool_calls", []) or []
-                tool_msgs = []
-                if tool_calls:
-                    for call in tool_calls:
-                        try:
-                            args = json.loads(call.function.arguments or "{}")
-                            if not isinstance(args, dict):
-                                args = {}
-                        except Exception:
+            msg = first.choices[0].message
+            tool_calls = getattr(msg, "tool_calls", []) or []
+            tool_msgs = []
+            if tool_calls:
+                for call in tool_calls:
+                    try:
+                        args = json.loads(call.function.arguments or "{}")
+                        if not isinstance(args, dict):
                             args = {}
-                        name = call.function.name
-                        out = {"error":"unknown tool"}
-                        if name == "pandas_count": out = pandas_count(args.get("query",""))
-                        if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
-                        if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
-                        if name == "keyword_stats": out = keyword_stats(args.get("term",""))
-                        if name == "get_metrics_snapshot": out = get_metrics_snapshot()
-                        tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
+                    except Exception:
+                        args = {}
+                    name = call.function.name
+                    out = {"error":"unknown tool"}
+                    if name == "pandas_count": out = pandas_count(args.get("query",""))
+                    if name == "pandas_mean":  out = pandas_mean(args.get("column",""), args.get("query"))
+                    if name == "symptom_stats": out = symptom_stats(args.get("symptom",""))
+                    if name == "keyword_stats": out = keyword_stats(args.get("term",""))
+                    if name == "get_metrics_snapshot": out = get_metrics_snapshot()
+                    tool_msgs.append({"tool_call_id": call.id, "role":"tool", "name": name, "content": json.dumps(out)})
 
-                if tool_msgs:
-                    follow = {"model": selected_model,
-                              "messages":[
-                                  {"role":"system","content":sys_ctx},
-                                  {"role":"assistant","tool_calls": tool_calls, "content": None},
-                                  *tool_msgs
-                              ]}
-                    if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
-                    res2 = client.chat.completions.create(**follow)
-                    final_text = res2.choices[0].message.content
-                else:
-                    final_text = msg.content
+            if tool_msgs:
+                follow = {"model": selected_model,
+                          "messages":[
+                              {"role":"system","content":sys_ctx},
+                              {"role":"assistant","tool_calls": tool_calls, "content": None},
+                              *tool_msgs
+                          ]}
+                if model_supports_temperature(selected_model): follow["temperature"] = llm_temp
+                res2 = client.chat.completions.create(**follow)
+                final_text = res2.choices[0].message.content
+            else:
+                final_text = msg.content
 
-            except Exception as e:
-                # Hard fallback: local
-                st.info("AI is currently unavailable or rate-limited. Showing local analysis instead.")
-                final_text = _local_answer_fallback()
-        else:
-            # AI disabled → local analysis only
-            final_text = _local_answer_fallback()
+        except Exception:
+            # Hard fallback: robust local answer
+            st.info("AI temporarily unavailable. Showing local analysis with evidence instead.")
+            final_text = local_answer
 
-        st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -816,7 +997,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Distribution chart (guard for missing column)
+# Distribution chart
 if "Star Rating" in filtered.columns:
     star_counts = pd.to_numeric(filtered["Star Rating"], errors="coerce").dropna().value_counts().sort_index()
 else:
@@ -825,7 +1006,6 @@ total_reviews = len(filtered)
 percentages = ((star_counts / total_reviews * 100).round(1)) if total_reviews else (star_counts * 0)
 star_labels = [f"{int(star)} stars" for star in star_counts.index]
 
-# Color-safe mapping by star value
 color_map = {1:"#EF4444", 2:"#F59E0B", 3:"#EAB308", 4:"#10B981", 5:"#22C55E"}
 bar_colors = [color_map.get(int(s), "#CBD5E1") for s in star_counts.index]
 
@@ -978,7 +1158,7 @@ with p5:
 
 st.markdown("---")
 
-# ---------- Feedback (anchor fallback) ----------
+# ---------- Feedback ----------
 anchor("feedback-anchor")
 st.markdown("## 💬 Submit Feedback")
 st.caption("Tell us what to improve. We care about making this tool user-centric.")
@@ -1031,4 +1211,5 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+
 
