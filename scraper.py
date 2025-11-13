@@ -24,7 +24,7 @@ Notes
   **subscription-key**.
 • Validation prioritizes the Account/Quotas endpoint (200 ⇒ key is valid). A 404 from the
   product-lookup endpoint can simply mean the product URL wasn’t found.
-• You can now paste **raw ASINs** (e.g., `B0FKKQ2PH1`) or full Amazon URLs. The app will build
+• You can paste **raw ASINs** (e.g., `B0FKKQ2PH1`) or full Amazon URLs. The app will build
   `https://<marketplace>/dp/<ASIN>?psc=1` automatically.
 """
 from __future__ import annotations
@@ -87,6 +87,11 @@ DEFAULT_MARKET = "United States"
 ASIN_RE = re.compile(r"^[A-Za-z0-9]{10}$")
 
 
+def sanitize_key(s: str) -> str:
+    """Remove whitespace, commas and quotes from an API key safely."""
+    return re.sub(r"[\s,\"']+", "", s or "")
+
+
 def ensure_psc_1(raw_url: str) -> str:
     """Ensure URL contains psc=1. Raises ValueError if URL is not absolute."""
     parts = urlparse(raw_url.strip())
@@ -122,7 +127,7 @@ def _auth_apply(headers: Dict[str, str], params: Dict[str, str], *, mode: str, h
 
 
 def call_axesso_lookup(amazon_url: str, api_key: str, *, base_url: str, auth_mode: str, auth_header: str, auth_param: str, timeout: float) -> Tuple[int, Any, Dict[str, Any]]:
-    headers: Dict[str, str] = {"User-Agent": "axesso-streamlit/1.2"}
+    headers: Dict[str, str] = {"User-Agent": "axesso-streamlit/1.3"}
     params: Dict[str, str] = {"url": amazon_url}
     _auth_apply(headers, params, mode=auth_mode, header_name=auth_header, param_name=auth_param, api_key=api_key)
     try:
@@ -138,7 +143,7 @@ def call_axesso_lookup(amazon_url: str, api_key: str, *, base_url: str, auth_mod
 
 
 def call_account_quotas(api_key: str, *, quotas_url: str, auth_mode: str, auth_header: str, auth_param: str, timeout: float) -> Tuple[int, Any, Dict[str, Any]]:
-    headers: Dict[str, str] = {"User-Agent": "axesso-streamlit/1.2"}
+    headers: Dict[str, str] = {"User-Agent": "axesso-streamlit/1.3"}
     params: Dict[str, str] = {}
     _auth_apply(headers, params, mode=auth_mode, header_name=auth_header, param_name=auth_param, api_key=api_key)
     try:
@@ -168,8 +173,7 @@ def validate_api_key(api_key: str, *, base_url: str, quotas_url: str, auth_mode:
     if l_code in (401, 403):
         return False, f"Unauthorized to Product Lookup (HTTP {l_code})."
     if l_code == 404:
-        return True, "Backend reached (HTTP 404 on sample product) — key likely valid. Try your own product." \
-            + ""
+        return True, "Backend reached (HTTP 404 on sample product) — key likely valid. Try your own product."
     if l_code == 0:
         return False, f"Network error: {l_data.get('error', 'Unknown error')}"
     return False, f"Unexpected validation responses (Quotas {q_code}, Lookup {l_code}). See Raw response for details."
@@ -241,14 +245,11 @@ key_form = st.form("key_form")
 with key_form:
     st.subheader("1) Enter your API key")
     api_key_input = st.text_input("Axesso API key", value=st.session_state.api_key, type="password", help="Stored only in session state. Use Streamlit Secrets for production.")
-    # Sanitize obvious paste artifacts (spaces, commas, quotes, newlines)
-    sanitized = api_key_input.replace(" ", "").replace(",", "").replace("
-", "").replace("	", "").strip().strip("'\"")
+    sanitized = sanitize_key(api_key_input)
     if api_key_input and api_key_input != sanitized:
-        st.info("We removed spaces/commas/quotes from the key you pasted.")
-    # Quick format hint (Axesso APIM keys are often 32 hex chars)
+        st.info("We removed spaces/commas/quotes/whitespace from the key you pasted.")
     if sanitized and not re.fullmatch(r"[0-9A-Fa-f]{32}", sanitized):
-        st.caption("Heads up: your key doesn’t look like a 32‑char hex token.")
+        st.caption("Heads up: your key doesn’t look like a typical 32‑char hex token.")
     kcol1, kcol2, kcol3 = st.columns([1, 1, 1])
     validate_pressed = kcol1.form_submit_button("Validate & Save", use_container_width=True)
     quotas_pressed = kcol2.form_submit_button("Check quotas", use_container_width=True)
@@ -329,11 +330,14 @@ if quotas_pressed:
                 st.error(q_data.get("error"))
             else:
                 st.warning("Couldn’t parse quotas payload. See Raw & Debug below.")
+
+        # Provide ready-to-run cURL to test outside the app
         with st.expander("Test this call via cURL", expanded=False):
             if st.session_state.auth_mode == "Header":
                 st.code(f"curl -sS '{st.session_state.quotas_url}' -H '{st.session_state.auth_header}: {st.session_state.api_key}'")
             else:
                 st.code(f"curl -sS '{st.session_state.quotas_url}?{st.session_state.auth_param}={st.session_state.api_key}'")
+
         with st.expander("Raw quotas response", expanded=False):
             st.write(q_data)
         with st.expander("Quotas request debug", expanded=False):
@@ -520,6 +524,7 @@ if submit_lookup:
 
 # Footer note
 st.caption("Note: Don’t commit API keys to source control. Prefer Streamlit Secrets or environment variables.")
+
 
 
 
