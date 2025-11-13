@@ -5,6 +5,7 @@ import json
 import re
 import time
 from typing import List
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -35,7 +36,6 @@ def extract_asins(text: str) -> List[str]:
             a = m.upper()
             if re.fullmatch(r"[A-Z0-9]{10}", a):
                 found.append(a)
-    # unique, preserve order
     seen, uniq = set(), []
     for a in found:
         if a not in seen:
@@ -43,19 +43,12 @@ def extract_asins(text: str) -> List[str]:
     return uniq
 
 def parse_reviews_from_payload(payload: dict):
-    """
-    Tolerant extractor: different tenants/operations name the reviews array differently.
-    Tries common keys and a couple of nested shapes.
-    """
+    # tolerate multiple response shapes
     candidates = ["reviews", "reviewList", "items", "data", "productReviews"]
-
-    # direct list
     for k in candidates:
         v = payload.get(k)
         if isinstance(v, list) and (not v or isinstance(v[0], dict)):
             return v
-
-    # nested dict -> list
     for k in candidates:
         v = payload.get(k)
         if isinstance(v, dict):
@@ -63,15 +56,12 @@ def parse_reviews_from_payload(payload: dict):
                 vv = v.get(kk)
                 if isinstance(vv, list) and (not vv or isinstance(vv[0], dict)):
                     return vv
-
-    # sometimes under "result"
     res = payload.get("result")
     if isinstance(res, dict):
         for k in candidates:
             v = res.get(k)
             if isinstance(v, list) and (not v or isinstance(v[0], dict)):
                 return v
-
     return []
 
 def normalize_review(asin: str, domain: str, meta: dict, it: dict):
@@ -89,7 +79,6 @@ def normalize_review(asin: str, domain: str, meta: dict, it: dict):
         "author": g(it, "author", "reviewer", "user", "reviewerName", "nickname"),
         "date": g(it, "date", "reviewDate", "submissionTime", "createdAt", "time"),
         "helpful": g(it, "helpful", "helpfulCount", "helpfulVotes", "votes", "vote"),
-        # meta (per page)
         "productTitle": meta.get("productTitle", ""),
         "url": meta.get("url", ""),
         "page": meta.get("page"),
@@ -107,7 +96,27 @@ def estimate_calls(asins, fetch_all, start_page, max_pages_cap, lastpage_cache, 
     return sum(per_asin_calls(a) for a in asins)
 
 # -----------------------------
-# Sidebar (settings)
+# Require secret key (no manual headers allowed)
+# -----------------------------
+
+API_KEY = None
+try:
+    # Prefer APIM secret name; fallback to Axesso key name
+    API_KEY = st.secrets.get("OCP_APIM_KEY") or st.secrets.get("AXESSO_API_KEY")
+except Exception:
+    API_KEY = None
+
+if not API_KEY or not isinstance(API_KEY, str) or not API_KEY.strip():
+    st.error(
+        "Missing API key. Add it to `.streamlit/secrets.toml`:\n\n"
+        '```toml\nOCP_APIM_KEY = "3693f51a06054a57a95af4dc56ed319b"\n```'
+    )
+    st.stop()
+
+HEADERS = {"Ocp-Apim-Subscription-Key": API_KEY.strip()}
+
+# -----------------------------
+# Sidebar
 # -----------------------------
 
 with st.sidebar:
@@ -115,54 +124,18 @@ with st.sidebar:
     gateway = st.text_input(
         "APIM Gateway Base URL",
         value="https://axesso.azure-api.net",
-        help="Use the **gateway** host you see in the portal’s “Try it” (not the developer site)."
+        help="Use the **gateway** host from the portal’s “Try it”."
     )
     reviews_path = st.text_input(
         "Reviews endpoint path",
         value="/amz/amazon-product-reviews",
-        help="Copy the exact operation path from the portal (APIs → Amazon API → Reviews by ASIN)."
+        help="Copy the exact operation path from the portal."
     )
     domain_code = st.selectbox("Amazon domainCode", options=SUPPORTED_DOMAINS, index=0)
 
-    st.markdown("### 🔑 Auth")
-    # Prefer secrets if present
-    secret_headers = None
-    try:
-        if "OCP_APIM_KEY" in st.secrets:
-            secret_headers = {"Ocp-Apim-Subscription-Key": st.secrets["OCP_APIM_KEY"]}
-        elif "AXESSO_API_KEY" in st.secrets:
-            # If you stored plain Axesso key, still send in the APIM header slot
-            secret_headers = {"Ocp-Apim-Subscription-Key": st.secrets["AXESSO_API_KEY"]}
-    except Exception:
-        secret_headers = None
-
-    use_secret = st.checkbox("Use key from secrets (if available)", value=bool(secret_headers))
-    if use_secret and secret_headers:
-        headers = dict(secret_headers)
-        # masked preview
-        try:
-            masked = {k: (v[:3] + "…" if isinstance(v, str) and len(v) > 6 else v) for k, v in headers.items()}
-            st.caption(f"Using secrets: {masked}")
-        except Exception:
-            pass
-        headers_raw = ""
-    else:
-        headers_raw = st.text_area(
-            "Headers (JSON)",
-            value='{"Ocp-Apim-Subscription-Key":"YOUR_KEY"}',
-            height=92,
-            help='Paste JSON. APIM default header is "Ocp-Apim-Subscription-Key".'
-        )
-        headers = None
-        if headers_raw.strip():
-            try:
-                headers = json.loads(headers_raw)
-                if not isinstance(headers, dict):
-                    st.warning("Headers JSON must be an object like {\"Ocp-Apim-Subscription-Key\":\"...\"}.")
-                    headers = None
-            except Exception as e:
-                st.warning(f"Could not parse headers JSON: {e}")
-                headers = None
+    st.markdown("### 🔑 Key (from secrets)")
+    masked = (API_KEY[:3] + "…") if len(API_KEY) > 3 else "***"
+    st.caption(f"Using secret key: `{masked}` (from OCP_APIM_KEY / AXESSO_API_KEY)")
 
     st.markdown("### ⚙️ Fetch Scope")
     fetch_all = st.checkbox("Fetch **ALL pages**", value=True, help="Loop pages until last page (or cap).")
@@ -179,7 +152,7 @@ if "lastpage_cache" not in st.session_state:
 # -----------------------------
 
 st.title("⭐ Amazon Reviews (Axesso APIM)")
-st.caption("Paste ASINs or Amazon URLs. Configure APIM gateway + path + key, then fetch paginated reviews and download CSV/JSON.")
+st.caption("Paste ASINs or Amazon URLs. Configure APIM gateway + path; key is required via secrets.")
 
 asin_input = st.text_area(
     "ASINs or URLs (one per line or mixed)",
@@ -209,14 +182,12 @@ metas = st.session_state.get("reviews_meta", [])
 def do_request(asin: str, page: int):
     url = f"{gateway.rstrip('/')}{reviews_path}"
     params = {"asin": asin, "domainCode": domain_code, "page": page}
-    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r = requests.get(url, headers=HEADERS, params=params, timeout=30)
     return r
 
 if go:
     if not asins:
         st.error("Please paste at least one ASIN or Amazon product URL.")
-    elif not headers:
-        st.error("Please provide your APIM subscription key in headers (or secrets).")
     else:
         rows, metas = [], []
         total_calls = max(1, total_est_calls)
@@ -224,7 +195,6 @@ if go:
         progress = st.progress(0)
 
         for asin in asins:
-            # Plan pages for this ASIN
             if fetch_all:
                 key = f"{asin}:{domain_code}"
                 if isinstance(st.session_state.lastpage_cache.get(key), int):
@@ -247,25 +217,20 @@ if go:
                         break
 
                     data = r.json()
-
-                    # Capture pagination hints if present
                     current_page = data.get("currentPage") or p
                     last_page = data.get("lastPage")
                     if isinstance(last_page, int):
                         st.session_state.lastpage_cache[f"{asin}:{domain_code}"] = last_page
 
-                    # Meta (per page)
                     meta_fields = ["productTitle", "url", "countReview", "productRating"]
                     meta = {k: data.get(k) for k in meta_fields}
                     meta.update({"asin": asin, "page": current_page})
                     metas.append(meta)
 
-                    # Extract reviews
                     items = parse_reviews_from_payload(data)
                     for it in items:
                         rows.append(normalize_review(asin, domain_code, meta, it))
 
-                    # Stop conditions
                     if isinstance(last_page, int) and int(current_page) >= int(last_page):
                         break
                     if not items and not isinstance(last_page, int):
@@ -286,7 +251,6 @@ if rows:
     st.success(f"Collected {len(rows)} reviews across {len(asins)} ASIN(s).")
     df = pd.DataFrame(rows)
 
-    # Optional: derive numeric rating if needed
     if "rating" in df.columns:
         def parse_rating(x):
             if x is None: return None
@@ -323,16 +287,11 @@ if metas:
 st.divider()
 st.markdown("### Code Snippets")
 first_asin = asins[0] if asins else "B08N5WRWNW"
-
-# Mask key in curl preview
-mask_key = "***"
-if isinstance(headers, dict) and "Ocp-Apim-Subscription-Key" in headers:
-    v = str(headers.get("Ocp-Apim-Subscription-Key") or "")
-    mask_key = (v[:3] + "…") if len(v) > 3 else "***"
+mask = (API_KEY[:3] + "…") if len(API_KEY) > 3 else "***"
 
 st.markdown("**cURL** (replace values as needed)")
 st.code(
-    f'''curl -G "{gateway.rstrip('/')}{reviews_path}" -H "Ocp-Apim-Subscription-Key: {mask_key}"
+    f'''curl -G "{gateway.rstrip('/')}{reviews_path}" -H "Ocp-Apim-Subscription-Key: {mask}"
   --data-urlencode "asin={first_asin}"
   --data-urlencode "domainCode={domain_code}"
   --data-urlencode "page=1"''',
@@ -345,7 +304,7 @@ f"""import requests
 
 GATEWAY = "{gateway.rstrip('/')}"
 REVIEWS_PATH = "{reviews_path}"
-HEADERS = {json.dumps(headers or {"Ocp-Apim-Subscription-Key":"YOUR_KEY"}, indent=2)}
+HEADERS = {{"Ocp-Apim-Subscription-Key": "YOUR_KEY"}}
 params = {{"asin": "{first_asin}", "domainCode": "{domain_code}", "page": 1}}
 
 r = requests.get(f"{{GATEWAY}}{{REVIEWS_PATH}}", headers=HEADERS, params=params, timeout=30)
@@ -353,5 +312,3 @@ print(r.status_code)
 print(r.json())""",
 language="python"
 )
-
-
