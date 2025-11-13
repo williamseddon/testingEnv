@@ -1,5 +1,5 @@
 """
-Streamlit app — Axesso Amazon Product Lookup (API‑key validator + Quotas + ASIN input)
+Streamlit app — Axesso Amazon Product Lookup (API-key validator + Quotas + ASIN input)
 
 How to run
 ----------
@@ -89,7 +89,7 @@ ASIN_RE = re.compile(r"^[A-Za-z0-9]{10}$")
 
 def sanitize_key(s: str) -> str:
     """Remove whitespace, commas and quotes from an API key safely."""
-    return re.sub(r"[\s,\"']+", "", s or "")
+    return re.sub(r'[\s,"\']+', "", s or "")
 
 
 def ensure_psc_1(raw_url: str) -> str:
@@ -126,13 +126,29 @@ def _auth_apply(headers: Dict[str, str], params: Dict[str, str], *, mode: str, h
         params[param_name] = api_key
 
 
-def call_axesso_lookup(amazon_url: str, api_key: str, *, base_url: str, auth_mode: str, auth_header: str, auth_param: str, timeout: float) -> Tuple[int, Any, Dict[str, Any]]:
+def call_axesso_lookup(
+    amazon_url: str,
+    api_key: str,
+    *,
+    base_url: str,
+    auth_mode: str,
+    auth_header: str,
+    auth_param: str,
+    timeout: float,
+) -> Tuple[int, Any, Dict[str, Any]]:
     headers: Dict[str, str] = {"User-Agent": "axesso-streamlit/1.3"}
     params: Dict[str, str] = {"url": amazon_url}
     _auth_apply(headers, params, mode=auth_mode, header_name=auth_header, param_name=auth_param, api_key=api_key)
     try:
         resp = requests.get(base_url, headers=headers, params=params, timeout=timeout)
-        debug = {"request": {"url": resp.request.url, "method": resp.request.method, "headers": {k: ("<hidden>" if k.lower() in {auth_header.lower(), "authorization"} else v) for k, v in resp.request.headers.items()}}, "response": {"status_code": resp.status_code, "headers": dict(resp.headers)}}
+        debug = {
+            "request": {
+                "url": resp.request.url,
+                "method": resp.request.method,
+                "headers": {k: ("<hidden>" if k.lower() in {auth_header.lower(), "authorization"} else v) for k, v in resp.request.headers.items()},
+            },
+            "response": {"status_code": resp.status_code, "headers": dict(resp.headers)},
+        }
         try:
             data = resp.json()
         except ValueError:
@@ -142,13 +158,28 @@ def call_axesso_lookup(amazon_url: str, api_key: str, *, base_url: str, auth_mod
         return 0, {"error": str(e)}, {"exception": repr(e)}
 
 
-def call_account_quotas(api_key: str, *, quotas_url: str, auth_mode: str, auth_header: str, auth_param: str, timeout: float) -> Tuple[int, Any, Dict[str, Any]]:
+def call_account_quotas(
+    api_key: str,
+    *,
+    quotas_url: str,
+    auth_mode: str,
+    auth_header: str,
+    auth_param: str,
+    timeout: float,
+) -> Tuple[int, Any, Dict[str, Any]]:
     headers: Dict[str, str] = {"User-Agent": "axesso-streamlit/1.3"}
     params: Dict[str, str] = {}
     _auth_apply(headers, params, mode=auth_mode, header_name=auth_header, param_name=auth_param, api_key=api_key)
     try:
         resp = requests.get(quotas_url, headers=headers, params=params, timeout=timeout)
-        debug = {"request": {"url": resp.request.url, "method": resp.request.method, "headers": {k: ("<hidden>" if k.lower() in {auth_header.lower(), "authorization"} else v) for k, v in resp.request.headers.items()}}, "response": {"status_code": resp.status_code, "headers": dict(resp.headers)}}
+        debug = {
+            "request": {
+                "url": resp.request.url,
+                "method": resp.request.method,
+                "headers": {k: ("<hidden>" if k.lower() in {auth_header.lower(), "authorization"} else v) for k, v in resp.request.headers.items()},
+            },
+            "response": {"status_code": resp.status_code, "headers": dict(resp.headers)},
+        }
         try:
             data = resp.json()
         except ValueError:
@@ -158,16 +189,40 @@ def call_account_quotas(api_key: str, *, quotas_url: str, auth_mode: str, auth_h
         return 0, {"error": str(e)}, {"exception": repr(e)}
 
 
-def validate_api_key(api_key: str, *, base_url: str, quotas_url: str, auth_mode: str, auth_header: str, auth_param: str, timeout: float) -> Tuple[bool, str]:
+def validate_api_key(
+    api_key: str,
+    *,
+    base_url: str,
+    quotas_url: str,
+    auth_mode: str,
+    auth_header: str,
+    auth_param: str,
+    timeout: float,
+) -> Tuple[bool, str]:
     """Validate using Account/Quotas first; fall back to product lookup if ambiguous."""
-    q_code, q_data, _ = call_account_quotas(api_key, quotas_url=quotas_url, auth_mode=auth_mode, auth_header=auth_header, auth_param=auth_param, timeout=timeout)
+    q_code, q_data, _ = call_account_quotas(
+        api_key,
+        quotas_url=quotas_url,
+        auth_mode=auth_mode,
+        auth_header=auth_header,
+        auth_param=auth_param,
+        timeout=timeout,
+    )
     if q_code == 200:
         return True, "Key validated via Account/Quotas (HTTP 200)."
     if q_code in (401, 403):
         return False, f"Unauthorized to Account/Quotas (HTTP {q_code}). Check key + auth placement/name."
 
     # Fallback to lookup sample URL — just in case quotas endpoint is tenant-restricted
-    l_code, l_data, _ = call_axesso_lookup(SAMPLE_AMZ_URL, api_key, base_url=base_url, auth_mode=auth_mode, auth_header=auth_header, auth_param=auth_param, timeout=timeout)
+    l_code, l_data, _ = call_axesso_lookup(
+        SAMPLE_AMZ_URL,
+        api_key,
+        base_url=base_url,
+        auth_mode=auth_mode,
+        auth_header=auth_header,
+        auth_param=auth_param,
+        timeout=timeout,
+    )
     if l_code == 200:
         return True, "Key validated via Product Lookup (HTTP 200)."
     if l_code in (401, 403):
@@ -233,23 +288,40 @@ with st.expander("Advanced settings", expanded=False):
     with c1:
         st.session_state.base_url = st.text_input("Base API URL (product lookup)", st.session_state.base_url)
         st.session_state.quotas_url = st.text_input("Account/Quotas URL", st.session_state.quotas_url)
-        st.session_state.auth_mode = st.selectbox("Auth placement", options=["Header", "Query parameter"], index=0 if st.session_state.auth_mode == "Header" else 1)
+        st.session_state.auth_mode = st.selectbox(
+            "Auth placement",
+            options=["Header", "Query parameter"],
+            index=0 if st.session_state.auth_mode == "Header" else 1,
+        )
     with c2:
         if st.session_state.auth_mode == "Header":
-            st.session_state.auth_header = st.text_input("Auth header name", st.session_state.auth_header, help="Azure APIM default: Ocp-Apim-Subscription-Key")
+            st.session_state.auth_header = st.text_input(
+                "Auth header name",
+                st.session_state.auth_header,
+                help="Azure APIM default: Ocp-Apim-Subscription-Key",
+            )
         else:
-            st.session_state.auth_param = st.text_input("Auth query param name", st.session_state.auth_param, help="Azure APIM default: subscription-key")
+            st.session_state.auth_param = st.text_input(
+                "Auth query param name",
+                st.session_state.auth_param,
+                help="Azure APIM default: subscription-key",
+            )
 
 # --- Key entry, validation & quotas ---
 key_form = st.form("key_form")
 with key_form:
     st.subheader("1) Enter your API key")
-    api_key_input = st.text_input("Axesso API key", value=st.session_state.api_key, type="password", help="Stored only in session state. Use Streamlit Secrets for production.")
+    api_key_input = st.text_input(
+        "Axesso API key",
+        value=st.session_state.api_key,
+        type="password",
+        help="Stored only in session state. Use Streamlit Secrets for production.",
+    )
     sanitized = sanitize_key(api_key_input)
     if api_key_input and api_key_input != sanitized:
         st.info("We removed spaces/commas/quotes/whitespace from the key you pasted.")
     if sanitized and not re.fullmatch(r"[0-9A-Fa-f]{32}", sanitized):
-        st.caption("Heads up: your key doesn’t look like a typical 32‑char hex token.")
+        st.caption("Heads up: your key doesn’t look like a typical 32-char hex token.")
     kcol1, kcol2, kcol3 = st.columns([1, 1, 1])
     validate_pressed = kcol1.form_submit_button("Validate & Save", use_container_width=True)
     quotas_pressed = kcol2.form_submit_button("Check quotas", use_container_width=True)
@@ -360,7 +432,10 @@ with st.form("lookup_form", clear_on_submit=False):
         )
     with right:
         st.session_state.market = st.selectbox(
-            "Marketplace (for ASIN)", list(MARKET_DOMAINS.keys()), index=list(MARKET_DOMAINS.keys()).index(DEFAULT_MARKET), disabled=lookup_disabled,
+            "Marketplace (for ASIN)",
+            list(MARKET_DOMAINS.keys()),
+            index=list(MARKET_DOMAINS.keys()).index(DEFAULT_MARKET),
+            disabled=lookup_disabled,
         )
     cols = st.columns([1, 1, 2])
     submit_lookup = cols[0].form_submit_button("Lookup Product", disabled=lookup_disabled, use_container_width=True)
@@ -409,29 +484,40 @@ if submit_lookup:
                     with ctop[1]:
                         st.markdown(f"### {title}")
                         meta = []
-                        if asin: meta.append(f"**ASIN:** {asin}")
-                        if data.get("productRating"): meta.append(f"**Rating:** {data.get('productRating')}")
-                        if data.get("countReview") is not None: meta.append(f"**Reviews:** {data.get('countReview')}")
-                        if data.get("answeredQuestions") is not None: meta.append(f"**Q&A:** {data.get('answeredQuestions')}")
+                        if asin:
+                            meta.append(f"**ASIN:** {asin}")
+                        if data.get("productRating"):
+                            meta.append(f"**Rating:** {data.get('productRating')}")
+                        if data.get("countReview") is not None:
+                            meta.append(f"**Reviews:** {data.get('countReview')}")
+                        if data.get("answeredQuestions") is not None:
+                            meta.append(f"**Q&A:** {data.get('answeredQuestions')}")
                         st.markdown(" • ".join(meta))
 
                         econ = []
                         price = data.get("price")
-                        if price is not None: econ.append(f"**Price:** {price}")
+                        if price is not None:
+                            econ.append(f"**Price:** {price}")
                         rprice = data.get("retailPrice")
-                        if rprice is not None: econ.append(f"**Retail:** {rprice}")
+                        if rprice is not None:
+                            econ.append(f"**Retail:** {rprice}")
                         ship = data.get("shippingPrice")
-                        if ship is not None: econ.append(f"**Shipping:** {ship}")
+                        if ship is not None:
+                            econ.append(f"**Shipping:** {ship}")
                         psi = data.get("priceShippingInformation")
-                        if psi: econ.append(f"**Shipping info:** {psi}")
+                        if psi:
+                            econ.append(f"**Shipping info:** {psi}")
                         if econ:
                             st.markdown("<br/>" + " • ".join(econ), unsafe_allow_html=True)
 
                     with ctop[2]:
                         seller_bits = []
-                        if data.get("soldBy"): seller_bits.append(f"**Sold by:** {data['soldBy']}")
-                        if data.get("fulfilledBy"): seller_bits.append(f"**Fulfilled by:** {data['fulfilledBy']}")
-                        if data.get("sellerId"): seller_bits.append(f"**Seller ID:** {data['sellerId']}")
+                        if data.get("soldBy"):
+                            seller_bits.append(f"**Sold by:** {data['soldBy']}")
+                        if data.get("fulfilledBy"):
+                            seller_bits.append(f"**Fulfilled by:** {data['fulfilledBy']}")
+                        if data.get("sellerId"):
+                            seller_bits.append(f"**Seller ID:** {data['sellerId']}")
                         if seller_bits:
                             st.markdown("\n".join(seller_bits))
                         cats = data.get("categories") or []
@@ -469,19 +555,47 @@ if submit_lookup:
                     reviews = data.get("reviews") or []
                     if reviews:
                         with st.expander("Reviews (local)", expanded=False):
-                            st.dataframe([
-                                {"date": r.get("date"), "rating": r.get("rating"), "title": r.get("title"), "userName": r.get("userName"), "text": r.get("text"), "variationList": ", ".join(r.get("variationList") or [])}
-                                for r in reviews
-                            ], use_container_width=True)
+                            st.dataframe(
+                                [
+                                    {
+                                        "date": r.get("date"),
+                                        "rating": r.get("rating"),
+                                        "title": r.get("title"),
+                                        "userName": r.get("userName"),
+                                        "text": r.get("text"),
+                                        "variationList": ", ".join(r.get("variationList") or []),
+                                    }
+                                    for r in reviews
+                                ],
+                                use_container_width=True,
+                            )
 
                     # Global reviews
                     greviews = data.get("globalReviews") or []
                     if greviews:
                         with st.expander("Global reviews", expanded=False):
-                            st.dataframe([
-                                {"locale": "/".join(filter(None, [(r.get("locale") or {}).get("language"), (r.get("locale") or {}).get("country")])), "date": r.get("date"), "rating": r.get("rating"), "title": r.get("title"), "userName": r.get("userName"), "text": r.get("text")}
-                                for r in greviews
-                            ], use_container_width=True)
+                            st.dataframe(
+                                [
+                                    {
+                                        "locale": "/".join(
+                                            filter(
+                                                None,
+                                                [
+                                                    (r.get("locale") or {}).get("language"),
+                                                    (r.get("locale") or {}).get("country"),
+                                                ],
+                                            )
+                                        ),
+                                        "date": r.get("date"),
+                                        "rating": r.get("rating"),
+                                        "title": r.get("title"),
+                                        "userName": r.get("userName"),
+                                        "text": r.get("text"),
+                                    }
+                                    for r in greviews
+                                ],
+                                use_container_width=True,
+                            )
 
                     # Review insights
                     ri = (data.get("reviewInsights") or {})
@@ -497,7 +611,13 @@ if submit_lookup:
 
                     # Download raw JSON
                     raw_json = json.dumps(data, indent=2, ensure_ascii=False)
-                    st.download_button("Download JSON", data=raw_json, file_name=f"axesso_product_{asin or 'result'}.json", mime="application/json", use_container_width=True)
+                    st.download_button(
+                        "Download JSON",
+                        data=raw_json,
+                        file_name=f"axesso_product_{asin or 'result'}.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
 
                 else:
                     # 404 case with array payload (error list) or any other shape
@@ -524,6 +644,7 @@ if submit_lookup:
 
 # Footer note
 st.caption("Note: Don’t commit API keys to source control. Prefer Streamlit Secrets or environment variables.")
+
 
 
 
