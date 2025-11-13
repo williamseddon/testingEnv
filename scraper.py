@@ -241,6 +241,14 @@ key_form = st.form("key_form")
 with key_form:
     st.subheader("1) Enter your API key")
     api_key_input = st.text_input("Axesso API key", value=st.session_state.api_key, type="password", help="Stored only in session state. Use Streamlit Secrets for production.")
+    # Sanitize obvious paste artifacts (spaces, commas, quotes, newlines)
+    sanitized = api_key_input.replace(" ", "").replace(",", "").replace("
+", "").replace("	", "").strip().strip("'\"")
+    if api_key_input and api_key_input != sanitized:
+        st.info("We removed spaces/commas/quotes from the key you pasted.")
+    # Quick format hint (Axesso APIM keys are often 32 hex chars)
+    if sanitized and not re.fullmatch(r"[0-9A-Fa-f]{32}", sanitized):
+        st.caption("Heads up: your key doesn’t look like a 32‑char hex token.")
     kcol1, kcol2, kcol3 = st.columns([1, 1, 1])
     validate_pressed = kcol1.form_submit_button("Validate & Save", use_container_width=True)
     quotas_pressed = kcol2.form_submit_button("Check quotas", use_container_width=True)
@@ -252,7 +260,7 @@ if clear_pressed:
     st.toast("Cleared key from session.")
 
 if validate_pressed:
-    st.session_state.api_key = api_key_input.strip()
+    st.session_state.api_key = sanitized
     if not st.session_state.api_key:
         st.error("Please enter an API key.")
     else:
@@ -274,7 +282,7 @@ if validate_pressed:
             st.warning(msg)
 
 if quotas_pressed:
-    st.session_state.api_key = api_key_input.strip()
+    st.session_state.api_key = sanitized
     if not st.session_state.api_key:
         st.error("Please enter an API key.")
     else:
@@ -321,6 +329,11 @@ if quotas_pressed:
                 st.error(q_data.get("error"))
             else:
                 st.warning("Couldn’t parse quotas payload. See Raw & Debug below.")
+        with st.expander("Test this call via cURL", expanded=False):
+            if st.session_state.auth_mode == "Header":
+                st.code(f"curl -sS '{st.session_state.quotas_url}' -H '{st.session_state.auth_header}: {st.session_state.api_key}'")
+            else:
+                st.code(f"curl -sS '{st.session_state.quotas_url}?{st.session_state.auth_param}={st.session_state.api_key}'")
         with st.expander("Raw quotas response", expanded=False):
             st.write(q_data)
         with st.expander("Quotas request debug", expanded=False):
@@ -507,6 +520,7 @@ if submit_lookup:
 
 # Footer note
 st.caption("Note: Don’t commit API keys to source control. Prefer Streamlit Secrets or environment variables.")
+
 
 
 
