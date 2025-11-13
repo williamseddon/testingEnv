@@ -5,12 +5,13 @@ import json
 import re
 import time
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Amazon Reviews (Key-Gated)", page_icon="🔐", layout="wide")
+st.set_page_config(page_title="Amazon Reviews (Key-Gated) • Axesso APIM", page_icon="🔐", layout="wide")
 
 # =========================
 # Helpers
@@ -36,7 +37,6 @@ def extract_asins(text: str) -> List[str]:
             a = m.upper()
             if re.fullmatch(r"[A-Z0-9]{10}", a):
                 found.append(a)
-    # unique while preserving order
     seen, uniq = set(), []
     for a in found:
         if a not in seen:
@@ -45,7 +45,7 @@ def extract_asins(text: str) -> List[str]:
 
 def tolerant_reviews(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Extract reviews from various common shapes across tenants/tiers.
+    Extract reviews from common shapes across tenants/tiers.
     """
     keys = ("reviews","reviewList","items","data","productReviews")
     # direct list
@@ -86,7 +86,6 @@ def normalize_review(asin: str, domain: str, meta: Dict[str, Any], it: Dict[str,
         "author": g(it, "author", "reviewer", "user", "reviewerName", "nickname"),
         "date": g(it, "date", "reviewDate", "submissionTime", "createdAt", "time"),
         "helpful": g(it, "helpful", "helpfulCount", "helpfulVotes", "votes", "vote"),
-        # page/meta
         "productTitle": meta.get("productTitle", ""),
         "page": meta.get("page"),
         "sourceUrl": meta.get("url") or "",
@@ -99,10 +98,15 @@ def rating_to_float(x: Any) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 def backoff_sleep(base: float, attempt: int, max_sleep: float = 8.0):
+    # simple exponential backoff helper
     time.sleep(min(max_sleep, base * (2 ** max(0, attempt - 1))))
 
+# Initialize session defaults for URL wizard
+st.session_state.setdefault("base_url", "https://axesso.azure-api.net")
+st.session_state.setdefault("reviews_path", "/amz/amazon-product-reviews")
+
 # =========================
-# Sidebar — Key Gate
+# Sidebar — Key Gate + Settings
 # =========================
 with st.sidebar:
     st.markdown("## 🔐 Enter API Key (required)")
@@ -117,34 +121,53 @@ with st.sidebar:
     if show_key and user_key:
         st.caption(f"Key preview: `{user_key[:3]}…{user_key[-2:] if len(user_key) > 5 else ''}`")
 
+    use_query_auth = st.checkbox(
+        "Use query auth (`subscription-key`) instead of header (APIM only)",
+        value=False,
+        help="Some APIM tenants accept/require `?subscription-key=...`",
+    )
+
     st.markdown("---")
     st.markdown("### 🔧 Endpoint settings")
+
+    # Wizard: paste exact Try-it URL to auto-split base + path
+    with st.expander("🔧 Paste the exact Request URL from the Axesso portal (Try it)"):
+        raw_url = st.text_input(
+            "Full Request URL",
+            placeholder="https://<gateway>.azure-api.net/amz/amazon-product-reviews?asin=...&domainCode=...&page=1",
+        )
+        if st.button("Apply URL"):
+            u = urlparse((raw_url or "").strip())
+            if not (u.scheme and u.netloc and u.path):
+                st.error("That doesn’t look like a valid URL (missing scheme/host/path).")
+            else:
+                st.session_state.base_url = f"{u.scheme}://{u.netloc}"
+                st.session_state.reviews_path = u.path
+                st.success(f"Applied → base: {st.session_state.base_url} | path: {st.session_state.reviews_path}")
+
     base_url = st.text_input(
         "Gateway base URL",
-        value="https://axesso.azure-api.net",
-        help=(
-            "Use the **gateway** (…azure-api.net) you see in the portal’s “Try it”. "
-            "Not the developer site (…developer.azure-api.net)."
-        ),
+        value=st.session_state.base_url,
+        help="Use the APIM gateway host (…azure-api.net), not the developer site.",
     )
     reviews_path = st.text_input(
         "Reviews path",
-        value="/amz/amazon-product-reviews",
+        value=st.session_state.reviews_path,
         help=(
-            "Copy the exact path from your portal. Two valid splits:\n"
+            "Match the portal path exactly. Two valid splits:\n"
             "A) base=https://...  path=/amz/amazon-product-reviews\n"
             "B) base=https://.../amz  path=/amazon-product-reviews"
         ),
     )
     domain_code = st.selectbox("Amazon domainCode", options=SUPPORTED_DOMAINS, index=0)
 
-# Hard gate — no key, no app.
+# Hard gate — no key, no app
 if not user_key.strip():
     st.title("Amazon Reviews (Key-Gated)")
     st.error("An API key is required to use this app. Enter it in the left sidebar.")
     st.stop()
 
-# Auth header
+# Auth header (or query auth)
 header_name = "Ocp-Apim-Subscription-Key" if auth_mode.startswith("Azure") else "x-api-key"
 HEADERS = {header_name: user_key.strip()}
 
@@ -154,21 +177,33 @@ HEADERS = {header_name: user_key.strip()}
 with st.expander("🔎 Request URL debugger"):
     final_url = f"{base_url.rstrip('/')}{reviews_path}"
     st.write("Resolved URL:", final_url)
+
     base_has_amz = "/amz" in base_url.rstrip("/")
     path_starts_amz = reviews_path.startswith("/amz/")
     if base_has_amz and path_starts_amz:
         st.error("Double '/amz' detected. Remove '/amz' from either the base URL or the path.")
     if (not base_has_amz) and (not path_starts_amz):
         st.warning("No '/amz' segment found. Many Axesso operations require '/amz' in either the base or the path.")
+
     masked_key = "***" if not user_key else (user_key[:3] + "…")
-    st.code(
-        f'curl -G "{final_url}" '
-        f'-H "{header_name}: {masked_key}" '
-        f'--data-urlencode "asin=B08N5WRWNW" '
-        f'--data-urlencode "domainCode={domain_code}" '
-        f'--data-urlencode "page=1"',
-        language="bash",
-    )
+    if auth_mode.startswith("Azure") and use_query_auth:
+        st.code(
+            f'curl -G "{final_url}" '
+            f'--data-urlencode "subscription-key={masked_key}" '
+            f'--data-urlencode "asin=B08N5WRWNW" '
+            f'--data-urlencode "domainCode={domain_code}" '
+            f'--data-urlencode "page=1"',
+            language="bash",
+        )
+    else:
+        st.code(
+            f'curl -G "{final_url}" '
+            f'-H "{header_name}: {masked_key}" '
+            f'--data-urlencode "asin=B08N5WRWNW" '
+            f'--data-urlencode "domainCode={domain_code}" '
+            f'--data-urlencode "page=1"',
+            language="bash",
+        )
 
 # =========================
 # Main UI
@@ -212,7 +247,14 @@ metas = st.session_state.get("reviews_meta", [])
 def do_call(asin: str, page: int) -> requests.Response:
     url = f"{base_url.rstrip('/')}{reviews_path}"
     params = {"asin": asin, "domainCode": domain_code, "page": page}
-    return requests.get(url, headers=HEADERS, params=params, timeout=30)
+    headers = dict(HEADERS)
+
+    # Optional: APIM via query param instead of header
+    if auth_mode.startswith("Azure") and use_query_auth:
+        params["subscription-key"] = user_key.strip()
+        headers = {}  # omit header if using query auth
+
+    return requests.get(url, headers=headers, params=params, timeout=30)
 
 # Quick one-page check to validate key + path
 if test_btn:
@@ -244,18 +286,18 @@ if fetch_btn:
         progress = st.progress(0)
 
         for asin in asins:
-            # bounded forward pagination; stop early if API reports lastPage
-            attempt = 0
+            attempt = 0  # backoff attempt counter (per ASIN)
             for p in range(int(start_page), int(start_page) + int(max_pages)):
                 try:
                     r = do_call(asin, p)
                     call_i += 1
                     progress.progress(min(1.0, call_i / float(total_calls)))
 
+                    # brief retry for transient errors
                     if r.status_code in (429, 500, 502, 503, 504):
                         attempt += 1
                         backoff_sleep(delay or 0.4, attempt)
-                        r = do_call(asin, p)  # retry once per page for brevity
+                        r = do_call(asin, p)
 
                     if r.status_code != 200:
                         metas.append({"asin": asin, "page": p, "error": f"HTTP {r.status_code}: {r.text[:200]}"})
@@ -297,7 +339,6 @@ if rows:
     st.success(f"Collected {len(rows)} review rows from {len(asins)} ASIN(s).")
     df = pd.DataFrame(rows)
 
-    # derive numeric rating if possible
     if "rating" in df.columns:
         df["rating_num"] = df["rating"].apply(rating_to_float)
 
@@ -325,6 +366,3 @@ if metas:
     dfm = pd.DataFrame(metas)
     with st.expander("Meta / call log"):
         st.dataframe(dfm, use_container_width=True)
-
-
-
