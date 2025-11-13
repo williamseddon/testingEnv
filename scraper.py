@@ -6,23 +6,22 @@ import re
 import time
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Axesso Quotas + Amazon Lookup", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Axesso: API Setup → Quotas → Amazon Lookup", page_icon="✅", layout="wide")
 
-# =========================
-# Helpers
-# =========================
+# =============== Utilities ===============
 
 SUPPORTED_DOMAINS = [
     "com","co.uk","de","fr","it","es","ca","com.mx","com.au","co.jp",
     "nl","se","pl","sg","ae","in","br"
 ]
 
-ASIN_REGEXES = [
+ASIN_PATTERNS = [
     r"/dp/([A-Z0-9]{10})",
     r"/gp/product/([A-Z0-9]{10})",
     r"/product/([A-Z0-9]{10})",
@@ -32,7 +31,7 @@ ASIN_REGEXES = [
 def extract_asins(text: str) -> List[str]:
     text = text or ""
     found = []
-    for rx in ASIN_REGEXES:
+    for rx in ASIN_PATTERNS:
         for m in re.findall(rx, text, flags=re.IGNORECASE):
             a = m.upper()
             if re.fullmatch(r"[A-Z0-9]{10}", a):
@@ -55,24 +54,37 @@ def ensure_psc_1(url: str, force: bool) -> str:
     q["psc"] = "1"
     return urlunparse(u._replace(query=urlencode(q)))
 
-def tolerant_list(payload: Dict[str, Any], keys: List[str]):
-    for k in keys:
-        v = payload.get(k)
-        if isinstance(v, list):
-            return v
-    res = payload.get("result") or {}
-    if isinstance(res, dict):
-        for k in keys:
-            v = res.get(k)
-            if isinstance(v, list):
-                return v
-    return []
-
-def rating_to_float(x: Any) -> Optional[float]:
-    if x is None:
+def parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s: return None
+    try:
+        # Accept Z suffix
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
         return None
-    m = re.search(r"(\d+(\.\d+)?)", str(x))
-    return float(m.group(1)) if m else None
+
+def window_status(now_utc: datetime, start: Optional[datetime], end: Optional[datetime]) -> str:
+    if start and start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if start and now_utc < start:
+        return f"⏳ Subscription window not active yet. Starts {start.isoformat()}"
+    if end and now_utc > end:
+        return f"⛔ Subscription window ended {end.isoformat()}"
+    return "✅ Subscription window appears active."
+
+def tolerant_reviews_block(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Tries several common keys
+    for k in ("reviews","reviewList","items","data","productReviews"):
+        v = payload.get(k)
+        if isinstance(v, list): return v
+    res = payload.get("result") or {}
+    for k in ("reviews","reviewList","items","data","productReviews"):
+        v = res.get(k)
+        if isinstance(v, list): return v
+    return []
 
 def normalize_review(it: Dict[str, Any]) -> Dict[str, Any]:
     def g(*keys, default=""):
@@ -80,12 +92,15 @@ def normalize_review(it: Dict[str, Any]) -> Dict[str, Any]:
             if k in it and it[k] is not None:
                 return it[k]
         return default
+    # numeric rating if possible
+    rt = g("rating", "stars", "starRating", "ratingValue")
+    m = re.search(r"(\d+(\.\d+)?)", str(rt)) if rt else None
+    rnum = float(m.group(1)) if m else None
     return {
         "reviewId": g("reviewId", "id"),
         "title": g("title", "reviewTitle"),
         "text": g("text", "reviewText", "content", "body", "comment"),
-        "rating": g("rating", "stars", "starRating", "ratingValue"),
-        "rating_num": rating_to_float(g("rating", "stars", "starRating", "ratingValue")),
+        "rating": rt, "rating_num": rnum,
         "userName": g("userName", "author", "reviewer", "nickname"),
         "date": g("date", "reviewDate", "createdAt", "submissionTime", "time"),
         "url": g("url"),
@@ -109,105 +124,33 @@ def flatten_variations(variations: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             })
     return rows
 
-def flatten_product_details(pdetails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = []
-    for it in pdetails or []:
-        if isinstance(it, dict):
-            rows.append({"name": it.get("name"), "value": it.get("value")})
-    return rows
+# =============== FRONT & CENTER: API SETUP ===============
 
-def product_core_fields(p: Dict[str, Any]) -> Dict[str, Any]:
-    fields = [
-        "productTitle","manufacturer","asin","productRating","countReview","answeredQuestions",
-        "soldBy","fulfilledBy","sellerId","warehouseAvailability","retailPrice","price","shippingPrice",
-        "priceSaving","dealPrice","salePrice","prime","addon","pantry","used","currency","deal","pastSales"
-    ]
-    return {k: p.get(k) for k in fields}
+st.title("✅ Axesso API Setup → Quotas → Amazon Lookup")
 
-def combine_reviews(p: Dict[str, Any]) -> List[Dict[str, Any]]:
-    raw_local = tolerant_list(p, ["reviews"])
-    raw_global = tolerant_list(p, ["globalReviews"])
-    merged, seen = [], set()
-    for src in (raw_local or []):
-        n = normalize_review(src)
-        key = n.get("reviewId") or (n.get("title"), n.get("userName"), n.get("date"))
-        if key not in seen:
-            seen.add(key); merged.append(n)
-    for src in (raw_global or []):
-        n = normalize_review(src)
-        key = n.get("reviewId") or (n.get("title"), n.get("userName"), n.get("date"))
-        if key not in seen:
-            seen.add(key); merged.append(n)
-    return merged
+with st.container():
+    st.markdown("### 1) Paste your API key")
+    key = st.text_input("API key (Primary or Secondary)", type="password", placeholder="paste your key here")
+    show = st.checkbox("Show key")
+    if show and key:
+        st.caption(f"Key preview: `{key[:4]}…{key[-4:] if len(key)>8 else ''}`")
 
-def backoff_sleep(base: float, attempt: int, max_sleep: float = 8.0):
-    time.sleep(min(max_sleep, base * (2 ** max(0, attempt - 1))))
+    st.markdown("### 2) Where is your **Quotas** endpoint?")
+    st.caption("Defaults for Axesso Account API. If your portal shows a different host/path, paste it below.")
+    quota_host = st.text_input("Quotas host", value="https://api.axesso.de")
+    quota_path = st.text_input("Quotas path", value="/v1/account/quotas")
 
-# =========================
-# Session defaults
-# =========================
-st.session_state.setdefault("base_url", "https://axesso.azure-api.net")
-st.session_state.setdefault("lookup_path", "/amz/amazon-lookup-product")
-st.session_state.setdefault("quota_host", "https://api.axesso.de")
-st.session_state.setdefault("quota_path", "/v1/account/quotas")
+    st.markdown("**Validation strategy:** The app will auto-try these auth styles until one works:")
+    st.write("• APIM header `Ocp-Apim-Subscription-Key` → APIM query `subscription-key` → Direct header `x-api-key`")
 
-# =========================
-# Sidebar — Keys & Endpoints
-# =========================
-with st.sidebar:
-    st.markdown("## 🔐 Enter API Key (required)")
-    user_key = st.text_input("API key", type="password", placeholder="paste your key here")
-    show_key = st.checkbox("Show key")
-    if show_key and user_key:
-        st.caption(f"Key preview: `{user_key[:3]}…{user_key[-2:] if len(user_key) > 5 else ''}`")
+    go_validate = st.button("🔎 Validate key & show quota", type="primary", use_container_width=True)
 
-    st.markdown("### Amazon API auth mode")
-    amazon_auth_mode = st.radio(
-        "Amazon API type",
-        options=["Azure APIM (recommended)", "Direct Axesso"],
-        index=0,
-        help="Amazon endpoints: APIM uses 'Ocp-Apim-Subscription-Key'; Direct uses 'x-api-key'.",
-    )
-    use_query_auth = st.checkbox(
-        "APIM: send key as query (`subscription-key`) instead of header",
-        value=False,
-        help="Some APIM tenants accept/require `?subscription-key=...`"
-    )
+# Validate key
+quota_df = None
+quota_msg = ""
+auth_used = None
 
-    st.markdown("---")
-    st.markdown("### 📊 Quotas endpoint")
-    with st.expander("Paste the **Try-it** Quotas URL to auto-set host/path"):
-        raw_q_url = st.text_input(
-            "Full Quotas URL",
-            placeholder="https://api.axesso.de/v1/account/quotas  OR  https://<gateway>.azure-api.net/v1/account/quotas",
-            key="quota_tryit"
-        )
-        if st.button("Apply Quotas URL"):
-            u = urlparse((raw_q_url or "").strip())
-            if not (u.scheme and u.netloc and u.path):
-                st.error("Invalid URL (missing scheme/host/path).")
-            else:
-                st.session_state.quota_host = f"{u.scheme}://{u.netloc}"
-                st.session_state.quota_path = u.path
-                st.success(f"Applied → host: {st.session_state.quota_host} | path: {st.session_state.quota_path}")
-
-    quota_host = st.text_input("Quota host", value=st.session_state.quota_host)
-    quota_path = st.text_input("Quota path", value=st.session_state.quota_path)
-
-    st.caption("The app will auto-try three auth styles for Quotas until one works.")
-    btn_check_quota = st.button("🔎 Validate key & fetch quota", use_container_width=True)
-
-# Hard gate — key required
-if not user_key.strip():
-    st.title("Axesso Quotas + Amazon Lookup")
-    st.error("An API key is required. Enter it in the left sidebar.")
-    st.stop()
-
-# =========================
-# Smart Quota Fetch (auto-detect auth style)
-# =========================
-
-def fetch_quota_once(host: str, path: str, key: str, style: str) -> requests.Response:
+def do_quota(host: str, path: str, key: str, style: str) -> requests.Response:
     url = f"{host.rstrip('/')}{path}"
     headers, params = {}, {}
     if style == "apim_header":
@@ -218,303 +161,240 @@ def fetch_quota_once(host: str, path: str, key: str, style: str) -> requests.Res
         headers["x-api-key"] = key.strip()
     return requests.get(url, headers=headers, params=params, timeout=30)
 
-def fetch_quotas_smart(host: str, path: str, key: str, preferred: str):
-    # Order attempts based on user expectation
-    if "azure" in preferred.lower() or "apim" in preferred.lower():
-        order = ["apim_header", "apim_query", "direct"]
+if go_validate:
+    if not key.strip():
+        st.error("Please paste your API key first.")
     else:
-        order = ["direct", "apim_header", "apim_query"]
+        tried = []
+        for style in ("apim_header", "apim_query", "direct"):
+            try:
+                r = do_quota(quota_host, quota_path, key, style)
+                tried.append((style, r.status_code))
+                if r.status_code == 200:
+                    auth_used = style
+                    data = r.json()
+                    qs = data.get("quotas") or []
+                    quota_df = pd.DataFrame(qs)
+                    if not quota_df.empty:
+                        # compute callsLeft and window status
+                        if all(c in quota_df.columns for c in ("callsLimit","callsCount")):
+                            quota_df["callsLeft"] = quota_df["callsLimit"].fillna(0).astype(int) - quota_df["callsCount"].fillna(0).astype(int)
+                        st.success(f"Quota OK (auth: {auth_used}).")
+                        st.dataframe(quota_df, use_container_width=True)
 
-    last = None
-    for style in order:
-        r = fetch_quota_once(host, path, key, style)
-        if r.status_code != 401:  # if not "missing subscription key", accept
-            return r, style
-        last = r
-    return last, order[-1]
+                        # Window check
+                        now = datetime.now(timezone.utc)
+                        ps = parse_iso(qs[0].get("periodStartTime") if qs else None)
+                        pe = parse_iso(qs[0].get("periodEndTime") if qs else None)
+                        st.info(window_status(now, ps, pe))
 
-def summarize_quotas(payload: Dict[str, Any]) -> pd.DataFrame:
-    qs = payload.get("quotas") or []
-    df = pd.DataFrame(qs)
-    if not df.empty:
-        if "callsLimit" in df.columns and "callsCount" in df.columns:
-            df["callsLeft"] = df["callsLimit"].fillna(0).astype(int) - df["callsCount"].fillna(0).astype(int)
-    return df
-
-quota_df = None
-quota_style_used = None
-quota_err = None
-
-if btn_check_quota:
-    try:
-        r, quota_style_used = fetch_quotas_smart(quota_host, quota_path, user_key, preferred=("APIM" if amazon_auth_mode.startswith("Azure") else "Direct"))
-        st.info(f"Quota HTTP {r.status_code} (auth tried: {quota_style_used})")
-        if r.status_code == 200:
-            data = r.json()
-            quota_df = summarize_quotas(data)
-            if quota_df is not None and not quota_df.empty:
-                st.success("Quota retrieved.")
-                st.dataframe(quota_df, use_container_width=True)
-                st.session_state["quota_df"] = quota_df
-                st.session_state["quota_style"] = quota_style_used
-            else:
-                st.warning("Quota call succeeded, but no quota rows were returned.")
+                        total_left = int(quota_df["callsLeft"].fillna(0).sum()) if "callsLeft" in quota_df else None
+                        if total_left is not None:
+                            st.caption(f"**Calls left (total across subscriptions): {total_left}**")
+                        break
+                    else:
+                        st.warning("Quota call succeeded, but returned no rows. Your key may not include Account API access.")
+                        auth_used = style
+                        break
+                # If 401/403/404, keep trying other styles
+            except Exception as e:
+                tried.append((style, f"error: {e}"))
         else:
-            quota_err = r.text[:400]
-            st.error(f"Quota call failed. Body (first 400 chars): {quota_err}")
-            st.caption("Tip: If you used api.axesso.de and got 401, try your APIM gateway host and vice-versa.")
-    except Exception as e:
-        quota_err = str(e)
-        st.error(f"Quota request error: {quota_err}")
+            st.error("Could not validate your key against the Quotas API.")
+            st.caption(f"Tried: {tried}")
 
-# =========================
-# Amazon Product Lookup setup
-# =========================
+# =============== PRODUCT LOOKUP (unlocked after key validation or if you want to try anyway) ===============
 
-st.session_state.setdefault("base_url", st.session_state.get("base_url", "https://axesso.azure-api.net"))
-st.session_state.setdefault("lookup_path", st.session_state.get("lookup_path", "/amz/amazon-lookup-product"))
+st.markdown("---")
+st.subheader("2) Amazon Product Lookup (Pictures, Details & Reviews)")
 
-with st.expander("Paste **Try-it** Product Lookup URL to auto-set base/path"):
-    raw_url = st.text_input(
-        "Full Product Lookup URL",
-        placeholder="https://<gateway>.azure-api.net/amz/amazon-lookup-product?url=https://www.amazon.com/dp/B08...%3Fpsc%3D1",
-        key="lookup_tryit"
+colA, colB, colC = st.columns([2,1,1])
+
+with colA:
+    st.markdown("**a) Endpoint**")
+    st.caption("Paste the **exact Try-it Request URL** from your portal to avoid path errors.")
+    tri = st.text_input(
+        "Try-it Request URL (optional)",
+        placeholder="https://<gateway>.azure-api.net/amz/amazon-lookup-product?url=...",
+        key="tryit_url"
     )
-    if st.button("Apply Product URL"):
-        u = urlparse((raw_url or "").strip())
-        if not (u.scheme and u.netloc and u.path):
-            st.error("Invalid URL (missing scheme/host/path).")
+    if st.button("Apply Try-it URL"):
+        u = urlparse((tri or "").strip())
+        if u.scheme and u.netloc and u.path:
+            st.session_state["prod_base"] = f"{u.scheme}://{u.netloc}"
+            st.session_state["prod_path"] = u.path
+            st.success(f"Applied → base: {st.session_state['prod_base']} | path: {st.session_state['prod_path']}")
         else:
-            st.session_state.base_url = f"{u.scheme}://{u.netloc}"
-            st.session_state.lookup_path = u.path
-            st.success(f"Applied → base: {st.session_state.base_url} | path: {st.session_state.lookup_path}")
+            st.error("That doesn't look like a valid URL (missing scheme/host/path).")
 
-base_url = st.text_input("Amazon Gateway base URL", value=st.session_state.base_url)
-lookup_path = st.text_input("Amazon Lookup path", value=st.session_state.lookup_path)
+with colB:
+    base_default = st.session_state.get("prod_base", "https://axesso.azure-api.net")
+    st.text_input("Product base URL", value=base_default, key="prod_base_in")
+with colC:
+    path_default = st.session_state.get("prod_path", "/amz/amazon-lookup-product")
+    st.text_input("Product path", value=path_default, key="prod_path_in")
 
-amazon_header_name = "Ocp-Apim-Subscription-Key" if amazon_auth_mode.startswith("Azure") else "x-api-key"
-AMAZON_DEFAULT_HEADERS = {amazon_header_name: user_key.strip()}
+# Auth style for product (we’ll try header first; optional query toggle)
+col1, col2, col3 = st.columns([1,1,1])
+with col1:
+    product_auth = st.selectbox("Auth style", ["APIM header", "APIM query (?subscription-key=)", "Direct (x-api-key)"])
+with col2:
+    domain_code = st.selectbox("Amazon domainCode (for ASIN→URL)", SUPPORTED_DOMAINS, index=0)
+with col3:
+    force_psc = st.checkbox("Auto-add ?psc=1", value=True)
 
-with st.expander("🔎 Product Lookup — Request URL debugger"):
-    final_endpoint = f"{base_url.rstrip('/')}{lookup_path}"
-    example_url = "https://www.amazon.com/dp/B07TCHYBSK?psc=1"
-    masked_key = (user_key[:3] + "…") if user_key else "***"
-    st.write("Lookup endpoint:", final_endpoint)
-    if amazon_auth_mode.startswith("Azure") and use_query_auth:
-        st.code(
-            f'curl -G "{final_endpoint}" '
-            f'--data-urlencode "subscription-key={masked_key}" '
-            f'--data-urlencode "url={example_url}"',
-            language="bash",
-        )
+st.markdown("**b) Enter ASIN or full product URL**")
+item = st.text_input("ASIN or URL", placeholder="B07TCHYBSK  or  https://www.amazon.com/dp/B07TCHYBSK?psc=1")
+fetch_btn = st.button("📥 Fetch product", use_container_width=True)
+
+def do_product_lookup(base: str, path: str, key: str, auth: str, product_url: str) -> Tuple[int, str, Optional[Dict[str, Any]]]:
+    url = f"{base.rstrip('/')}{path}"
+    headers, params = {}, {"url": product_url}
+    if auth.startswith("APIM header"):
+        headers["Ocp-Apim-Subscription-Key"] = key.strip()
+    elif auth.startswith("APIM query"):
+        params["subscription-key"] = key.strip()
     else:
-        st.code(
-            f'curl -G "{final_endpoint}" '
-            f'-H "{amazon_header_name}: {masked_key}" '
-            f'--data-urlencode "url={example_url}"',
-            language="bash",
-        )
-
-# =========================
-# Main UI
-# =========================
-
-st.title("📊 Quotas + 🖼️ Amazon Product Lookup")
-
-quota_brief = st.session_state.get("quota_df")
-if quota_brief is not None and not quota_brief.empty:
+        headers["x-api-key"] = key.strip()
+    r = requests.get(url, headers=headers, params=params, timeout=45)
     try:
-        total_left = int(quota_brief["callsLeft"].fillna(0).sum())
-        total_used = int(quota_brief["callsCount"].fillna(0).sum())
-        total_limit = int(quota_brief["callsLimit"].fillna(0).sum())
-        st.caption(f"Quota summary — Used: {total_used} / Limit: {total_limit} • **Left: {total_left}** (auth: {st.session_state.get('quota_style','?')})")
-        if total_left <= 0:
-            st.error("No calls left per your quota. Product calls are blocked until you add quota.")
+        data = r.json()
     except Exception:
-        pass
+        data = None
+    return r.status_code, r.text[:400], data
 
-tab1, tab2 = st.tabs(["Lookup", "Batch"])
-
-with tab1:
-    col_a, col_b = st.columns([2,1])
-    with col_a:
-        inp = st.text_input("Amazon product URL or ASIN", placeholder="https://www.amazon.com/dp/B07TCHYBSK?psc=1  OR  B07TCHYBSK")
-    with col_b:
-        domain_code = st.selectbox("Domain for ASIN → URL", options=SUPPORTED_DOMAINS, index=0)
-        force_psc = st.checkbox("Auto-add ?psc=1 to URL", value=True)
-    btn_go = st.button("🔍 Fetch product", use_container_width=True, disabled=(quota_brief is not None and not quota_brief.empty and (quota_brief["callsLeft"].fillna(0).sum() <= 0)))
-
-with tab2:
-    multi_inp = st.text_area("Multiple URLs/ASINs (one per line)", height=140, placeholder="B0B17BYJ5R\nhttps://www.amazon.com/dp/B07TCHYBSK?psc=1\nB0C3H9ABCD")
-    domain_code_multi = st.selectbox("Domain for ASINs → URLs (batch)", options=SUPPORTED_DOMAINS, index=0, key="d_multi")
-    force_psc_multi = st.checkbox("Auto-add ?psc=1 to URLs (batch)", value=True, key="psc_multi")
-    delay = st.number_input("Delay between requests (sec)", min_value=0.0, value=0.4, step=0.1)
-    btn_batch = st.button("📦 Fetch batch", use_container_width=True, disabled=(quota_brief is not None and not quota_brief.empty and (quota_brief["callsLeft"].fillna(0).sum() <= 0)))
-
-# State
-if "products" not in st.session_state:
-    st.session_state.products = []
-if "failures" not in st.session_state:
-    st.session_state.failures = []
-
-def to_lookup_url_or_fix(s: str, domain: str, force_psc_flag: bool) -> Tuple[str, bool]:
-    s = (s or "").strip()
-    if not s:
-        return "", False
-    if re.fullmatch(r"[A-Za-z0-9]{10}", s):
-        return build_dp_url(s.upper(), domain, force_psc_flag), True
-    return ensure_psc_1(s, force_psc_flag), True
-
-def do_lookup_call(product_url: str) -> requests.Response:
-    endpoint = f"{base_url.rstrip('/')}{lookup_path}"
-    headers = dict(AMAZON_DEFAULT_HEADERS)
-    params = {"url": product_url}
-    if amazon_auth_mode.startswith("Azure") and use_query_auth:
-        params["subscription-key"] = user_key.strip()
-        headers = {}
-    return requests.get(endpoint, headers=headers, params=params, timeout=45)
-
-def render_product(p: Dict[str, Any]):
-    core = product_core_fields(p)
-    left, right = st.columns([2, 1])
-
+def render_product(payload: Dict[str, Any]):
+    # Images + headline
+    left, right = st.columns([2,1])
     with left:
-        main_url = (p.get("mainImage") or {}).get("imageUrl")
-        image_list = p.get("imageUrlList") or []
-        if main_url:
-            st.image(main_url, caption="Main image", use_container_width=True)
-        if image_list:
-            st.markdown("#### Image Gallery")
+        main = (payload.get("mainImage") or {}).get("imageUrl")
+        imgs = payload.get("imageUrlList") or []
+        if main:
+            st.image(main, caption="Main image", use_container_width=True)
+        if imgs:
+            st.markdown("#### Gallery")
             cols = st.columns(3)
-            for i, img in enumerate(image_list[:12]):
+            for i, img in enumerate(imgs[:12]):
                 with cols[i % 3]:
                     st.image(img, use_container_width=True)
-
-        videos = p.get("videoeUrlList") or []
-        if videos:
+        vids = payload.get("videoeUrlList") or []
+        if vids:
             with st.expander("🎞️ Videos"):
-                for v in videos[:6]:
-                    try:
-                        st.video(v)
-                    except Exception:
-                        st.write(v)
-
+                for v in vids[:6]:
+                    try: st.video(v)
+                    except: st.write(v)
     with right:
         st.markdown("### Product")
-        st.write(f"**Title:** {core.get('productTitle') or ''}")
-        st.write(f"**ASIN:** {core.get('asin') or ''}")
-        st.write(f"**Rating:** {core.get('productRating') or ''}  •  **Reviews:** {core.get('countReview') or ''}")
-        st.write(f"**Sold by:** {core.get('soldBy') or ''}  •  **Fulfilled by:** {core.get('fulfilledBy') or ''}")
-        st.write(f"**Seller ID:** {core.get('sellerId') or ''}")
-        st.write(f"**Price:** {core.get('price')}  •  **Retail:** {core.get('retailPrice')}  •  **Shipping:** {core.get('shippingPrice')}")
-        st.write(f"**Availability:** {core.get('warehouseAvailability') or ''}")
-        feats = p.get("features") or []
+        for k in ("productTitle","asin","productRating","countReview","soldBy","fulfilledBy","sellerId","price","retailPrice","shippingPrice","warehouseAvailability"):
+            if payload.get(k) not in (None, "", []):
+                st.write(f"**{k}**: {payload.get(k)}")
+        feats = payload.get("features") or []
         if feats:
             st.markdown("**Features**")
             for f in feats[:10]:
                 st.write(f"- {f}")
 
-    variations = p.get("variations") or []
-    if variations:
-        st.markdown("### Variations")
-        var_rows = flatten_variations(variations)
-        if var_rows:
-            st.dataframe(pd.DataFrame(var_rows), use_container_width=True)
+    # Variations
+    vars_ = payload.get("variations") or []
+    if vars_:
+        flat = flatten_variations(vars_)
+        if flat:
+            st.markdown("### Variations")
+            st.dataframe(pd.DataFrame(flat), use_container_width=True)
 
-    pdetails = p.get("productDetails") or []
-    if pdetails:
+    # Product details
+    pdet = payload.get("productDetails") or []
+    if pdet:
+        dfp = pd.DataFrame([{"name": d.get("name"), "value": d.get("value")} for d in pdet if isinstance(d, dict)])
         st.markdown("### Product details")
-        st.dataframe(pd.DataFrame(flatten_product_details(pdetails)), use_container_width=True)
+        st.dataframe(dfp, use_container_width=True)
 
-    cats = p.get("categoriesExtended") or []
-    if cats:
-        st.markdown("### Categories")
-        st.dataframe(pd.DataFrame(cats), use_container_width=True)
-
-    reviews = combine_reviews(p)
+    # Reviews (local + global)
+    reviews = []
+    for block_key in ("reviews","globalReviews"):
+        block = payload.get(block_key) or []
+        if isinstance(block, list):
+            for it in block:
+                reviews.append(normalize_review(it))
     st.markdown("### Reviews")
-    st.caption(f"{len(reviews)} reviews parsed from response.")
+    st.caption(f"{len(reviews)} review rows parsed.")
     if reviews:
-        df_rev = pd.DataFrame(reviews)
-        st.dataframe(df_rev, use_container_width=True)
+        dfr = pd.DataFrame(reviews)
+        st.dataframe(dfr, use_container_width=True)
         c1, c2 = st.columns(2)
         with c1:
-            st.download_button(
-                "⬇️ Download Reviews (JSON)",
-                data=json.dumps(reviews, indent=2),
-                file_name=f"{p.get('asin','product')}_reviews.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Reviews (JSON)", data=json.dumps(reviews, indent=2),
+                               file_name=f"{payload.get('asin','product')}_reviews.json",
+                               mime="application/json", use_container_width=True)
         with c2:
-            st.download_button(
-                "⬇️ Download Reviews (CSV)",
-                data=df_rev.to_csv(index=False),
-                file_name=f"{p.get('asin','product')}_reviews.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Reviews (CSV)", data=dfr.to_csv(index=False),
+                               file_name=f"{payload.get('asin','product')}_reviews.csv",
+                               mime="text/csv", use_container_width=True)
 
-# ---- Lookup actions
-tab1, tab2 = st.tabs(["Lookup", "Batch"])
+# Run product fetch
+if fetch_btn:
+    if not key.strip():
+        st.error("Paste your API key in Step 1 first.")
+    else:
+        # Make a proper product URL
+        s = (item or "").strip()
+        if not s:
+            st.error("Enter an ASIN or a product URL.")
+        else:
+            if re.fullmatch(r"[A-Za-z0-9]{10}", s):
+                product_url = build_dp_url(s.upper(), domain_code, force_psc)
+            else:
+                product_url = ensure_psc_1(s, force_psc)
 
-with tab1:
-    pass  # tabs already declared above; Streamlit re-renders—keeping content above
+            base = st.session_state.get("prod_base_in") or st.session_state.get("prod_base") or "https://axesso.azure-api.net"
+            path = st.session_state.get("prod_path_in") or st.session_state.get("prod_path") or "/amz/amazon-lookup-product"
 
-with tab2:
-    pass
+            with st.expander("🔎 Request URL debugger"):
+                st.write("Endpoint:", f"{base.rstrip('/')}{path}")
+                mk = key[:4] + "…" if key else "***"
+                if product_auth.startswith("APIM header"):
+                    st.code(f'curl -G "{base.rstrip("/")}{path}" -H "Ocp-Apim-Subscription-Key: {mk}" --data-urlencode "url={product_url}"', language="bash")
+                elif product_auth.startswith("APIM query"):
+                    st.code(f'curl -G "{base.rstrip("/")}{path}" --data-urlencode "subscription-key={mk}" --data-urlencode "url={product_url}"', language="bash")
+                else:
+                    st.code(f'curl -G "{base.rstrip("/")}{path}" -H "x-api-key: {mk}" --data-urlencode "url={product_url}"', language="bash")
 
-# One-off lookup
-if st.session_state.get("quota_df") is not None and not st.session_state["quota_df"].empty:
-    total_left = int(st.session_state["quota_df"]["callsLeft"].fillna(0).sum())
-else:
-    total_left = None
+            code, body, data = do_product_lookup(base, path, key, product_auth, product_url)
+            st.info(f"HTTP {code}")
+            if code == 200 and isinstance(data, dict):
+                st.success("Product retrieved.")
+                render_product(data)
+            else:
+                # Friendly diagnoses
+                if code in (401, 403):
+                    st.error("Auth rejected (401/403). This often means wrong auth style or your subscription window isn’t active yet.")
+                    st.caption("Try switching auth style (APIM header/query vs Direct), and confirm your subscription **Start date** has already begun.")
+                elif code == 404:
+                    st.error("404 Not Found: usually a **base/path** mismatch.")
+                    st.caption("Paste the **exact Try-it URL** from your portal and click Apply; avoid double `/amz` or missing `/amz`.")
+                else:
+                    st.error(f"Call failed. Body (first 400 chars): {body}")
 
-go_disabled = (total_left is not None and total_left <= 0)
+# =============== Notes / Why it might not work ===============
 
-# Rebuild the UI buttons after calculations
-col_go1, col_go2 = st.columns(2)
-with col_go1:
-    go = st.button("🔍 Fetch product (from Lookup tab input)", disabled=go_disabled, use_container_width=True)
-with col_go2:
-    batch = st.button("📦 Fetch batch (from Batch tab input)", disabled=go_disabled, use_container_width=True)
-
-# Inputs read again to ensure latest values
-inp_val = st.session_state.get("Amazon product URL or ASIN")  # not reliable—fallback to querying widgets directly
-# Safer: rebuild the input references
-# (We’ll re-create the inputs quickly to capture latest values)
-# NOTE: Streamlit state complexity; for clarity we simply request the user presses the fetch buttons after filling inputs.
-
-def get_widget_val(label: str, default: str = ""):
-    # light attempt to fetch from session; otherwise return default
-    for k, v in st.session_state.items():
-        if isinstance(v, str) and v == label:
-            return st.session_state[k]
-    return default
-
-# We’ll instead keep the originals in local scope by re-parsing text inputs directly where we used them.
-# For brevity in this example, we’ll ask users to click the buttons right after entering values.
-
-if go:
-    st.session_state.products.clear()
-    st.session_state.failures.clear()
-    # Re-render inputs to capture values
-    st.experimental_rerun()
-
-# Batch handled via earlier controls -> simplest path: instruct user to press "Fetch batch" right after filling fields.
-if batch:
-    st.session_state.products.clear()
-    st.session_state.failures.clear()
-    st.experimental_rerun()
-
-with st.expander("💡 Troubleshooting tips"):
+with st.expander("🛠 Why keys fail & quick fixes"):
     st.markdown("""
-- **Quota 401**: Try pasting your **Quotas Try-it URL** and let the app auto-detect auth style.  
-  It will try: header `Ocp-Apim-Subscription-Key` → query `subscription-key` → header `x-api-key`.
-- **Wrong host**: Some tenants expose Quotas on the **APIM gateway** (…azure-api.net) not `api.axesso.de`. Paste the Try-it URL.
-- **Product 404**: Use the Product Try-it URL wizard to set **base** and **path** exactly (avoid `/amz/amz` or missing `/amz`).  
-- **Keys**: Make sure the key isn’t truncated and has no spaces. If you have multiple products/subscriptions, confirm your key has access to **Account API**.
+- **Subscription not active yet**: If your portal shows **“Started on 11/13/2025”** and today is 11/12/2025, your window hasn't opened.  
+  Until the start time passes, APIM will return **401** even with a correct key.
+- **Wrong host**:  
+  • **Quotas** are typically on `https://api.axesso.de/v1/account/quotas`.  
+  • **Amazon endpoints** are often on an **APIM gateway** like `https://axesso.azure-api.net`.  
+  Use the **Try-it URL** from your portal to set base/path exactly.
+- **Wrong auth style**:  
+  • APIM expects `Ocp-Apim-Subscription-Key` **header** or `subscription-key` **query**.  
+  • Direct Axesso uses **`x-api-key`** header.  
+  If you send the wrong one, you’ll get a 401 with “missing subscription key”.
+- **Path mismatch** (`/amz` gotchas):  
+  Either put `/amz` on the **base** or on the **path**, **not both**.  
+  Example: `base=https://…` + `path=/amz/amazon-lookup-product` **OR** `base=https://…/amz` + `path=/amazon-lookup-product`.
+- **Product URL**: Use a **dp URL** (or just paste an ASIN). The app appends `?psc=1` to stabilize the selected variation.
 """)
+
 
 
 
