@@ -4,14 +4,15 @@
 import json
 import re
 import time
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse
+from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Amazon Reviews (Key-Gated) • Axesso APIM", page_icon="🔐", layout="wide")
+st.set_page_config(page_title="Amazon Product Lookup (Pictures, Details & Reviews) • Axesso APIM",
+                   page_icon="🖼️", layout="wide")
 
 # =========================
 # Helpers
@@ -37,59 +38,38 @@ def extract_asins(text: str) -> List[str]:
             a = m.upper()
             if re.fullmatch(r"[A-Z0-9]{10}", a):
                 found.append(a)
+    # unique while preserving order
     seen, uniq = set(), []
     for a in found:
         if a not in seen:
             seen.add(a); uniq.append(a)
     return uniq
 
-def tolerant_reviews(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Extract reviews from common shapes across tenants/tiers.
-    """
-    keys = ("reviews","reviewList","items","data","productReviews")
-    # direct list
+def build_dp_url(asin: str, domain_code: str, force_psc: bool = True) -> str:
+    base = f"https://www.amazon.{domain_code}/dp/{asin}"
+    return base + ("?psc=1" if force_psc else "")
+
+def ensure_psc_1(url: str, force: bool) -> str:
+    if not force:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+    q["psc"] = "1"
+    return urlunparse(u._replace(query=urlencode(q)))
+
+def tolerant_list(payload: Dict[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
+    # Return first list-of-dicts found at known keys (direct or nested in "result")
     for k in keys:
         v = payload.get(k)
-        if isinstance(v, list) and (not v or isinstance(v[0], dict)):
+        if isinstance(v, list) and (not v or isinstance(v[0], (dict, str))):
             return v
-    # nested dict -> list
-    for k in keys:
-        v = payload.get(k)
-        if isinstance(v, dict):
-            for kk in keys:
-                vv = v.get(kk)
-                if isinstance(vv, list) and (not vv or isinstance(vv[0], dict)):
-                    return vv
-    # sometimes under "result"
-    res = payload.get("result")
+    res = payload.get("result") or {}
     if isinstance(res, dict):
         for k in keys:
             v = res.get(k)
-            if isinstance(v, list) and (not v or isinstance(v[0], dict)):
+            if isinstance(v, list) and (not v or isinstance(v[0], (dict, str))):
                 return v
     return []
-
-def normalize_review(asin: str, domain: str, meta: Dict[str, Any], it: Dict[str, Any]) -> Dict[str, Any]:
-    def g(dct, *keys, default=""):
-        for k in keys:
-            if isinstance(dct, dict) and k in dct and dct[k] is not None:
-                return dct[k]
-        return default
-    return {
-        "asin": asin,
-        "domainCode": domain,
-        "reviewId": g(it, "reviewId", "id"),
-        "title": g(it, "title", "reviewTitle"),
-        "text": g(it, "text", "content", "reviewText", "body", "comment"),
-        "rating": g(it, "rating", "stars", "starRating", "ratingValue"),
-        "author": g(it, "author", "reviewer", "user", "reviewerName", "nickname"),
-        "date": g(it, "date", "reviewDate", "submissionTime", "createdAt", "time"),
-        "helpful": g(it, "helpful", "helpfulCount", "helpfulVotes", "votes", "vote"),
-        "productTitle": meta.get("productTitle", ""),
-        "page": meta.get("page"),
-        "sourceUrl": meta.get("url") or "",
-    }
 
 def rating_to_float(x: Any) -> Optional[float]:
     if x is None:
@@ -97,16 +77,83 @@ def rating_to_float(x: Any) -> Optional[float]:
     m = re.search(r"(\d+(\.\d+)?)", str(x))
     return float(m.group(1)) if m else None
 
-def backoff_sleep(base: float, attempt: int, max_sleep: float = 8.0):
-    # simple exponential backoff helper
-    time.sleep(min(max_sleep, base * (2 ** max(0, attempt - 1))))
+def normalize_review(it: Dict[str, Any]) -> Dict[str, Any]:
+    def g(*keys, default=""):
+        for k in keys:
+            if k in it and it[k] is not None:
+                return it[k]
+        return default
+    return {
+        "reviewId": g("reviewId", "id"),
+        "title": g("title", "reviewTitle"),
+        "text": g("text", "reviewText", "content", "body", "comment"),
+        "rating": g("rating", "stars", "starRating", "ratingValue"),
+        "rating_num": rating_to_float(g("rating", "stars", "starRating", "ratingValue")),
+        "userName": g("userName", "author", "reviewer", "nickname"),
+        "date": g("date", "reviewDate", "createdAt", "submissionTime", "time"),
+        "url": g("url"),
+        "variationList": g("variationList", default=[]),
+    }
 
-# Initialize session defaults for URL wizard
+def flatten_variations(variations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Turn variations[].values[] into a flat table with columns: variationName, value, price, available, selected, asin, dpUrl, imageUrl
+    """
+    rows = []
+    for var in variations or []:
+        name = var.get("variationName")
+        for v in var.get("values", []):
+            rows.append({
+                "variationName": name,
+                "value": v.get("value"),
+                "price": v.get("price"),
+                "available": v.get("available"),
+                "selected": v.get("selected"),
+                "asin": v.get("asin"),
+                "dpUrl": v.get("dpUrl"),
+                "imageUrl": v.get("imageUrl"),
+            })
+    return rows
+
+def flatten_product_details(pdetails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = []
+    for it in pdetails or []:
+        if isinstance(it, dict):
+            rows.append({"name": it.get("name"), "value": it.get("value")})
+    return rows
+
+def product_core_fields(p: Dict[str, Any]) -> Dict[str, Any]:
+    fields = [
+        "productTitle","manufacturer","asin","productRating","countReview","answeredQuestions",
+        "soldBy","fulfilledBy","sellerId","warehouseAvailability","retailPrice","price","shippingPrice",
+        "priceSaving","dealPrice","salePrice","prime","addon","pantry","used","currency","deal","pastSales"
+    ]
+    return {k: p.get(k) for k in fields}
+
+def combine_reviews(p: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Axesso sometimes places page reviews in "reviews" and/or "globalReviews"
+    raw_local = tolerant_list(p, ["reviews"])
+    raw_global = tolerant_list(p, ["globalReviews"])
+    merged = []
+    seen = set()
+    for src in (raw_local or []):
+        n = normalize_review(src)
+        key = n.get("reviewId") or (n.get("title"), n.get("userName"), n.get("date"))
+        if key not in seen:
+            seen.add(key); merged.append(n)
+    for src in (raw_global or []):
+        n = normalize_review(src)
+        key = n.get("reviewId") or (n.get("title"), n.get("userName"), n.get("date"))
+        if key not in seen:
+            seen.add(key); merged.append(n)
+    return merged
+
+# Session defaults for URL wizard
 st.session_state.setdefault("base_url", "https://axesso.azure-api.net")
-st.session_state.setdefault("reviews_path", "/amz/amazon-product-reviews")
+st.session_state.setdefault("lookup_path", "/amz/amazon-lookup-product")
 
 # =========================
-# Sidebar — Key Gate + Settings
+# Sidebar — Key Gate + Endpoint
 # =========================
 with st.sidebar:
     st.markdown("## 🔐 Enter API Key (required)")
@@ -114,9 +161,9 @@ with st.sidebar:
         "API type",
         options=["Azure APIM (recommended)", "Direct Axesso"],
         index=0,
-        help="APIM uses header 'Ocp-Apim-Subscription-Key'. Direct Axesso uses 'x-api-key'.",
+        help="APIM uses 'Ocp-Apim-Subscription-Key'. Direct Axesso uses 'x-api-key'.",
     )
-    user_key = st.text_input("API key", value="", type="password", placeholder="paste your key here")
+    user_key = st.text_input("API key", type="password", placeholder="paste your key here")
     show_key = st.checkbox("Show key")
     if show_key and user_key:
         st.caption(f"Key preview: `{user_key[:3]}…{user_key[-2:] if len(user_key) > 5 else ''}`")
@@ -124,17 +171,15 @@ with st.sidebar:
     use_query_auth = st.checkbox(
         "Use query auth (`subscription-key`) instead of header (APIM only)",
         value=False,
-        help="Some APIM tenants accept/require `?subscription-key=...`",
+        help="Some APIM tenants accept/require `?subscription-key=...`.",
     )
 
     st.markdown("---")
     st.markdown("### 🔧 Endpoint settings")
-
-    # Wizard: paste exact Try-it URL to auto-split base + path
     with st.expander("🔧 Paste the exact Request URL from the Axesso portal (Try it)"):
         raw_url = st.text_input(
             "Full Request URL",
-            placeholder="https://<gateway>.azure-api.net/amz/amazon-product-reviews?asin=...&domainCode=...&page=1",
+            placeholder="https://<gateway>.azure-api.net/amz/amazon-lookup-product?url=https://www.amazon.com/dp/B08...%3Fpsc%3D1",
         )
         if st.button("Apply URL"):
             u = urlparse((raw_url or "").strip())
@@ -142,227 +187,285 @@ with st.sidebar:
                 st.error("That doesn’t look like a valid URL (missing scheme/host/path).")
             else:
                 st.session_state.base_url = f"{u.scheme}://{u.netloc}"
-                st.session_state.reviews_path = u.path
-                st.success(f"Applied → base: {st.session_state.base_url} | path: {st.session_state.reviews_path}")
+                st.session_state.lookup_path = u.path
+                st.success(f"Applied → base: {st.session_state.base_url} | path: {st.session_state.lookup_path}")
 
     base_url = st.text_input(
         "Gateway base URL",
         value=st.session_state.base_url,
         help="Use the APIM gateway host (…azure-api.net), not the developer site.",
     )
-    reviews_path = st.text_input(
-        "Reviews path",
-        value=st.session_state.reviews_path,
+    lookup_path = st.text_input(
+        "Lookup path",
+        value=st.session_state.lookup_path,
         help=(
             "Match the portal path exactly. Two valid splits:\n"
-            "A) base=https://...  path=/amz/amazon-product-reviews\n"
-            "B) base=https://.../amz  path=/amazon-product-reviews"
+            "A) base=https://...  path=/amz/amazon-lookup-product\n"
+            "B) base=https://.../amz  path=/amazon-lookup-product"
         ),
     )
-    domain_code = st.selectbox("Amazon domainCode", options=SUPPORTED_DOMAINS, index=0)
 
-# Hard gate — no key, no app
+# Hard gate — key required
 if not user_key.strip():
-    st.title("Amazon Reviews (Key-Gated)")
-    st.error("An API key is required to use this app. Enter it in the left sidebar.")
+    st.title("Amazon Product Lookup (Pictures, Details & Reviews)")
+    st.error("An API key is required. Enter it in the left sidebar.")
     st.stop()
 
-# Auth header (or query auth)
+# Build auth
 header_name = "Ocp-Apim-Subscription-Key" if auth_mode.startswith("Azure") else "x-api-key"
-HEADERS = {header_name: user_key.strip()}
+DEFAULT_HEADERS = {header_name: user_key.strip()}
 
 # =========================
 # URL Debugger
 # =========================
 with st.expander("🔎 Request URL debugger"):
-    final_url = f"{base_url.rstrip('/')}{reviews_path}"
-    st.write("Resolved URL:", final_url)
-
-    base_has_amz = "/amz" in base_url.rstrip("/")
-    path_starts_amz = reviews_path.startswith("/amz/")
-    if base_has_amz and path_starts_amz:
-        st.error("Double '/amz' detected. Remove '/amz' from either the base URL or the path.")
-    if (not base_has_amz) and (not path_starts_amz):
-        st.warning("No '/amz' segment found. Many Axesso operations require '/amz' in either the base or the path.")
-
-    masked_key = "***" if not user_key else (user_key[:3] + "…")
-    if auth_mode.startswith("Azure") and use_query_auth:
-        st.code(
-            f'curl -G "{final_url}" '
-            f'--data-urlencode "subscription-key={masked_key}" '
-            f'--data-urlencode "asin=B08N5WRWNW" '
-            f'--data-urlencode "domainCode={domain_code}" '
-            f'--data-urlencode "page=1"',
-            language="bash",
-        )
-    else:
-        st.code(
-            f'curl -G "{final_url}" '
-            f'-H "{header_name}: {masked_key}" '
-            f'--data-urlencode "asin=B08N5WRWNW" '
-            f'--data-urlencode "domainCode={domain_code}" '
-            f'--data-urlencode "page=1"',
-            language="bash",
-        )
+    example_url = "https://www.amazon.com/dp/B07TCHYBSK?psc=1"
+    final_endpoint = f"{base_url.rstrip('/')}{lookup_path}"
+    masked_key = (user_key[:3] + "…") if user_key else "***"
+    st.write("Lookup endpoint:", final_endpoint)
+    st.code(
+        (
+            f'curl -G "{final_endpoint}" '
+            + (f'--data-urlencode "subscription-key={masked_key}" ' if (auth_mode.startswith("Azure") and use_query_auth) else f'-H "{header_name}: {masked_key}" ')
+            + f'--data-urlencode "url={example_url}"'
+        ),
+        language="bash",
+    )
 
 # =========================
 # Main UI
 # =========================
-st.title("Amazon Reviews (Key-Gated)")
-st.caption("Paste ASINs or product URLs. Your key stays in-memory for this session only.")
+st.title("🖼️ Amazon Product Lookup (Pictures, Details & Reviews)")
+st.caption("Paste **Amazon URLs** or **ASINs**. The app will fetch pictures, details, variations, and reviews.")
 
-asin_input = st.text_area(
-    "ASINs or URLs (one per line or mixed)",
-    height=140,
-    placeholder="B08N5WRWNW\nhttps://www.amazon.com/dp/B0C3H9ABCD\nhttps://www.amazon.com/gp/product/B07XYZ1234",
-)
-asins = extract_asins(asin_input)
-st.write(f"**Detected ASINs:** {len(asins)}")
+tab1, tab2 = st.tabs(["Lookup", "Batch"])
 
-col1, col2, col3 = st.columns([1,1,1])
-with col1:
-    start_page = st.number_input("Start page", min_value=1, value=1, step=1)
-with col2:
-    max_pages = st.number_input("Max pages (cap)", min_value=1, value=5, step=1)
-with col3:
-    delay = st.number_input("Delay between calls (sec)", min_value=0.0, value=0.4, step=0.1)
+with tab1:
+    col_a, col_b = st.columns([2,1])
+    with col_a:
+        inp = st.text_input(
+            "Amazon product URL or ASIN",
+            placeholder="https://www.amazon.com/dp/B07TCHYBSK?psc=1  OR  B07TCHYBSK"
+        )
+    with col_b:
+        domain_code = st.selectbox("Domain for ASIN → URL", options=SUPPORTED_DOMAINS, index=0)
+        force_psc = st.checkbox("Auto-add ?psc=1 to URL", value=True)
 
-st.caption(f"**API call estimate** — up to **{len(asins) * int(max_pages)}** calls (ASINs × pages).")
+    btn_go = st.button("🔍 Fetch product", use_container_width=True)
 
-b1, b2, b3 = st.columns([1,1,1])
-with b1:
-    test_btn = st.button("🔎 Test Key (single call)", use_container_width=True)
-with b2:
-    fetch_btn = st.button("📥 Fetch Reviews", use_container_width=True)
-with b3:
-    clear_btn = st.button("🧹 Clear results", use_container_width=True)
+with tab2:
+    multi_inp = st.text_area(
+        "Multiple URLs/ASINs (one per line)",
+        height=140,
+        placeholder="B0B17BYJ5R\nhttps://www.amazon.com/dp/B07TCHYBSK?psc=1\nB0C3H9ABCD",
+    )
+    domain_code_multi = st.selectbox("Domain for ASINs → URLs (batch)", options=SUPPORTED_DOMAINS, index=0, key="d_multi")
+    force_psc_multi = st.checkbox("Auto-add ?psc=1 to URLs (batch)", value=True, key="psc_multi")
+    delay = st.number_input("Delay between requests (sec)", min_value=0.0, value=0.4, step=0.1)
+    btn_batch = st.button("📦 Fetch batch", use_container_width=True)
 
-if clear_btn:
-    st.session_state.pop("reviews_rows", None)
-    st.session_state.pop("reviews_meta", None)
+# Share state
+if "products" not in st.session_state:
+    st.session_state.products = []   # raw payloads
+if "failures" not in st.session_state:
+    st.session_state.failures = []   # errors
 
-rows = st.session_state.get("reviews_rows", [])
-metas = st.session_state.get("reviews_meta", [])
+def to_lookup_url_or_fix(s: str, domain: str, force_psc_flag: bool) -> Tuple[str, bool]:
+    s = (s or "").strip()
+    if not s:
+        return "", False
+    # If it's an ASIN, convert to dp URL
+    if re.fullmatch(r"[A-Za-z0-9]{10}", s):
+        return build_dp_url(s.upper(), domain, force_psc_flag), True
+    # Otherwise, assume it's a URL
+    # Force psc=1 if checked
+    return ensure_psc_1(s, force_psc_flag), True
 
-def do_call(asin: str, page: int) -> requests.Response:
-    url = f"{base_url.rstrip('/')}{reviews_path}"
-    params = {"asin": asin, "domainCode": domain_code, "page": page}
-    headers = dict(HEADERS)
+def do_lookup_call(product_url: str) -> requests.Response:
+    endpoint = f"{base_url.rstrip('/')}{lookup_path}"
+    headers = dict(DEFAULT_HEADERS)
+    params = {"url": product_url}
 
-    # Optional: APIM via query param instead of header
     if auth_mode.startswith("Azure") and use_query_auth:
         params["subscription-key"] = user_key.strip()
-        headers = {}  # omit header if using query auth
+        headers = {}  # move auth to query
 
-    return requests.get(url, headers=headers, params=params, timeout=30)
+    return requests.get(endpoint, headers=headers, params=params, timeout=45)
 
-# Quick one-page check to validate key + path
-if test_btn:
-    demo_asin = asins[0] if asins else "B08N5WRWNW"
-    try:
-        r = do_call(demo_asin, 1)
-        st.info(f"HTTP {r.status_code}")
-        if 200 <= r.status_code < 300:
-            st.success("Key + endpoint look valid.")
-            try:
-                payload = r.json()
-                revs = tolerant_reviews(payload)
-                st.caption(f"This page returned {len(revs)} review(s).")
-            except Exception as e:
-                st.warning(f"Response not JSON or parse issue: {e}")
-        else:
-            st.error(f"Call failed. Body (first 300 chars): {r.text[:300]}")
-    except Exception as e:
-        st.error(f"Request error: {e}")
+def render_product(p: Dict[str, Any]):
+    # Top meta
+    core = product_core_fields(p)
+    left, right = st.columns([2, 1])
 
-# Full pagination loop
-if fetch_btn:
-    if not asins:
-        st.error("Paste at least one ASIN or Amazon product URL.")
+    # Images
+    with left:
+        main_url = (p.get("mainImage") or {}).get("imageUrl")
+        image_list = p.get("imageUrlList") or []
+        if main_url:
+            st.image(main_url, caption="Main image", use_container_width=True)
+        if image_list:
+            st.markdown("#### Image Gallery")
+            # simple grid
+            n = min(12, len(image_list))
+            cols = st.columns(3)
+            for i in range(n):
+                with cols[i % 3]:
+                    st.image(image_list[i], use_container_width=True)
+
+        # Videos (if present)
+        videos = p.get("videoeUrlList") or []
+        if videos:
+            with st.expander("🎞️ Videos"):
+                for v in videos[:6]:
+                    try:
+                        st.video(v)
+                    except Exception:
+                        st.write(v)
+
+    # Core fields + features
+    with right:
+        st.markdown("### Product")
+        st.write(f"**Title:** {core.get('productTitle') or ''}")
+        st.write(f"**ASIN:** {core.get('asin') or ''}")
+        st.write(f"**Rating:** {core.get('productRating') or ''}  •  **Reviews:** {core.get('countReview') or ''}")
+        st.write(f"**Sold by:** {core.get('soldBy') or ''}  •  **Fulfilled by:** {core.get('fulfilledBy') or ''}")
+        st.write(f"**Seller ID:** {core.get('sellerId') or ''}")
+        st.write(f"**Price:** {core.get('price')}  •  **Retail:** {core.get('retailPrice')}  •  **Shipping:** {core.get('shippingPrice')}")
+        st.write(f"**Availability:** {core.get('warehouseAvailability') or ''}")
+
+        feats = p.get("features") or []
+        if feats:
+            st.markdown("**Features**")
+            for f in feats[:10]:
+                st.write(f"- {f}")
+
+    # Variations
+    variations = p.get("variations") or []
+    if variations:
+        st.markdown("### Variations")
+        var_rows = flatten_variations(variations)
+        if var_rows:
+            st.dataframe(pd.DataFrame(var_rows), use_container_width=True)
+
+    # Product details (bullets like Dimensions, Model, etc.)
+    pdetails = p.get("productDetails") or []
+    if pdetails:
+        st.markdown("### Product details")
+        st.dataframe(pd.DataFrame(flatten_product_details(pdetails)), use_container_width=True)
+
+    # Categories
+    cats = p.get("categoriesExtended") or []
+    if cats:
+        st.markdown("### Categories")
+        st.dataframe(pd.DataFrame(cats), use_container_width=True)
+
+    # Reviews
+    reviews = combine_reviews(p)
+    st.markdown("### Reviews")
+    st.caption(f"{len(reviews)} reviews parsed from response.")
+    if reviews:
+        df_rev = pd.DataFrame(reviews)
+        st.dataframe(df_rev, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "⬇️ Download Reviews (JSON)",
+                data=json.dumps(reviews, indent=2),
+                file_name=f"{p.get('asin','product')}_reviews.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with c2:
+            st.download_button(
+                "⬇️ Download Reviews (CSV)",
+                data=df_rev.to_csv(index=False),
+                file_name=f"{p.get('asin','product')}_reviews.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+# ---- One-off lookup
+if tab1 and btn_go:
+    st.session_state.products.clear()
+    st.session_state.failures.clear()
+
+    url_or_asin = (inp or "").strip()
+    product_url, ok = to_lookup_url_or_fix(url_or_asin, domain_code, force_psc)
+    if not ok:
+        st.error("Enter an Amazon product URL or an ASIN.")
     else:
-        rows, metas = [], []
-        total_calls = max(1, len(asins) * int(max_pages))
-        call_i = 0
-        progress = st.progress(0)
-
-        for asin in asins:
-            attempt = 0  # backoff attempt counter (per ASIN)
-            for p in range(int(start_page), int(start_page) + int(max_pages)):
-                try:
-                    r = do_call(asin, p)
-                    call_i += 1
-                    progress.progress(min(1.0, call_i / float(total_calls)))
-
-                    # brief retry for transient errors
-                    if r.status_code in (429, 500, 502, 503, 504):
-                        attempt += 1
-                        backoff_sleep(delay or 0.4, attempt)
-                        r = do_call(asin, p)
-
-                    if r.status_code != 200:
-                        metas.append({"asin": asin, "page": p, "error": f"HTTP {r.status_code}: {r.text[:200]}"})
-                        break
-
+        with st.spinner("Fetching…"):
+            try:
+                r = do_lookup_call(product_url)
+                if r.status_code != 200:
+                    st.error(f"HTTP {r.status_code}: {r.text[:300]}")
+                else:
                     data = r.json()
+                    # Axesso returns details directly at top-level
+                    st.session_state.products.append(data)
+            except Exception as e:
+                st.session_state.failures.append({"input": url_or_asin, "error": str(e)})
 
-                    # Meta (page-level)
-                    current_page = int(data.get("currentPage", p))
-                    last_page = data.get("lastPage")
-                    meta_fields = ["productTitle", "url", "countReview", "productRating"]
-                    meta = {k: data.get(k) for k in meta_fields}
-                    meta.update({"asin": asin, "page": current_page})
-                    metas.append(meta)
+# ---- Batch lookup
+if tab2 and btn_batch:
+    st.session_state.products.clear()
+    st.session_state.failures.clear()
 
-                    # Extract & normalize reviews
-                    items = tolerant_reviews(data)
-                    for it in items:
-                        rows.append(normalize_review(asin, domain_code, meta, it))
+    lines = [ln.strip() for ln in (multi_inp or "").splitlines() if ln.strip()]
+    total = len(lines)
+    progress = st.progress(0)
+    for i, item in enumerate(lines, start=1):
+        product_url, ok = to_lookup_url_or_fix(item, domain_code_multi, force_psc_multi)
+        if not ok:
+            st.session_state.failures.append({"input": item, "error": "Invalid line"})
+            progress.progress(i/total)
+            continue
 
-                    # stop if API indicates end
-                    if isinstance(last_page, int) and current_page >= int(last_page):
-                        break
+        try:
+            r = do_lookup_call(product_url)
+            if r.status_code != 200:
+                st.session_state.failures.append({"input": item, "error": f"HTTP {r.status_code}: {r.text[:200]}"})
+            else:
+                st.session_state.products.append(r.json())
+        except Exception as e:
+            st.session_state.failures.append({"input": item, "error": str(e)})
 
-                    if delay > 0:
-                        time.sleep(float(delay))
-
-                except Exception as e:
-                    metas.append({"asin": asin, "page": p, "error": str(e)})
-                    break
-
-        st.session_state["reviews_rows"] = rows
-        st.session_state["reviews_meta"] = metas
+        progress.progress(i/total)
+        if delay > 0:
+            time.sleep(float(delay))
 
 # =========================
-# Results & Export
+# Render Results / Export
 # =========================
-if rows:
-    st.success(f"Collected {len(rows)} review rows from {len(asins)} ASIN(s).")
-    df = pd.DataFrame(rows)
+if st.session_state.products:
+    st.success(f"Fetched {len(st.session_state.products)} product payload(s).")
+    for idx, prod in enumerate(st.session_state.products, start=1):
+        st.divider()
+        st.markdown(f"## Result {idx}")
+        render_product(prod)
 
-    if "rating" in df.columns:
-        df["rating_num"] = df["rating"].apply(rating_to_float)
+    # Export products (raw)
+    st.markdown("### Export all products (raw)")
+    st.download_button(
+        "⬇️ Download Products (JSON)",
+        data=json.dumps(st.session_state.products, indent=2),
+        file_name="products_raw.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
-    st.dataframe(df, use_container_width=True)
+# Any failures?
+if st.session_state.failures:
+    st.warning(f"{len(st.session_state.failures)} request(s) failed.")
+    st.dataframe(pd.DataFrame(st.session_state.failures), use_container_width=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "⬇️ Download Reviews (JSON)",
-            data=json.dumps(rows, indent=2),
-            file_name="amazon_reviews.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "⬇️ Download Reviews (CSV)",
-            data=df.to_csv(index=False),
-            file_name="amazon_reviews.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+# Helpful tips
+with st.expander("💡 Troubleshooting"):
+    st.markdown("""
+- **404 Not Found**: Usually means your **base + path** are wrong for your tenant. Use the **Paste Try-it URL** wizard above to auto-fill.
+- **Include `?psc=1`**: The lookup API recommends it; use the **Auto-add `?psc=1`** option. If you pass an ASIN, the app builds a proper dp URL for you.
+- Use real **product dp URLs** (not category pages, search pages, or truncated links).
+- **Auth**: Azure APIM header `Ocp-Apim-Subscription-Key` (or toggle query `subscription-key`). Direct Axesso uses `x-api-key`.
+""")
 
-if metas:
-    dfm = pd.DataFrame(metas)
-    with st.expander("Meta / call log"):
-        st.dataframe(dfm, use_container_width=True)
