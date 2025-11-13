@@ -2,6 +2,7 @@
 # Run with: streamlit run streamlit_app.py
 
 import json
+import re
 import time
 from urllib.parse import urlencode
 
@@ -13,8 +14,8 @@ import streamlit as st
 # Page setup
 # -----------------------------
 st.set_page_config(
-    page_title="Amazon ASIN Finder (Axesso)",
-    page_icon="🦈",
+    page_title="Amazon ASIN Tools (Axesso)",
+    page_icon="🛒",
     layout="wide",
 )
 
@@ -22,6 +23,7 @@ st.set_page_config(
 # Constants & helpers
 # -----------------------------
 DEFAULT_BASE_URL = "http://api.axesso.de/amz/amazon-seller-products"
+DEFAULT_LOOKUP_URL = "http://api.axesso.de/amz/amazon-lookup-product"  # <- used for single-ASIN lookups
 
 SUPPORTED_DOMAINS = [
     "com", "co.uk", "de", "fr", "it", "es", "ca", "com.mx", "com.au", "co.jp",
@@ -90,41 +92,22 @@ EXAMPLE_RESPONSE = {
             "productRating": "4.6 out of 5",
             "prime": True,
             "salesVolume": "2K+ bought in past month"
-        },
-        {
-            "productDescription": "Shark Steam Mop",
-            "asin": "SHARK4444",
-            "countReview": 412,
-            "imgUrl": "https://m.media-amazon.com/images/I/74x.jpg",
-            "price": 69.99,
-            "retailPrice": 79.99,
-            "productRating": "4.5 out of 5",
-            "prime": False,
-            "salesVolume": "200+ bought in past month"
-        },
-        {
-            "productDescription": "Ninja Professional Blender 1000",
-            "asin": "NINJA5555",
-            "countReview": 22310,
-            "imgUrl": "https://m.media-amazon.com/images/I/75x.jpg",
-            "price": 99.99,
-            "retailPrice": 129.99,
-            "productRating": "4.8 out of 5",
-            "prime": True,
-            "salesVolume": "10K+ bought in past month"
-        },
-        {
-            "productDescription": "Dyson Supersonic Hair Dryer",
-            "asin": "DYSON6666",
-            "countReview": 30210,
-            "imgUrl": "https://m.media-amazon.com/images/I/76x.jpg",
-            "price": 429.99,
-            "retailPrice": 429.99,
-            "productRating": "4.7 out of 5",
-            "prime": True,
-            "salesVolume": "1K+ bought in past month"
         }
     ]
+}
+
+EXAMPLE_LOOKUP = {
+    "responseStatus": "PRODUCT_FOUND_RESPONSE",
+    "responseMessage": "Product successfully found!",
+    "asin": "SHARK1111",
+    "productTitle": "Shark Cordless Stick Vacuum UltraLight",
+    "manufacturer": "Shark",
+    "countReview": 1542,
+    "productRating": "4.6 out of 5",
+    "retailPrice": 249.99,
+    "price": 199.99,
+    "imageUrlList": ["https://m.media-amazon.com/images/I/71x.jpg"],
+    "url": "https://www.amazon.com/dp/SHARK1111"
 }
 
 def amazon_dp_url(asin: str, domain_code: str) -> str:
@@ -143,6 +126,7 @@ def looks_like_brand(s: str, brand: str) -> bool:
     return b in s
 
 def build_curl(base_url, params, headers: dict | None):
+    from urllib.parse import urlencode
     hlines = []
     if headers:
         for k, v in headers.items():
@@ -152,20 +136,45 @@ def build_curl(base_url, params, headers: dict | None):
         header_str = " \\\n  " + header_str
     return f"""curl -X GET "{base_url}?{urlencode(params)}"{header_str}"""
 
+# Extract ASINs from freeform paste (ASINs and/or product URLs)
+ASIN_REGEXES = [
+    r"/dp/([A-Z0-9]{10})",
+    r"/gp/product/([A-Z0-9]{10})",
+    r"/product/([A-Z0-9]{10})",
+    r"\b([A-Z0-9]{10})\b",
+]
+def extract_asins(text: str) -> list[str]:
+    text = text or ""
+    found = []
+    for rx in ASIN_REGEXES:
+        for m in re.findall(rx, text, flags=re.IGNORECASE):
+            a = m.upper()
+            if re.fullmatch(r"[A-Z0-9]{10}", a):
+                found.append(a)
+    # preserve order + unique
+    seen = set()
+    uniq = []
+    for a in found:
+        if a not in seen:
+            seen.add(a)
+            uniq.append(a)
+    return uniq
+
 # -----------------------------
 # Sidebar
 # -----------------------------
 with st.sidebar:
     st.markdown("## 🔧 Settings")
-    base_url = st.text_input("API Base URL", value=DEFAULT_BASE_URL)
+    base_url = st.text_input("Seller Products Endpoint", value=DEFAULT_BASE_URL)
+    lookup_url = st.text_input("ASIN Lookup Endpoint", value=DEFAULT_LOOKUP_URL)
     domain_code = st.selectbox("Amazon Domain", options=SUPPORTED_DOMAINS, index=0, key="domain_code")
     seller_id = st.text_input(
         "Seller ID",
         value="A2QWFZRANX2P5J",  # SharkNinja (US)
         key="seller_id",
-        help="e.g., A2QWFZRANX2P5J (SharkNinja US), A1VLPNTGGRFAR6 (Streamlight US)."
+        help="e.g., A2QWFZRANX2P5J (SharkNinja US), A1VLPNTGGRFAR6 (Streamlight US)"
     )
-    default_page = st.number_input("Page (for single fetch)", min_value=1, step=1, value=1, key="page_input")
+    default_page = st.number_input("Page (single fetch)", min_value=1, step=1, value=1, key="page_input")
 
     st.markdown("### 🎯 Presets")
     colp1, colp2, colp3 = st.columns(3)
@@ -185,16 +194,14 @@ with st.sidebar:
             st.experimental_rerun()
     with colp3:
         if st.button("Dyson (US)", use_container_width=True):
-            # Paste the current official Dyson seller ID if/when you have it.
             st.session_state["domain_code"] = "com"
-            st.session_state["seller_id"] = ""  # <- fill when known
+            st.session_state["seller_id"] = ""  # fill when known
             st.session_state["page_input"] = 1
             st.session_state.page = 1
             st.experimental_rerun()
 
     st.markdown("### ➕ Headers / Keys")
     st.caption("Use secrets or paste JSON headers. Example: {\"x-api-key\":\"YOUR_KEY\"}")
-    # Secrets-based headers (preferred)
     secret_headers = None
     try:
         if "AXESSO_API_KEY" in st.secrets:
@@ -230,12 +237,12 @@ with st.sidebar:
                 parsed_headers = None
 
     st.markdown("### 🧪 Demo / Fallback")
-    use_example = st.toggle("Use example response (no network call for first page)", value=False)
+    use_example = st.toggle("Use example response for first page/ASIN (no network for that one)", value=False)
 
-    st.markdown("### 📚 Fetch Scope")
-    fetch_all = st.checkbox("Fetch **ALL pages**", value=True, help="Loops through pages until lastPage (or safety cap).")
+    st.markdown("### 📚 Fetch Scope (Seller)")
+    fetch_all = st.checkbox("Fetch **ALL pages** (seller view)", value=True)
     start_page = st.number_input("Start page", value=1, min_value=1, step=1)
-    max_pages_cap = st.number_input("Max pages (safety cap)", value=50, min_value=1, step=1)
+    max_pages_cap = st.number_input("Max pages (cap)", value=50, min_value=1, step=1)
     per_request_delay = st.number_input("Delay between requests (seconds)", value=0.5, min_value=0.0, step=0.1)
     dedupe_by_asin = st.checkbox("Dedupe by ASIN", value=True)
 
@@ -246,44 +253,154 @@ if default_page != st.session_state.page:
     st.session_state.page = int(default_page)
 
 # -----------------------------
-# UI
+# Shared helpers for requests
 # -----------------------------
-st.title("🛒 Amazon ASIN Finder (by Seller)")
-st.caption("Powered by Axesso — query any seller, gather ASINs across pages, and filter for Shark, Ninja, or Dyson.")
-
-tab_asin, tab_table, tab_snippets = st.tabs(["ASIN Finder", "Products Table & Gallery", "Code Snippets"])
-
-# --------------------------------------
-# Shared request helper
-# --------------------------------------
-def do_request(page_num: int, base_url, domain_code, seller_id, headers):
+def do_request_seller(page_num: int, base_url, domain_code, seller_id, headers):
     q = {"domainCode": domain_code, "sellerId": seller_id.strip(), "page": page_num}
     r = requests.get(base_url, params=q, headers=headers, timeout=20)
     return r
 
+def do_request_lookup(asin: str, lookup_url: str, domain_code: str, headers):
+    """
+    Primary: call lookup endpoint with ?asin & domainCode.
+    Fallback: try with ?url=...dp/ASIN in case that variant is required.
+    """
+    # Try asin param
+    try:
+        r = requests.get(lookup_url, params={"asin": asin, "domainCode": domain_code}, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r
+    except Exception:
+        pass
+    # Fallback via URL param
+    try:
+        dp = amazon_dp_url(asin, domain_code)
+        r2 = requests.get(lookup_url, params={"url": dp}, headers=headers, timeout=20)
+        return r2
+    except Exception as e:
+        raise e
+
 def brand_filter_row(desc: str, brand_choice: str) -> bool:
-    """Return True if row matches selected brand filter."""
     if brand_choice == "Any":
         return True
     return looks_like_brand(desc, brand_choice)
 
 def estimate_fetch_click_calls(fetch_all, use_example, start_page, max_pages_cap, lp_cache):
     if fetch_all:
-        # planned pages: lastPage-based or worst-case cap
         if isinstance(lp_cache, int):
             planned_pages = max(0, min(int(max_pages_cap), int(lp_cache) - int(start_page) + 1))
         else:
             planned_pages = int(max_pages_cap)
-        # first page demo = no network call
-        network_calls = max(0, planned_pages - (1 if use_example else 0))
+        return max(0, planned_pages - (1 if use_example else 0))
     else:
-        network_calls = 0 if use_example else 1
-    return network_calls
+        return 0 if use_example else 1
+
+# -----------------------------
+# Tabs
+# -----------------------------
+tab_asin_lookup, tab_asin_finder, tab_table, tab_snippets = st.tabs(
+    ["ASIN Lookup (Amazon)", "ASIN Finder (by Seller)", "Products Table & Gallery", "Code Snippets"]
+)
 
 # --------------------------------------
-# Tab: ASIN Finder
+# Tab 1: ASIN Lookup (Amazon)
 # --------------------------------------
-with tab_asin:
+with tab_asin_lookup:
+    st.subheader("Paste ASIN(s) or Amazon product URLs")
+    st.caption("The app extracts ASINs automatically from anything you paste below.")
+    paste_input = st.text_area(
+        "ASINs or URLs (one per line or mixed)",
+        height=120,
+        placeholder="B08N5WRWNW\nhttps://www.amazon.com/dp/B0C3H9ABCD\nhttps://www.amazon.com/gp/product/B07XYZ1234",
+    )
+
+    look_c1, look_c2, look_c3 = st.columns([1,1,2])
+    with look_c1:
+        look_btn = st.button("🔎 Fetch ASIN details", use_container_width=True)
+    with look_c2:
+        clear_btn = st.button("🧹 Clear results", use_container_width=True)
+
+    # API call estimate
+    asins_extracted = extract_asins(paste_input)
+    est_calls = 0 if (use_example and asins_extracted[:1]) else len(asins_extracted)
+    st.caption(f"**API call estimate** — ASIN Lookup: **{est_calls}** (for {len(asins_extracted)} ASINs)")
+
+    if clear_btn:
+        st.session_state.pop("asin_lookup_rows", None)
+
+    rows = st.session_state.get("asin_lookup_rows", [])
+
+    if look_btn:
+        if not asins_extracted:
+            st.error("Please paste at least one ASIN or Amazon URL.")
+        else:
+            progress = st.progress(0)
+            rows = []
+            for i, a in enumerate(asins_extracted):
+                try:
+                    if use_example and i == 0:
+                        data = dict(EXAMPLE_LOOKUP)
+                        data["asin"] = a
+                        data["url"] = amazon_dp_url(a, domain_code)
+                    else:
+                        r = do_request_lookup(a, lookup_url, domain_code, parsed_headers)
+                        if r.status_code != 200:
+                            st.warning(f"{a}: HTTP {r.status_code} — {r.text[:180]}")
+                            continue
+                        data = r.json()
+                        # Some APIs return nested payloads — if so, flatten minimally
+                        if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
+                            data = data["data"]
+                    # Normalize a few helpful fields
+                    data["_asin"] = data.get("asin", a)
+                    data["_title"] = data.get("productTitle") or data.get("title") or ""
+                    data["_manufacturer"] = data.get("manufacturer") or ""
+                    data["_countReview"] = data.get("countReview")
+                    data["_rating"] = data.get("productRating") or data.get("rating")
+                    data["_price"] = data.get("price")
+                    data["_retailPrice"] = data.get("retailPrice")
+                    data["_url"] = data.get("url") or amazon_dp_url(a, domain_code)
+                    rows.append(data)
+                except Exception as e:
+                    st.warning(f"{a}: {e}")
+                finally:
+                    progress.progress(min(1.0, (i + 1) / max(1, len(asins_extracted))))
+
+            st.session_state["asin_lookup_rows"] = rows
+
+    if rows:
+        st.success(f"Fetched details for {len(rows)} ASIN(s).")
+        df_cols = ["_asin","_title","_manufacturer","_countReview","_rating","_price","_retailPrice","_url"]
+        df = pd.DataFrame([{k: r.get(k) for k in df_cols} for r in rows])
+        # Pretty prices
+        if "_price" in df.columns:
+            df["_price"] = df["_price"].apply(to_readable_price)
+        if "_retailPrice" in df.columns:
+            df["_retailPrice"] = df["_retailPrice"].apply(to_readable_price)
+        st.dataframe(df, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "⬇️ Download (JSON)",
+                data=json.dumps(rows, indent=2),
+                file_name="asin_lookup.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with c2:
+            st.download_button(
+                "⬇️ Download (CSV)",
+                data=df.to_csv(index=False),
+                file_name="asin_lookup.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+# --------------------------------------
+# Tab 2: ASIN Finder (by Seller)
+# --------------------------------------
+with tab_asin_finder:
     st.subheader("Fetch ASINs from this seller")
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
@@ -299,7 +416,6 @@ with tab_asin:
     prev_next_calls = 0 if use_example else 1
     st.caption(f"**API call estimate** — 🔎 Fetch: **{fetch_click_calls}** • ⬅️/➡️ Prev/Next: **{prev_next_calls}**")
 
-    # Prev/Next adjust page
     if prev_btn:
         st.session_state.page = max(1, int(st.session_state.page) - 1)
     if next_btn:
@@ -315,13 +431,7 @@ with tab_asin:
     with filt_col2:
         asin_separator = st.selectbox("ASIN separator", options=["newline", "comma", "space"], index=0)
 
-    # Assemble params
-    params = {
-        "domainCode": domain_code,
-        "sellerId": (seller_id or "").strip(),
-        "page": int(st.session_state.page),
-    }
-
+    params = {"domainCode": domain_code, "sellerId": (seller_id or "").strip(), "page": int(st.session_state.page)}
     trigger = fetch_btn or prev_btn or next_btn
     response_data = None
     error_msg = None
@@ -337,12 +447,11 @@ with tab_asin:
             try:
                 if fetch_all:
                     st.info("Fetching ALL pages — this may take a bit depending on caps and delay.")
-                    products = []
-                    seen_asins = set()
+                    products, seen_asins = [], set()
                     last_page_hint = None
                     start = int(start_page)
                     cap = int(max_pages_cap)
-                    total_planned = cap  # refined as we learn lastPage
+                    total_planned = cap
                     progress = st.progress(0)
 
                     for idx, p in enumerate(range(start, start + cap)):
@@ -350,14 +459,13 @@ with tab_asin:
                             if use_example and p == start:
                                 data = EXAMPLE_RESPONSE
                             else:
-                                r = do_request(p, base_url, domain_code, seller_id, parsed_headers)
+                                r = do_request_seller(p, base_url, domain_code, seller_id, parsed_headers)
                                 if r.status_code != 200:
                                     error_msg = f"HTTP {r.status_code} on page {p}: {r.text[:200]}"
                                     break
                                 data = r.json()
                             pages_fetched += 1
 
-                            # read lastPage hint
                             last_page_hint = data.get("lastPage", last_page_hint)
                             if isinstance(last_page_hint, int):
                                 st.session_state.lastPage_cache = int(last_page_hint)
@@ -373,11 +481,9 @@ with tab_asin:
                             else:
                                 products.extend(page_products)
 
-                            # progress
                             denom = total_planned if total_planned else cap
                             progress.progress(min(1.0, (idx + 1) / float(denom)))
 
-                            # stop conditions
                             if isinstance(last_page_hint, int) and p >= last_page_hint:
                                 break
                             if not page_products and not isinstance(last_page_hint, int):
@@ -394,7 +500,7 @@ with tab_asin:
 
                 else:
                     with st.spinner("Contacting Axesso API..."):
-                        r = do_request(params["page"], base_url, domain_code, seller_id, parsed_headers)
+                        r = do_request_seller(params["page"], base_url, domain_code, seller_id, parsed_headers)
                     if r.status_code == 200:
                         response_data = r.json()
                     else:
@@ -405,13 +511,9 @@ with tab_asin:
     if error_msg:
         st.error(error_msg)
 
-    # --------- If we got ALL pages
+    # ALL pages aggregated
     if aggregated_products is not None:
-        # Build filtered ASIN list
-        filtered = [
-            p for p in aggregated_products
-            if brand_filter_row(p.get("productDescription", ""), brand_choice)
-        ]
+        filtered = [p for p in aggregated_products if brand_filter_row(p.get("productDescription", ""), brand_choice)]
         asins = [p.get("asin") for p in filtered if p.get("asin")]
         unique_asins = list(dict.fromkeys(asins))
 
@@ -420,48 +522,23 @@ with tab_asin:
             f"Products (after brand filter '{brand_choice}'): {len(filtered)} • Unique ASINs: {len(unique_asins)}"
         )
 
-        # Show ASINs
-        if asin_separator == "newline":
-            asin_blob = "\n".join(unique_asins)
-        elif asin_separator == "comma":
-            asin_blob = ",".join(unique_asins)
-        else:
-            asin_blob = " ".join(unique_asins)
-
+        asin_blob = (
+            "\n".join(unique_asins) if asin_separator == "newline"
+            else (",".join(unique_asins) if asin_separator == "comma" else " ".join(unique_asins))
+        )
         st.subheader("ASINs")
         st.code(asin_blob or "—", language="text")
 
-        # Downloads
         colD1, colD2, colD3 = st.columns(3)
         with colD1:
-            st.download_button(
-                "⬇️ Download ASINs (TXT)",
-                data=asin_blob,
-                file_name=f"asins_{seller_id}_{domain_code}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download ASINs (TXT)", asin_blob, file_name=f"asins_{seller_id}_{domain_code}.txt", mime="text/plain", use_container_width=True)
         with colD2:
-            st.download_button(
-                "⬇️ Download ASINs (JSON)",
-                data=json.dumps(unique_asins, indent=2),
-                file_name=f"asins_{seller_id}_{domain_code}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download ASINs (JSON)", json.dumps(unique_asins, indent=2), file_name=f"asins_{seller_id}_{domain_code}.json", mime="application/json", use_container_width=True)
         with colD3:
             df_asins = pd.DataFrame({"asin": unique_asins})
-            st.download_button(
-                "⬇️ Download ASINs (CSV)",
-                data=df_asins.to_csv(index=False),
-                file_name=f"asins_{seller_id}_{domain_code}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download ASINs (CSV)", df_asins.to_csv(index=False), file_name=f"asins_{seller_id}_{domain_code}.csv", mime="text/csv", use_container_width=True)
 
-        st.info("Tip: switch the Brand filter to **Shark**, **Ninja**, or **Dyson** to get those specific ASINs.")
-
-    # --------- If we got a single page
+    # Single page
     if response_data:
         status = response_data.get("responseStatus")
         currentPage = response_data.get("currentPage", params["page"])
@@ -472,52 +549,28 @@ with tab_asin:
         st.write(f"**Status:** {status or '—'} • **Page:** {currentPage} / {lastPage or '—'}")
 
         products = response_data.get("searchProductDetails") or []
-        filtered = [
-            p for p in products
-            if brand_filter_row(p.get("productDescription", ""), brand_choice)
-        ]
+        filtered = [p for p in products if brand_filter_row(p.get("productDescription", ""), brand_choice)]
         asins = [p.get("asin") for p in filtered if p.get("asin")]
         unique_asins = list(dict.fromkeys(asins))
 
         st.subheader("ASINs (this page)")
-        if asin_separator == "newline":
-            asin_blob = "\n".join(unique_asins)
-        elif asin_separator == "comma":
-            asin_blob = ",".join(unique_asins)
-        else:
-            asin_blob = " ".join(unique_asins)
-
+        asin_blob = (
+            "\n".join(unique_asins) if asin_separator == "newline"
+            else (",".join(unique_asins) if asin_separator == "comma" else " ".join(unique_asins))
+        )
         st.code(asin_blob or "—", language="text")
 
         colD1, colD2, colD3 = st.columns(3)
         with colD1:
-            st.download_button(
-                "⬇️ Download (TXT)",
-                data=asin_blob,
-                file_name=f"asins_p{currentPage}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download (TXT)", asin_blob, file_name=f"asins_p{currentPage}.txt", mime="text/plain", use_container_width=True)
         with colD2:
-            st.download_button(
-                "⬇️ Download (JSON)",
-                data=json.dumps(unique_asins, indent=2),
-                file_name=f"asins_p{currentPage}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download (JSON)", json.dumps(unique_asins, indent=2), file_name=f"asins_p{currentPage}.json", mime="application/json", use_container_width=True)
         with colD3:
             df_asins = pd.DataFrame({"asin": unique_asins})
-            st.download_button(
-                "⬇️ Download (CSV)",
-                data=df_asins.to_csv(index=False),
-                file_name=f"asins_p{currentPage}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download (CSV)", df_asins.to_csv(index=False), file_name=f"asins_p{currentPage}.csv", mime="text/csv", use_container_width=True)
 
 # --------------------------------------
-# Tab: Products Table & Gallery (nice to have)
+# Tab 3: Products Table & Gallery
 # --------------------------------------
 with tab_table:
     st.subheader("Optional: Fetch page to view products")
@@ -527,8 +580,6 @@ with tab_table:
     with colB:
         page_for_table = st.number_input("Page to fetch", min_value=1, step=1, value=int(st.session_state.page), key="tbl_page")
 
-    # Estimate (same as single-page fetch)
-    prev_next_calls = 0 if use_example else 1
     st.caption(f"**API call estimate** — this action: **{0 if use_example else 1}**")
 
     if fetch_one_btn:
@@ -537,7 +588,7 @@ with tab_table:
         else:
             try:
                 with st.spinner("Contacting Axesso API..."):
-                    r = do_request(int(page_for_table), base_url, domain_code, seller_id, parsed_headers)
+                    r = do_request_seller(int(page_for_table), base_url, domain_code, seller_id, parsed_headers)
                 if r.status_code == 200:
                     data = r.json()
                 else:
@@ -555,7 +606,6 @@ with tab_table:
             products = data.get("searchProductDetails") or []
             if products:
                 df = pd.DataFrame(products)
-                # pretties
                 if "asin" in df.columns:
                     df.insert(0, "amazonUrl", df["asin"].apply(lambda a: amazon_dp_url(a, domain_code)))
                 if "price" in df.columns:
@@ -567,24 +617,6 @@ with tab_table:
                     df[["productDescription", "asin", "price_display", "retailPrice_display", "countReview", "productRating", "prime", "salesVolume", "amazonUrl"]],
                     use_container_width=True,
                 )
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.download_button(
-                        "⬇️ Download JSON",
-                        data=json.dumps(products, indent=2),
-                        file_name=f"seller_products_{seller_id}_{domain_code}_p{data.get('currentPage', page_for_table)}.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
-                with c2:
-                    st.download_button(
-                        "⬇️ Download CSV",
-                        data=df.to_csv(index=False),
-                        file_name=f"seller_products_{seller_id}_{domain_code}_p{data.get('currentPage', page_for_table)}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
 
                 st.markdown("### Gallery")
                 cards_per_row = 3
@@ -607,29 +639,30 @@ with tab_table:
                             a = p.get("asin")
                             if a:
                                 st.link_button("Open on Amazon", amazon_dp_url(a, domain_code), use_container_width=True)
-            else:
-                st.info("No products returned for this page.")
 
 # --------------------------------------
-# Tab: Code Snippets
+# Tab 4: Code Snippets
 # --------------------------------------
 with tab_snippets:
     st.subheader("cURL / Python for your current inputs")
-    cur_params = {
-        "domainCode": domain_code,
-        "sellerId": (seller_id or "").strip(),
-        "page": int(st.session_state.page),
-    }
-    st.markdown("**cURL**")
+    cur_params = {"domainCode": domain_code, "sellerId": (seller_id or "").strip(), "page": int(st.session_state.page)}
+    st.markdown("**Seller Products — cURL**")
     st.code(build_curl(DEFAULT_BASE_URL, cur_params, parsed_headers), language="bash")
+
+    st.markdown("**ASIN Lookup — cURL**")
+    st.code(build_curl(DEFAULT_LOOKUP_URL, {"asin": "B08N5WRWNW", "domainCode": domain_code}, parsed_headers), language="bash")
 
     st.markdown("**Python (requests)**")
     py_headers = f", headers={json.dumps(parsed_headers, indent=2)}" if parsed_headers else ""
     st.code(f"""import requests
 
-base_url = "{DEFAULT_BASE_URL}"
+seller_base = "{DEFAULT_BASE_URL}"
+lookup_base = "{DEFAULT_LOOKUP_URL}"
+
+# Seller page
 params = {json.dumps(cur_params, indent=2)}
-res = requests.get(base_url, params=params{py_headers}, timeout=20)
-print(res.json())""", language="python")
+print(requests.get(seller_base, params=params{py_headers}, timeout=20).json())
 
-
+# Single ASIN lookup
+asin_params = {{"asin":"B08N5WRWNW","domainCode":"{domain_code}"}}
+print(requests.get(lookup_base, params=asin_params{py_headers}, timeout=20).json())""", language="python")
