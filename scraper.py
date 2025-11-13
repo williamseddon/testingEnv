@@ -4,7 +4,7 @@
 import json
 import re
 import time
-from typing import List
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import requests
@@ -12,9 +12,10 @@ import streamlit as st
 
 st.set_page_config(page_title="Amazon Reviews (Key-Gated)", page_icon="🔐", layout="wide")
 
-# -----------------------------
+# =========================
 # Helpers
-# -----------------------------
+# =========================
+
 SUPPORTED_DOMAINS = [
     "com","co.uk","de","fr","it","es","ca","com.mx","com.au","co.jp",
     "nl","se","pl","sg","ae","in","br"
@@ -42,32 +43,34 @@ def extract_asins(text: str) -> List[str]:
             seen.add(a); uniq.append(a)
     return uniq
 
-def parse_reviews_from_payload(payload: dict):
-    """Tolerant extractor (Axesso payloads vary by plan/region)."""
-    candidates = ["reviews", "reviewList", "items", "data", "productReviews"]
+def tolerant_reviews(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extract reviews from various common shapes across tenants/tiers.
+    """
+    keys = ("reviews","reviewList","items","data","productReviews")
     # direct list
-    for k in candidates:
+    for k in keys:
         v = payload.get(k)
         if isinstance(v, list) and (not v or isinstance(v[0], dict)):
             return v
     # nested dict -> list
-    for k in candidates:
+    for k in keys:
         v = payload.get(k)
         if isinstance(v, dict):
-            for kk in candidates:
+            for kk in keys:
                 vv = v.get(kk)
                 if isinstance(vv, list) and (not vv or isinstance(vv[0], dict)):
                     return vv
-    # sometimes under result.reviews
+    # sometimes under "result"
     res = payload.get("result")
     if isinstance(res, dict):
-        for k in candidates:
+        for k in keys:
             v = res.get(k)
             if isinstance(v, list) and (not v or isinstance(v[0], dict)):
                 return v
     return []
 
-def normalize_review(asin: str, domain: str, meta: dict, it: dict):
+def normalize_review(asin: str, domain: str, meta: Dict[str, Any], it: Dict[str, Any]) -> Dict[str, Any]:
     def g(dct, *keys, default=""):
         for k in keys:
             if isinstance(dct, dict) and k in dct and dct[k] is not None:
@@ -76,27 +79,38 @@ def normalize_review(asin: str, domain: str, meta: dict, it: dict):
     return {
         "asin": asin,
         "domainCode": domain,
+        "reviewId": g(it, "reviewId", "id"),
         "title": g(it, "title", "reviewTitle"),
         "text": g(it, "text", "content", "reviewText", "body", "comment"),
         "rating": g(it, "rating", "stars", "starRating", "ratingValue"),
         "author": g(it, "author", "reviewer", "user", "reviewerName", "nickname"),
         "date": g(it, "date", "reviewDate", "submissionTime", "createdAt", "time"),
         "helpful": g(it, "helpful", "helpfulCount", "helpfulVotes", "votes", "vote"),
+        # page/meta
         "productTitle": meta.get("productTitle", ""),
-        "url": meta.get("url", ""),
         "page": meta.get("page"),
+        "sourceUrl": meta.get("url") or "",
     }
 
-# -----------------------------
-# Sidebar — REQUIRED key gate
-# -----------------------------
+def rating_to_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    m = re.search(r"(\d+(\.\d+)?)", str(x))
+    return float(m.group(1)) if m else None
+
+def backoff_sleep(base: float, attempt: int, max_sleep: float = 8.0):
+    time.sleep(min(max_sleep, base * (2 ** max(0, attempt - 1))))
+
+# =========================
+# Sidebar — Key Gate
+# =========================
 with st.sidebar:
     st.markdown("## 🔐 Enter API Key (required)")
     auth_mode = st.radio(
         "API type",
         options=["Azure APIM (recommended)", "Direct Axesso"],
         index=0,
-        help="APIM uses header 'Ocp-Apim-Subscription-Key'. Direct Axesso uses 'x-api-key'."
+        help="APIM uses header 'Ocp-Apim-Subscription-Key'. Direct Axesso uses 'x-api-key'.",
     )
     user_key = st.text_input("API key", value="", type="password", placeholder="paste your key here")
     show_key = st.checkbox("Show key")
@@ -105,18 +119,22 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🔧 Endpoint settings")
-    # For APIM, these defaults fit Axesso’s Amazon reviews-by-ASIN operation. Adjust to your tenant if needed.
     base_url = st.text_input(
         "Gateway base URL",
         value="https://axesso.azure-api.net",
-        help="Use the APIM gateway host (not the developer portal)."
+        help=(
+            "Use the **gateway** (…azure-api.net) you see in the portal’s “Try it”. "
+            "Not the developer site (…developer.azure-api.net)."
+        ),
     )
     reviews_path = st.text_input(
         "Reviews path",
         value="/amz/amazon-product-reviews",
-        help="Copy the exact path from the portal ‘Try it’. Example splits:\n"
-             "A) base=https://.../  path=/amz/amazon-product-reviews\n"
-             "B) base=https://.../amz  path=/amazon-product-reviews"
+        help=(
+            "Copy the exact path from your portal. Two valid splits:\n"
+            "A) base=https://...  path=/amz/amazon-product-reviews\n"
+            "B) base=https://.../amz  path=/amazon-product-reviews"
+        ),
     )
     domain_code = st.selectbox("Amazon domainCode", options=SUPPORTED_DOMAINS, index=0)
 
@@ -126,25 +144,22 @@ if not user_key.strip():
     st.error("An API key is required to use this app. Enter it in the left sidebar.")
     st.stop()
 
-# Build auth headers based on mode
+# Auth header
 header_name = "Ocp-Apim-Subscription-Key" if auth_mode.startswith("Azure") else "x-api-key"
 HEADERS = {header_name: user_key.strip()}
 
-# -----------------------------
-# URL Debugger (helps fix 404s)
-# -----------------------------
+# =========================
+# URL Debugger
+# =========================
 with st.expander("🔎 Request URL debugger"):
     final_url = f"{base_url.rstrip('/')}{reviews_path}"
     st.write("Resolved URL:", final_url)
-
-    # Heuristics to catch usual causes of 404
     base_has_amz = "/amz" in base_url.rstrip("/")
     path_starts_amz = reviews_path.startswith("/amz/")
     if base_has_amz and path_starts_amz:
-        st.error("Double '/amz' detected. Either remove '/amz' from the base URL or from the path.")
+        st.error("Double '/amz' detected. Remove '/amz' from either the base URL or the path.")
     if (not base_has_amz) and (not path_starts_amz):
-        st.warning("No '/amz' segment found. Many Axesso operations require '/amz' in either the base URL or the path.")
-
+        st.warning("No '/amz' segment found. Many Axesso operations require '/amz' in either the base or the path.")
     masked_key = "***" if not user_key else (user_key[:3] + "…")
     st.code(
         f'curl -G "{final_url}" '
@@ -152,65 +167,74 @@ with st.expander("🔎 Request URL debugger"):
         f'--data-urlencode "asin=B08N5WRWNW" '
         f'--data-urlencode "domainCode={domain_code}" '
         f'--data-urlencode "page=1"',
-        language="bash"
+        language="bash",
     )
 
-# -----------------------------
-# Main UI — fetch + export
-# -----------------------------
+# =========================
+# Main UI
+# =========================
 st.title("Amazon Reviews (Key-Gated)")
-st.caption("Paste ASINs or product URLs. Your key is required and used only for this session (not saved).")
+st.caption("Paste ASINs or product URLs. Your key stays in-memory for this session only.")
 
 asin_input = st.text_area(
     "ASINs or URLs (one per line or mixed)",
     height=140,
-    placeholder="B08N5WRWNW\nhttps://www.amazon.com/dp/B0C3H9ABCD\nhttps://www.amazon.com/gp/product/B07XYZ1234"
+    placeholder="B08N5WRWNW\nhttps://www.amazon.com/dp/B0C3H9ABCD\nhttps://www.amazon.com/gp/product/B07XYZ1234",
 )
 asins = extract_asins(asin_input)
 st.write(f"**Detected ASINs:** {len(asins)}")
 
-start_page = st.number_input("Start page", min_value=1, value=1, step=1)
-max_pages = st.number_input("Max pages to fetch (cap)", min_value=1, value=3, step=1)
-delay = st.number_input("Delay between requests (sec)", min_value=0.0, value=0.3, step=0.1)
+col1, col2, col3 = st.columns([1,1,1])
+with col1:
+    start_page = st.number_input("Start page", min_value=1, value=1, step=1)
+with col2:
+    max_pages = st.number_input("Max pages (cap)", min_value=1, value=5, step=1)
+with col3:
+    delay = st.number_input("Delay between calls (sec)", min_value=0.0, value=0.4, step=0.1)
 
-# Simple estimate (worst case): N ASINs × max_pages
-st.caption(f"**API call estimate** — up to **{len(asins) * int(max_pages)}** calls.")
+st.caption(f"**API call estimate** — up to **{len(asins) * int(max_pages)}** calls (ASINs × pages).")
 
-col_go, col_clear, col_test = st.columns([1,1,1])
-with col_go:
-    go = st.button("📥 Fetch Reviews", use_container_width=True)
-with col_clear:
-    clear = st.button("🧹 Clear results", use_container_width=True)
-with col_test:
-    test = st.button("🔎 Test Key (quick call)", use_container_width=True)
+b1, b2, b3 = st.columns([1,1,1])
+with b1:
+    test_btn = st.button("🔎 Test Key (single call)", use_container_width=True)
+with b2:
+    fetch_btn = st.button("📥 Fetch Reviews", use_container_width=True)
+with b3:
+    clear_btn = st.button("🧹 Clear results", use_container_width=True)
 
-if clear:
+if clear_btn:
     st.session_state.pop("reviews_rows", None)
     st.session_state.pop("reviews_meta", None)
 
 rows = st.session_state.get("reviews_rows", [])
 metas = st.session_state.get("reviews_meta", [])
 
-def do_call(asin: str, page: int):
+def do_call(asin: str, page: int) -> requests.Response:
     url = f"{base_url.rstrip('/')}{reviews_path}"
     params = {"asin": asin, "domainCode": domain_code, "page": page}
     return requests.get(url, headers=HEADERS, params=params, timeout=30)
 
-# Quick key test — 1 call only
-if test:
+# Quick one-page check to validate key + path
+if test_btn:
     demo_asin = asins[0] if asins else "B08N5WRWNW"
     try:
         r = do_call(demo_asin, 1)
-        ok = 200 <= r.status_code < 300
-        st.info(f"Test status: {r.status_code}")
-        if ok:
+        st.info(f"HTTP {r.status_code}")
+        if 200 <= r.status_code < 300:
             st.success("Key + endpoint look valid.")
+            try:
+                payload = r.json()
+                revs = tolerant_reviews(payload)
+                st.caption(f"This page returned {len(revs)} review(s).")
+            except Exception as e:
+                st.warning(f"Response not JSON or parse issue: {e}")
         else:
             st.error(f"Call failed. Body (first 300 chars): {r.text[:300]}")
     except Exception as e:
         st.error(f"Request error: {e}")
 
-if go:
+# Full pagination loop
+if fetch_btn:
     if not asins:
         st.error("Paste at least one ASIN or Amazon product URL.")
     else:
@@ -220,30 +244,40 @@ if go:
         progress = st.progress(0)
 
         for asin in asins:
+            # bounded forward pagination; stop early if API reports lastPage
+            attempt = 0
             for p in range(int(start_page), int(start_page) + int(max_pages)):
                 try:
                     r = do_call(asin, p)
                     call_i += 1
                     progress.progress(min(1.0, call_i / float(total_calls)))
 
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        attempt += 1
+                        backoff_sleep(delay or 0.4, attempt)
+                        r = do_call(asin, p)  # retry once per page for brevity
+
                     if r.status_code != 200:
                         metas.append({"asin": asin, "page": p, "error": f"HTTP {r.status_code}: {r.text[:200]}"})
                         break
 
                     data = r.json()
-                    current_page = data.get("currentPage", p)
+
+                    # Meta (page-level)
+                    current_page = int(data.get("currentPage", p))
+                    last_page = data.get("lastPage")
                     meta_fields = ["productTitle", "url", "countReview", "productRating"]
                     meta = {k: data.get(k) for k in meta_fields}
                     meta.update({"asin": asin, "page": current_page})
                     metas.append(meta)
 
-                    items = parse_reviews_from_payload(data)
+                    # Extract & normalize reviews
+                    items = tolerant_reviews(data)
                     for it in items:
                         rows.append(normalize_review(asin, domain_code, meta, it))
 
-                    # stop if response tells us we're done
-                    last_page = data.get("lastPage")
-                    if isinstance(last_page, int) and int(current_page) >= int(last_page):
+                    # stop if API indicates end
+                    if isinstance(last_page, int) and current_page >= int(last_page):
                         break
 
                     if delay > 0:
@@ -256,17 +290,15 @@ if go:
         st.session_state["reviews_rows"] = rows
         st.session_state["reviews_meta"] = metas
 
-# Results
+# =========================
+# Results & Export
+# =========================
 if rows:
-    st.success(f"Collected {len(rows)} reviews from {len(asins)} ASIN(s).")
+    st.success(f"Collected {len(rows)} review rows from {len(asins)} ASIN(s).")
     df = pd.DataFrame(rows)
 
     # derive numeric rating if possible
     if "rating" in df.columns:
-        def rating_to_float(x):
-            if x is None: return None
-            m = re.search(r"(\d+(\.\d+)?)", str(x))
-            return float(m.group(1)) if m else None
         df["rating_num"] = df["rating"].apply(rating_to_float)
 
     st.dataframe(df, use_container_width=True)
@@ -293,5 +325,6 @@ if metas:
     dfm = pd.DataFrame(metas)
     with st.expander("Meta / call log"):
         st.dataframe(dfm, use_container_width=True)
+
 
 
