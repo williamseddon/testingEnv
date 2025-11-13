@@ -106,10 +106,18 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔧 Endpoint settings")
     # For APIM, these defaults fit Axesso’s Amazon reviews-by-ASIN operation. Adjust to your tenant if needed.
-    gateway_default = "https://axesso.azure-api.net"
-    base_url = st.text_input("Gateway base URL", value=gateway_default, help="Use the APIM gateway host (not the developer portal).")
-    path_default = "/amz/amazon-product-reviews"
-    reviews_path = st.text_input("Reviews path", value=path_default, help="Copy the exact path from the portal ‘Try it’.")
+    base_url = st.text_input(
+        "Gateway base URL",
+        value="https://axesso.azure-api.net",
+        help="Use the APIM gateway host (not the developer portal)."
+    )
+    reviews_path = st.text_input(
+        "Reviews path",
+        value="/amz/amazon-product-reviews",
+        help="Copy the exact path from the portal ‘Try it’. Example splits:\n"
+             "A) base=https://.../  path=/amz/amazon-product-reviews\n"
+             "B) base=https://.../amz  path=/amazon-product-reviews"
+    )
     domain_code = st.selectbox("Amazon domainCode", options=SUPPORTED_DOMAINS, index=0)
 
 # Hard gate — no key, no app.
@@ -123,7 +131,32 @@ header_name = "Ocp-Apim-Subscription-Key" if auth_mode.startswith("Azure") else 
 HEADERS = {header_name: user_key.strip()}
 
 # -----------------------------
-# Main UI — minimal functional demo
+# URL Debugger (helps fix 404s)
+# -----------------------------
+with st.expander("🔎 Request URL debugger"):
+    final_url = f"{base_url.rstrip('/')}{reviews_path}"
+    st.write("Resolved URL:", final_url)
+
+    # Heuristics to catch usual causes of 404
+    base_has_amz = "/amz" in base_url.rstrip("/")
+    path_starts_amz = reviews_path.startswith("/amz/")
+    if base_has_amz and path_starts_amz:
+        st.error("Double '/amz' detected. Either remove '/amz' from the base URL or from the path.")
+    if (not base_has_amz) and (not path_starts_amz):
+        st.warning("No '/amz' segment found. Many Axesso operations require '/amz' in either the base URL or the path.")
+
+    masked_key = "***" if not user_key else (user_key[:3] + "…")
+    st.code(
+        f'curl -G "{final_url}" '
+        f'-H "{header_name}: {masked_key}" '
+        f'--data-urlencode "asin=B08N5WRWNW" '
+        f'--data-urlencode "domainCode={domain_code}" '
+        f'--data-urlencode "page=1"',
+        language="bash"
+    )
+
+# -----------------------------
+# Main UI — fetch + export
 # -----------------------------
 st.title("Amazon Reviews (Key-Gated)")
 st.caption("Paste ASINs or product URLs. Your key is required and used only for this session (not saved).")
@@ -139,6 +172,9 @@ st.write(f"**Detected ASINs:** {len(asins)}")
 start_page = st.number_input("Start page", min_value=1, value=1, step=1)
 max_pages = st.number_input("Max pages to fetch (cap)", min_value=1, value=3, step=1)
 delay = st.number_input("Delay between requests (sec)", min_value=0.0, value=0.3, step=0.1)
+
+# Simple estimate (worst case): N ASINs × max_pages
+st.caption(f"**API call estimate** — up to **{len(asins) * int(max_pages)}** calls.")
 
 col_go, col_clear, col_test = st.columns([1,1,1])
 with col_go:
@@ -168,7 +204,7 @@ if test:
         ok = 200 <= r.status_code < 300
         st.info(f"Test status: {r.status_code}")
         if ok:
-            st.success("Key looks valid for this endpoint.")
+            st.success("Key + endpoint look valid.")
         else:
             st.error(f"Call failed. Body (first 300 chars): {r.text[:300]}")
     except Exception as e:
@@ -179,7 +215,7 @@ if go:
         st.error("Paste at least one ASIN or Amazon product URL.")
     else:
         rows, metas = [], []
-        total_calls = len(asins) * int(max_pages)
+        total_calls = max(1, len(asins) * int(max_pages))
         call_i = 0
         progress = st.progress(0)
 
@@ -257,4 +293,5 @@ if metas:
     dfm = pd.DataFrame(metas)
     with st.expander("Meta / call log"):
         st.dataframe(dfm, use_container_width=True)
+
 
