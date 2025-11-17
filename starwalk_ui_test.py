@@ -1027,43 +1027,54 @@ fig_bar_horizontal.update_layout(
 )
 st.plotly_chart(fig_bar_horizontal, use_container_width=True)
 
-# ---------- Avg ★ Over Time by Region ----------
+# ---------- Avg ★ Over Time by Region (clean) ----------
 st.markdown("### 📈 Avg ★ Over Time by Region")
 
 if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
     st.info("Need 'Review Date' and 'Star Rating' columns to compute this chart.")
 else:
     # Controls
-    c1, c2, c3 = st.columns([1.2, 1.2, 1])
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 0.9])
     with c1:
         bucket_label = st.selectbox("Bucket size", options=["Day", "Week", "Month"], index=2, key="region_bucket")
         _freq_map = {"Day": "D", "Week": "W", "Month": "M"}
         freq = _freq_map[bucket_label]
     with c2:
         # Choose which column represents "region"
-        possible_regions = [c for c in ["Country", "Source", "Model (SKU)"] if c in filtered.columns]
-        region_col = st.selectbox("Region field", options=possible_regions or ["(none)"], key="region_col")
+        _candidates = [c for c in ["Country", "Source", "Model (SKU)"] if c in filtered.columns]
+        region_col = st.selectbox("Region field", options=_candidates or ["(none)"], key="region_col")
     with c3:
         top_n = st.number_input("Top regions by volume", min_value=1, max_value=15, value=5, step=1, key="region_topn")
+    with c4:
+        organic_only = st.toggle("Organic Only", value=False, help="Exclude reviews where Seeded == YES")
 
-    if region_col not in filtered.columns:
+    if region_col not in filtered.columns or region_col == "(none)":
         st.info("No region column found for this chart.")
     else:
         d = filtered.copy()
+
+        # Apply Organic Only toggle
+        if organic_only and "Seeded" in d.columns:
+            d = d[d["Seeded"].astype("string").str.upper().ne("YES")]
+
         # Clean / coerce
         d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
         d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
         d = d.dropna(subset=["Review Date", "Star Rating"])
+
         if d.empty:
-            st.warning("No data available for the selected filters.")
+            st.warning("No data available for the current selections.")
         else:
-            # Pick top-N regions by count over the filtered set (for sane defaults)
+            # Determine default regions (Top-N by count in current subset)
             counts = (d[region_col].astype("string").str.strip()
                       .replace({"": pd.NA}).dropna())
             top_regions = counts.value_counts().head(int(top_n)).index.tolist()
 
-            # Region picker (defaults to top-N)
-            regions_available = sorted([r for r in d[region_col].astype("string").dropna().unique().tolist() if str(r).strip() != ""])
+            regions_available = sorted([
+                r for r in d[region_col].astype("string").dropna().unique().tolist()
+                if str(r).strip() != ""
+            ])
+
             chosen_regions = st.multiselect(
                 "Regions to plot",
                 options=regions_available,
@@ -1071,65 +1082,104 @@ else:
                 key="region_pick"
             )
 
-            # Subset to chosen regions (if any chosen)
+            # Optional subsetting to chosen regions
             if chosen_regions:
                 d = d[d[region_col].astype("string").isin(chosen_regions)]
 
-            # Group by time bucket + region
-            # Note: for Week, Pandas uses week-ending by default with 'W';
-            # if you prefer week-start Monday, use 'W-MON'
-            freq_eff = "W-MON" if freq == "W" else freq
-            grp = (d.groupby([
-                        d[region_col].astype("string"),
-                        pd.Grouper(key="Review Date", freq=freq_eff)
-                   ])["Star Rating"]
-                   .mean()
-                   .reset_index()
-                   .rename(columns={"Star Rating":"Avg Star"}))
-
-            # Keep nice continuous x-axis and drop NaNs
-            grp = grp.dropna(subset=["Avg Star"])
-
-            if grp.empty:
-                st.warning("No aggregated data to plot for the current selections.")
+            if d.empty:
+                st.warning("No data after region selection.")
             else:
-                # Build Plotly line chart
-                fig_lines = go.Figure()
-                for reg in (chosen_regions or grp[region_col].unique().tolist()):
-                    sub = grp[grp[region_col] == reg]
-                    if sub.empty: 
-                        continue
-                    fig_lines.add_trace(go.Scatter(
-                        x=sub["Review Date"], y=sub["Avg Star"],
-                        mode="lines+markers", name=str(reg),
-                        hovertemplate=(
-                            f"{region_col}: %{ {''} }<br>"
-                            "Date: %{x|%Y-%m-%d}<br>"
-                            "Avg ★: %{y:.2f}<extra></extra>"
-                        ).replace("%{  }","")  # tiny workaround to keep f-string tidy
-                    ))
+                # Aggregate by bucket + region
+                freq_eff = "W-MON" if freq == "W" else freq  # Monday-start weeks
+                grp = (d.groupby([
+                            d[region_col].astype("string"),
+                            pd.Grouper(key="Review Date", freq=freq_eff)
+                       ])["Star Rating"]
+                       .mean()
+                       .reset_index()
+                       .rename(columns={"Star Rating": "Avg Star"})) \
+                       .dropna(subset=["Avg Star"])
 
-                title_bucket = {"D":"Daily","W":"Weekly","M":"Monthly"}[freq]
-                fig_lines.update_layout(
-                    title=f"<b>{title_bucket} Average ★ by {region_col}</b>",
-                    xaxis=dict(title="Date", showgrid=False),
-                    yaxis=dict(title="Average ★", range=[1,5], showgrid=True),
-                    plot_bgcolor="white",
-                    template="plotly_white",
-                    margin=dict(l=40, r=30, t=50, b=40),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-                )
-                st.plotly_chart(fig_lines, use_container_width=True)
+                # Overall line (across all regions in this subset)
+                overall = (d.groupby(pd.Grouper(key="Review Date", freq=freq_eff))["Star Rating"]
+                           .mean()
+                           .reset_index()
+                           .rename(columns={"Star Rating": "Avg Star"})) \
+                           .dropna(subset=["Avg Star"])
 
-                # Small table preview (latest bucket per region)
-                latest_per_region = (grp.sort_values("Review Date")
-                                       .groupby(region_col)
-                                       .tail(1)
-                                       .sort_values("Avg Star", ascending=False))
-                st.dataframe(
-                    latest_per_region.rename(columns={"Review Date":"Latest Bucket", "Avg Star":"Latest Avg ★"}),
-                    use_container_width=True, hide_index=True
-                )
+                if grp.empty and overall.empty:
+                    st.warning("No aggregated data to plot for the current selections.")
+                else:
+                    # ---- Plotly chart (clean visuals) ----
+                    fig = go.Figure()
+
+                    # Region lines
+                    for reg in (chosen_regions or grp[region_col].unique().tolist()):
+                        sub = grp[grp[region_col] == reg]
+                        if sub.empty:
+                            continue
+                        fig.add_trace(go.Scatter(
+                            x=sub["Review Date"], y=sub["Avg Star"],
+                            mode="lines+markers",
+                            name=str(reg),
+                            line=dict(width=2),
+                            marker=dict(size=5),
+                            hovertemplate=(
+                                f"{region_col}: {reg}<br>" +
+                                "Date: %{x|%Y-%m-%d}<br>" +
+                                "Avg ★: %{y:.2f}<extra></extra>"
+                            ),
+                        ))
+
+                    # Overall dashed line
+                    if not overall.empty:
+                        fig.add_trace(go.Scatter(
+                            x=overall["Review Date"], y=overall["Avg Star"],
+                            mode="lines",
+                            name="Overall",
+                            line=dict(width=3, dash="dash"),
+                            hovertemplate="Overall<br>Date: %{x|%Y-%m-%d}<br>Avg ★: %{y:.2f}<extra></extra>",
+                        ))
+
+                    title_bucket = {"D": "Daily", "W": "Weekly", "M": "Monthly"}[freq]
+                    title_org = " • Organic Only" if organic_only else ""
+                    fig.update_layout(
+                        title=f"<b>{title_bucket} Average ★ by {region_col}{title_org}</b>",
+                        xaxis=dict(title="Date", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                        yaxis=dict(title="Average ★", range=[1, 5], showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                        hovermode="x unified",
+                        plot_bgcolor="white",
+                        template="plotly_white",
+                        margin=dict(l=40, r=30, t=50, b=40),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Latest bucket snapshot (per region + overall)
+                    latest_per_region = (
+                        grp.sort_values("Review Date")
+                           .groupby(region_col)
+                           .tail(1)
+                           .assign(**{region_col: lambda x: x[region_col].astype(str)})
+                    )
+
+                    overall_row = pd.DataFrame()
+                    if not overall.empty:
+                        overall_row = (overall.sort_values("Review Date").tail(1)
+                                       .assign(**{region_col: "Overall"})
+                                       .rename(columns={"Review Date": "Latest Bucket", "Avg Star": "Latest Avg ★"}))
+
+                    if not latest_per_region.empty:
+                        latest_per_region = latest_per_region.rename(
+                            columns={"Review Date": "Latest Bucket", "Avg Star": "Latest Avg ★"}
+                        )[[region_col, "Latest Bucket", "Latest Avg ★"]]
+
+                    summary_table = pd.concat([latest_per_region, overall_row], ignore_index=True)
+                    if not summary_table.empty:
+                        st.dataframe(
+                            summary_table.sort_values("Latest Avg ★", ascending=False),
+                            use_container_width=True, hide_index=True
+                        )
 
 
 
