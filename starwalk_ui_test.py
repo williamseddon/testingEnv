@@ -1027,6 +1027,112 @@ fig_bar_horizontal.update_layout(
 )
 st.plotly_chart(fig_bar_horizontal, use_container_width=True)
 
+# ---------- Avg ★ Over Time by Region ----------
+st.markdown("### 📈 Avg ★ Over Time by Region")
+
+if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
+    st.info("Need 'Review Date' and 'Star Rating' columns to compute this chart.")
+else:
+    # Controls
+    c1, c2, c3 = st.columns([1.2, 1.2, 1])
+    with c1:
+        bucket_label = st.selectbox("Bucket size", options=["Day", "Week", "Month"], index=2, key="region_bucket")
+        _freq_map = {"Day": "D", "Week": "W", "Month": "M"}
+        freq = _freq_map[bucket_label]
+    with c2:
+        # Choose which column represents "region"
+        possible_regions = [c for c in ["Country", "Source", "Model (SKU)"] if c in filtered.columns]
+        region_col = st.selectbox("Region field", options=possible_regions or ["(none)"], key="region_col")
+    with c3:
+        top_n = st.number_input("Top regions by volume", min_value=1, max_value=15, value=5, step=1, key="region_topn")
+
+    if region_col not in filtered.columns:
+        st.info("No region column found for this chart.")
+    else:
+        d = filtered.copy()
+        # Clean / coerce
+        d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+        d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
+        d = d.dropna(subset=["Review Date", "Star Rating"])
+        if d.empty:
+            st.warning("No data available for the selected filters.")
+        else:
+            # Pick top-N regions by count over the filtered set (for sane defaults)
+            counts = (d[region_col].astype("string").str.strip()
+                      .replace({"": pd.NA}).dropna())
+            top_regions = counts.value_counts().head(int(top_n)).index.tolist()
+
+            # Region picker (defaults to top-N)
+            regions_available = sorted([r for r in d[region_col].astype("string").dropna().unique().tolist() if str(r).strip() != ""])
+            chosen_regions = st.multiselect(
+                "Regions to plot",
+                options=regions_available,
+                default=[r for r in top_regions if r in regions_available],
+                key="region_pick"
+            )
+
+            # Subset to chosen regions (if any chosen)
+            if chosen_regions:
+                d = d[d[region_col].astype("string").isin(chosen_regions)]
+
+            # Group by time bucket + region
+            # Note: for Week, Pandas uses week-ending by default with 'W';
+            # if you prefer week-start Monday, use 'W-MON'
+            freq_eff = "W-MON" if freq == "W" else freq
+            grp = (d.groupby([
+                        d[region_col].astype("string"),
+                        pd.Grouper(key="Review Date", freq=freq_eff)
+                   ])["Star Rating"]
+                   .mean()
+                   .reset_index()
+                   .rename(columns={"Star Rating":"Avg Star"}))
+
+            # Keep nice continuous x-axis and drop NaNs
+            grp = grp.dropna(subset=["Avg Star"])
+
+            if grp.empty:
+                st.warning("No aggregated data to plot for the current selections.")
+            else:
+                # Build Plotly line chart
+                fig_lines = go.Figure()
+                for reg in (chosen_regions or grp[region_col].unique().tolist()):
+                    sub = grp[grp[region_col] == reg]
+                    if sub.empty: 
+                        continue
+                    fig_lines.add_trace(go.Scatter(
+                        x=sub["Review Date"], y=sub["Avg Star"],
+                        mode="lines+markers", name=str(reg),
+                        hovertemplate=(
+                            f"{region_col}: %{ {''} }<br>"
+                            "Date: %{x|%Y-%m-%d}<br>"
+                            "Avg ★: %{y:.2f}<extra></extra>"
+                        ).replace("%{  }","")  # tiny workaround to keep f-string tidy
+                    ))
+
+                title_bucket = {"D":"Daily","W":"Weekly","M":"Monthly"}[freq]
+                fig_lines.update_layout(
+                    title=f"<b>{title_bucket} Average ★ by {region_col}</b>",
+                    xaxis=dict(title="Date", showgrid=False),
+                    yaxis=dict(title="Average ★", range=[1,5], showgrid=True),
+                    plot_bgcolor="white",
+                    template="plotly_white",
+                    margin=dict(l=40, r=30, t=50, b=40),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+                )
+                st.plotly_chart(fig_lines, use_container_width=True)
+
+                # Small table preview (latest bucket per region)
+                latest_per_region = (grp.sort_values("Review Date")
+                                       .groupby(region_col)
+                                       .tail(1)
+                                       .sort_values("Avg Star", ascending=False))
+                st.dataframe(
+                    latest_per_region.rename(columns={"Review Date":"Latest Bucket", "Avg Star":"Latest Avg ★"}),
+                    use_container_width=True, hide_index=True
+                )
+
+
+
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
 detractors_results = analyze_delighters_detractors(filtered, existing_detractor_columns).head(20)
