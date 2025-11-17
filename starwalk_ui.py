@@ -1,5 +1,6 @@
 # starwalk_ui_v7_3_evidence_opt.py — Evidence-Locked Labeling, optimized & error-checked
 # ETA, presets, overwrite, undo, similarity guard, polished UI, evidence highlighting (no header relabeling)
+# Now includes: THEME-FOCUSED new-symptom inbox + "Overwrite & Symptomize ALL (start at row 1)"
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 
 import streamlit as st
@@ -24,7 +25,9 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 # ------------------- Page Setup -------------------
 st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.3")
 st.title("✨ Review Symptomizer — v7.3")
-st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Evidence-locked labeling • In-session cache • Themeized new symptoms")
+st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • "
+           "Similarity guard • Evidence-locked labeling • In-session cache • Themeized new symptoms • "
+           "Overwrite & Symptomize ALL (start at row 1)")
 
 # ------------------- Global CSS -------------------
 st.markdown(
@@ -204,6 +207,20 @@ def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
         if h not in df_in.columns:
             df_in[h] = None
     return df_in
+
+def clear_all_ai_slots_in_df(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    Hard-reset ALL AI symptom and meta columns across the entire dataframe.
+    Returns a new dataframe with cleared columns.
+    """
+    df2 = ensure_ai_columns(df_in.copy())
+    for j in range(1, 11):
+        df2[f"AI Symptom Detractor {j}"] = None
+        df2[f"AI Symptom Delighter {j}"] = None
+    df2["AI Safety"] = None
+    df2["AI Reliability"] = None
+    df2["AI # of Sessions"] = None
+    return df2
 
 def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
     del_map = {_canon(x): x for x in delighters}
@@ -674,8 +691,8 @@ if "undo_stack" not in st.session_state:
 # Row 1: actions
 r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
 with r1a: run_n_btn = st.button("▶️ Symptomize N", use_container_width=True)
-with r1b: run_all_btn = st.button("🚀 Symptomize All", use_container_width=True)
-with r1c: overwrite_btn = st.button("♻️ Overwrite & Re-symptomize", use_container_width=True)
+with r1b: run_all_btn = st.button("🚀 Symptomize All (current scope)", use_container_width=True)
+with r1c: overwrite_btn = st.button("🧹 Overwrite & Symptomize ALL (start at row 1)", use_container_width=True)
 with r1d: run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
 with r1e: undo_btn = st.button("↩️ Undo last run", use_container_width=True)
 
@@ -844,17 +861,33 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
 
     st.session_state["undo_stack"].append({"rows": snapshot})
 
-# Execute by buttons
+# ------------------- Execute by buttons (updated overwrite-all logic) -------------------
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
     if run_missing_both_btn:
-        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+        # one-click on the current 'missing both' subset
+        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])].sort_index()
         _run_symptomize(rows_iter, overwrite_mode=False)
+
     elif overwrite_btn:
-        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
-        _run_symptomize(rows_iter, overwrite_mode=True)
+        # 🔥 FULL RESET: clear every AI slot in the entire df, recompute, then process ALL rows from row 1
+        df = clear_all_ai_slots_in_df(df)
+
+        # Recompute column map and needs after clearing
+        colmap = detect_symptom_columns(df)
+        work = detect_missing(df, colmap)
+
+        # Process ALL rows, top-to-bottom (index order)
+        rows_iter = work.sort_index()  # full dataset in original row order
+        _run_symptomize(rows_iter, overwrite_mode=False)  # we already wiped globally
+
     else:
-        rows_iter = target if run_all_btn else target.head(int(st.session_state.get("n_to_process", 10)))
+        # Normal paths: either N from scope or ALL from scope, without wiping global state
+        if run_all_btn:
+            rows_iter = target.sort_index()
+        else:
+            rows_iter = target.sort_index().head(int(st.session_state.get("n_to_process", 10)))
         _run_symptomize(rows_iter, overwrite_mode=False)
+
     st.success(f"Symptomized {len(processed_rows)} review(s).")
 
 # Undo last run
@@ -1057,7 +1090,6 @@ if cand_del or cand_det:
                 for _, r_ in editor_del.iterrows():
                     if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
                         side_val = str(r_.get("Side","Delighter")).strip() or "Delighter"
-                        # Theme-normalize once more for safety
                         label_out = thematize_label(str(r_["Label"]).strip(), side_val) if themeize_toggle else str(r_["Label"]).strip()
                         selections.append((label_out, side_val))
         except Exception:
@@ -1135,7 +1167,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _chips(items, color: str):
-        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()] )
+        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
         if not items_sorted:
             st.write("(none)")
         else:
@@ -1185,5 +1217,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 
 # Footer
 st.divider()
-st.caption("v7.3 — Evidence-locked labeling, in-session caching, minor cleanups, and THEME-FOCUSED new-symptom inbox (e.g., 'Hair loss/pull', 'Overall satisfaction'). Exports: K–T/U–AD, meta: AE/AF/AG. No header relabeling.")
+st.caption("v7.3 — Evidence-locked labeling, in-session caching, THEME-FOCUSED new-symptom inbox (e.g., 'Hair loss/pull', "
+           "'Overall satisfaction'), and full reset: Overwrite & Symptomize ALL starts from row 1. Exports: K–T/U–AD, meta: AE/AF/AG.")
+
 
