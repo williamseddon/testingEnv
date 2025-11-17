@@ -24,7 +24,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 # ------------------- Page Setup -------------------
 st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.3")
 st.title("✨ Review Symptomizer — v7.3")
-st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Evidence-locked labeling • In-session cache")
+st.caption("Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • New-symptom inbox • Tiles UI • Similarity guard • Evidence-locked labeling • In-session cache • Themeized new symptoms")
 
 # ------------------- Global CSS -------------------
 st.markdown(
@@ -232,6 +232,78 @@ def _ensure_label_cache():
         st.session_state["_label_cache"] = {}
     return st.session_state["_label_cache"]
 
+# ------------------- Theme normalization (NEW) -------------------
+THEME_RULES = [
+    # detractors
+    (re.compile(r"\b(pulls?|pulled|pulling).{0,12}\bhair\b|\bhair\s+(?:loss|fall(?:ing)?|coming\s+out|pulled)\b", re.I),
+     {"det": "Hair loss/pull"}),
+    (re.compile(r"\b(snags?|tangles?|catches?)\s+(?:hair|strands?)\b", re.I),
+     {"det": "Hair snag/tangle"}),
+    (re.compile(r"\b(too\s+hot|burns?|scalds?)\b", re.I),
+     {"det": "Excess heat"}),
+    (re.compile(r"\b(too\s+noisy|loud|whine|high\s+noise)\b", re.I),
+     {"det": "High noise"}),
+    (re.compile(r"\b(battery|charge|runtime)\b.+\b(poor|short|bad|low)\b|\b(poor|short|bad|low)\b.+\b(battery|charge|runtime)\b", re.I),
+     {"det": "Battery life: short"}),
+
+    # delighters
+    (re.compile(r"\b(absolutely|totally|really)?\s*love(s|d)?\b|\bworks\s+(amazing|great|fantastic|perfect)\b|\boverall\b.+\b(great|good|positive|happy)\b", re.I),
+     {"del": "Overall satisfaction"}),
+    (re.compile(r"\b(easy|quick|simple)\s+to\s+(use|clean|attach|remove)\b|\buser[-\s]?friendly\b", re.I),
+     {"del": "Ease of use"}),
+    (re.compile(r"\b(fast|quick)\s+(dry|drying)\b|\bdries\s+quickly\b", re.I),
+     {"del": "Fast drying"}),
+    (re.compile(r"\b(shine|smooth|sleek|frizz\s*(?:free|control))\b", re.I),
+     {"del": "Frizz control/shine"}),
+    (re.compile(r"\b(attachments?|accessories?)\b.+\b(handy|useful|versatile|helpful)\b", re.I),
+     {"del": "Attachment usability"}),
+]
+
+def _short_title(s: str) -> str:
+    s = re.sub(r"[\s\-_/]+", " ", s.strip())
+    s = re.sub(r"[^\w\s+/]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.title()
+
+def thematize_label(raw: str, side_hint: str = "") -> str:
+    """Convert a raw unlisted phrase into a short, reusable theme label."""
+    txt = str(raw or "").strip()
+    if not txt:
+        return ""
+
+    # 1) Regex rules first (fast, deterministic)
+    for rx, mapping in THEME_RULES:
+        if rx.search(txt):
+            if side_hint.lower().startswith("del") and mapping.get("del"):
+                return mapping["del"]
+            if side_hint.lower().startswith("det") and mapping.get("det"):
+                return mapping["det"]
+            return mapping.get("del") or mapping.get("det") or _short_title(txt[:32])
+
+    # 2) Optional LLM fallback for crisp 1–3 word theme
+    if 'client' in globals() and globals().get('client') is not None:
+        try:
+            sys = (
+                "You convert raw customer phrases into VERY SHORT theme labels.\n"
+                "Return ONLY a concise noun phrase (1–3 words), Title Case, no punctuation or emojis.\n"
+                "Examples: 'pulls a lot of your hair out' -> 'Hair Loss/Pull'; "
+                "'ABSOLUTELY LOVE!' -> 'Overall Satisfaction'."
+            )
+            u = f"Raw phrase: {txt}\nSide hint: {side_hint or 'Unknown'}"
+            resp = client.chat.completions.create(
+                model=globals().get('selected_model', 'gpt-4o'),
+                temperature=0,
+                messages=[{"role":"system","content":sys},{"role":"user","content":u}],
+            )
+            candidate = (resp.choices[0].message.content or "").strip()
+            if 1 <= len(candidate) <= 40 and re.search(r"[A-Za-z]", candidate):
+                return candidate
+        except Exception:
+            pass
+
+    # 3) Heuristic fallback
+    return _short_title(txt[:40])
+
 def _openai_labeler(
     verbatim: str,
     client,
@@ -260,6 +332,7 @@ def _openai_labeler(
     if key in cache:
         return cache[key]
 
+    # Strengthened prompt: unlisted items must be THEME (1–3 words)
     sys = "\n".join([
         "You label consumer reviews with predefined symptom lists.",
         "Return STRICT JSON with this schema:",
@@ -271,6 +344,8 @@ def _openai_labeler(
         f"- Evidence MUST be exact substrings from the review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
         "- Only include a label if there is clear textual support in the review.",
         "- Use the allowed lists; if close wording appears, pick the closest allowed label or list it under unlisted_*.",
+        "- For unlisted_* items, RETURN A THEME (1–3 word noun phrase, Title Case). Examples: 'Hair Loss/Pull', 'Overall Satisfaction'.",
+        "- No punctuation (except slashes), no emojis.",
         "- Cap to maximum 10 detractors and 10 delighters.",
     ])
     user_payload = {
@@ -551,6 +626,13 @@ if client is None:
 sim_threshold = st.sidebar.slider("New-symptom similarity guard", 0.80, 0.99, 0.94, 0.01,
                                   help="Raise to suppress near-duplicates; lower to see more proposals.")
 
+# Themeizing toggle (NEW)
+themeize_toggle = st.sidebar.checkbox(
+    "Theme-ize new symptom suggestions (recommended)",
+    value=True,
+    help="If ON, candidate labels are normalized to short, reusable themes (e.g., 'Hair loss/pull', 'Overall satisfaction')."
+)
+
 # ----- Evidence settings ----- (checkbox compatible with Streamlit >=1.28)
 require_evidence = st.sidebar.checkbox(
     "Require evidence to write labels",
@@ -721,6 +803,14 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         df.loc[idx, "AI Reliability"] = reliability
         df.loc[idx, "AI # of Sessions"] = sessions
 
+        # Normalize unlisted to themes (NEW)
+        if themeize_toggle:
+            unl_dels_themes = [thematize_label(x, "Delighter") for x in (unl_dels or []) if str(x).strip()]
+            unl_dets_themes = [thematize_label(x, "Detractor") for x in (unl_dets or []) if str(x).strip()]
+        else:
+            unl_dels_themes = [x for x in (unl_dels or []) if str(x).strip()]
+            unl_dets_themes = [x for x in (unl_dets or []) if str(x).strip()]
+
         # Evidence coverage for this row
         total_labels = len(wrote_dets) + len(wrote_dels)
         labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, []))>0) + \
@@ -734,8 +824,8 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             "Added_Delighters": wrote_dels,
             "Evidence_Detractors": ev_written_det,
             "Evidence_Delighters": ev_written_del,
-            "Unlisted_Detractors": unl_dets,
-            "Unlisted_Delighters": unl_dels,
+            "Unlisted_Detractors": unl_dets_themes,   # themed or raw per toggle
+            "Unlisted_Delighters": unl_dels_themes,   # themed or raw per toggle
             ">10 Detractors Detected": len(dets) > 10,
             ">10 Delighters Detected": len(dels) > 10,
             "Safety": safety,
@@ -844,13 +934,28 @@ if processed_rows:
                         for e in evs: st.write(f"- {e}")
 
 # ------------------- New Symptom Candidates (Approval form) -------------------
-cand_del: Dict[str, List[int]] = {}
-cand_det: Dict[str, List[int]] = {}
+# Build raw counts from processed rows (already themed if toggle was ON during processing)
+cand_del_raw: Dict[str, List[int]] = {}
+cand_det_raw: Dict[str, List[int]] = {}
 for rec in processed_rows:
     for u in rec.get("Unlisted_Delighters", []) or []:
-        cand_del.setdefault(u, []).append(rec["Index"])
+        cand_del_raw.setdefault(u, []).append(rec["Index"])
     for u in rec.get("Unlisted_Detractors", []) or []:
-        cand_det.setdefault(u, []).append(rec["Index"])
+        cand_det_raw.setdefault(u, []).append(rec["Index"])
+
+# If the toggle changed after processing, allow re-thematization here
+def _maybe_theme(k: str, side: str) -> str:
+    return thematize_label(k, side) if themeize_toggle else k
+
+cand_del: Dict[str, List[int]] = {}
+for sym, refs in cand_del_raw.items():
+    sym2 = _maybe_theme(sym, "Delighter")
+    cand_del.setdefault(sym2, []).extend(refs)
+
+cand_det: Dict[str, List[int]] = {}
+for sym, refs in cand_det_raw.items():
+    sym2 = _maybe_theme(sym, "Detractor")
+    cand_det.setdefault(sym2, []).extend(refs)
 
 whitelist_all = set(DELIGHTERS + DETRACTORS)
 alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
@@ -952,7 +1057,9 @@ if cand_del or cand_det:
                 for _, r_ in editor_del.iterrows():
                     if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
                         side_val = str(r_.get("Side","Delighter")).strip() or "Delighter"
-                        selections.append((str(r_["Label"]).strip(), side_val))
+                        # Theme-normalize once more for safety
+                        label_out = thematize_label(str(r_["Label"]).strip(), side_val) if themeize_toggle else str(r_["Label"]).strip()
+                        selections.append((label_out, side_val))
         except Exception:
             pass
         try:
@@ -960,7 +1067,8 @@ if cand_del or cand_det:
                 for _, r_ in editor_det.iterrows():
                     if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
                         side_val = str(r_.get("Side","Detractor")).strip() or "Detractor"
-                        selections.append((str(r_["Label"]).strip(), side_val))
+                        label_out = thematize_label(str(r_["Label"]).strip(), side_val) if themeize_toggle else str(r_["Label"]).strip()
+                        selections.append((label_out, side_val))
         except Exception:
             pass
 
@@ -1027,7 +1135,7 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _chips(items, color: str):
-        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
+        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()] )
         if not items_sorted:
             st.write("(none)")
         else:
@@ -1077,4 +1185,5 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 
 # Footer
 st.divider()
-st.caption("v7.3 — Evidence-locked labeling, in-session caching, minor cleanups. Exports: K–T/U–AD, meta: AE/AF/AG. No header relabeling.")
+st.caption("v7.3 — Evidence-locked labeling, in-session caching, minor cleanups, and THEME-FOCUSED new-symptom inbox (e.g., 'Hair loss/pull', 'Overall satisfaction'). Exports: K–T/U–AD, meta: AE/AF/AG. No header relabeling.")
+
