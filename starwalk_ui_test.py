@@ -1171,45 +1171,6 @@ else:
                         use_container_width=True, hide_index=True
                     )
 
-# ---- Spacing / layout polish (drop-in) ----
-# Collect y-values to compute padded range
-ys = []
-for tr in fig.data:
-    if hasattr(tr, "y") and tr.y is not None:
-        try:
-            ys.extend([float(v) for v in tr.y if v is not None])
-        except Exception:
-            pass
-
-if ys:
-    y_min, y_max = min(ys), max(ys)
-    pad = max(0.1, (y_max - y_min) * 0.08)  # 8% pad, at least 0.1
-    # Clamp to rating scale if you want hard bounds; loosen slightly to avoid visual clipping
-    lo = max(1.0, y_min - pad)
-    hi = min(5.2, y_max + pad)  # allow a hair above 5 to avoid dot clipping at the top
-    fig.update_yaxes(range=[lo, hi], automargin=True)
-else:
-    fig.update_yaxes(automargin=True)
-
-fig.update_xaxes(automargin=True)
-
-# Keep legend out of the way (below the chart)
-fig.update_layout(
-    margin=dict(l=60, r=50, t=80, b=80),
-    legend=dict(
-        orientation="h",
-        yanchor="top",
-        y=-0.2,          # place below the plot area
-        xanchor="left",
-        x=0,
-        bgcolor="rgba(255,255,255,0)"
-    ),
-)
-
-# Prevent markers/lines from getting cut at plot edge
-fig.update_traces(cliponaxis=False)
-
-
 
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
