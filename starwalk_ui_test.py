@@ -1170,33 +1170,6 @@ else:
 
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Latest snapshot (per region + overall)
-                latest_per_region = (
-                    tmp.sort_values("Review Date")
-                       .groupby("_region").tail(1)
-                       .rename(columns={
-                           "_region": region_col,
-                           "Review Date": "Latest Bucket",
-                           "Cumulative Avg ★": "Latest Cum. Avg ★",
-                           "cum_cnt": "Cum. Reviews"
-                       })[[region_col, "Latest Bucket", "Latest Cum. Avg ★", "Cum. Reviews"]]
-                )
-                overall_row = pd.DataFrame()
-                if not overall.empty:
-                    overall_row = (
-                        overall.tail(1)
-                               .assign(**{region_col: "Overall"})
-                               .rename(columns={
-                                   "Review Date": "Latest Bucket",
-                                   "Cumulative Avg ★": "Latest Cum. Avg ★",
-                                   "cum_cnt": "Cum. Reviews"
-                               })[[region_col, "Latest Bucket", "Latest Cum. Avg ★", "Cum. Reviews"]]
-                    )
-                summary_table = pd.concat([latest_per_region, overall_row], ignore_index=True)
-                if not summary_table.empty:
-                    st.dataframe(summary_table.sort_values("Latest Cum. Avg ★", ascending=False),
-                                 use_container_width=True, hide_index=True)
-
 
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
