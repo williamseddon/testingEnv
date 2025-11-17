@@ -1006,7 +1006,7 @@ else:
     # Controls
     c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 0.9])
     with c1:
-        bucket_label = st.selectbox("Bucket size", options=["Day", "Week", "Month"], index=2, key="region_bucket")
+        bucket_label = st.selectbox("Bucket size", ["Day", "Week", "Month"], index=2, key="region_bucket")
         _freq_map = {"Day": "D", "Week": "W", "Month": "M"}
         freq = _freq_map[bucket_label]
     with c2:
@@ -1014,7 +1014,7 @@ else:
         _candidates = [c for c in ["Country", "Source", "Model (SKU)"] if c in filtered.columns]
         region_col = st.selectbox("Region field", options=_candidates or ["(none)"], key="region_col")
     with c3:
-        top_n = st.number_input("Top regions by volume", min_value=1, max_value=15, value=5, step=1, key="region_topn")
+        top_n = st.number_input("Top regions by volume", 1, 15, value=5, step=1, key="region_topn")
     with c4:
         organic_only = st.toggle("Organic Only", value=False, help="Exclude reviews where Seeded == YES")
 
@@ -1027,7 +1027,7 @@ else:
         if organic_only and "Seeded" in d.columns:
             d = d[d["Seeded"].astype("string").str.upper().ne("YES")]
 
-        # Clean/coerce
+        # Clean / coerce
         d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
         d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
         d = d.dropna(subset=["Review Date", "Star Rating"])
@@ -1036,14 +1036,13 @@ else:
             st.warning("No data available for the current selections.")
         else:
             # Default regions = Top-N by count
-            counts = (d[region_col].astype("string").str.strip()
-                      .replace({"": pd.NA}).dropna())
+            counts = (d[region_col].astype("string").str.strip().replace({"": pd.NA}).dropna())
             top_regions = counts.value_counts().head(int(top_n)).index.tolist()
 
-            regions_available = sorted([
+            regions_available = sorted(
                 r for r in d[region_col].astype("string").dropna().unique().tolist()
                 if str(r).strip() != ""
-            ])
+            )
             chosen_regions = st.multiselect(
                 "Regions to plot",
                 options=regions_available,
@@ -1061,8 +1060,9 @@ else:
                 # ----------------------------
                 # CUMULATIVE WEIGHTED AGGREGATION
                 # ----------------------------
-                # 1) Aggregate by bucket and region to get per-bucket sums & counts
                 freq_eff = "W-MON" if freq == "W" else freq  # Monday-start weeks
+
+                # Per-region bucket sums/counts
                 tmp = (
                     d.assign(_region=d[region_col].astype("string"))
                      .groupby([pd.Grouper(key="Review Date", freq=freq_eff), "_region"])["Star Rating"]
@@ -1070,13 +1070,12 @@ else:
                      .reset_index()
                      .sort_values(["_region", "Review Date"])
                 )
-
-                # 2) Cumulative sums by region → cumulative weighted average
+                # Cumulative → weighted average
                 tmp["cum_sum"] = tmp.groupby("_region")["bucket_sum"].cumsum()
                 tmp["cum_cnt"] = tmp.groupby("_region")["bucket_count"].cumsum()
                 tmp["Cumulative Avg ★"] = tmp["cum_sum"] / tmp["cum_cnt"]
 
-                # 3) Overall line (across all selected regions/rows)
+                # Overall cumulative line
                 overall = (
                     d.groupby(pd.Grouper(key="Review Date", freq=freq_eff))["Star Rating"]
                      .agg(bucket_sum="sum", bucket_count="count")
@@ -1087,7 +1086,7 @@ else:
                 overall["cum_cnt"] = overall["bucket_count"].cumsum()
                 overall["Cumulative Avg ★"] = overall["cum_sum"] / overall["cum_cnt"]
 
-                # Plot
+                # ---- Plotly chart ----
                 fig = go.Figure()
 
                 # Region lines
@@ -1098,9 +1097,10 @@ else:
                         continue
                     fig.add_trace(go.Scatter(
                         x=sub["Review Date"], y=sub["Cumulative Avg ★"],
-                        mode="lines",
+                        mode="lines+markers",
                         name=str(reg),
                         line=dict(width=2),
+                        marker=dict(size=5),
                         hovertemplate=(
                             f"{region_col}: {reg}<br>"
                             "Bucket end: %{x|%Y-%m-%d}<br>"
@@ -1126,25 +1126,54 @@ else:
                         customdata=overall["cum_cnt"],
                     ))
 
+                # Axis formatting based on bucket
+                _tickformat = {"D": "%b %d, %Y", "W": "%b %d, %Y", "M": "%b %Y"}[freq]
+                fig.update_xaxes(tickformat=_tickformat, automargin=True)
+                fig.update_yaxes(automargin=True)
+
+                # Title/legend/layout (legend below x-axis)
                 title_bucket = {"D": "Daily", "W": "Weekly", "M": "Monthly"}[freq]
                 title_org = " • Organic Only" if organic_only else ""
                 fig.update_layout(
                     title=f"<b>{title_bucket} Cumulative (Weighted) Avg ★ by {region_col}{title_org}</b>",
                     xaxis=dict(title="Date", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                    yaxis=dict(title="Cumulative Avg ★", range=[1, 5], showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                    yaxis=dict(title="Cumulative Avg ★", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
                     hovermode="x unified",
                     plot_bgcolor="white",
                     template="plotly_white",
-                    margin=dict(l=40, r=30, t=50, b=40),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+                    margin=dict(l=60, r=40, t=70, b=100),
+                    legend=dict(
+                        orientation="h",
+                        yanchor="top",
+                        y=-0.28,          # below x-axis
+                        xanchor="center",
+                        x=0.5,
+                        bgcolor="rgba(255,255,255,0)",
+                    ),
                 )
+
+                # Extra spacing / no clipping
+                ys = []
+                for tr in fig.data:
+                    if getattr(tr, "y", None) is not None:
+                        try:
+                            ys.extend([float(v) for v in tr.y if v is not None])
+                        except Exception:
+                            pass
+                if ys:
+                    y_min, y_max = min(ys), max(ys)
+                    pad = max(0.1, (y_max - y_min) * 0.08)
+                    lo = max(1.0, y_min - pad)
+                    hi = min(5.2, y_max + pad)
+                    fig.update_yaxes(range=[lo, hi])
+                fig.update_traces(cliponaxis=False)
+
                 st.plotly_chart(fig, use_container_width=True)
 
                 # Latest snapshot (per region + overall)
                 latest_per_region = (
                     tmp.sort_values("Review Date")
-                       .groupby("_region")
-                       .tail(1)
+                       .groupby("_region").tail(1)
                        .rename(columns={
                            "_region": region_col,
                            "Review Date": "Latest Bucket",
@@ -1152,24 +1181,21 @@ else:
                            "cum_cnt": "Cum. Reviews"
                        })[[region_col, "Latest Bucket", "Latest Cum. Avg ★", "Cum. Reviews"]]
                 )
-
                 overall_row = pd.DataFrame()
                 if not overall.empty:
-                    last_overall = (overall.tail(1)
-                                    .assign(**{region_col: "Overall"})
-                                    .rename(columns={
-                                        "Review Date": "Latest Bucket",
-                                        "Cumulative Avg ★": "Latest Cum. Avg ★",
-                                        "cum_cnt": "Cum. Reviews"
-                                    })[[region_col, "Latest Bucket", "Latest Cum. Avg ★", "Cum. Reviews"]])
-                    overall_row = last_overall
-
+                    overall_row = (
+                        overall.tail(1)
+                               .assign(**{region_col: "Overall"})
+                               .rename(columns={
+                                   "Review Date": "Latest Bucket",
+                                   "Cumulative Avg ★": "Latest Cum. Avg ★",
+                                   "cum_cnt": "Cum. Reviews"
+                               })[[region_col, "Latest Bucket", "Latest Cum. Avg ★", "Cum. Reviews"]]
+                    )
                 summary_table = pd.concat([latest_per_region, overall_row], ignore_index=True)
                 if not summary_table.empty:
-                    st.dataframe(
-                        summary_table.sort_values("Latest Cum. Avg ★", ascending=False),
-                        use_container_width=True, hide_index=True
-                    )
+                    st.dataframe(summary_table.sort_values("Latest Cum. Avg ★", ascending=False),
+                                 use_container_width=True, hide_index=True)
 
 
 # ---------- Symptom Tables ----------
