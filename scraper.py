@@ -1,6 +1,5 @@
-# Write the latest full Streamlit app code to a file for you to download
-code = r'''# streamlit_app.py
-# Amazon Scraper (Axesso) — Scrape‑first UI + FULL REVIEWS
+# streamlit_app.py
+# Amazon Scraper (Axesso) — Scrape-first UI + FULL REVIEWS
 # --------------------------------------------------------
 # This version adds a **Reviews Harvester** that can fetch (near) *all* reviews
 # for a product using the Axesso Amazon Reviews Scraper on Apify.
@@ -11,7 +10,7 @@ code = r'''# streamlit_app.py
 #   reviews via Apify Actor `axesso_data/amazon-reviews-scraper`.
 # - Options for sort, star filter, reviewer type, media filter, and max pages.
 # - De-duplication by `reviewId` + heuristic fallback.
-# - One‑click CSV export of *all* fetched reviews.
+# - One-click CSV export of *all* fetched reviews.
 #
 # Auth
 # - Axesso REST key in sidebar or .streamlit/secrets.toml as:
@@ -436,7 +435,7 @@ if run_reviews:
         st.stop()
     asin_clean = (asin_input or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{10}", asin_clean):
-        st.error("Please enter a valid 10‑char ASIN.")
+        st.error("Please enter a valid 10-char ASIN.")
         st.stop()
 
     with st.spinner("Fetching reviews via Apify (this may take a while for many pages)..."):
@@ -470,10 +469,7 @@ if run_reviews:
 
 st.divider()
 st.caption("Scrape responsibly. **Full reviews** use Apify's Axesso Actor and can return thousands of reviews depending on product and filters.")
-'''
-with open('/mnt/data/streamlit_app.py', 'w', encoding='utf-8') as f:
-    f.write(code)
-print("Saved to /mnt/data/streamlit_app.py")
+
 
 
 
