@@ -1,4 +1,5 @@
-# streamlit_app.py
+# Write the latest full Streamlit app code to a file for you to download
+code = r'''# streamlit_app.py
 # Amazon Scraper (Axesso) — Scrape‑first UI + FULL REVIEWS
 # --------------------------------------------------------
 # This version adds a **Reviews Harvester** that can fetch (near) *all* reviews
@@ -278,8 +279,7 @@ st.markdown("### 1) Scrape Queue (Products)")
 queue_text = st.text_area(
     "Paste ASINs or Amazon product URLs (one per line)",
     height=160,
-    placeholder=("B07TCHYBSK")
-https://www.amazon.com/dp/B0B17BYJ5R?psc=1"),
+    placeholder="B07TCHYBSK\nhttps://www.amazon.com/dp/B0B17BYJ5R?psc=1",
 )
 col_a, col_b = st.columns([1,1])
 with col_a:
@@ -402,9 +402,7 @@ if run:
     if errors:
         with st.expander("Error log"):
             for u, msg in errors:
-                st.error(f"{u}
-
-{msg}")
+                st.error(f"{u}\n\n{msg}")
 
 # ------------------------- REVIEWS HARVESTER ----------------------
 
@@ -472,6 +470,11 @@ if run_reviews:
 
 st.divider()
 st.caption("Scrape responsibly. **Full reviews** use Apify's Axesso Actor and can return thousands of reviews depending on product and filters.")
+'''
+with open('/mnt/data/streamlit_app.py', 'w', encoding='utf-8') as f:
+    f.write(code)
+print("Saved to /mnt/data/streamlit_app.py")
+
 
 
 
