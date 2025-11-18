@@ -1,22 +1,24 @@
 # streamlit_app.py
-# Streamlit Amazon Product Scraper using Axesso Amazon API
+# Amazon Scraper (Axesso) — Scrape‑first UI + FULL REVIEWS
 # --------------------------------------------------------
-# Features
-# - Enter a single Amazon product URL (we auto-append ?psc=1 when missing)
-# - Optional bulk mode: paste multiple URLs (one per line)
-# - Secure API key input (sidebar); supports Streamlit Secrets if set
-# - Product card with title, price, rating, seller, fulfillment, availability
-# - Image gallery, features, about section, product details
-# - Variations table (if present)
-# - Reviews viewer with filters (rating, US-only/global toggle, search)
-# - Download raw JSON and flattened CSV
-# - Basic caching + rate limiting + graceful error handling
+# This version adds a **Reviews Harvester** that can fetch (near) *all* reviews
+# for a product using the Axesso Amazon Reviews Scraper on Apify.
 #
-# How to provide your API key (choose one):
-# 1) In the UI: Sidebar → "Axesso API Key" (masked input)
-# 2) In ".streamlit/secrets.toml":
-#    [axesso]\nAPI_KEY = "YOUR_KEY"
-# --------------------------------------------------------
+# Highlights
+# - Queue-first product scraping (Axesso REST) as before.
+# - NEW: Reviews Harvester (Apify): supply ASIN + marketplace → get paginated
+#   reviews via Apify Actor `axesso_data/amazon-reviews-scraper`.
+# - Options for sort, star filter, reviewer type, media filter, and max pages.
+# - De-duplication by `reviewId` + heuristic fallback.
+# - One‑click CSV export of *all* fetched reviews.
+#
+# Auth
+# - Axesso REST key in sidebar or .streamlit/secrets.toml as:
+#     [axesso]
+#     API_KEY = "..."
+# - Apify token for reviews in sidebar or secrets as:
+#     [apify]
+#     TOKEN = "..."
 
 from __future__ import annotations
 import json
@@ -30,15 +32,17 @@ import streamlit as st
 
 # ----------------------------- Config -----------------------------
 st.set_page_config(
-    page_title="Amazon Product Scraper (Axesso)",
-    page_icon="🛒",
+    page_title="Amazon Scraper (Axesso) — Full Reviews",
+    page_icon="🧲",
     layout="wide",
 )
 
 API_ENDPOINT = "https://api.axesso.de/amz/amazon-lookup-product"
-DEFAULT_AMZ_URL = "https://www.amazon.com/dp/B07TCHYBSK?psc=1"
-REQUEST_TIMEOUT = 30  # seconds
-THROTTLE_SECONDS = 1.0  # be nice to the API in bulk mode
+APIFY_RUN_SYNC_DATASET = "https://api.apify.com/v2/acts/axesso_data~amazon-reviews-scraper/run-sync-get-dataset-items"
+REQUEST_TIMEOUT = 30
+DEFAULT_THROTTLE = 1.0
+DEFAULT_MARKET = "com"
+MARKETS = ["com", "de", "co.uk", "fr", "it", "es", "ca", "com.au", "co.jp"]
 
 # --------------------------- Utilities ----------------------------
 
@@ -49,103 +53,90 @@ def _load_api_key_from_secrets() -> Optional[str]:
         return None
 
 
-def add_psc_param(url: str) -> str:
-    """Ensure ?psc=1 is present to load the correct variation (Axesso's recommendation)."""
-    if not url:
-        return url
-    if "psc=" in url:
-        return url
-    # If URL already has query params, append with &; else use ?
-    return url + ("&psc=1" if ("?" in url) else "?psc=1")
+def _load_apify_token_from_secrets() -> Optional[str]:
+    try:
+        return st.secrets.get("apify", {}).get("TOKEN")
+    except Exception:
+        return None
 
 
-def normalize_amazon_url(url: str) -> str:
-    url = url.strip()
+def add_psc(url: str) -> str:
     if not url:
         return url
-    # Accept partials like /dp/ASIN and prefix with https://www.amazon.com
+    return url if "psc=" in url else (url + ("&psc=1" if "?" in url else "?psc=1"))
+
+
+def normalize_url_or_asin(text: str, market: str) -> Tuple[str, Optional[str]]:
+    s = (text or "").strip()
+    if not s:
+        return "", None
+    # ASIN token
+    m = re.fullmatch(r"[A-Z0-9]{10}", s, flags=re.I)
+    if m:
+        asin = m.group(0).upper()
+        return f"https://www.amazon.{market}/dp/{asin}", asin
+    # Try extract from URL
+    url = s
     if url.startswith("/dp/"):
-        url = "https://www.amazon.com" + url
-    # Ensure https scheme for consistency
+        url = f"https://www.amazon.{market}{url}"
     if url.startswith("http://"):
         url = "https://" + url[len("http://"):]
-    # Quick sanity check for amazon host (not strict – Amazon has many TLDs)
-    if "amazon." not in url:
-        return url  # let API decide; we still show a warning in UI
-    return url
+    asin2 = extract_asin(url)
+    return url, asin2
+
+
+def extract_asin(s: str) -> Optional[str]:
+    m = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", s, flags=re.I)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"(?<![A-Z0-9])([A-Z0-9]{10})(?![A-Z0-9])", s, flags=re.I)
+    return m.group(1).upper() if m else None
 
 
 @st.cache_data(show_spinner=False)
 def fetch_product(url: str, api_key: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Call Axesso API. Returns (data, error_message)."""
-    params = {"url": url}
     headers = {"axesso-api-key": api_key}
     try:
-        resp = requests.get(API_ENDPOINT, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(API_ENDPOINT, params={"url": url}, headers=headers, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
         return None, f"Network error: {e}"
-
     if resp.status_code != 200:
-        # Attempt to surface API error payload when available
         try:
-            err_payload = resp.json()
+            payload = resp.json()
         except Exception:
-            err_payload = resp.text
-        return None, f"HTTP {resp.status_code}: {err_payload}"
-
+            payload = resp.text
+        return None, f"HTTP {resp.status_code}: {payload}"
     try:
         data = resp.json()
     except Exception as e:
-        return None, f"Failed to parse JSON: {e}"
-
-    # Axesso returns 200 even for some non-found cases; inspect responseStatus/message
+        return None, f"Bad JSON: {e}"
     status = str(data.get("responseStatus", "")).upper()
     if "NOT_FOUND" in status:
         return None, data.get("responseMessage") or "Product not found"
-
     return data, None
 
 
-def stars_from_text(rating_text: Optional[str]) -> Optional[float]:
-    if not rating_text:
-        return None
-    m = re.search(r"([0-9]+(?:\.[0-9])?)\s*out of\s*5", rating_text)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-
 def flatten_product_for_csv(data: Dict[str, Any]) -> pd.DataFrame:
-    """Flatten key product fields and one row per review (if present)."""
     base = {
         "asin": data.get("asin"),
-        "productTitle": data.get("productTitle"),
+        "title": data.get("productTitle"),
         "price": data.get("price"),
         "retailPrice": data.get("retailPrice"),
         "shippingPrice": data.get("shippingPrice"),
-        "productRating": data.get("productRating"),
-        "countReview": data.get("countReview"),
+        "ratingText": data.get("productRating"),
+        "reviewCount": data.get("countReview"),
         "soldBy": data.get("soldBy"),
         "fulfilledBy": data.get("fulfilledBy"),
-        "warehouseAvailability": data.get("warehouseAvailability"),
+        "availability": data.get("warehouseAvailability"),
         "categories": ", ".join(data.get("categories", []) or []),
     }
-
     rows: List[Dict[str, Any]] = []
-
-    def _append(row_extra: Dict[str, Any]):
-        r = base.copy()
-        r.update(row_extra)
-        rows.append(r)
-
-    # If there are reviews, create one row per review; else add a single row
     reviews = data.get("reviews") or data.get("globalReviews") or []
     if reviews:
         for rv in reviews:
-            _append({
+            r = base.copy()
+            r.update({
+                "reviewId": rv.get("reviewId"),
                 "reviewTitle": rv.get("title"),
                 "reviewText": rv.get("text"),
                 "reviewRating": rv.get("rating"),
@@ -154,358 +145,334 @@ def flatten_product_for_csv(data: Dict[str, Any]) -> pd.DataFrame:
                 "reviewUrl": rv.get("url"),
                 "reviewLocale": json.dumps(rv.get("locale")) if isinstance(rv.get("locale"), dict) else rv.get("locale"),
             })
+            rows.append(r)
     else:
-        _append({})
-
+        rows.append(base)
     return pd.DataFrame(rows)
 
 
+def dedupe_reviews_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "reviewId" in df.columns:
+        return df.drop_duplicates(subset=["reviewId"], keep="first")
+    tmp = df.copy()
+    txt = tmp.get("reviewText")
+    if txt is not None:
+        tmp["_k"] = (
+            tmp.get("asin", "").astype(str)
+            + "|" + tmp.get("reviewUser", "").astype(str)
+            + "|" + tmp.get("reviewDate", "").astype(str)
+            + "|" + txt.astype(str).str.slice(0, 80)
+        )
+    else:
+        tmp["_k"] = (
+            tmp.get("asin", "").astype(str)
+            + "|" + tmp.get("reviewUser", "").astype(str)
+            + "|" + tmp.get("reviewDate", "").astype(str)
+        )
+    return tmp.drop_duplicates(subset=["_k"], keep="first").drop(columns=["_k"], errors="ignore")
+
+# ------------------------- Apify Reviews API -----------------------
+
+def fetch_reviews_apify(
+    apify_token: str,
+    asin: str,
+    domain_code: str = "com",
+    sort_by: str = "recent",          # recent | top | helpful
+    filter_by_star: str = "all_stars", # all_stars | five_star | four_star | ...
+    reviewer_type: str = "all_reviews",# all_reviews | verified_purchase
+    media_type: str = "all_contents",  # all_contents | with_media | text_only
+    max_pages: int = 50,               # how many review pages to crawl
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Run the Apify Actor synchronously and return a DataFrame of reviews."""
+    headers = {"Content-Type": "application/json"}
+    params = {"token": apify_token}
+
+    actor_input = {
+        "input": [
+            {
+                "asin": asin,
+                "domainCode": domain_code,
+                "sortBy": sort_by,
+                "maxPages": max_pages,
+                "filterByStar": filter_by_star,
+                "reviewerType": reviewer_type,
+                "formatType": "current_format",
+                "mediaType": media_type,
+            }
+        ]
+    }
+    try:
+        resp = requests.post(
+            APIFY_RUN_SYNC_DATASET,
+            params=params,
+            headers=headers,
+            data=json.dumps(actor_input),
+            timeout=1200,
+        )
+    except requests.RequestException as e:
+        return pd.DataFrame(), f"Network error calling Apify: {e}"
+
+    if resp.status_code != 200:
+        try:
+            err = resp.json()
+        except Exception:
+            err = resp.text
+        return pd.DataFrame(), f"Apify HTTP {resp.status_code}: {err}"
+
+    # Apify returns dataset items directly (JSON array)
+    try:
+        items = resp.json()
+    except Exception as e:
+        return pd.DataFrame(), f"Failed to parse Apify dataset JSON: {e}"
+
+    if not isinstance(items, list):
+        return pd.DataFrame(), "Unexpected Apify response format"
+
+    df = pd.DataFrame(items)
+    # Standardize some expected fields
+    rename_map = {
+        "id": "reviewId",
+        "title": "reviewTitle",
+        "text": "reviewText",
+        "rating": "reviewRating",
+        "date": "reviewDate",
+        "userName": "reviewUser",
+        "asin": "asin",
+    }
+    for k, v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df[v] = df[k]
+    if "asin" not in df.columns:
+        df["asin"] = asin
+
+    return df, None
+
 # ------------------------------ UI -------------------------------
 
-st.title("🛒 Amazon Product Scraper (Axesso)")
-st.caption("Enter an Amazon product URL. We'll call the Axesso API and render the results.")
+st.title("🧲 Amazon Scraper (Axesso) — Full Reviews")
+st.caption("Queue products for scraping and harvest full reviews via Apify. Minimal UI, scrape-first.")
 
 with st.sidebar:
-    st.header("Settings")
-    default_key = _load_api_key_from_secrets()
-    api_key = st.text_input(
-        "Axesso API Key",
-        value=st.session_state.get("axesso_api_key", default_key or ""),
-        type="password",
-        help=(
-            "Your Axesso subscription key. You can also set it in .streamlit/secrets.toml as:\n"
-            "[axesso]\nAPI_KEY='YOUR_KEY'"
-        ),
-    )
+    st.header("Auth & Controls")
+    default_axesso = _load_api_key_from_secrets()
+    default_apify = _load_apify_token_from_secrets()
+
+    api_key = st.text_input("Axesso API Key", value=st.session_state.get("axesso_api_key", default_axesso or ""), type="password")
     if api_key:
         st.session_state["axesso_api_key"] = api_key
 
-    st.divider()
-    st.subheader("Mode")
-    mode = st.radio("Select mode", ["Single URL", "Bulk URLs"], index=0, horizontal=True)
+    apify_token = st.text_input("Apify Token (for full reviews)", value=st.session_state.get("apify_token", default_apify or ""), type="password")
+    if apify_token:
+        st.session_state["apify_token"] = apify_token
 
-# --------------------------- Single URL ---------------------------
-if mode == "Single URL":
-    col_left, col_right = st.columns([2, 1], gap="large")
-    with col_left:
-        url_input = st.text_input("Amazon Product URL", value=DEFAULT_AMZ_URL, placeholder="https://www.amazon.com/dp/ASIN?psc=1")
-        col_a, col_b, col_c = st.columns([1,1,1])
-        with col_a:
-            ensure_psc = st.checkbox("Ensure ?psc=1", value=True, help="Recommended by Axesso to load the correct variation")
-        with col_b:
-            show_raw_json = st.checkbox("Show raw JSON", value=False)
-        with col_c:
-            cache_ok = st.checkbox("Use cache", value=True, help="Disable to force a fresh call")
+    market = st.selectbox("Marketplace for bare ASINs", MARKETS, index=MARKETS.index(DEFAULT_MARKET))
+    ensure_psc = st.checkbox("Ensure ?psc=1", value=True)
+    throttle = st.number_input("Throttle between calls (sec)", min_value=0.0, max_value=10.0, step=0.1, value=DEFAULT_THROTTLE)
+    max_items = st.number_input("Max items to fetch (0 = no cap)", min_value=0, value=0, step=50)
+    dedupe_inputs = st.checkbox("De-duplicate inputs by ASIN", value=True)
+    use_cache = st.checkbox("Use cache (Axesso)", value=True)
 
-        run = st.button("Fetch Product", type="primary")
+st.markdown("### 1) Scrape Queue (Products)")
+queue_text = st.text_area(
+    "Paste ASINs or Amazon product URLs (one per line)",
+    height=160,
+    placeholder=("B07TCHYBSK
+https://www.amazon.com/dp/B0B17BYJ5R?psc=1"),
+)
+col_a, col_b = st.columns([1,1])
+with col_a:
+    prepared = st.button("Prepare Queue", use_container_width=True)
+with col_b:
+    run = st.button("Run Product Scraper", type="primary", use_container_width=True)
 
-    with col_right:
-        st.info(
-            "**Tips**\n\n- Works for most amazon.* domains.\n- We'll auto-add `?psc=1` unless you uncheck it.\n- Use the reviews filters below to sift through feedback.")
+# Session slots
+if "prepared_items" not in st.session_state:
+    st.session_state["prepared_items"] = []
 
-    if run:
-        if not api_key:
-            st.error("Please enter your Axesso API key in the sidebar.")
-            st.stop()
-
-        url = normalize_amazon_url(url_input)
+if prepared:
+    raw = [ln.strip() for ln in queue_text.splitlines() if ln.strip()]
+    items: List[Tuple[str, Optional[str]]] = []
+    seen: set[str] = set()
+    for line in raw:
+        url, asin_guess = normalize_url_or_asin(line, market)
+        if not url:
+            continue
         if ensure_psc:
-            url = add_psc_param(url)
+            url = add_psc(url)
+        if dedupe_inputs and asin_guess:
+            if asin_guess in seen:
+                continue
+            seen.add(asin_guess)
+        items.append((url, asin_guess))
+    if max_items and max_items > 0:
+        items = items[: max_items]
+    st.session_state["prepared_items"] = items
+    st.success(f"Prepared {len(items)} item(s). Click 'Run Product Scraper'.")
 
-        if "amazon." not in url:
-            st.warning("This doesn't look like an Amazon URL; the API may reject it.")
+if run:
+    if not api_key:
+        st.error("Enter your Axesso API key in the sidebar.")
+        st.stop()
+    if not use_cache:
+        fetch_product.clear()
 
-        if not cache_ok:
-            fetch_product.clear()  # drop cache for next call
+    items = st.session_state.get("prepared_items") or []
+    if not items:
+        raw = [ln.strip() for ln in queue_text.splitlines() if ln.strip()]
+        items = []
+        seen: set[str] = set()
+        for line in raw:
+            url, asin_guess = normalize_url_or_asin(line, market)
+            if not url:
+                continue
+            if ensure_psc:
+                url = add_psc(url)
+            if dedupe_inputs and asin_guess:
+                if asin_guess in seen:
+                    continue
+                seen.add(asin_guess)
+            items.append((url, asin_guess))
+        if max_items and max_items > 0:
+            items = items[: max_items]
+        st.session_state["prepared_items"] = items
 
-        with st.spinner("Calling Axesso API..."):
-            data, err = fetch_product(url, api_key)
+    if not items:
+        st.warning("No items to scrape.")
+        st.stop()
 
+    st.markdown("### 2) Scraping Products")
+    progress = st.progress(0)
+    status = st.empty()
+
+    results: List[Dict[str, Any]] = []
+    errors: List[Tuple[str, str]] = []
+
+    for i, (target_url, asin_guess) in enumerate(items, start=1):
+        status.info(f"Fetching {i}/{len(items)}: {target_url}")
+        data, err = fetch_product(target_url, api_key)
         if err:
-            st.error(err)
-            st.stop()
+            errors.append((target_url, err))
+        else:
+            results.append(data)
+        progress.progress(i / len(items))
+        if throttle:
+            time.sleep(float(throttle))
 
-        # ---------------------- Rendering ----------------------
-        # Header card
-        title = data.get("productTitle") or "(No title)"
-        rating_text = data.get("productRating")
-        rating_value = stars_from_text(rating_text)
-        count_review = data.get("countReview")
-        price = data.get("price")
-        retail_price = data.get("retailPrice")
-        sold_by = data.get("soldBy")
-        fulfilled_by = data.get("fulfilledBy")
-        availability = data.get("warehouseAvailability")
-        asin = data.get("asin")
+    status.empty()
 
-        st.subheader(title)
-        top_cols = st.columns([1, 2])
+    st.markdown("### 3) Results")
+    if results:
+        # Compact table
+        rows = [{
+            "asin": r.get("asin"),
+            "title": r.get("productTitle"),
+            "price": r.get("price"),
+            "rating": r.get("productRating"),
+            "reviews": r.get("countReview"),
+            "soldBy": r.get("soldBy"),
+            "fulfilledBy": r.get("fulfilledBy"),
+        } for r in results]
+        df_summary = pd.DataFrame(rows).drop_duplicates(subset=["asin"], keep="first")
+        st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
-        with top_cols[0]:
-            main_image = (data.get("mainImage") or {}).get("imageUrl")
-            imgs = data.get("imageUrlList") or ([] if not main_image else [main_image])
-            if imgs:
-                st.image(imgs, use_column_width=True, caption=["image" for _ in imgs] if len(imgs) > 1 else None)
-            else:
-                st.caption("No images available")
+        # Exports
+        st.markdown("#### Exports (Products)")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Download all (JSON)",
+                data=json.dumps(results, indent=2),
+                file_name="axesso_products.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with col2:
+            frames = [flatten_product_for_csv(r) for r in results]
+            products_csv = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            st.download_button(
+                "Download flattened products CSV",
+                data=products_csv.to_csv(index=False),
+                file_name="products_flattened.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
-        with top_cols[1]:
-            if price not in (None, 0, 0.0):
-                st.metric("Price", f"${price:,.2f}")
-            elif retail_price not in (None, 0, 0.0):
-                st.metric("Retail Price", f"${retail_price:,.2f}")
-            else:
-                st.metric("Price", "N/A")
+    if errors:
+        with st.expander("Error log"):
+            for u, msg in errors:
+                st.error(f"{u}
 
-            meta_cols = st.columns(3)
-            meta_cols[0].write(f"**ASIN**\n\n{asin or '—'}")
-            meta_cols[1].write(f"**Sold by**\n\n{sold_by or '—'}")
-            meta_cols[2].write(f"**Fulfilled by**\n\n{fulfilled_by or '—'}")
+{msg}")
 
-            if rating_value is not None:
-                st.write(f"**Rating**: {rating_value:.1f} / 5  (\~{count_review or 0} reviews)")
-            elif rating_text:
-                st.write(f"**Rating**: {rating_text}")
+# ------------------------- REVIEWS HARVESTER ----------------------
 
-            if availability:
-                st.success(availability)
+st.markdown("---")
+st.header("Reviews Harvester (Full Reviews via Apify)")
 
-        tabs = st.tabs(["Overview", "Details", "Variations", "Reviews", "Global Reviews", "Downloads"])
+col_r1, col_r2, col_r3 = st.columns(3)
+with col_r1:
+    asin_input = st.text_input("ASIN for reviews", placeholder="e.g., B07TCHYBSK")
+with col_r2:
+    domain_code = st.selectbox("Marketplace", MARKETS, index=MARKETS.index(DEFAULT_MARKET))
+with col_r3:
+    max_pages = st.number_input("Max pages", min_value=1, max_value=500, value=50, step=1, help="Higher = more reviews. 50–200 is common.")
 
-        with tabs[0]:
-            features = data.get("features") or []
-            about = data.get("aboutProduct") or []
-            desc = data.get("productDescription")
-            if desc:
-                st.markdown(desc)
-            if features:
-                st.markdown("### Features")
-                for f in features:
-                    st.markdown(f"- {f}")
-            if about:
-                st.markdown("### About this item")
-                for pair in about:
-                    st.markdown(f"- **{pair.get('name','')}**: {pair.get('value','')}")
+col_r4, col_r5, col_r6 = st.columns(3)
+with col_r4:
+    sort_by = st.selectbox("Sort by", ["recent", "top", "helpful"], index=0)
+with col_r5:
+    filter_star = st.selectbox("Star filter", [
+        "all_stars", "five_star", "four_star", "three_star", "two_star", "one_star"
+    ], index=0)
+with col_r6:
+    reviewer_type = st.selectbox("Reviewer type", ["all_reviews", "verified_purchase"], index=0)
 
-        with tabs[1]:
-            details = data.get("productDetails") or []
-            if details:
-                dt = pd.DataFrame(details)
-                dt.columns = ["Name", "Value"]
-                st.dataframe(dt, use_container_width=True, hide_index=True)
-            else:
-                st.caption("No product details found")
+media_type = st.selectbox("Media filter", ["all_contents", "with_media", "text_only"], index=0)
+run_reviews = st.button("Run Reviews Harvester", type="primary")
 
-        with tabs[2]:
-            variations = data.get("variations") or []
-            if variations:
-                all_rows: List[Dict[str, Any]] = []
-                for var in variations:
-                    vname = var.get("variationName")
-                    for val in var.get("values", []):
-                        all_rows.append({
-                            "variationName": vname,
-                            "value": val.get("value"),
-                            "selected": val.get("selected"),
-                            "available": val.get("available"),
-                            "price": val.get("price"),
-                            "asin": val.get("asin"),
-                            "dpUrl": val.get("dpUrl"),
-                        })
-                st.dataframe(pd.DataFrame(all_rows), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No variations present")
+if run_reviews:
+    if not st.session_state.get("apify_token"):
+        st.error("Enter your Apify token in the sidebar to fetch full reviews.")
+        st.stop()
+    asin_clean = (asin_input or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{10}", asin_clean):
+        st.error("Please enter a valid 10‑char ASIN.")
+        st.stop()
 
-        def render_reviews(area_label: str, reviews: List[Dict[str, Any]]):
-            if not reviews:
-                st.caption("No reviews to display")
-                return
+    with st.spinner("Fetching reviews via Apify (this may take a while for many pages)..."):
+        df_reviews, err = fetch_reviews_apify(
+            apify_token=st.session_state["apify_token"],
+            asin=asin_clean,
+            domain_code=domain_code,
+            sort_by=sort_by,
+            filter_by_star=filter_star,
+            reviewer_type=reviewer_type,
+            media_type=media_type,
+            max_pages=int(max_pages),
+        )
 
-            col1, col2, col3 = st.columns([1, 1, 2])
-            with col1:
-                rating_filter = st.selectbox(
-                    f"{area_label} — Min stars",
-                    options=["All", 5, 4, 3, 2, 1],
-                    format_func=lambda x: str(x) if x == "All" else f">= {x}",
-                    key=f"minstars_{area_label}",
-                )
-            with col2:
-                search_text = st.text_input(f"{area_label} — Search in text", key=f"search_{area_label}")
-            with col3:
-                max_rows = st.slider(f"{area_label} — Max rows", 0, 200, 25, 5, key=f"max_{area_label}")
+    if err:
+        st.error(err)
+    else:
+        # Deduplicate and export
+        before = len(df_reviews)
+        df_reviews = dedupe_reviews_df(df_reviews)
+        after = len(df_reviews)
+        st.success(f"Fetched {before} reviews; {after} unique after de-dup.")
+        st.dataframe(df_reviews, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download FULL reviews (CSV)",
+            data=df_reviews.to_csv(index=False),
+            file_name=f"{asin_clean}_reviews_full.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-            def _rating_to_float(r: Any) -> Optional[float]:
-                if isinstance(r, (int, float)):
-                    return float(r)
-                if isinstance(r, str):
-                    m = re.search(r"([0-9]+(?:\.[0-9])?)", r)
-                    if m:
-                        try:
-                            return float(m.group(1))
-                        except Exception:
-                            return None
-                return None
-
-            filt = []
-            for rv in reviews:
-                ok = True
-                if rating_filter != "All":
-                    val = _rating_to_float(rv.get("rating"))
-                    ok = ok and (val is not None and val >= float(rating_filter))
-                if search_text:
-                    blob = " ".join([
-                        str(rv.get("title", "")),
-                        str(rv.get("text", "")),
-                        str(rv.get("userName", "")),
-                    ]).lower()
-                    ok = ok and (search_text.lower() in blob)
-                if ok:
-                    filt.append(rv)
-                if len(filt) >= max_rows:
-                    break
-
-            if not filt:
-                st.caption("No reviews match your filters")
-                return
-
-            df = pd.DataFrame([
-                {
-                    "date": rv.get("date"),
-                    "rating": rv.get("rating"),
-                    "title": rv.get("title"),
-                    "user": rv.get("userName"),
-                    "text": rv.get("text"),
-                    "url": rv.get("url"),
-                    "variation": ", ".join(rv.get("variationList", []) or []),
-                }
-                for rv in filt
-            ])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-        with tabs[3]:
-            render_reviews("US Reviews", data.get("reviews", []))
-
-        with tabs[4]:
-            render_reviews("Global Reviews", data.get("globalReviews", []))
-
-        with tabs[5]:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    label="Download raw JSON",
-                    data=json.dumps(data, indent=2),
-                    file_name=f"{asin or 'product'}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
-            with c2:
-                df = flatten_product_for_csv(data)
-                st.download_button(
-                    label="Download flattened CSV",
-                    data=df.to_csv(index=False),
-                    file_name=f"{asin or 'product'}_flattened.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-# ---------------------------- Bulk Mode ---------------------------
-else:
-    st.markdown("### Bulk fetch")
-    urls_blob = st.text_area(
-        "Paste Amazon product URLs (one per line)",
-        height=200,
-        placeholder=(
-            "https://www.amazon.com/dp/B07TCHYBSK?psc=1\n"
-            "https://www.amazon.com/dp/B0B17BYJ5R?psc=1"
-        ),
-    )
-    ensure_psc_bulk = st.checkbox("Ensure ?psc=1 on all", value=True)
-    cache_ok = st.checkbox("Use cache", value=True)
-    run_bulk = st.button("Fetch All", type="primary")
-
-    if run_bulk:
-        if not api_key:
-            st.error("Please enter your Axesso API key in the sidebar.")
-            st.stop()
-
-        if not cache_ok:
-            fetch_product.clear()
-
-        raw_urls = [u.strip() for u in urls_blob.splitlines() if u.strip()]
-        if not raw_urls:
-            st.warning("Please paste at least one URL.")
-            st.stop()
-
-        results: List[Dict[str, Any]] = []
-        errors: List[Tuple[str, str]] = []
-
-        progress = st.progress(0)
-        status = st.empty()
-
-        for i, u in enumerate(raw_urls, start=1):
-            url = normalize_amazon_url(u)
-            if ensure_psc_bulk:
-                url = add_psc_param(url)
-
-            status.info(f"Fetching {i}/{len(raw_urls)}: {url}")
-            data, err = fetch_product(url, api_key)
-            if err:
-                errors.append((url, err))
-            else:
-                results.append(data)
-
-            progress.progress(i / len(raw_urls))
-            time.sleep(THROTTLE_SECONDS)
-
-        status.empty()
-
-        if results:
-            # Show a compact table of key fields across products
-            table_rows = []
-            for r in results:
-                table_rows.append({
-                    "asin": r.get("asin"),
-                    "title": r.get("productTitle"),
-                    "price": r.get("price"),
-                    "rating": r.get("productRating"),
-                    "reviews": r.get("countReview"),
-                    "soldBy": r.get("soldBy"),
-                    "fulfilledBy": r.get("fulfilledBy"),
-                })
-            st.markdown("#### Summary")
-            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-            # Bulk downloads
-            colj, colc = st.columns(2)
-            with colj:
-                st.download_button(
-                    label="Download all (JSON)",
-                    data=json.dumps(results, indent=2),
-                    file_name="axesso_products.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
-            with colc:
-                # Concatenate flattened frames
-                frames = [flatten_product_for_csv(r) for r in results]
-                csv_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-                st.download_button(
-                    label="Download flattened CSV",
-                    data=csv_df.to_csv(index=False),
-                    file_name="axesso_products_flattened.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-        if errors:
-            st.markdown("#### Errors")
-            for bad_url, msg in errors:
-                st.error(f"{bad_url}\n\n{msg}")
-
-# ---------------------------- Footer ------------------------------
 st.divider()
-st.caption(
-    "Built with ❤️ using Streamlit + Axesso. Note: Respect Axesso rate limits and your plan's quotas.")
+st.caption("Scrape responsibly. **Full reviews** use Apify's Axesso Actor and can return thousands of reviews depending on product and filters.")
+
 
 
 
