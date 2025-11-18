@@ -1,19 +1,22 @@
 # streamlit_app.py
 # Streamlit Amazon Product Scraper using Axesso Amazon API
 # --------------------------------------------------------
-# New (bulk+dedupe upgrade)
-# - Works with URLs; optional ASIN extraction for dedupe
-# - Bulk mode: input ASINs/URLs mixed; normalize + (optional) dedupe by ASIN
-# - Adjustable throttle between calls for large pulls
-# - Merged Reviews export across all products with robust de-duplication
-# - Duplicate review removal by `reviewId` (preferred) or fallback heuristics
-# - Progress, error log, and summary stats
-# - Everything else from v1: product cards, filters, JSON/CSV exports
+# Features
+# - Enter a single Amazon product URL (we auto-append ?psc=1 when missing)
+# - Optional bulk mode: paste multiple URLs (one per line)
+# - Secure API key input (sidebar); supports Streamlit Secrets if set
+# - Product card with title, price, rating, seller, fulfillment, availability
+# - Image gallery, features, about section, product details
+# - Variations table (if present)
+# - Reviews viewer with filters (rating, US-only/global toggle, search)
+# - Download raw JSON and flattened CSV
+# - Basic caching + rate limiting + graceful error handling
 #
-# HOW TO USE
-# 1) Put your Axesso API key in the sidebar (or .streamlit/secrets.toml)
-# 2) Single URL tab for one-off checks
-# 3) Bulk tab for big lists (hundreds+). Use dedupe and exports.
+# How to provide your API key (choose one):
+# 1) In the UI: Sidebar → "Axesso API Key" (masked input)
+# 2) In ".streamlit/secrets.toml":
+#    [axesso]\nAPI_KEY = "YOUR_KEY"
+# --------------------------------------------------------
 
 from __future__ import annotations
 import json
@@ -35,7 +38,7 @@ st.set_page_config(
 API_ENDPOINT = "https://api.axesso.de/amz/amazon-lookup-product"
 DEFAULT_AMZ_URL = "https://www.amazon.com/dp/B07TCHYBSK?psc=1"
 REQUEST_TIMEOUT = 30  # seconds
-DEFAULT_THROTTLE_SECONDS = 1.0  # polite default in bulk mode
+THROTTLE_SECONDS = 1.0  # be nice to the API in bulk mode
 
 # --------------------------- Utilities ----------------------------
 
@@ -52,11 +55,12 @@ def add_psc_param(url: str) -> str:
         return url
     if "psc=" in url:
         return url
+    # If URL already has query params, append with &; else use ?
     return url + ("&psc=1" if ("?" in url) else "?psc=1")
 
 
 def normalize_amazon_url(url: str) -> str:
-    url = (url or "").strip()
+    url = url.strip()
     if not url:
         return url
     # Accept partials like /dp/ASIN and prefix with https://www.amazon.com
@@ -65,22 +69,10 @@ def normalize_amazon_url(url: str) -> str:
     # Ensure https scheme for consistency
     if url.startswith("http://"):
         url = "https://" + url[len("http://"):]
+    # Quick sanity check for amazon host (not strict – Amazon has many TLDs)
+    if "amazon." not in url:
+        return url  # let API decide; we still show a warning in UI
     return url
-
-
-def extract_asin(text: str) -> Optional[str]:
-    """Best-effort ASIN extraction from line or URL."""
-    if not text:
-        return None
-    # direct 10-char token
-    m = re.search(r"(?<![A-Z0-9])([A-Z0-9]{10})(?![A-Z0-9])", text, flags=re.I)
-    if m:
-        return m.group(1).upper()
-    # URL patterns
-    m = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", text, flags=re.I)
-    if m:
-        return m.group(1).upper()
-    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -94,6 +86,7 @@ def fetch_product(url: str, api_key: str) -> Tuple[Optional[Dict[str, Any]], Opt
         return None, f"Network error: {e}"
 
     if resp.status_code != 200:
+        # Attempt to surface API error payload when available
         try:
             err_payload = resp.json()
         except Exception:
@@ -105,6 +98,7 @@ def fetch_product(url: str, api_key: str) -> Tuple[Optional[Dict[str, Any]], Opt
     except Exception as e:
         return None, f"Failed to parse JSON: {e}"
 
+    # Axesso returns 200 even for some non-found cases; inspect responseStatus/message
     status = str(data.get("responseStatus", "")).upper()
     if "NOT_FOUND" in status:
         return None, data.get("responseMessage") or "Product not found"
@@ -147,6 +141,7 @@ def flatten_product_for_csv(data: Dict[str, Any]) -> pd.DataFrame:
         r.update(row_extra)
         rows.append(r)
 
+    # If there are reviews, create one row per review; else add a single row
     reviews = data.get("reviews") or data.get("globalReviews") or []
     if reviews:
         for rv in reviews:
@@ -157,7 +152,6 @@ def flatten_product_for_csv(data: Dict[str, Any]) -> pd.DataFrame:
                 "reviewDate": rv.get("date"),
                 "reviewUser": rv.get("userName"),
                 "reviewUrl": rv.get("url"),
-                "reviewId": rv.get("reviewId"),
                 "reviewLocale": json.dumps(rv.get("locale")) if isinstance(rv.get("locale"), dict) else rv.get("locale"),
             })
     else:
@@ -169,7 +163,7 @@ def flatten_product_for_csv(data: Dict[str, Any]) -> pd.DataFrame:
 # ------------------------------ UI -------------------------------
 
 st.title("🛒 Amazon Product Scraper (Axesso)")
-st.caption("Enter URLs (or ASINs in bulk). We'll call the Axesso API and render the results. For big lists, see the Bulk tab.")
+st.caption("Enter an Amazon product URL. We'll call the Axesso API and render the results.")
 
 with st.sidebar:
     st.header("Settings")
@@ -188,7 +182,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Mode")
-    mode = st.radio("Select mode", ["Single URL", "Bulk"], index=0, horizontal=True)
+    mode = st.radio("Select mode", ["Single URL", "Bulk URLs"], index=0, horizontal=True)
 
 # --------------------------- Single URL ---------------------------
 if mode == "Single URL":
@@ -207,7 +201,7 @@ if mode == "Single URL":
 
     with col_right:
         st.info(
-            "**Tips**\n\n- Works for most amazon.* domains.\n- We'll auto-add `?psc=1` unless you uncheck it.\n- Use the Reviews tabs to sift feedback.")
+            "**Tips**\n\n- Works for most amazon.* domains.\n- We'll auto-add `?psc=1` unless you uncheck it.\n- Use the reviews filters below to sift through feedback.")
 
     if run:
         if not api_key:
@@ -232,6 +226,7 @@ if mode == "Single URL":
             st.stop()
 
         # ---------------------- Rendering ----------------------
+        # Header card
         title = data.get("productTitle") or "(No title)"
         rating_text = data.get("productRating")
         rating_value = stars_from_text(rating_text)
@@ -415,29 +410,17 @@ if mode == "Single URL":
 
 # ---------------------------- Bulk Mode ---------------------------
 else:
-    st.markdown("### Bulk fetch (ASINs or URLs)")
+    st.markdown("### Bulk fetch")
     urls_blob = st.text_area(
-        "Paste ASINs or Amazon product URLs (one per line)",
-        height=240,
+        "Paste Amazon product URLs (one per line)",
+        height=200,
         placeholder=(
-            "B07TCHYBSK\n"
+            "https://www.amazon.com/dp/B07TCHYBSK?psc=1\n"
             "https://www.amazon.com/dp/B0B17BYJ5R?psc=1"
         ),
     )
-    c1, c2, c3 = st.columns([1,1,1])
-    with c1:
-        ensure_psc_bulk = st.checkbox("Ensure ?psc=1", value=True)
-    with c2:
-        dedupe_by_asin = st.checkbox("De-duplicate inputs by ASIN", value=True, help="Skips repeated ASINs before fetching")
-    with c3:
-        throttle = st.number_input("Throttle (sec)", min_value=0.0, max_value=10.0, value=DEFAULT_THROTTLE_SECONDS, step=0.1)
-
-    c4, c5 = st.columns(2)
-    with c4:
-        cache_ok = st.checkbox("Use cache", value=True)
-    with c5:
-        max_items = st.number_input("Max items to fetch (0 = no cap)", min_value=0, value=0, step=50)
-
+    ensure_psc_bulk = st.checkbox("Ensure ?psc=1 on all", value=True)
+    cache_ok = st.checkbox("Use cache", value=True)
     run_bulk = st.button("Fetch All", type="primary")
 
     if run_bulk:
@@ -448,30 +431,9 @@ else:
         if not cache_ok:
             fetch_product.clear()
 
-        raw_lines = [u.strip() for u in urls_blob.splitlines() if u.strip()]
-        if not raw_lines:
-            st.warning("Please paste at least one ASIN or URL.")
-            st.stop()
-
-        # Normalize lines -> url + asin (best effort)
-        items: List[Tuple[str, Optional[str]]] = []
-        seen_asins: set[str] = set()
-        for line in raw_lines:
-            asin_guess = extract_asin(line)
-            url = normalize_amazon_url(line)
-            if ensure_psc_bulk:
-                url = add_psc_param(url)
-            if dedupe_by_asin and asin_guess:
-                if asin_guess in seen_asins:
-                    continue
-                seen_asins.add(asin_guess)
-            items.append((url, asin_guess))
-
-        if max_items and max_items > 0:
-            items = items[: max_items]
-
-        if not items:
-            st.warning("No items to fetch after de-duplication.")
+        raw_urls = [u.strip() for u in urls_blob.splitlines() if u.strip()]
+        if not raw_urls:
+            st.warning("Please paste at least one URL.")
             st.stop()
 
         results: List[Dict[str, Any]] = []
@@ -480,24 +442,26 @@ else:
         progress = st.progress(0)
         status = st.empty()
 
-        for i, (target_url, maybe_asin) in enumerate(items, start=1):
-            status.info(f"Fetching {i}/{len(items)}: {target_url}")
-            data, err = fetch_product(target_url, api_key)
+        for i, u in enumerate(raw_urls, start=1):
+            url = normalize_amazon_url(u)
+            if ensure_psc_bulk:
+                url = add_psc_param(url)
+
+            status.info(f"Fetching {i}/{len(raw_urls)}: {url}")
+            data, err = fetch_product(url, api_key)
             if err:
-                errors.append((target_url, err))
+                errors.append((url, err))
             else:
                 results.append(data)
-            progress.progress(i / len(items))
-            if throttle:
-                time.sleep(float(throttle))
+
+            progress.progress(i / len(raw_urls))
+            time.sleep(THROTTLE_SECONDS)
 
         status.empty()
 
-        # ---------------- Results summary -----------------
         if results:
+            # Show a compact table of key fields across products
             table_rows = []
-            all_reviews: List[Dict[str, Any]] = []
-
             for r in results:
                 table_rows.append({
                     "asin": r.get("asin"),
@@ -508,22 +472,11 @@ else:
                     "soldBy": r.get("soldBy"),
                     "fulfilledBy": r.get("fulfilledBy"),
                 })
-                # collect reviews (US + Global) with ASIN tag
-                for rv in (r.get("reviews") or []):
-                    rr = rv.copy()
-                    rr["asin"] = r.get("asin")
-                    all_reviews.append(rr)
-                for rv in (r.get("globalReviews") or []):
-                    rr = rv.copy()
-                    rr["asin"] = r.get("asin")
-                    all_reviews.append(rr)
+            st.markdown("#### Summary")
+            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
-            st.markdown("#### Summary (unique ASINs)")
-            df_summary = pd.DataFrame(table_rows).drop_duplicates(subset=["asin"], keep="first")
-            st.dataframe(df_summary, use_container_width=True, hide_index=True)
-
-            # ---------------- Exports -----------------
-            colj, colc, cold = st.columns(3)
+            # Bulk downloads
+            colj, colc = st.columns(2)
             with colj:
                 st.download_button(
                     label="Download all (JSON)",
@@ -533,48 +486,27 @@ else:
                     use_container_width=True,
                 )
             with colc:
+                # Concatenate flattened frames
                 frames = [flatten_product_for_csv(r) for r in results]
                 csv_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 st.download_button(
-                    label="Download flattened CSV (per product/review)",
+                    label="Download flattened CSV",
                     data=csv_df.to_csv(index=False),
                     file_name="axesso_products_flattened.csv",
                     mime="text/csv",
                     use_container_width=True,
                 )
-            with cold:
-                # Build merged reviews DF and de-duplicate
-                if all_reviews:
-                    df_reviews = pd.DataFrame(all_reviews)
-                    # preferred exact key
-                    if "reviewId" in df_reviews.columns:
-                        df_reviews_dedup = df_reviews.drop_duplicates(subset=["reviewId"], keep="first")
-                    else:
-                        # heuristic: asin + userName + date + first 80 chars of text
-                        tmp = df_reviews.copy()
-                        tmp["_text80"] = tmp.get("text", "").astype(str).str.slice(0, 80)
-                        df_reviews_dedup = tmp.drop_duplicates(subset=["asin", "userName", "date", "_text80"], keep="first").drop(columns=["_text80"], errors="ignore")
-
-                    st.caption(f"Merged reviews: {len(df_reviews_dedup)} unique from {len(df_reviews)} total")
-                    st.download_button(
-                        label="Download merged reviews (deduped)",
-                        data=df_reviews_dedup.to_csv(index=False),
-                        file_name="axesso_merged_reviews_dedup.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                else:
-                    st.caption("No reviews found across fetched products")
 
         if errors:
             st.markdown("#### Errors")
-            for bad_target, msg in errors:
-                st.error(f"{bad_target}\n\n{msg}")
+            for bad_url, msg in errors:
+                st.error(f"{bad_url}\n\n{msg}")
 
 # ---------------------------- Footer ------------------------------
 st.divider()
 st.caption(
-    "Built with ❤️ using Streamlit + Axesso. Tips: Use input de-duplication, set a small throttle for reliability, and export merged reviews to avoid duplicates.")
+    "Built with ❤️ using Streamlit + Axesso. Note: Respect Axesso rate limits and your plan's quotas.")
+
 
 
 
