@@ -278,7 +278,7 @@ st.markdown("### 1) Scrape Queue (Products)")
 queue_text = st.text_area(
     "Paste ASINs or Amazon product URLs (one per line)",
     height=160,
-    placeholder=("B07TCHYBSK
+    placeholder=("B07TCHYBSK")
 https://www.amazon.com/dp/B0B17BYJ5R?psc=1"),
 )
 col_a, col_b = st.columns([1,1])
