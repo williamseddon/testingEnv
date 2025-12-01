@@ -74,6 +74,7 @@ def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
 
 @st.cache_resource
 def get_client(api_key: str):
+    """Cached OpenAI client so we don't re-init on every rerun."""
     return OpenAI(api_key=api_key)
 
 
@@ -141,7 +142,7 @@ api_key = api_key_input or default_api_key
 model_choice = st.sidebar.selectbox(
     "Model",
     ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"],
-    index=1,
+    index=0,  # default to the faster mini model
 )
 
 # Optional: helper to design prompts with AI
@@ -150,7 +151,7 @@ use_prompt_assistant = st.sidebar.checkbox("✨ Use AI to help design a custom p
 
 
 # ---------------------------------------------------------
-# Step 1 – File Upload
+# 1️⃣ File Upload
 # ---------------------------------------------------------
 st.header("1️⃣ Upload Your File")
 uploaded_file = st.file_uploader("Upload an Excel or CSV file", type=["xlsx", "csv"])
@@ -172,7 +173,7 @@ if df.empty:
     st.stop()
 
 # ---------------------------------------------------------
-# Step 2 – Column Selection (Flexible, not hard-coded)
+# 2️⃣ Column Selection
 # ---------------------------------------------------------
 st.header("2️⃣ Configure Columns")
 
@@ -204,7 +205,7 @@ st.caption(
 )
 
 # ---------------------------------------------------------
-# Step 3 – Filters (with pre-populated values)
+# 3️⃣ Filters (with pre-populated values)
 # ---------------------------------------------------------
 st.header("3️⃣ Filter Rows (Optional)")
 
@@ -268,9 +269,9 @@ if filtered_df.empty:
     st.stop()
 
 # ---------------------------------------------------------
-# Step 4 – Preset Tasks (user-selectable prompts)
+# 4️⃣ Preset Tasks / Prompts
 # ---------------------------------------------------------
-st.header("4️⃣ Choose Tasks / Prompts")
+st.header("4️⃣ Choose Tasks / Preset Prompts")
 
 st.subheader("Preset LLM Tasks (Recommended)")
 
@@ -299,12 +300,26 @@ default_symptom_prompt = (
     "Return ONLY a JSON object that matches the given schema."
 )
 
+default_error_indicator_prompt = (
+    "You are given TEXT, a summary or transcript snippet of a customer support call.\n\n"
+    "Task: Determine whether the customer mentions any explicit error code, flashing lights, "
+    "blinking LEDs, or on-screen error messages / icons.\n"
+    "If so, return a short phrase that captures the key indicator "
+    "(for example: 'E02 error code', 'red light flashing', 'all lights blinking', "
+    "'filter icon flashing').\n"
+    "If there is no such indicator, return 'none'.\n\n"
+    "Return ONLY a JSON object that matches the given schema."
+)
+
 # System prompts
 purchase_task_system = (
     "You are an expert at extracting structured information from noisy customer support text."
 )
 symptom_task_system = (
     "You are an expert quality engineer classifying customer calls by technical symptom."
+)
+error_indicator_system = (
+    "You are an expert at extracting error codes and UI/LED indicators from customer complaints."
 )
 
 # User explicitly selects which presets to use
@@ -334,6 +349,20 @@ if use_symptom_preset:
         value=default_symptom_prompt,
         height=200,
         key="symptom_preset_prompt",
+    )
+
+use_error_indicator_preset = st.checkbox(
+    "💡 Use preset: Detect error code / flashing UI indicator "
+    "(→ column: error_indicator)"
+)
+
+error_indicator_template = None
+if use_error_indicator_preset:
+    error_indicator_template = st.text_area(
+        "Error indicator preset prompt (you can edit this):",
+        value=default_error_indicator_prompt,
+        height=220,
+        key="error_indicator_preset_prompt",
     )
 
 # Structured JSON schemas
@@ -368,8 +397,23 @@ symptom_schema = {
     "additionalProperties": False,
 }
 
+error_indicator_schema = {
+    "type": "object",
+    "properties": {
+        "error_indicator": {
+            "type": "string",
+            "description": (
+                "Short description of any error code, flashing light, or UI indicator mentioned. "
+                "Use 'none' if not mentioned."
+            ),
+        }
+    },
+    "required": ["error_indicator"],
+    "additionalProperties": False,
+}
+
 # ---------------------------------------------------------
-# Step 5 – Custom Prompts (with examples)
+# 5️⃣ Custom Prompts (with examples)
 # ---------------------------------------------------------
 st.subheader("Custom LLM Tasks")
 
@@ -454,93 +498,148 @@ if use_prompt_assistant and text_col:
                 st.error(f"Error generating prompt suggestion: {e}")
 
 # ---------------------------------------------------------
-# Step 6 – Run Processing
+# 6️⃣ Performance Settings (for faster runs)
 # ---------------------------------------------------------
-st.header("5️⃣ Run LLM Processing")
+st.header("5️⃣ Performance Settings")
+
+max_rows_default = len(filtered_df)
+max_rows = st.number_input(
+    "Max rows to process (for speed tuning)",
+    min_value=1,
+    max_value=len(filtered_df),
+    value=max_rows_default,
+    step=1,
+)
+
+skip_short = st.checkbox(
+    "Skip rows where text length is very short (≤ 10 characters)",
+    value=True,
+    help="This can avoid wasting LLM calls on empty or trivial rows.",
+)
+
+# Precompute which output columns might be written (for skip logic)
+active_output_cols = []
+if use_purchase_preset:
+    active_output_cols.append("purchase_date")
+if use_symptom_preset:
+    active_output_cols.append("symptom")
+if use_error_indicator_preset:
+    active_output_cols.append("error_indicator")
+active_output_cols.extend(custom_output_cols)
+
+# ---------------------------------------------------------
+# 7️⃣ Run LLM Processing
+# ---------------------------------------------------------
+st.header("6️⃣ Run LLM Processing")
 
 if st.button("🚀 Run on filtered rows"):
     if not api_key:
         st.error("No API key available. Add OPENAI_API_KEY to secrets or provide an override.")
     else:
-        tasks_selected = any([use_purchase_preset, use_symptom_preset, use_custom])
+        tasks_selected = any([use_purchase_preset, use_symptom_preset, use_error_indicator_preset, use_custom])
         if not tasks_selected:
             st.error("Select at least one preset task or add a custom prompt.")
         else:
             client = get_client(api_key)
             results_df = df.copy()
 
-            total_rows = len(filtered_df)
+            rows_to_process = filtered_df.head(int(max_rows))
+            total_rows = len(rows_to_process)
             progress = st.progress(0.0)
             status = st.empty()
 
-            for i, (idx, row) in enumerate(filtered_df.iterrows(), start=1):
+            for i, (idx, row) in enumerate(rows_to_process.iterrows(), start=1):
                 text_val = str(row.get(text_col, ""))
                 call_date_val = str(row.get(call_date_col, "")) if call_date_col else ""
                 inferred_hint = infer_year_from_relative(text_val, call_date_val) if call_date_col else None
 
-                # 1) Purchase date preset (structured JSON)
-                if use_purchase_preset and purchase_task_template:
-                    user_prompt = (
-                        purchase_task_template
-                        + f"\n\nTEXT:\n{text_val}\n\n"
-                        + f"CALL_DATE: {call_date_val}\n"
-                        + f"INFERRED_RELATIVE_DATE_HINT: {inferred_hint}"
-                    )
-
-                    try:
-                        data = call_llm_json(
-                            client,
-                            model_choice,
-                            purchase_task_system,
-                            user_prompt,
-                            schema_name="purchase_date_extraction",
-                            schema=purchase_schema,
+                # Optionally skip very short text rows to save LLM calls
+                if skip_short and len(text_val.strip()) <= 10:
+                    for col in active_output_cols:
+                        results_df.loc[idx, col] = ""
+                else:
+                    # 1) Purchase date preset (structured JSON)
+                    if use_purchase_preset and purchase_task_template:
+                        user_prompt = (
+                            purchase_task_template
+                            + f"\n\nTEXT:\n{text_val}\n\n"
+                            + f"CALL_DATE: {call_date_val}\n"
+                            + f"INFERRED_RELATIVE_DATE_HINT: {inferred_hint}"
                         )
-                        purchase_date_str = None
-                        if isinstance(data, dict):
-                            purchase_date_str = data.get("purchase_date") or data.get("_raw")
-                        results_df.loc[idx, "purchase_date"] = purchase_date_str
-                    except Exception as e:
-                        results_df.loc[idx, "purchase_date"] = f"ERROR: {e}"
 
-                # 2) Symptom preset (structured JSON)
-                if use_symptom_preset and symptom_task_template:
-                    user_prompt = symptom_task_template + f"\n\nTEXT:\n{text_val}\n"
-                    try:
-                        data = call_llm_json(
-                            client,
-                            model_choice,
-                            symptom_task_system,
-                            user_prompt,
-                            schema_name="symptom_extraction",
-                            schema=symptom_schema,
+                        try:
+                            data = call_llm_json(
+                                client,
+                                model_choice,
+                                purchase_task_system,
+                                user_prompt,
+                                schema_name="purchase_date_extraction",
+                                schema=purchase_schema,
+                            )
+                            purchase_date_str = None
+                            if isinstance(data, dict):
+                                purchase_date_str = data.get("purchase_date") or data.get("_raw")
+                            results_df.loc[idx, "purchase_date"] = purchase_date_str
+                        except Exception as e:
+                            results_df.loc[idx, "purchase_date"] = f"ERROR: {e}"
+
+                    # 2) Symptom preset (structured JSON)
+                    if use_symptom_preset and symptom_task_template:
+                        user_prompt = symptom_task_template + f"\n\nTEXT:\n{text_val}\n"
+                        try:
+                            data = call_llm_json(
+                                client,
+                                model_choice,
+                                symptom_task_system,
+                                user_prompt,
+                                schema_name="symptom_extraction",
+                                schema=symptom_schema,
+                            )
+                            symptom_val = None
+                            if isinstance(data, dict):
+                                symptom_val = data.get("symptom") or data.get("_raw")
+                            results_df.loc[idx, "symptom"] = symptom_val
+                        except Exception as e:
+                            results_df.loc[idx, "symptom"] = f"ERROR: {e}"
+
+                    # 3) Error indicator preset (structured JSON)
+                    if use_error_indicator_preset and error_indicator_template:
+                        user_prompt = error_indicator_template + f"\n\nTEXT:\n{text_val}\n"
+                        try:
+                            data = call_llm_json(
+                                client,
+                                model_choice,
+                                error_indicator_system,
+                                user_prompt,
+                                schema_name="error_indicator_extraction",
+                                schema=error_indicator_schema,
+                            )
+                            indicator_val = None
+                            if isinstance(data, dict):
+                                indicator_val = data.get("error_indicator") or data.get("_raw")
+                            results_df.loc[idx, "error_indicator"] = indicator_val
+                        except Exception as e:
+                            results_df.loc[idx, "error_indicator"] = f"ERROR: {e}"
+
+                    # 4) Custom free-text prompts
+                    for p, out_col in zip(custom_prompts, custom_output_cols):
+                        full_prompt = (
+                            f"TEXT: {text_val}\n"
+                            f"CALL_DATE: {call_date_val}\n\n"
+                            f"TASK: {p}"
                         )
-                        symptom_val = None
-                        if isinstance(data, dict):
-                            symptom_val = data.get("symptom") or data.get("_raw")
-                        results_df.loc[idx, "symptom"] = symptom_val
-                    except Exception as e:
-                        results_df.loc[idx, "symptom"] = f"ERROR: {e}"
+                        try:
+                            out = call_llm_free_text(
+                                client,
+                                model_choice,
+                                system_prompt="You are a helpful assistant analyzing customer support data.",
+                                user_prompt=full_prompt,
+                            )
+                        except Exception as e:
+                            out = f"ERROR: {e}"
+                        results_df.loc[idx, out_col] = out
 
-                # 3) Custom free-text prompts
-                for p, out_col in zip(custom_prompts, custom_output_cols):
-                    full_prompt = (
-                        f"TEXT: {text_val}\n"
-                        f"CALL_DATE: {call_date_val}\n\n"
-                        f"TASK: {p}"
-                    )
-                    try:
-                        out = call_llm_free_text(
-                            client,
-                            model_choice,
-                            system_prompt="You are a helpful assistant analyzing customer support data.",
-                            user_prompt=full_prompt,
-                        )
-                    except Exception as e:
-                        out = f"ERROR: {e}"
-                    results_df.loc[idx, out_col] = out
-
-                progress.progress(i / total_rows)
+                progress.progress(i / float(total_rows))
                 status.write(f"Processed {i} / {total_rows} rows...")
 
             # After loop: compute ownership period in days if we have purchase_date + call_date_col
@@ -562,9 +661,9 @@ if st.button("🚀 Run on filtered rows"):
             st.success("LLM processing complete. Preview, analyze, and download below.")
 
             # ---------------------------------------------------------
-            # Step 7 – Quick Analysis of New Data
+            # 8️⃣ Quick Analysis of New Data
             # ---------------------------------------------------------
-            st.header("6️⃣ Quick Analysis of New Data")
+            st.header("7️⃣ Quick Analysis of New Data")
 
             st.subheader("Preview of Enriched Dataset")
             st.dataframe(results_df.head())
@@ -599,6 +698,19 @@ if st.button("🚀 Run on filtered rows"):
                     st.table(top_symptoms.to_frame("count"))
                 else:
                     st.info("No non-empty symptom values to analyze.")
+
+            # Error indicator distribution
+            if "error_indicator" in results_df.columns:
+                st.subheader("Error Indicators (codes / flashing lights / UI)")
+                ei_series = results_df["error_indicator"].dropna().astype(str).str.strip()
+                ei_series = ei_series[ei_series != ""]
+                if not ei_series.empty:
+                    top_ei = ei_series.value_counts().head(15)
+                    st.write("Top 15 indicators:")
+                    st.bar_chart(top_ei)
+                    st.table(top_ei.to_frame("count"))
+                else:
+                    st.info("No non-empty error_indicator values to analyze.")
 
             # Purchase date by year
             if "purchase_date" in results_df.columns:
@@ -636,4 +748,5 @@ if st.button("🚀 Run on filtered rows"):
                 file_name="processed_output.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
 
