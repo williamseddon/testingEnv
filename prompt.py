@@ -381,7 +381,6 @@ with st.expander("⚡ Big-file loader options (CSV)", expanded=False):
         use_pyarrow = st.checkbox("Use pyarrow CSV engine (faster if available)", value=True)
         # Allow header-only to pick columns, then re-load with usecols
         if st.checkbox("Load only selected columns for CSV"):
-            # Read header
             import io
             hdr_df = pd.read_csv(io.BytesIO(file_bytes), nrows=0)
             chosen_cols = st.multiselect("Columns to load", options=list(hdr_df.columns), default=list(hdr_df.columns))
@@ -581,7 +580,7 @@ model_prompt = st.text_area(
 ) if use_modelnum else None
 
 # =========================================================
-# 5) Custom Prompts
+# 5) Custom Prompts + AI Prompt Assistant
 # =========================================================
 st.header("5️⃣ Custom Tasks")
 use_custom = st.checkbox("➕ Enable custom prompts")
@@ -609,6 +608,57 @@ if use_custom:
         if p.strip() and o.strip():
             custom_prompts.append(p.strip())
             custom_outcols.append(o.strip())
+
+# ---- AI Prompt Assistant (for custom prompts or even presets) ----
+st.subheader("✨ AI Prompt Assistant (optional)")
+use_prompt_assistant = st.checkbox("Use AI to suggest a prompt for you")
+if use_prompt_assistant:
+    desc = st.text_area(
+        "Describe what you want the model to extract/classify:",
+        placeholder="Example: Classify each call into airflow, power, overheating, noise, cosmetic, or other...",
+        key="prompt_assistant_desc",
+    )
+    sample_n = st.slider(
+        "How many sample rows from the selected text column to show the AI",
+        min_value=1,
+        max_value=10,
+        value=5,
+        key="prompt_assistant_sample_n",
+    )
+    if st.button("Generate suggested prompt", key="prompt_assistant_btn"):
+        if not api_key:
+            st.error("Add your API key (secrets or override) to use the AI prompt assistant.")
+        else:
+            client = get_client(api_key)
+            series = filtered_df[text_col].dropna().astype(str)
+            if series.empty:
+                st.warning("No non-empty values in the selected text column to show as examples.")
+            else:
+                if len(series) > sample_n:
+                    examples = series.sample(sample_n, random_state=42)
+                else:
+                    examples = series
+                example_block = "\n".join(f"- {normalize_text(t)[:400]}" for t in examples)
+
+                system_msg = "You are an expert prompt engineer for LLMs analyzing customer support text row-by-row."
+                user_msg = (
+                    f"The analyst wants the model to do the following:\n{desc}\n\n"
+                    f"Here are sample values from the text column '{text_col}':\n{example_block}\n\n"
+                    "Write ONE reusable prompt they can apply row-by-row. "
+                    "Do not include examples in the output, just the final prompt."
+                )
+                try:
+                    suggestion = call_llm_text(
+                        client,
+                        model_choice,
+                        system_msg,
+                        user_msg,
+                        limiter=None,
+                    )
+                    st.success("Suggested prompt (you can copy-paste this into a custom prompt or preset):")
+                    st.code(suggestion)
+                except Exception as e:
+                    st.error(f"Error generating prompt suggestion: {e}")
 
 # =========================================================
 # 6) Throughput & Guardrails
@@ -933,3 +983,4 @@ else:
         file_name="processed_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
