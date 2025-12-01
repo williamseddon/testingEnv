@@ -14,7 +14,7 @@ from threading import Lock
 # App Config
 # =========================================================
 st.set_page_config(page_title="AI QE Assistant — High Throughput", layout="wide")
-st.title("🦈📊 AI QE Assistant — High‑Throughput, Big‑File Friendly")
+st.title("🦈📊 AI QE Assistant — High-Throughput, Big-File Friendly")
 
 RUN_STAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -73,7 +73,9 @@ MONTHS = [
 MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec"]
 
 def infer_year_from_relative(text: str, call_date_str: str) -> Optional[str]:
-    """If text says 'last September', infer YYYY-MM-01 using call_date year - 1."""
+    """
+    If text says 'last September', infer YYYY-MM-15 using call_date year - 1.
+    """
     if not isinstance(text, str) or not text:
         return None
     if not isinstance(call_date_str, str) or not call_date_str:
@@ -87,11 +89,11 @@ def infer_year_from_relative(text: str, call_date_str: str) -> Optional[str]:
     t = text.lower()
     for i, m in enumerate(MONTHS, start=1):
         if f"last {m}" in t:
-            return f"{call_date.year - 1}-{i:02d}-01"
+            return f"{call_date.year - 1}-{i:02d}-15"
     for i, m in enumerate(MONTH_ABBR, start=1):
         if f"last {m}" in t:
             month_index = min(i, 12)
-            return f"{call_date.year - 1}-{month_index:02d}-01"
+            return f"{call_date.year - 1}-{month_index:02d}-15"
     return None
 
 DATE_PATTERNS = [
@@ -114,7 +116,10 @@ DATE_FORMATS = [
 ]
 
 def try_parse_date(text: str) -> Optional[str]:
-    """Parse first explicit date found into YYYY-MM-DD; month-year → day=01."""
+    """
+    Parse first explicit date found into YYYY-MM-DD.
+    For month+year (no day), assume day=15 to approximate mid-month.
+    """
     if not isinstance(text, str) or not text:
         return None
     for pat in DATE_PATTERNS:
@@ -125,10 +130,83 @@ def try_parse_date(text: str) -> Optional[str]:
             for fmt in DATE_FORMATS:
                 try:
                     dt = datetime.strptime(chunk, fmt)
+                    # For month-year patterns, bump day to 15 instead of 1
+                    if fmt in ("%B %Y", "%b %Y"):
+                        dt = dt.replace(day=15)
                     return dt.strftime("%Y-%m-%d")
                 except Exception:
                     continue
     return None
+
+def infer_month_only_date(text: str, call_date_str: Optional[str]) -> Optional[str]:
+    """
+    If text has a bare month name (e.g. 'in October') with no day/year,
+    assume same year as call_date and day=15.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    if not isinstance(call_date_str, str) or not call_date_str:
+        return None
+    try:
+        call_year = datetime.strptime(call_date_str.split()[0], "%Y-%m-%d").year
+    except Exception:
+        return None
+    t = text.lower()
+    for i, m in enumerate(MONTHS, start=1):
+        if re.search(rf"\b{m}\b", t):
+            return f"{call_year}-{i:02d}-15"
+    for i, m in enumerate(MONTH_ABBR, start=1):
+        if re.search(rf"\b{m}\b", t):
+            month_index = min(i, 12)
+            return f"{call_year}-{month_index:02d}-15"
+    return None
+
+def purchase_date_heuristic(text: str, call_date_str: Optional[str]) -> Optional[str]:
+    """
+    Heuristic for purchase date:
+    1) explicit date with day,
+    2) 'Month YYYY' → YYYY-MM-15,
+    3) 'last <month>' → previous year, month, day=15,
+    4) bare month (e.g. 'in October') → call_date.year, month, day=15.
+    """
+    # 1–2: explicit or month+year
+    iso = try_parse_date(text)
+    if iso:
+        return iso
+    # 3: relative
+    rel = infer_year_from_relative(text, call_date_str or "")
+    if rel:
+        return rel
+    # 4: bare month
+    mon_only = infer_month_only_date(text, call_date_str)
+    if mon_only:
+        return mon_only
+    return None
+
+def normalize_purchase_date_output(value: Any, call_date_str: Optional[str]) -> str:
+    """
+    Normalize any purchase_date string into best-guess ISO date if possible.
+    Uses same heuristics as above and assumes day=15 when only month present.
+    """
+    if value is None:
+        raw = ""
+    else:
+        raw = str(value).strip()
+    if not raw or raw.lower() in ("unknown", "na", "n/a", "none"):
+        return "unknown"
+
+    # Try parsing the raw string itself
+    iso = try_parse_date(raw)
+    if iso:
+        return iso
+    rel = infer_year_from_relative(raw, call_date_str or "")
+    if rel:
+        return rel
+    mon_only = infer_month_only_date(raw, call_date_str)
+    if mon_only:
+        return mon_only
+    # Fallback: keep raw, but ownership calc may fail if not parseable
+    return raw
 
 ERROR_CODE_REGEXES = [
     r"\b[Ee]rr(?:or)?\s?[-:]?\s?\d{1,4}\b",
@@ -298,7 +376,7 @@ if not uploaded_file:
 file_bytes = uploaded_file.getvalue()
 is_csv = uploaded_file.name.lower().endswith(".csv")
 
-with st.expander("⚡ Big‑file loader options (CSV)", expanded=False):
+with st.expander("⚡ Big-file loader options (CSV)", expanded=False):
     if is_csv:
         use_pyarrow = st.checkbox("Use pyarrow CSV engine (faster if available)", value=True)
         # Allow header-only to pick columns, then re-load with usecols
@@ -328,9 +406,9 @@ else:
     st.dataframe(df.head(preview_rows))
 
 # Optional: memory optimization
-with st.expander("🧠 Optimize in‑memory DataFrame"):
+with st.expander("🧠 Optimize in-memory DataFrame"):
     do_downcast = st.checkbox("Downcast numeric dtypes", value=True)
-    to_category = st.checkbox("Convert low‑cardinality object columns to category", value=True)
+    to_category = st.checkbox("Convert low-cardinality object columns to category", value=True)
     if do_downcast or to_category:
         df = optimize_dataframe(df, downcast_numeric=do_downcast, to_category=to_category)
 
@@ -346,14 +424,16 @@ st.header("2️⃣ Configure Columns")
 def suggest_text_column(df: pd.DataFrame) -> Optional[str]:
     preferred = ["Zoom Summary", "zoom_summary", "Sentiment Text", "Comment", "Customer Issue"]
     for c in preferred:
-        if c in df.columns: return c
+        if c in df.columns:
+            return c
     obj = df.select_dtypes(include=["object", "category"]).columns.tolist()
     return obj[0] if obj else (df.columns[0] if len(df.columns) else None)
 
 def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
     preferred = ["Start Time (Date/Time)", "Start Time", "Date Created", "Created At"]
     for c in preferred:
-        if c in df.columns: return c
+        if c in df.columns:
+            return c
     for c in df.columns:
         n = str(c).lower()
         if "date" in n or "time" in n:
@@ -361,15 +441,22 @@ def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 text_suggest = suggest_text_column(df)
-text_col = st.selectbox("Text column (sent to LLM)", options=df.columns,
-                        index=(list(df.columns).index(text_suggest) if text_suggest in df.columns else 0))
+text_col = st.selectbox(
+    "Text column (sent to LLM)",
+    options=df.columns,
+    index=(list(df.columns).index(text_suggest) if text_suggest in df.columns else 0),
+)
 
 date_suggest = suggest_date_column(df)
 date_opts = ["<none>"] + list(df.columns)
 date_idx = 0
 if date_suggest and date_suggest in df.columns:
     date_idx = date_opts.index(date_suggest)
-call_date_col = st.selectbox("Call date/time column (for relative dates & ownership)", options=date_opts, index=date_idx)
+call_date_col = st.selectbox(
+    "Call date/time column (for relative dates & ownership)",
+    options=date_opts,
+    index=date_idx,
+)
 if call_date_col == "<none>":
     call_date_col = None
 
@@ -440,22 +527,58 @@ symptom_system = "You classify customer calls by primary technical symptom."
 error_system   = "You extract error codes and UI/LED indicators from support text."
 model_system   = "You extract product model numbers (e.g., NV356E, ZU62, AZ2000, HT300) from support text."
 
-purchase_schema = {"type":"object","properties":{"purchase_date":{"type":"string"}},"required":["purchase_date"],"additionalProperties":False}
-symptom_schema  = {"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"],"additionalProperties":False}
-error_schema    = {"type":"object","properties":{"error_indicator":{"type":"string"}},"required":["error_indicator"],"additionalProperties":False}
-model_schema    = {"type":"object","properties":{"model_number":{"type":"string"}},"required":["model_number"],"additionalProperties":False}
+purchase_schema = {
+    "type": "object",
+    "properties": {"purchase_date": {"type": "string"}},
+    "required": ["purchase_date"],
+    "additionalProperties": False,
+}
+symptom_schema = {
+    "type": "object",
+    "properties": {"symptom": {"type": "string"}},
+    "required": ["symptom"],
+    "additionalProperties": False,
+}
+error_schema = {
+    "type": "object",
+    "properties": {"error_indicator": {"type": "string"}},
+    "required": ["error_indicator"],
+    "additionalProperties": False,
+}
+model_schema = {
+    "type": "object",
+    "properties": {"model_number": {"type": "string"}},
+    "required": ["model_number"],
+    "additionalProperties": False,
+}
 
 use_purchase = st.checkbox("📅 Purchase date → `purchase_date` (also computes `ownership_period_days`)")
-purchase_prompt = st.text_area("Purchase preset (editable):", value=default_purchase_prompt, height=160) if use_purchase else None
+purchase_prompt = st.text_area(
+    "Purchase preset (editable):",
+    value=default_purchase_prompt,
+    height=160,
+) if use_purchase else None
 
 use_symptom = st.checkbox("🩺 Primary symptom → `symptom`")
-symptom_prompt = st.text_area("Symptom preset (editable):", value=default_symptom_prompt, height=130) if use_symptom else None
+symptom_prompt = st.text_area(
+    "Symptom preset (editable):",
+    value=default_symptom_prompt,
+    height=130,
+) if use_symptom else None
 
 use_error = st.checkbox("💡 Error code / flashing indicator → `error_indicator`")
-error_prompt = st.text_area("Error/Indicator preset (editable):", value=default_error_indicator_prompt, height=130) if use_error else None
+error_prompt = st.text_area(
+    "Error/Indicator preset (editable):",
+    value=default_error_indicator_prompt,
+    height=130,
+) if use_error else None
 
 use_modelnum = st.checkbox("🔢 Model number → `model_number`")
-model_prompt = st.text_area("Model number preset (editable):", value=default_model_number_prompt, height=130) if use_modelnum else None
+model_prompt = st.text_area(
+    "Model number preset (editable):",
+    value=default_model_number_prompt,
+    height=130,
+) if use_modelnum else None
 
 # =========================================================
 # 5) Custom Prompts
@@ -484,20 +607,31 @@ if use_custom:
         with c2:
             o = st.text_input(f"Output column {i+1}", key=f"co_{i}")
         if p.strip() and o.strip():
-            custom_prompts.append(p.strip()); custom_outcols.append(o.strip())
+            custom_prompts.append(p.strip())
+            custom_outcols.append(o.strip())
 
 # =========================================================
-# 6) Throughput & Big-file Guardrails
+# 6) Throughput & Guardrails
 # =========================================================
 st.header("6️⃣ Throughput & Guardrails")
 cA, cB, cC = st.columns(3)
 with cA:
-    max_rows = st.number_input("Max rows to process", min_value=1, max_value=len(filtered_df), value=len(filtered_df))
+    max_rows = st.number_input(
+        "Max rows to process",
+        min_value=1,
+        max_value=len(filtered_df),
+        value=len(filtered_df),
+    )
 with cB:
     threads = st.slider("Concurrency (parallel requests)", min_value=1, max_value=16, value=6)
 with cC:
-    target_rpm = st.slider("Target Requests Per Minute (RPM)", min_value=0, max_value=600, value=120,
-                           help="0 = no throttling; set to your account's safe RPM.")
+    target_rpm = st.slider(
+        "Target Requests Per Minute (RPM)",
+        min_value=0,
+        max_value=600,
+        value=120,
+        help="0 = no throttling; set to your account's safe RPM.",
+    )
 
 skip_short = st.checkbox("Skip very short texts (≤ 10 chars)", value=True)
 use_heuristics = st.checkbox("Use heuristics before LLM (faster/cheaper)", value=True)
@@ -508,32 +642,47 @@ if "memo_cache" not in st.session_state:
     st.session_state.memo_cache: Dict[Tuple[str, str], str] = {}
 
 # =========================================================
-# 7) Run LLM Processing (parallel + rate‑limited)
+# 7) Run LLM Processing (parallel + rate-limited)
 # =========================================================
 st.header("7️⃣ Run LLM Processing")
 
 # Active outputs
-active_cols = []
-if use_purchase: active_cols.append("purchase_date")
-if use_symptom:  active_cols.append("symptom")
-if use_error:    active_cols.append("error_indicator")
-if use_modelnum: active_cols.append("model_number")
+active_cols: List[str] = []
+if use_purchase:
+    active_cols.append("purchase_date")
+if use_symptom:
+    active_cols.append("symptom")
+if use_error:
+    active_cols.append("error_indicator")
+if use_modelnum:
+    active_cols.append("model_number")
 active_cols += custom_outcols
 
-# Preset config (per‑row calls; batching is also possible if desired)
+# Preset config
 PRESETS = []
-if use_purchase: PRESETS.append(("purchase_date", purchase_system, purchase_prompt, purchase_schema))
-if use_symptom:  PRESETS.append(("symptom",       symptom_system,  symptom_prompt,  symptom_schema))
-if use_error:    PRESETS.append(("error_indicator", error_system,  error_prompt,    error_schema))
-if use_modelnum: PRESETS.append(("model_number",   model_system,   model_prompt,    model_schema))
+if use_purchase:
+    PRESETS.append(("purchase_date", purchase_system, purchase_prompt, purchase_schema))
+if use_symptom:
+    PRESETS.append(("symptom", symptom_system, symptom_prompt, symptom_schema))
+if use_error:
+    PRESETS.append(("error_indicator", error_system, error_prompt, error_schema))
+if use_modelnum:
+    PRESETS.append(("model_number", model_system, model_prompt, model_schema))
 
 def process_row(
-    idx: int, row: pd.Series, client: OpenAI, model: str,
-    presets, custom_prompts, custom_outcols,
-    text_col: str, call_date_col: Optional[str],
-    use_heuristics: bool, skip_short: bool,
+    idx: int,
+    row: pd.Series,
+    client: OpenAI,
+    model: str,
+    presets,
+    custom_prompts,
+    custom_outcols,
+    text_col: str,
+    call_date_col: Optional[str],
+    use_heuristics: bool,
+    skip_short: bool,
     memo: Dict[Tuple[str, str], str],
-    limiter: Optional[RateLimiter]
+    limiter: Optional[RateLimiter],
 ) -> Tuple[int, Dict[str, Any]]:
     out: Dict[str, Any] = {}
     text_val = normalize_text(row.get(text_col, ""))
@@ -541,33 +690,44 @@ def process_row(
     hint = infer_year_from_relative(text_val, call_date_val) if call_date_col else None
 
     if skip_short and len(text_val.strip()) <= 10:
-        for c in active_cols: out[c] = ""
+        for c in active_cols:
+            out[c] = ""
         return idx, out
 
     # Presets
     for col, sys, prompt, schema in presets:
         key = (text_val, f"preset::{col}")
         if key in memo:
-            out[col] = memo[key]
-            continue
+            value = memo[key]
+        else:
+            value = None
+            if use_heuristics:
+                if col == "purchase_date":
+                    value = purchase_date_heuristic(text_val, call_date_val)
+                elif col == "error_indicator":
+                    value = heuristic_error_indicator(text_val)
+                elif col == "model_number":
+                    value = heuristic_model_number(text_val)
 
-        value = None
-        if use_heuristics:
+            if value is None:
+                user_prompt = (prompt or "") + f"\n\nTEXT:\n{text_val}\n"
+                if col == "purchase_date":
+                    user_prompt += f"\nCALL_DATE: {call_date_val}\nINFERRED_RELATIVE_DATE_HINT: {hint}"
+                data = call_llm_json_safe(
+                    client,
+                    model,
+                    sys,
+                    user_prompt,
+                    f"{col}_extraction",
+                    schema,
+                    limiter,
+                )
+                value = data.get(col) or data.get("_raw") or (
+                    "unknown" if col in ("purchase_date", "model_number") else ""
+                )
             if col == "purchase_date":
-                value = try_parse_date(text_val) or (hint if hint else None)
-            elif col == "error_indicator":
-                value = heuristic_error_indicator(text_val)
-            elif col == "model_number":
-                value = heuristic_model_number(text_val)
-
-        if value is None:
-            user_prompt = prompt + f"\n\nTEXT:\n{text_val}\n"
-            if col == "purchase_date":
-                user_prompt += f"\nCALL_DATE: {call_date_val}\nINFERRED_RELATIVE_DATE_HINT: {hint}"
-            data = call_llm_json_safe(client, model, sys, user_prompt,
-                                      f"{col}_extraction", schema, limiter)
-            value = data.get(col) or data.get("_raw") or ("unknown" if col in ("purchase_date","model_number") else "")
-        memo[key] = value
+                value = normalize_purchase_date_output(value, call_date_val)
+            memo[key] = value
         out[col] = value
 
     # Custom prompts
@@ -577,7 +737,13 @@ def process_row(
             out[c] = memo[key]
         else:
             user_prompt = f"TEXT:\n{text_val}\n\nCALL_DATE: {call_date_val}\n\nTASK:\n{p}"
-            val = call_llm_text(client, model, "You analyze support text precisely.", user_prompt, limiter)
+            val = call_llm_text(
+                client,
+                model,
+                "You analyze support text precisely.",
+                user_prompt,
+                limiter,
+            )
             memo[key] = val
             out[c] = val
 
@@ -603,14 +769,19 @@ if st.button("🚀 Run"):
         if only_missing and active_cols:
             # Build a boolean need-mask across active output cols (NA or empty → needs processing)
             sub = results_df.loc[rows.index, active_cols]
-            miss_mask = sub.apply(lambda col: col.isna() | (col.astype(str).str.strip() == ""), axis=1)
+            miss_mask = sub.apply(
+                lambda col: col.isna() | (col.astype(str).str.strip() == ""),
+                axis=1,
+            )
             need_mask = miss_mask.any(axis=1)
-            # ✅ FIX: always use .loc with a boolean Series aligned to rows.index
+            # Always use .loc with a boolean Series aligned to rows.index
             rows = rows.loc[need_mask]
 
         total = len(rows)
         if total == 0:
-            st.info("Nothing to do (outputs already present). Uncheck 'Only process rows where outputs are missing' or broaden filters.")
+            st.info(
+                "Nothing to do (outputs already present). Uncheck 'Only process rows where outputs are missing' or broaden filters."
+            )
         else:
             limiter = RateLimiter(target_rpm) if target_rpm > 0 else None
             memo = st.session_state.memo_cache
@@ -622,19 +793,31 @@ if st.button("🚀 Run"):
             futures = []
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 for idx, row in rows.iterrows():
-                    futures.append(pool.submit(
-                        process_row, idx, row, client, model_choice,
-                        PRESETS, custom_prompts, custom_outcols,
-                        text_col, call_date_col, use_heuristics, skip_short,
-                        memo, limiter
-                    ))
+                    futures.append(
+                        pool.submit(
+                            process_row,
+                            idx,
+                            row,
+                            client,
+                            model_choice,
+                            PRESETS,
+                            custom_prompts,
+                            custom_outcols,
+                            text_col,
+                            call_date_col,
+                            use_heuristics,
+                            skip_short,
+                            memo,
+                            limiter,
+                        )
+                    )
                 done = 0
                 for fut in as_completed(futures):
                     idx, out = fut.result()
                     for col, val in out.items():
                         results_df.loc[idx, col] = val
                     done += 1
-                    progress.progress(done/total)
+                    progress.progress(done / total)
                     status.write(f"Processed {done}/{total} rows...")
 
             # Derived ownership period
@@ -714,11 +897,25 @@ else:
         else:
             st.info("No valid purchase_date values.")
 
-    call_date_col = next((c for c in df.columns if c in results_df.columns and c.lower().startswith("start") or "date" in c.lower() or "time" in c.lower()), None)
-    # If the user had selected one earlier, it's better, but keep a fallback
-    if call_date_col and call_date_col in results_df.columns:
-        st.subheader(f"Calls Over Time (based on '{call_date_col}')")
-        cdt = pd.to_datetime(results_df[call_date_col], errors="coerce").dropna()
+    # Use selected call_date_col if available, otherwise try to infer for visualization only
+    viz_call_col = call_date_col
+    if viz_call_col is None:
+        viz_call_col = next(
+            (
+                c
+                for c in results_df.columns
+                if (
+                    str(c).lower().startswith("start")
+                    or "date" in str(c).lower()
+                    or "time" in str(c).lower()
+                )
+            ),
+            None,
+        )
+
+    if viz_call_col and viz_call_col in results_df.columns:
+        st.subheader(f"Calls Over Time (based on '{viz_call_col}')")
+        cdt = pd.to_datetime(results_df[viz_call_col], errors="coerce").dropna()
         if not cdt.empty:
             by_month = cdt.dt.to_period("M").value_counts().sort_index()
             by_month.index = by_month.index.astype(str)
@@ -736,7 +933,3 @@ else:
         file_name="processed_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
-
-
