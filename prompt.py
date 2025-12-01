@@ -10,17 +10,17 @@ from typing import Optional, Dict, Tuple, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-# =========================
+# =========================================================
 # App Config
-# =========================
-st.set_page_config(page_title="AI Data Assistant — High Throughput", layout="wide")
-st.title("🦈📊 AI QE Assistant — High‑Throughput & Rate‑Limited")
+# =========================================================
+st.set_page_config(page_title="AI QE Assistant — High Throughput", layout="wide")
+st.title("🦈📊 AI QE Assistant — High‑Throughput, Big‑File Friendly")
 
 RUN_STAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-# =========================
+# =========================================================
 # Secrets & Client
-# =========================
+# =========================================================
 @st.cache_resource
 def get_client(api_key: str):
     return OpenAI(api_key=api_key)
@@ -37,18 +37,15 @@ def get_api_key() -> str:
         type="password",
         help="Leave blank to use OPENAI_API_KEY from Streamlit secrets.",
     )
-    api_key = override or default_key
-    if not api_key:
-        st.sidebar.error("API key is required.")
-    return api_key
+    return override or default_key
 
-# =========================
+# =========================================================
 # Rate Limiter (RPM)
-# =========================
+# =========================================================
 class RateLimiter:
     """
-    Simple leaky-bucket style rate limiter based on RPM (requests per minute).
-    Threads call acquire() before making a request.
+    Simple leaky-bucket rate limiter based on RPM (requests per minute).
+    Call acquire() before each request.
     """
     def __init__(self, rpm: int):
         self.rpm = max(0, int(rpm))
@@ -66,9 +63,9 @@ class RateLimiter:
                 now = time.monotonic()
             self._next_time = now + self.interval
 
-# =========================
+# =========================================================
 # Heuristics & Parsing
-# =========================
+# =========================================================
 MONTHS = [
     "january","february","march","april","may","june",
     "july","august","september","october","november","december"
@@ -76,9 +73,7 @@ MONTHS = [
 MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec"]
 
 def infer_year_from_relative(text: str, call_date_str: str) -> Optional[str]:
-    """
-    If text says 'last September', infer YYYY-MM-01 using call_date year - 1.
-    """
+    """If text says 'last September', infer YYYY-MM-01 using call_date year - 1."""
     if not isinstance(text, str) or not text:
         return None
     if not isinstance(call_date_str, str) or not call_date_str:
@@ -109,7 +104,6 @@ DATE_PATTERNS = [
     r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
     r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{4}\b",
 ]
-
 DATE_FORMATS = [
     "%Y-%m-%d",
     "%m/%d/%Y", "%m/%d/%y",
@@ -161,18 +155,13 @@ def heuristic_error_indicator(text: str) -> Optional[str]:
         return ", ".join(sorted(set(found_terms))[:3])
     return None
 
-# Model number heuristics (common Shark patterns like NV356E, ZU62, AZ2000, HT300, LA502, HZ2000, etc.)
-MODEL_TOKEN = re.compile(
-    r"\b([A-Z]{1,3}\d{2,4}[A-Z0-9\-]*)\b"
-)
-
+MODEL_TOKEN = re.compile(r"\b([A-Z]{1,3}\d{2,4}[A-Z0-9\-]*)\b")
 def heuristic_model_number(text: str) -> Optional[str]:
     if not isinstance(text, str) or not text:
         return None
     matches = MODEL_TOKEN.findall(text.upper())
     if not matches:
         return None
-    # Prefer patterns starting with common prefixes
     prefixes = ("NV","ZU","AZ","LA","HZ","HV","IZ","IF","HT","CM","ZS","XZ","VM","SV","WV","HP")
     prioritized = [m for m in matches if m.startswith(prefixes)]
     return prioritized[0] if prioritized else matches[0]
@@ -182,9 +171,9 @@ def normalize_text(x: Any) -> str:
         x = "" if pd.isna(x) else str(x)
     return " ".join(x.split())
 
-# =========================
-# LLM Wrappers with Retry & RateLimiter
-# =========================
+# =========================================================
+# LLM wrappers with retry + limiter
+# =========================================================
 def llm_retry_json(client, model, system_prompt, user_prompt, schema_name, schema,
                    limiter: Optional[RateLimiter], retries=4, base_delay=1.25):
     last_err = None
@@ -238,7 +227,6 @@ def call_llm_json_safe(client, model, system_prompt, user_prompt, schema_name, s
         return json.loads(resp.choices[0].message.content)
     except Exception:
         try:
-            # Fallback to text + best-effort JSON parse
             resp2 = llm_retry_text(client, model, system_prompt, user_prompt, limiter)
             return json.loads(resp2.choices[0].message.content)
         except Exception:
@@ -248,9 +236,48 @@ def call_llm_text(client, model, system_prompt, user_prompt, limiter: Optional[R
     resp = llm_retry_text(client, model, system_prompt, user_prompt, limiter)
     return resp.choices[0].message.content
 
-# =========================
+# =========================================================
+# Cached Loading + Big-file Options
+# =========================================================
+@st.cache_data(show_spinner=False)
+def load_csv_cached(file_bytes: bytes, use_pyarrow: bool, usecols: Optional[List[str]] = None) -> pd.DataFrame:
+    import io
+    buf = io.BytesIO(file_bytes)
+    if use_pyarrow:
+        try:
+            return pd.read_csv(buf, engine="pyarrow", usecols=usecols)
+        except Exception:
+            buf.seek(0)
+            return pd.read_csv(buf, usecols=usecols)
+    return pd.read_csv(buf, usecols=usecols)
+
+@st.cache_data(show_spinner=False)
+def load_excel_cached(file_bytes: bytes, usecols: Optional[List[str]] = None) -> pd.DataFrame:
+    import io
+    buf = io.BytesIO(file_bytes)
+    try:
+        return pd.read_excel(buf, usecols=usecols)
+    except Exception:
+        buf.seek(0)
+        return pd.read_excel(buf)
+
+def optimize_dataframe(df: pd.DataFrame, downcast_numeric=True, to_category=True, cat_threshold=2000) -> pd.DataFrame:
+    """Memory optimization to smooth big-file interactions."""
+    out = df.copy()
+    if downcast_numeric:
+        for col in out.select_dtypes(include=["int", "int64", "float", "float64"]).columns:
+            out[col] = pd.to_numeric(out[col], errors="ignore", downcast="integer")
+            out[col] = pd.to_numeric(out[col], errors="ignore", downcast="float")
+    if to_category:
+        for col in out.select_dtypes(include=["object"]).columns:
+            uniq = out[col].nunique(dropna=True)
+            if 0 < uniq <= cat_threshold:
+                out[col] = out[col].astype("category")
+    return out
+
+# =========================================================
 # Sidebar — API & Model
-# =========================
+# =========================================================
 st.sidebar.header("🔐 API & Model")
 api_key = get_api_key()
 model_choice = st.sidebar.selectbox(
@@ -259,30 +286,68 @@ model_choice = st.sidebar.selectbox(
     index=0,
 )
 
-# =========================
-# 1) Upload
-# =========================
+# =========================================================
+# 1) Upload + Big File Loader
+# =========================================================
 st.header("1️⃣ Upload Your File")
+
 uploaded_file = st.file_uploader("Upload an Excel or CSV file", type=["xlsx", "csv"])
 if not uploaded_file:
     st.stop()
 
-df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-st.write("### Preview")
-st.dataframe(df.head())
+file_bytes = uploaded_file.getvalue()
+is_csv = uploaded_file.name.lower().endswith(".csv")
+
+with st.expander("⚡ Big‑file loader options (CSV)", expanded=False):
+    if is_csv:
+        use_pyarrow = st.checkbox("Use pyarrow CSV engine (faster if available)", value=True)
+        # Allow header-only to pick columns, then re-load with usecols
+        if st.checkbox("Load only selected columns for CSV"):
+            # Read header
+            import io
+            hdr_df = pd.read_csv(io.BytesIO(file_bytes), nrows=0)
+            chosen_cols = st.multiselect("Columns to load", options=list(hdr_df.columns), default=list(hdr_df.columns))
+            if st.button("Reload CSV with selected columns"):
+                df = load_csv_cached(file_bytes, use_pyarrow, usecols=chosen_cols)
+            else:
+                df = load_csv_cached(file_bytes, use_pyarrow)
+        else:
+            df = load_csv_cached(file_bytes, use_pyarrow=True)
+    else:
+        df = load_excel_cached(file_bytes)
+
+# Preview controls
+cprev1, cprev2 = st.columns(2)
+with cprev1:
+    preview_rows = st.slider("Preview rows", 5, 200, 20, 5)
+with cprev2:
+    sample_preview = st.checkbox("Random sample for preview (instead of head)")
+if sample_preview:
+    st.dataframe(df.sample(min(preview_rows, len(df)), random_state=42))
+else:
+    st.dataframe(df.head(preview_rows))
+
+# Optional: memory optimization
+with st.expander("🧠 Optimize in‑memory DataFrame"):
+    do_downcast = st.checkbox("Downcast numeric dtypes", value=True)
+    to_category = st.checkbox("Convert low‑cardinality object columns to category", value=True)
+    if do_downcast or to_category:
+        df = optimize_dataframe(df, downcast_numeric=do_downcast, to_category=to_category)
+
 if df.empty:
     st.warning("The uploaded file appears to be empty.")
     st.stop()
 
-# =========================
+# =========================================================
 # 2) Configure Columns
-# =========================
+# =========================================================
 st.header("2️⃣ Configure Columns")
+
 def suggest_text_column(df: pd.DataFrame) -> Optional[str]:
     preferred = ["Zoom Summary", "zoom_summary", "Sentiment Text", "Comment", "Customer Issue"]
     for c in preferred:
         if c in df.columns: return c
-    obj = df.select_dtypes(include=["object"]).columns.tolist()
+    obj = df.select_dtypes(include=["object", "category"]).columns.tolist()
     return obj[0] if obj else (df.columns[0] if len(df.columns) else None)
 
 def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
@@ -308,11 +373,11 @@ call_date_col = st.selectbox("Call date/time column (for relative dates & owners
 if call_date_col == "<none>":
     call_date_col = None
 
-st.caption("Selected text column feeds the prompts. Call date helps infer relative dates and ownership period.")
+st.caption("Selected text column feeds all prompts. The call date helps infer relative dates and compute ownership period.")
 
-# =========================
-# 3) Filters with prepopulated values
-# =========================
+# =========================================================
+# 3) Filters
+# =========================================================
 st.header("3️⃣ Filter Rows (Optional)")
 filtered_df = df.copy()
 
@@ -335,44 +400,39 @@ for col in filter_cols:
         filtered_df = filtered_df[filtered_df[col].astype(str).isin(sel)]
 
 st.write("### Filtered Preview")
-st.dataframe(filtered_df.head())
+st.dataframe(filtered_df.head(min(preview_rows, len(filtered_df))))
 st.caption(f"Rows selected for processing: {len(filtered_df)} / {len(df)}")
 if filtered_df.empty:
     st.warning("No rows match the filters.")
     st.stop()
 
-# =========================
+# =========================================================
 # 4) Preset Tasks (editable)
-# =========================
+# =========================================================
 st.header("4️⃣ Preset Tasks / Prompts (Editable JSON outputs)")
 
-# Prompts
 default_purchase_prompt = (
     "You are given:\n"
     "- TEXT: A summary or transcript snippet of a customer support call.\n"
     "- CALL_DATE: The date/time of the call.\n"
     "- INFERRED_RELATIVE_DATE_HINT: Optional approximate YYYY-MM-DD derived from phrases like 'last September'.\n\n"
-    "Task: Extract the purchase date.\n"
-    "Rules:\n"
-    "- If a clear date is in the text, return YYYY-MM-DD.\n"
-    "- If only a relative month is available and a hint is provided, you MAY use the hint.\n"
-    "- Otherwise, return 'unknown'.\n\n"
-    "Return ONLY a JSON object that matches the schema."
+    "Task: Extract the purchase date. Return YYYY-MM-DD if available, otherwise 'unknown'.\n"
+    "You MUST return ONLY a JSON object matching the schema."
 )
 default_symptom_prompt = (
     "Given TEXT, identify the PRIMARY technical/functional symptom (e.g., 'no power', 'weak airflow', "
     "'overheating', 'burning smell', 'unit shuts off', 'error code'). Be concise.\n\n"
-    "Return ONLY a JSON object that matches the schema."
+    "Return ONLY a JSON object matching the schema."
 )
 default_error_indicator_prompt = (
     "Given TEXT, detect any explicit error code, flashing/blinking lights, or on-screen error icons/messages.\n"
     "If present, return a concise phrase (e.g., 'E02', 'red light flashing', 'filter icon flashing'); else 'none'.\n\n"
-    "Return ONLY a JSON object that matches the schema."
+    "Return ONLY a JSON object matching the schema."
 )
 default_model_number_prompt = (
-    "Given TEXT, extract the MODEL NUMBER of the product if mentioned (e.g., NV356E, ZU62, HZ2000, HT300).\n"
-    "If multiple, return the most specific one. If none, return 'unknown'.\n\n"
-    "Return ONLY a JSON object that matches the schema."
+    "Given TEXT, extract the MODEL NUMBER of the product if mentioned (e.g., NV356E, ZU62, HZ2000, HT300). "
+    "If multiple, return the most specific. If none, return 'unknown'.\n\n"
+    "Return ONLY a JSON object matching the schema."
 )
 
 purchase_system = "You extract structured purchase dates from noisy customer support text."
@@ -380,28 +440,27 @@ symptom_system = "You classify customer calls by primary technical symptom."
 error_system   = "You extract error codes and UI/LED indicators from support text."
 model_system   = "You extract product model numbers (e.g., NV356E, ZU62, AZ2000, HT300) from support text."
 
-# Schemas
 purchase_schema = {"type":"object","properties":{"purchase_date":{"type":"string"}},"required":["purchase_date"],"additionalProperties":False}
 symptom_schema  = {"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"],"additionalProperties":False}
 error_schema    = {"type":"object","properties":{"error_indicator":{"type":"string"}},"required":["error_indicator"],"additionalProperties":False}
 model_schema    = {"type":"object","properties":{"model_number":{"type":"string"}},"required":["model_number"],"additionalProperties":False}
 
 use_purchase = st.checkbox("📅 Purchase date → `purchase_date` (also computes `ownership_period_days`)")
-purchase_prompt = st.text_area("Purchase preset (editable):", value=default_purchase_prompt, height=180) if use_purchase else None
+purchase_prompt = st.text_area("Purchase preset (editable):", value=default_purchase_prompt, height=160) if use_purchase else None
 
 use_symptom = st.checkbox("🩺 Primary symptom → `symptom`")
-symptom_prompt = st.text_area("Symptom preset (editable):", value=default_symptom_prompt, height=150) if use_symptom else None
+symptom_prompt = st.text_area("Symptom preset (editable):", value=default_symptom_prompt, height=130) if use_symptom else None
 
 use_error = st.checkbox("💡 Error code / flashing indicator → `error_indicator`")
-error_prompt = st.text_area("Error/Indicator preset (editable):", value=default_error_indicator_prompt, height=150) if use_error else None
+error_prompt = st.text_area("Error/Indicator preset (editable):", value=default_error_indicator_prompt, height=130) if use_error else None
 
 use_modelnum = st.checkbox("🔢 Model number → `model_number`")
-model_prompt = st.text_area("Model number preset (editable):", value=default_model_number_prompt, height=140) if use_modelnum else None
+model_prompt = st.text_area("Model number preset (editable):", value=default_model_number_prompt, height=130) if use_modelnum else None
 
-# =========================
+# =========================================================
 # 5) Custom Prompts
-# =========================
-st.subheader("Custom LLM Tasks")
+# =========================================================
+st.header("5️⃣ Custom Tasks")
 use_custom = st.checkbox("➕ Enable custom prompts")
 custom_prompts: List[str] = []
 custom_outcols: List[str] = []
@@ -427,31 +486,10 @@ if use_custom:
         if p.strip() and o.strip():
             custom_prompts.append(p.strip()); custom_outcols.append(o.strip())
 
-# Optional AI helper
-use_prompt_assistant = st.checkbox("✨ Use AI to help craft a custom prompt")
-if use_prompt_assistant and text_col:
-    helper = st.text_area("Describe what you want to extract/classify:")
-    if st.button("Generate a suggested prompt"):
-        if not api_key:
-            st.error("Add your API key first.")
-        else:
-            client = get_client(api_key)
-            sample = filtered_df[text_col].dropna().astype(str).head(5).tolist()
-            example_block = "\n\n".join(f"- {s}" for s in sample)
-            sys = "Design a reusable prompt for row-by-row analysis of support text."
-            usr = (f"Goal:\n{helper}\n\nExamples from the text column:\n{example_block}\n\n"
-                   "Provide ONE reusable prompt (no examples in the output).")
-            try:
-                suggestion = call_llm_text(client, model_choice, sys, usr, limiter=None)
-                st.success("Suggested prompt:")
-                st.code(suggestion)
-            except Exception as e:
-                st.error(f"Prompt assistant error: {e}")
-
-# =========================
-# 6) Throughput Controls
-# =========================
-st.header("5️⃣ Throughput & Guardrails")
+# =========================================================
+# 6) Throughput & Big-file Guardrails
+# =========================================================
+st.header("6️⃣ Throughput & Guardrails")
 cA, cB, cC = st.columns(3)
 with cA:
     max_rows = st.number_input("Max rows to process", min_value=1, max_value=len(filtered_df), value=len(filtered_df))
@@ -459,39 +497,35 @@ with cB:
     threads = st.slider("Concurrency (parallel requests)", min_value=1, max_value=16, value=6)
 with cC:
     target_rpm = st.slider("Target Requests Per Minute (RPM)", min_value=0, max_value=600, value=120,
-                           help="0 = no throttling. Set to your account's safe RPM to fully utilize without 429s.")
+                           help="0 = no throttling; set to your account's safe RPM.")
 
 skip_short = st.checkbox("Skip very short texts (≤ 10 chars)", value=True)
-use_heuristics = st.checkbox("Use heuristics before LLM (faster/cheaper for dates & indicators & model #)", value=True)
+use_heuristics = st.checkbox("Use heuristics before LLM (faster/cheaper)", value=True)
 only_missing = st.checkbox("Only process rows where outputs are missing", value=True)
 
-# Session memo (dedupe identical requests)
+# Session memo to dedupe identical requests
 if "memo_cache" not in st.session_state:
     st.session_state.memo_cache: Dict[Tuple[str, str], str] = {}
 
-# =========================
-# 7) Run LLM Processing (parallel + rate-limited)
-# =========================
-st.header("6️⃣ Run LLM Processing")
+# =========================================================
+# 7) Run LLM Processing (parallel + rate‑limited)
+# =========================================================
+st.header("7️⃣ Run LLM Processing")
 
 # Active outputs
 active_cols = []
 if use_purchase: active_cols.append("purchase_date")
-if use_symptom: active_cols.append("symptom")
-if use_error:   active_cols.append("error_indicator")
-if use_modelnum:active_cols.append("model_number")
+if use_symptom:  active_cols.append("symptom")
+if use_error:    active_cols.append("error_indicator")
+if use_modelnum: active_cols.append("model_number")
 active_cols += custom_outcols
 
-# Systems & schemas per preset
+# Preset config (per‑row calls; batching is also possible if desired)
 PRESETS = []
-if use_purchase:
-    PRESETS.append(("purchase_date", purchase_system, purchase_prompt, purchase_schema))
-if use_symptom:
-    PRESETS.append(("symptom",       symptom_system,  symptom_prompt,  symptom_schema))
-if use_error:
-    PRESETS.append(("error_indicator", error_system,  error_prompt,    error_schema))
-if use_modelnum:
-    PRESETS.append(("model_number",   model_system,   model_prompt,    model_schema))
+if use_purchase: PRESETS.append(("purchase_date", purchase_system, purchase_prompt, purchase_schema))
+if use_symptom:  PRESETS.append(("symptom",       symptom_system,  symptom_prompt,  symptom_schema))
+if use_error:    PRESETS.append(("error_indicator", error_system,  error_prompt,    error_schema))
+if use_modelnum: PRESETS.append(("model_number",   model_system,   model_prompt,    model_schema))
 
 def process_row(
     idx: int, row: pd.Series, client: OpenAI, model: str,
@@ -536,7 +570,7 @@ def process_row(
         memo[key] = value
         out[col] = value
 
-    # Customs
+    # Custom prompts
     for p, c in zip(custom_prompts, custom_outcols):
         key = (text_val, f"custom::{c}")
         if key in memo:
@@ -560,30 +594,31 @@ if st.button("🚀 Run"):
 
         # Determine rows to process
         rows = filtered_df.head(int(max_rows)).copy()
+
+        # Ensure target columns exist before we compute masks
+        for c in active_cols:
+            if c not in results_df.columns:
+                results_df[c] = pd.NA
+
         if only_missing and active_cols:
-            need_mask = pd.Series(False, index=rows.index)
-            for c in active_cols:
-                if c in results_df.columns:
-                    need_mask = need_mask | results_df.loc[rows.index, c].isna()
-                else:
-                    need_mask = True
-            rows = rows[need_mask]
+            # Build a boolean need-mask across active output cols (NA or empty → needs processing)
+            sub = results_df.loc[rows.index, active_cols]
+            miss_mask = sub.apply(lambda col: col.isna() | (col.astype(str).str.strip() == ""), axis=1)
+            need_mask = miss_mask.any(axis=1)
+            # ✅ FIX: always use .loc with a boolean Series aligned to rows.index
+            rows = rows.loc[need_mask]
 
         total = len(rows)
         if total == 0:
-            st.info("Nothing to do (outputs already present). Uncheck 'Only process missing' or broaden filters.")
+            st.info("Nothing to do (outputs already present). Uncheck 'Only process rows where outputs are missing' or broaden filters.")
         else:
-            # Ensure columns exist
-            for c in active_cols:
-                if c not in results_df.columns:
-                    results_df[c] = pd.NA
-
             limiter = RateLimiter(target_rpm) if target_rpm > 0 else None
             memo = st.session_state.memo_cache
 
             progress = st.progress(0.0)
             status = st.empty()
 
+            # parallel execution
             futures = []
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 for idx, row in rows.iterrows():
@@ -614,17 +649,16 @@ if st.button("🚀 Run"):
             st.session_state["results_df"] = results_df
             st.success("Processing complete ✅")
 
-# =========================
+# =========================================================
 # 8) Analyze & Visualize
-# =========================
-st.header("7️⃣ Analyze & Visualize")
-
+# =========================================================
+st.header("8️⃣ Analyze & Visualize")
 results_df = st.session_state.get("results_df")
 if results_df is None:
     st.info("Run the processing to see analysis.")
 else:
     st.subheader("Enriched Dataset Preview")
-    st.dataframe(results_df.head())
+    st.dataframe(results_df.head(20))
 
     if "ownership_period_days" in results_df.columns:
         st.subheader("Ownership Period (Days)")
@@ -680,6 +714,8 @@ else:
         else:
             st.info("No valid purchase_date values.")
 
+    call_date_col = next((c for c in df.columns if c in results_df.columns and c.lower().startswith("start") or "date" in c.lower() or "time" in c.lower()), None)
+    # If the user had selected one earlier, it's better, but keep a fallback
     if call_date_col and call_date_col in results_df.columns:
         st.subheader(f"Calls Over Time (based on '{call_date_col}')")
         cdt = pd.to_datetime(results_df[call_date_col], errors="coerce").dropna()
@@ -700,6 +736,7 @@ else:
         file_name="processed_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
 
 
