@@ -1,752 +1,705 @@
 import streamlit as st
 import pandas as pd
+import re
+import json
+import time
 from io import BytesIO
 from openai import OpenAI
 from datetime import datetime
-from typing import Optional
-import json
+from typing import Optional, Dict, Tuple, Any, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
-# ---------------------------------------------------------
-# Streamlit Configuration
-# ---------------------------------------------------------
-st.set_page_config(page_title="AI Data Assistant", layout="wide")
-st.title("📊 AI Assistant for Row-by-Row Analysis (Flexible LLM-Driven)")
+# =========================
+# App Config
+# =========================
+st.set_page_config(page_title="AI Data Assistant — High Throughput", layout="wide")
+st.title("🦈📊 AI QE Assistant — High‑Throughput & Rate‑Limited")
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def infer_year_from_relative(text, call_date_str):
+RUN_STAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# =========================
+# Secrets & Client
+# =========================
+@st.cache_resource
+def get_client(api_key: str):
+    return OpenAI(api_key=api_key)
+
+def get_api_key() -> str:
+    try:
+        default_key = st.secrets["OPENAI_API_KEY"]
+        st.sidebar.success("Using OPENAI_API_KEY from Streamlit secrets.")
+    except Exception:
+        default_key = ""
+        st.sidebar.warning("No OPENAI_API_KEY in secrets. You can paste one below.")
+    override = st.sidebar.text_input(
+        "OpenAI API Key (optional override)",
+        type="password",
+        help="Leave blank to use OPENAI_API_KEY from Streamlit secrets.",
+    )
+    api_key = override or default_key
+    if not api_key:
+        st.sidebar.error("API key is required.")
+    return api_key
+
+# =========================
+# Rate Limiter (RPM)
+# =========================
+class RateLimiter:
     """
-    Infer an approximate YYYY-MM-DD string when the text contains phrases like
-    'last September', using the call date column as reference.
-    Returns None if nothing can be inferred.
+    Simple leaky-bucket style rate limiter based on RPM (requests per minute).
+    Threads call acquire() before making a request.
     """
+    def __init__(self, rpm: int):
+        self.rpm = max(0, int(rpm))
+        self.interval = 60.0 / self.rpm if self.rpm > 0 else 0.0
+        self._lock = Lock()
+        self._next_time = 0.0
+
+    def acquire(self):
+        if self.interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next_time:
+                time.sleep(self._next_time - now)
+                now = time.monotonic()
+            self._next_time = now + self.interval
+
+# =========================
+# Heuristics & Parsing
+# =========================
+MONTHS = [
+    "january","february","march","april","may","june",
+    "july","august","september","october","november","december"
+]
+MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec"]
+
+def infer_year_from_relative(text: str, call_date_str: str) -> Optional[str]:
+    """
+    If text says 'last September', infer YYYY-MM-01 using call_date year - 1.
+    """
+    if not isinstance(text, str) or not text:
+        return None
     if not isinstance(call_date_str, str) or not call_date_str:
         return None
     try:
-        # Expecting something like '2024-09-12 14:30:00' or '2024-09-12'
         first_token = call_date_str.split()[0]
         call_date = datetime.strptime(first_token, "%Y-%m-%d")
-        call_year = call_date.year
     except Exception:
         return None
 
-    if not isinstance(text, str):
+    t = text.lower()
+    for i, m in enumerate(MONTHS, start=1):
+        if f"last {m}" in t:
+            return f"{call_date.year - 1}-{i:02d}-01"
+    for i, m in enumerate(MONTH_ABBR, start=1):
+        if f"last {m}" in t:
+            month_index = min(i, 12)
+            return f"{call_date.year - 1}-{month_index:02d}-01"
+    return None
+
+DATE_PATTERNS = [
+    r"\b(20\d{2}|19\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b",  # YYYY-MM-DD
+    r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:19|20)?\d{2})\b",  # MM/DD/YYYY or MM/DD/YY
+    r"\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-]((?:19|20)?\d{2})\b",  # DD/MM/YYYY or DD/MM/YY
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b",
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b",
+    r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{4}\b",
+]
+
+DATE_FORMATS = [
+    "%Y-%m-%d",
+    "%m/%d/%Y", "%m/%d/%y",
+    "%d/%m/%Y", "%d/%m/%y",
+    "%b %d, %Y", "%B %d, %Y",
+    "%d %B %Y", "%d %b %Y",
+    "%B %Y", "%b %Y",
+]
+
+def try_parse_date(text: str) -> Optional[str]:
+    """Parse first explicit date found into YYYY-MM-DD; month-year → day=01."""
+    if not isinstance(text, str) or not text:
         return None
-    text_lower = text.lower()
-
-    months = [
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december"
-    ]
-    for idx, m in enumerate(months, start=1):
-        if f"last {m}" in text_lower:
-            # Approximate to the 1st of that month in the previous year
-            return f"{call_year - 1}-{idx:02d}-01"
+    for pat in DATE_PATTERNS:
+        for m in re.finditer(pat, text):
+            chunk = m.group(0)
+            chunk = re.sub(r"(st|nd|rd|th)", "", chunk, flags=re.IGNORECASE)
+            chunk = re.sub(r"\s{2,}", " ", chunk).strip()
+            for fmt in DATE_FORMATS:
+                try:
+                    dt = datetime.strptime(chunk, fmt)
+                    return dt.strftime("%Y-%m-%d")
+                except Exception:
+                    continue
     return None
 
+ERROR_CODE_REGEXES = [
+    r"\b[Ee]rr(?:or)?\s?[-:]?\s?\d{1,4}\b",
+    r"\b[Ee]\s?[-:]?\s?\d{1,4}\b",
+    r"\b[Cc]ode\s?[-:]?\s?\d{1,4}\b",
+    r"\b[Ff]\s?[-:]?\s?\d{1,4}\b",
+]
+FLASHING_TERMS = ["flashing", "blinking", "blinks", "blink", "flash", "strobing", "strobe", "pulsing", "pulse"]
+UI_TERMS = ["red light", "blue light", "filter icon", "warning light", "led", "indicator", "icon", "display error"]
 
-def suggest_text_column(df: pd.DataFrame) -> Optional[str]:
-    """Heuristic suggestion for which column is the main text/summary column."""
-    preferred = ["Zoom Summary", "zoom_summary", "Sentiment Text", "Comment", "Customer Issue"]
-    for col in preferred:
-        if col in df.columns:
-            return col
-    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
-    if obj_cols:
-        return obj_cols[0]
-    return df.columns[0] if len(df.columns) else None
-
-
-def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
-    """Heuristic suggestion for which column holds the call date/time."""
-    preferred = ["Start Time (Date/Time)", "Start Time", "Date Created", "Created At"]
-    for col in preferred:
-        if col in df.columns:
-            return col
-    # fallback: any col with 'date' or 'time' in the name
-    for col in df.columns:
-        name = str(col).lower()
-        if "date" in name or "time" in name:
-            return col
+def heuristic_error_indicator(text: str) -> Optional[str]:
+    if not isinstance(text, str) or not text:
+        return None
+    t = text.lower()
+    for rx in ERROR_CODE_REGEXES:
+        m = re.search(rx, t)
+        if m:
+            return m.group(0)
+    found_terms = []
+    for term in FLASHING_TERMS + UI_TERMS:
+        if term in t:
+            found_terms.append(term)
+    if found_terms:
+        return ", ".join(sorted(set(found_terms))[:3])
     return None
 
-
-@st.cache_resource
-def get_client(api_key: str):
-    """Cached OpenAI client so we don't re-init on every rerun."""
-    return OpenAI(api_key=api_key)
-
-
-def call_llm_free_text(client, model: str, system_prompt: str, user_prompt: str) -> str:
-    """Simple helper for free-text outputs."""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    return resp.choices[0].message.content
-
-
-def call_llm_json(client, model: str, system_prompt: str, user_prompt: str,
-                  schema_name: str, schema: dict) -> dict:
-    """
-    Helper to request strict JSON output using json_schema response_format.
-    Returns a dict (parsed JSON) or {'_raw': <content>} if parsing fails.
-    """
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "schema": schema,
-                "strict": True,
-            },
-        },
-    )
-    content = resp.choices[0].message.content
-    try:
-        return json.loads(content)
-    except Exception:
-        return {"_raw": content}
-
-
-# ---------------------------------------------------------
-# Sidebar – API & Model (use secrets + optional override)
-# ---------------------------------------------------------
-st.sidebar.header("🔐 API & Model Settings")
-
-# Try to pull from secrets first
-try:
-    default_api_key = st.secrets["OPENAI_API_KEY"]
-    st.sidebar.success("Using OPENAI_API_KEY from Streamlit secrets by default.")
-except Exception:
-    default_api_key = ""
-    st.sidebar.warning("No OPENAI_API_KEY found in secrets. You can paste one below.")
-
-api_key_input = st.sidebar.text_input(
-    "OpenAI API Key (optional override)",
-    type="password",
-    help="Leave blank to use OPENAI_API_KEY from Streamlit secrets.",
+# Model number heuristics (common Shark patterns like NV356E, ZU62, AZ2000, HT300, LA502, HZ2000, etc.)
+MODEL_TOKEN = re.compile(
+    r"\b([A-Z]{1,3}\d{2,4}[A-Z0-9\-]*)\b"
 )
 
-api_key = api_key_input or default_api_key
+def heuristic_model_number(text: str) -> Optional[str]:
+    if not isinstance(text, str) or not text:
+        return None
+    matches = MODEL_TOKEN.findall(text.upper())
+    if not matches:
+        return None
+    # Prefer patterns starting with common prefixes
+    prefixes = ("NV","ZU","AZ","LA","HZ","HV","IZ","IF","HT","CM","ZS","XZ","VM","SV","WV","HP")
+    prioritized = [m for m in matches if m.startswith(prefixes)]
+    return prioritized[0] if prioritized else matches[0]
 
+def normalize_text(x: Any) -> str:
+    if not isinstance(x, str):
+        x = "" if pd.isna(x) else str(x)
+    return " ".join(x.split())
+
+# =========================
+# LLM Wrappers with Retry & RateLimiter
+# =========================
+def llm_retry_json(client, model, system_prompt, user_prompt, schema_name, schema,
+                   limiter: Optional[RateLimiter], retries=4, base_delay=1.25):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            if limiter: limiter.acquire()
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "schema": schema,
+                        "strict": True,
+                    },
+                },
+                temperature=0,
+            )
+        except Exception as e:
+            last_err = e
+            time.sleep(base_delay * (2 ** attempt))
+    raise last_err
+
+def llm_retry_text(client, model, system_prompt, user_prompt,
+                   limiter: Optional[RateLimiter], retries=4, base_delay=1.25):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            if limiter: limiter.acquire()
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+            )
+        except Exception as e:
+            last_err = e
+            time.sleep(base_delay * (2 ** attempt))
+    raise last_err
+
+def call_llm_json_safe(client, model, system_prompt, user_prompt, schema_name, schema,
+                       limiter: Optional[RateLimiter]) -> Dict[str, Any]:
+    try:
+        resp = llm_retry_json(client, model, system_prompt, user_prompt, schema_name, schema, limiter)
+        return json.loads(resp.choices[0].message.content)
+    except Exception:
+        try:
+            # Fallback to text + best-effort JSON parse
+            resp2 = llm_retry_text(client, model, system_prompt, user_prompt, limiter)
+            return json.loads(resp2.choices[0].message.content)
+        except Exception:
+            return {"_raw": "LLM-ERROR or Non-JSON"}
+
+def call_llm_text(client, model, system_prompt, user_prompt, limiter: Optional[RateLimiter]) -> str:
+    resp = llm_retry_text(client, model, system_prompt, user_prompt, limiter)
+    return resp.choices[0].message.content
+
+# =========================
+# Sidebar — API & Model
+# =========================
+st.sidebar.header("🔐 API & Model")
+api_key = get_api_key()
 model_choice = st.sidebar.selectbox(
     "Model",
     ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"],
-    index=0,  # default to the faster mini model
+    index=0,
 )
 
-# Optional: helper to design prompts with AI
-st.sidebar.markdown("---")
-use_prompt_assistant = st.sidebar.checkbox("✨ Use AI to help design a custom prompt")
-
-
-# ---------------------------------------------------------
-# 1️⃣ File Upload
-# ---------------------------------------------------------
+# =========================
+# 1) Upload
+# =========================
 st.header("1️⃣ Upload Your File")
 uploaded_file = st.file_uploader("Upload an Excel or CSV file", type=["xlsx", "csv"])
-
 if not uploaded_file:
     st.stop()
 
-# Load file
-if uploaded_file.name.endswith(".csv"):
-    df = pd.read_csv(uploaded_file)
-else:
-    df = pd.read_excel(uploaded_file)
-
-st.write("### Preview of Uploaded Data")
+df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+st.write("### Preview")
 st.dataframe(df.head())
-
 if df.empty:
     st.warning("The uploaded file appears to be empty.")
     st.stop()
 
-# ---------------------------------------------------------
-# 2️⃣ Column Selection
-# ---------------------------------------------------------
+# =========================
+# 2) Configure Columns
+# =========================
 st.header("2️⃣ Configure Columns")
+def suggest_text_column(df: pd.DataFrame) -> Optional[str]:
+    preferred = ["Zoom Summary", "zoom_summary", "Sentiment Text", "Comment", "Customer Issue"]
+    for c in preferred:
+        if c in df.columns: return c
+    obj = df.select_dtypes(include=["object"]).columns.tolist()
+    return obj[0] if obj else (df.columns[0] if len(df.columns) else None)
 
-suggested_text = suggest_text_column(df)
-text_col = st.selectbox(
-    "Text column to send to the LLM (e.g., Zoom Summary, issue description)",
-    options=df.columns,
-    index=(list(df.columns).index(suggested_text) if suggested_text in df.columns else 0),
-)
+def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
+    preferred = ["Start Time (Date/Time)", "Start Time", "Date Created", "Created At"]
+    for c in preferred:
+        if c in df.columns: return c
+    for c in df.columns:
+        n = str(c).lower()
+        if "date" in n or "time" in n:
+            return c
+    return None
 
-suggested_date = suggest_date_column(df)
-date_col_options = ["<none>"] + list(df.columns)
-default_date_index = 0
-if suggested_date and suggested_date in df.columns:
-    default_date_index = date_col_options.index(suggested_date)
+text_suggest = suggest_text_column(df)
+text_col = st.selectbox("Text column (sent to LLM)", options=df.columns,
+                        index=(list(df.columns).index(text_suggest) if text_suggest in df.columns else 0))
 
-call_date_col = st.selectbox(
-    "Call date/time column (for ownership calculations & relative date hints)",
-    options=date_col_options,
-    index=default_date_index,
-)
+date_suggest = suggest_date_column(df)
+date_opts = ["<none>"] + list(df.columns)
+date_idx = 0
+if date_suggest and date_suggest in df.columns:
+    date_idx = date_opts.index(date_suggest)
+call_date_col = st.selectbox("Call date/time column (for relative dates & ownership)", options=date_opts, index=date_idx)
 if call_date_col == "<none>":
     call_date_col = None
 
-st.caption(
-    "The app will use the selected text column for all prompts. "
-    "If you choose a call date column, it will be used to interpret relative purchase dates "
-    "and compute ownership period (days between purchase and call)."
-)
+st.caption("Selected text column feeds the prompts. Call date helps infer relative dates and ownership period.")
 
-# ---------------------------------------------------------
-# 3️⃣ Filters (with pre-populated values)
-# ---------------------------------------------------------
+# =========================
+# 3) Filters with prepopulated values
+# =========================
 st.header("3️⃣ Filter Rows (Optional)")
-
 filtered_df = df.copy()
 
-# Quick filter: Disposition Sub Group = 'Defective Product'
-quick_filter_defective = st.checkbox("Quick Filter: Disposition Sub Group = 'Defective Product'")
-if quick_filter_defective and "Disposition Sub Group" in filtered_df.columns:
+q_def = st.checkbox("Quick Filter: Disposition Sub Group = 'Defective Product'")
+if q_def and "Disposition Sub Group" in filtered_df.columns:
     filtered_df = filtered_df[filtered_df["Disposition Sub Group"] == "Defective Product"]
 
-# Quick filter: Troubleshooting Result multi-select
-troubleshooting_filter_enabled = st.checkbox("Quick Filter: Troubleshooting Result (multi-select values)")
-if troubleshooting_filter_enabled and "Troubleshooting Result" in filtered_df.columns:
-    all_tr_values = (
-        filtered_df["Troubleshooting Result"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-    all_tr_values = sorted(all_tr_values)
-    troubleshooting_selected_values = st.multiselect(
-        "Select Troubleshooting Result values to keep",
-        options=all_tr_values,
-        default=all_tr_values,  # behaves like 'not blank' unless user narrows
-    )
-    filtered_df = filtered_df[
-        filtered_df["Troubleshooting Result"].astype(str).isin(troubleshooting_selected_values)
-    ]
+q_tr = st.checkbox("Quick Filter: Troubleshooting Result (multi-select)")
+if q_tr and "Troubleshooting Result" in filtered_df.columns:
+    vals = sorted(filtered_df["Troubleshooting Result"].dropna().astype(str).unique().tolist())
+    chosen = st.multiselect("Select Troubleshooting Result values to keep", options=vals, default=vals)
+    filtered_df = filtered_df[filtered_df["Troubleshooting Result"].astype(str).isin(chosen)]
 
-st.write("Custom filters (exact match across selected values):")
-filter_cols = st.multiselect("Select additional columns to filter on", options=df.columns)
-
-selected_filter_values = {}
+st.write("Custom filters (exact match):")
+filter_cols = st.multiselect("Select columns to filter on", options=df.columns)
 for col in filter_cols:
-    unique_vals = (
-        filtered_df[col]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-    unique_vals = sorted(unique_vals)
-    chosen_vals = st.multiselect(
-        f"Values to keep for '{col}'",
-        options=unique_vals,
-        key=f"filter_vals_{col}",
-    )
-    if chosen_vals:
-        selected_filter_values[col] = chosen_vals
+    u = sorted(filtered_df[col].dropna().astype(str).unique().tolist())
+    sel = st.multiselect(f"Values to keep for '{col}'", options=u, key=f"flt_{col}")
+    if sel:
+        filtered_df = filtered_df[filtered_df[col].astype(str).isin(sel)]
 
-for col, vals in selected_filter_values.items():
-    filtered_df = filtered_df[filtered_df[col].astype(str).isin(vals)]
-
-st.write("### Filtered Result Preview")
+st.write("### Filtered Preview")
 st.dataframe(filtered_df.head())
 st.caption(f"Rows selected for processing: {len(filtered_df)} / {len(df)}")
-
 if filtered_df.empty:
-    st.warning("No rows match the selected filters. Adjust filters or upload a different file.")
+    st.warning("No rows match the filters.")
     st.stop()
 
-# ---------------------------------------------------------
-# 4️⃣ Preset Tasks / Prompts
-# ---------------------------------------------------------
-st.header("4️⃣ Choose Tasks / Preset Prompts")
+# =========================
+# 4) Preset Tasks (editable)
+# =========================
+st.header("4️⃣ Preset Tasks / Prompts (Editable JSON outputs)")
 
-st.subheader("Preset LLM Tasks (Recommended)")
-
-# Default preset prompt texts (user can override in UI)
+# Prompts
 default_purchase_prompt = (
     "You are given:\n"
-    "- TEXT: A transcript snippet or summary of a customer support call.\n"
-    "- CALL_DATE: The date/time of the call from the selected call date column (may be blank).\n"
-    "- INFERRED_RELATIVE_DATE_HINT: An optional approximate YYYY-MM-DD value derived from phrases "
-    "like 'last September', based on CALL_DATE.\n\n"
-    "Task: Extract the date the customer purchased the product.\n"
+    "- TEXT: A summary or transcript snippet of a customer support call.\n"
+    "- CALL_DATE: The date/time of the call.\n"
+    "- INFERRED_RELATIVE_DATE_HINT: Optional approximate YYYY-MM-DD derived from phrases like 'last September'.\n\n"
+    "Task: Extract the purchase date.\n"
     "Rules:\n"
-    "- If the text clearly mentions a purchase date, return it in YYYY-MM-DD format.\n"
-    "- If the text only contains a relative month phrase like 'last September', and you have "
-    "CALL_DATE and INFERRED_RELATIVE_DATE_HINT, you may use the hint as the purchase date.\n"
-    "- If there is no clear purchase date, use 'unknown'.\n\n"
-    "Return ONLY a JSON object that matches the given schema."
+    "- If a clear date is in the text, return YYYY-MM-DD.\n"
+    "- If only a relative month is available and a hint is provided, you MAY use the hint.\n"
+    "- Otherwise, return 'unknown'.\n\n"
+    "Return ONLY a JSON object that matches the schema."
 )
-
 default_symptom_prompt = (
-    "You are given TEXT, a summary or transcript snippet of a customer support call.\n\n"
-    "Task: Identify the primary technical/functional symptom driving the call.\n"
-    "Return a concise phrase like 'no power', 'weak airflow', 'overheating', "
-    "'burning smell', 'not heating', 'unit shuts off', 'error code' etc.\n"
-    "If the complaint is unclear, choose the best available short description.\n\n"
-    "Return ONLY a JSON object that matches the given schema."
+    "Given TEXT, identify the PRIMARY technical/functional symptom (e.g., 'no power', 'weak airflow', "
+    "'overheating', 'burning smell', 'unit shuts off', 'error code'). Be concise.\n\n"
+    "Return ONLY a JSON object that matches the schema."
 )
-
 default_error_indicator_prompt = (
-    "You are given TEXT, a summary or transcript snippet of a customer support call.\n\n"
-    "Task: Determine whether the customer mentions any explicit error code, flashing lights, "
-    "blinking LEDs, or on-screen error messages / icons.\n"
-    "If so, return a short phrase that captures the key indicator "
-    "(for example: 'E02 error code', 'red light flashing', 'all lights blinking', "
-    "'filter icon flashing').\n"
-    "If there is no such indicator, return 'none'.\n\n"
-    "Return ONLY a JSON object that matches the given schema."
+    "Given TEXT, detect any explicit error code, flashing/blinking lights, or on-screen error icons/messages.\n"
+    "If present, return a concise phrase (e.g., 'E02', 'red light flashing', 'filter icon flashing'); else 'none'.\n\n"
+    "Return ONLY a JSON object that matches the schema."
+)
+default_model_number_prompt = (
+    "Given TEXT, extract the MODEL NUMBER of the product if mentioned (e.g., NV356E, ZU62, HZ2000, HT300).\n"
+    "If multiple, return the most specific one. If none, return 'unknown'.\n\n"
+    "Return ONLY a JSON object that matches the schema."
 )
 
-# System prompts
-purchase_task_system = (
-    "You are an expert at extracting structured information from noisy customer support text."
-)
-symptom_task_system = (
-    "You are an expert quality engineer classifying customer calls by technical symptom."
-)
-error_indicator_system = (
-    "You are an expert at extracting error codes and UI/LED indicators from customer complaints."
-)
+purchase_system = "You extract structured purchase dates from noisy customer support text."
+symptom_system = "You classify customer calls by primary technical symptom."
+error_system   = "You extract error codes and UI/LED indicators from support text."
+model_system   = "You extract product model numbers (e.g., NV356E, ZU62, AZ2000, HT300) from support text."
 
-# User explicitly selects which presets to use
-use_purchase_preset = st.checkbox(
-    "📅 Use preset: Extract purchase date & ownership period "
-    "(→ columns: purchase_date, ownership_period_days)"
-)
+# Schemas
+purchase_schema = {"type":"object","properties":{"purchase_date":{"type":"string"}},"required":["purchase_date"],"additionalProperties":False}
+symptom_schema  = {"type":"object","properties":{"symptom":{"type":"string"}},"required":["symptom"],"additionalProperties":False}
+error_schema    = {"type":"object","properties":{"error_indicator":{"type":"string"}},"required":["error_indicator"],"additionalProperties":False}
+model_schema    = {"type":"object","properties":{"model_number":{"type":"string"}},"required":["model_number"],"additionalProperties":False}
 
-purchase_task_template = None
-if use_purchase_preset:
-    purchase_task_template = st.text_area(
-        "Purchase date preset prompt (you can edit this):",
-        value=default_purchase_prompt,
-        height=230,
-        key="purchase_preset_prompt",
-    )
+use_purchase = st.checkbox("📅 Purchase date → `purchase_date` (also computes `ownership_period_days`)")
+purchase_prompt = st.text_area("Purchase preset (editable):", value=default_purchase_prompt, height=180) if use_purchase else None
 
-use_symptom_preset = st.checkbox(
-    "🩺 Use preset: Extract primary technical symptom "
-    "(→ column: symptom)"
-)
+use_symptom = st.checkbox("🩺 Primary symptom → `symptom`")
+symptom_prompt = st.text_area("Symptom preset (editable):", value=default_symptom_prompt, height=150) if use_symptom else None
 
-symptom_task_template = None
-if use_symptom_preset:
-    symptom_task_template = st.text_area(
-        "Symptom preset prompt (you can edit this):",
-        value=default_symptom_prompt,
-        height=200,
-        key="symptom_preset_prompt",
-    )
+use_error = st.checkbox("💡 Error code / flashing indicator → `error_indicator`")
+error_prompt = st.text_area("Error/Indicator preset (editable):", value=default_error_indicator_prompt, height=150) if use_error else None
 
-use_error_indicator_preset = st.checkbox(
-    "💡 Use preset: Detect error code / flashing UI indicator "
-    "(→ column: error_indicator)"
-)
+use_modelnum = st.checkbox("🔢 Model number → `model_number`")
+model_prompt = st.text_area("Model number preset (editable):", value=default_model_number_prompt, height=140) if use_modelnum else None
 
-error_indicator_template = None
-if use_error_indicator_preset:
-    error_indicator_template = st.text_area(
-        "Error indicator preset prompt (you can edit this):",
-        value=default_error_indicator_prompt,
-        height=220,
-        key="error_indicator_preset_prompt",
-    )
-
-# Structured JSON schemas
-purchase_schema = {
-    "type": "object",
-    "properties": {
-        "purchase_date": {
-            "type": "string",
-            "description": (
-                "Date the customer purchased the product. "
-                "Use YYYY-MM-DD format when possible. If unknown, use 'unknown'."
-            ),
-        }
-    },
-    "required": ["purchase_date"],
-    "additionalProperties": False,
-}
-
-symptom_schema = {
-    "type": "object",
-    "properties": {
-        "symptom": {
-            "type": "string",
-            "description": (
-                "Primary technical/functional symptom driving the call. "
-                "Examples: 'no power', 'weak airflow', 'overheating', 'smells bad', "
-                "'unit shuts off', 'error code on display'."
-            ),
-        }
-    },
-    "required": ["symptom"],
-    "additionalProperties": False,
-}
-
-error_indicator_schema = {
-    "type": "object",
-    "properties": {
-        "error_indicator": {
-            "type": "string",
-            "description": (
-                "Short description of any error code, flashing light, or UI indicator mentioned. "
-                "Use 'none' if not mentioned."
-            ),
-        }
-    },
-    "required": ["error_indicator"],
-    "additionalProperties": False,
-}
-
-# ---------------------------------------------------------
-# 5️⃣ Custom Prompts (with examples)
-# ---------------------------------------------------------
+# =========================
+# 5) Custom Prompts
+# =========================
 st.subheader("Custom LLM Tasks")
-
-custom_prompts = []
-custom_output_cols = []
-
 use_custom = st.checkbox("➕ Enable custom prompts")
+custom_prompts: List[str] = []
+custom_outcols: List[str] = []
 
-# Example prompt suggestions
 with st.expander("📌 Example custom prompts"):
     st.markdown(
         """
-- **Failure Mode Classification**  
-  `Classify the main failure mode into one of: airflow, power, overheating, noise, cosmetic, other. Return only the label.`
-
-- **Resolution Status**  
-  `Determine whether the issue was resolved during this call. Return one of: resolved, unresolved, unclear.`
-
-- **Filter Maintenance Behavior**  
-  `Identify whether the customer mentions cleaning or replacing the filter and summarize in one short sentence.`
-
-- **Customer Sentiment**  
-  `Classify the customer's sentiment as one of: calm, neutral, frustrated, angry. Return only the label.`
+- **Failure Mode** — `Classify the main failure mode into one of: airflow, power, overheating, noise, cosmetic, other. Return only the label.`
+- **Resolution Status** — `Determine whether the issue was resolved during this call. Return one of: resolved, unresolved, unclear.`
+- **Filter Maintenance** — `Identify whether the customer mentions cleaning or replacing the filter and summarize in one short sentence.`
+- **Sentiment** — `Classify sentiment as one of: calm, neutral, frustrated, angry. Return only the label.`
         """
     )
 
 if use_custom:
-    num_custom = st.number_input(
-        "How many custom prompts?",
-        min_value=1,
-        max_value=10,
-        value=1,
-        step=1,
-    )
-    for i in range(num_custom):
-        st.markdown(f"**Custom Task {i+1}**")
-        col1, col2 = st.columns(2)
-        with col1:
-            p = st.text_area(f"Prompt {i+1}", key=f"prompt_{i}")
-        with col2:
-            o = st.text_input(f"Output column name {i+1}", key=f"outcol_{i}")
+    n_custom = st.number_input("How many custom prompts?", min_value=1, max_value=12, value=1, step=1)
+    for i in range(n_custom):
+        c1, c2 = st.columns(2)
+        with c1:
+            p = st.text_area(f"Prompt {i+1}", key=f"cp_{i}")
+        with c2:
+            o = st.text_input(f"Output column {i+1}", key=f"co_{i}")
         if p.strip() and o.strip():
-            custom_prompts.append(p.strip())
-            custom_output_cols.append(o.strip())
+            custom_prompts.append(p.strip()); custom_outcols.append(o.strip())
 
-# Optional: AI helper to design a custom prompt
+# Optional AI helper
+use_prompt_assistant = st.checkbox("✨ Use AI to help craft a custom prompt")
 if use_prompt_assistant and text_col:
-    st.markdown("#### ✨ Let AI Suggest a Prompt")
-    helper_desc = st.text_area(
-        "Describe what you want the model to extract or classify from the text column:",
-        placeholder="Example: I want to classify whether the issue is related to airflow, power, or noise...",
-    )
-    if st.button("Generate Prompt Suggestion with AI"):
+    helper = st.text_area("Describe what you want to extract/classify:")
+    if st.button("Generate a suggested prompt"):
         if not api_key:
-            st.error("Enter your API key (via secrets or override) to use the prompt assistant.")
+            st.error("Add your API key first.")
         else:
             client = get_client(api_key)
-            examples = (
-                filtered_df[text_col]
-                .dropna()
-                .astype(str)
-                .head(5)
-                .tolist()
-            )
-            example_block = "\n\n".join(f"- {e}" for e in examples)
-            system_msg = (
-                "You are an expert at designing high-quality prompts for large language models "
-                "to analyze customer support text row-by-row in a spreadsheet."
-            )
-            user_msg = (
-                f"The analyst wants to achieve the following:\n{helper_desc}\n\n"
-                f"Here are some example texts from the selected column '{text_col}':\n"
-                f"{example_block}\n\n"
-                "Write a SINGLE clear prompt they can reuse for each row. Do not include examples, "
-                "just the prompt text itself."
-            )
+            sample = filtered_df[text_col].dropna().astype(str).head(5).tolist()
+            example_block = "\n\n".join(f"- {s}" for s in sample)
+            sys = "Design a reusable prompt for row-by-row analysis of support text."
+            usr = (f"Goal:\n{helper}\n\nExamples from the text column:\n{example_block}\n\n"
+                   "Provide ONE reusable prompt (no examples in the output).")
             try:
-                suggestion = call_llm_free_text(client, model_choice, system_msg, user_msg)
+                suggestion = call_llm_text(client, model_choice, sys, usr, limiter=None)
                 st.success("Suggested prompt:")
                 st.code(suggestion)
             except Exception as e:
-                st.error(f"Error generating prompt suggestion: {e}")
+                st.error(f"Prompt assistant error: {e}")
 
-# ---------------------------------------------------------
-# 6️⃣ Performance Settings (for faster runs)
-# ---------------------------------------------------------
-st.header("5️⃣ Performance Settings")
+# =========================
+# 6) Throughput Controls
+# =========================
+st.header("5️⃣ Throughput & Guardrails")
+cA, cB, cC = st.columns(3)
+with cA:
+    max_rows = st.number_input("Max rows to process", min_value=1, max_value=len(filtered_df), value=len(filtered_df))
+with cB:
+    threads = st.slider("Concurrency (parallel requests)", min_value=1, max_value=16, value=6)
+with cC:
+    target_rpm = st.slider("Target Requests Per Minute (RPM)", min_value=0, max_value=600, value=120,
+                           help="0 = no throttling. Set to your account's safe RPM to fully utilize without 429s.")
 
-max_rows_default = len(filtered_df)
-max_rows = st.number_input(
-    "Max rows to process (for speed tuning)",
-    min_value=1,
-    max_value=len(filtered_df),
-    value=max_rows_default,
-    step=1,
-)
+skip_short = st.checkbox("Skip very short texts (≤ 10 chars)", value=True)
+use_heuristics = st.checkbox("Use heuristics before LLM (faster/cheaper for dates & indicators & model #)", value=True)
+only_missing = st.checkbox("Only process rows where outputs are missing", value=True)
 
-skip_short = st.checkbox(
-    "Skip rows where text length is very short (≤ 10 characters)",
-    value=True,
-    help="This can avoid wasting LLM calls on empty or trivial rows.",
-)
+# Session memo (dedupe identical requests)
+if "memo_cache" not in st.session_state:
+    st.session_state.memo_cache: Dict[Tuple[str, str], str] = {}
 
-# Precompute which output columns might be written (for skip logic)
-active_output_cols = []
-if use_purchase_preset:
-    active_output_cols.append("purchase_date")
-if use_symptom_preset:
-    active_output_cols.append("symptom")
-if use_error_indicator_preset:
-    active_output_cols.append("error_indicator")
-active_output_cols.extend(custom_output_cols)
-
-# ---------------------------------------------------------
-# 7️⃣ Run LLM Processing
-# ---------------------------------------------------------
+# =========================
+# 7) Run LLM Processing (parallel + rate-limited)
+# =========================
 st.header("6️⃣ Run LLM Processing")
 
-if st.button("🚀 Run on filtered rows"):
-    if not api_key:
-        st.error("No API key available. Add OPENAI_API_KEY to secrets or provide an override.")
-    else:
-        tasks_selected = any([use_purchase_preset, use_symptom_preset, use_error_indicator_preset, use_custom])
-        if not tasks_selected:
-            st.error("Select at least one preset task or add a custom prompt.")
-        else:
-            client = get_client(api_key)
-            results_df = df.copy()
+# Active outputs
+active_cols = []
+if use_purchase: active_cols.append("purchase_date")
+if use_symptom: active_cols.append("symptom")
+if use_error:   active_cols.append("error_indicator")
+if use_modelnum:active_cols.append("model_number")
+active_cols += custom_outcols
 
-            rows_to_process = filtered_df.head(int(max_rows))
-            total_rows = len(rows_to_process)
+# Systems & schemas per preset
+PRESETS = []
+if use_purchase:
+    PRESETS.append(("purchase_date", purchase_system, purchase_prompt, purchase_schema))
+if use_symptom:
+    PRESETS.append(("symptom",       symptom_system,  symptom_prompt,  symptom_schema))
+if use_error:
+    PRESETS.append(("error_indicator", error_system,  error_prompt,    error_schema))
+if use_modelnum:
+    PRESETS.append(("model_number",   model_system,   model_prompt,    model_schema))
+
+def process_row(
+    idx: int, row: pd.Series, client: OpenAI, model: str,
+    presets, custom_prompts, custom_outcols,
+    text_col: str, call_date_col: Optional[str],
+    use_heuristics: bool, skip_short: bool,
+    memo: Dict[Tuple[str, str], str],
+    limiter: Optional[RateLimiter]
+) -> Tuple[int, Dict[str, Any]]:
+    out: Dict[str, Any] = {}
+    text_val = normalize_text(row.get(text_col, ""))
+    call_date_val = str(row.get(call_date_col, "")) if call_date_col else ""
+    hint = infer_year_from_relative(text_val, call_date_val) if call_date_col else None
+
+    if skip_short and len(text_val.strip()) <= 10:
+        for c in active_cols: out[c] = ""
+        return idx, out
+
+    # Presets
+    for col, sys, prompt, schema in presets:
+        key = (text_val, f"preset::{col}")
+        if key in memo:
+            out[col] = memo[key]
+            continue
+
+        value = None
+        if use_heuristics:
+            if col == "purchase_date":
+                value = try_parse_date(text_val) or (hint if hint else None)
+            elif col == "error_indicator":
+                value = heuristic_error_indicator(text_val)
+            elif col == "model_number":
+                value = heuristic_model_number(text_val)
+
+        if value is None:
+            user_prompt = prompt + f"\n\nTEXT:\n{text_val}\n"
+            if col == "purchase_date":
+                user_prompt += f"\nCALL_DATE: {call_date_val}\nINFERRED_RELATIVE_DATE_HINT: {hint}"
+            data = call_llm_json_safe(client, model, sys, user_prompt,
+                                      f"{col}_extraction", schema, limiter)
+            value = data.get(col) or data.get("_raw") or ("unknown" if col in ("purchase_date","model_number") else "")
+        memo[key] = value
+        out[col] = value
+
+    # Customs
+    for p, c in zip(custom_prompts, custom_outcols):
+        key = (text_val, f"custom::{c}")
+        if key in memo:
+            out[c] = memo[key]
+        else:
+            user_prompt = f"TEXT:\n{text_val}\n\nCALL_DATE: {call_date_val}\n\nTASK:\n{p}"
+            val = call_llm_text(client, model, "You analyze support text precisely.", user_prompt, limiter)
+            memo[key] = val
+            out[c] = val
+
+    return idx, out
+
+if st.button("🚀 Run"):
+    if not api_key:
+        st.error("No API key configured.")
+    elif not (PRESETS or custom_prompts):
+        st.error("Select at least one preset or add a custom prompt.")
+    else:
+        client = get_client(api_key)
+        results_df = df.copy()
+
+        # Determine rows to process
+        rows = filtered_df.head(int(max_rows)).copy()
+        if only_missing and active_cols:
+            need_mask = pd.Series(False, index=rows.index)
+            for c in active_cols:
+                if c in results_df.columns:
+                    need_mask = need_mask | results_df.loc[rows.index, c].isna()
+                else:
+                    need_mask = True
+            rows = rows[need_mask]
+
+        total = len(rows)
+        if total == 0:
+            st.info("Nothing to do (outputs already present). Uncheck 'Only process missing' or broaden filters.")
+        else:
+            # Ensure columns exist
+            for c in active_cols:
+                if c not in results_df.columns:
+                    results_df[c] = pd.NA
+
+            limiter = RateLimiter(target_rpm) if target_rpm > 0 else None
+            memo = st.session_state.memo_cache
+
             progress = st.progress(0.0)
             status = st.empty()
 
-            for i, (idx, row) in enumerate(rows_to_process.iterrows(), start=1):
-                text_val = str(row.get(text_col, ""))
-                call_date_val = str(row.get(call_date_col, "")) if call_date_col else ""
-                inferred_hint = infer_year_from_relative(text_val, call_date_val) if call_date_col else None
+            futures = []
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                for idx, row in rows.iterrows():
+                    futures.append(pool.submit(
+                        process_row, idx, row, client, model_choice,
+                        PRESETS, custom_prompts, custom_outcols,
+                        text_col, call_date_col, use_heuristics, skip_short,
+                        memo, limiter
+                    ))
+                done = 0
+                for fut in as_completed(futures):
+                    idx, out = fut.result()
+                    for col, val in out.items():
+                        results_df.loc[idx, col] = val
+                    done += 1
+                    progress.progress(done/total)
+                    status.write(f"Processed {done}/{total} rows...")
 
-                # Optionally skip very short text rows to save LLM calls
-                if skip_short and len(text_val.strip()) <= 10:
-                    for col in active_output_cols:
-                        results_df.loc[idx, col] = ""
-                else:
-                    # 1) Purchase date preset (structured JSON)
-                    if use_purchase_preset and purchase_task_template:
-                        user_prompt = (
-                            purchase_task_template
-                            + f"\n\nTEXT:\n{text_val}\n\n"
-                            + f"CALL_DATE: {call_date_val}\n"
-                            + f"INFERRED_RELATIVE_DATE_HINT: {inferred_hint}"
-                        )
+            # Derived ownership period
+            if use_purchase and call_date_col:
+                try:
+                    pd_purchase = pd.to_datetime(results_df["purchase_date"], errors="coerce")
+                    pd_call = pd.to_datetime(results_df[call_date_col], errors="coerce")
+                    results_df["ownership_period_days"] = (pd_call - pd_purchase).dt.days
+                except Exception as e:
+                    st.warning(f"Ownership calculation issue: {e}")
 
-                        try:
-                            data = call_llm_json(
-                                client,
-                                model_choice,
-                                purchase_task_system,
-                                user_prompt,
-                                schema_name="purchase_date_extraction",
-                                schema=purchase_schema,
-                            )
-                            purchase_date_str = None
-                            if isinstance(data, dict):
-                                purchase_date_str = data.get("purchase_date") or data.get("_raw")
-                            results_df.loc[idx, "purchase_date"] = purchase_date_str
-                        except Exception as e:
-                            results_df.loc[idx, "purchase_date"] = f"ERROR: {e}"
+            st.session_state["results_df"] = results_df
+            st.success("Processing complete ✅")
 
-                    # 2) Symptom preset (structured JSON)
-                    if use_symptom_preset and symptom_task_template:
-                        user_prompt = symptom_task_template + f"\n\nTEXT:\n{text_val}\n"
-                        try:
-                            data = call_llm_json(
-                                client,
-                                model_choice,
-                                symptom_task_system,
-                                user_prompt,
-                                schema_name="symptom_extraction",
-                                schema=symptom_schema,
-                            )
-                            symptom_val = None
-                            if isinstance(data, dict):
-                                symptom_val = data.get("symptom") or data.get("_raw")
-                            results_df.loc[idx, "symptom"] = symptom_val
-                        except Exception as e:
-                            results_df.loc[idx, "symptom"] = f"ERROR: {e}"
+# =========================
+# 8) Analyze & Visualize
+# =========================
+st.header("7️⃣ Analyze & Visualize")
 
-                    # 3) Error indicator preset (structured JSON)
-                    if use_error_indicator_preset and error_indicator_template:
-                        user_prompt = error_indicator_template + f"\n\nTEXT:\n{text_val}\n"
-                        try:
-                            data = call_llm_json(
-                                client,
-                                model_choice,
-                                error_indicator_system,
-                                user_prompt,
-                                schema_name="error_indicator_extraction",
-                                schema=error_indicator_schema,
-                            )
-                            indicator_val = None
-                            if isinstance(data, dict):
-                                indicator_val = data.get("error_indicator") or data.get("_raw")
-                            results_df.loc[idx, "error_indicator"] = indicator_val
-                        except Exception as e:
-                            results_df.loc[idx, "error_indicator"] = f"ERROR: {e}"
+results_df = st.session_state.get("results_df")
+if results_df is None:
+    st.info("Run the processing to see analysis.")
+else:
+    st.subheader("Enriched Dataset Preview")
+    st.dataframe(results_df.head())
 
-                    # 4) Custom free-text prompts
-                    for p, out_col in zip(custom_prompts, custom_output_cols):
-                        full_prompt = (
-                            f"TEXT: {text_val}\n"
-                            f"CALL_DATE: {call_date_val}\n\n"
-                            f"TASK: {p}"
-                        )
-                        try:
-                            out = call_llm_free_text(
-                                client,
-                                model_choice,
-                                system_prompt="You are a helpful assistant analyzing customer support data.",
-                                user_prompt=full_prompt,
-                            )
-                        except Exception as e:
-                            out = f"ERROR: {e}"
-                        results_df.loc[idx, out_col] = out
+    if "ownership_period_days" in results_df.columns:
+        st.subheader("Ownership Period (Days)")
+        series = results_df["ownership_period_days"].dropna()
+        if not series.empty:
+            st.write(series.describe())
+            bins = [-1, 30, 90, 180, 365, 730, 3650]
+            labels = ["0–30", "31–90", "91–180", "181–365", "366–730", ">730"]
+            bands = pd.cut(series, bins=bins, labels=labels)
+            st.write("Ownership bands:")
+            st.bar_chart(bands.value_counts().sort_index())
+        else:
+            st.info("No ownership period values.")
 
-                progress.progress(i / float(total_rows))
-                status.write(f"Processed {i} / {total_rows} rows...")
+    if "symptom" in results_df.columns:
+        st.subheader("Symptom Distribution")
+        s = results_df["symptom"].dropna().astype(str).str.strip()
+        s = s[s != ""]
+        if not s.empty:
+            top = s.value_counts().head(20)
+            st.bar_chart(top)
+            st.table(top.to_frame("count"))
+        else:
+            st.info("No symptom values.")
 
-            # After loop: compute ownership period in days if we have purchase_date + call_date_col
-            if use_purchase_preset and call_date_col:
-                if "purchase_date" in results_df.columns and call_date_col in results_df.columns:
-                    try:
-                        purchase_dates = pd.to_datetime(results_df["purchase_date"], errors="coerce")
-                        call_dates = pd.to_datetime(results_df[call_date_col], errors="coerce")
-                        ownership_days = (call_dates - purchase_dates).dt.days
-                        results_df["ownership_period_days"] = ownership_days
-                    except Exception as e:
-                        st.warning(f"Could not compute ownership_period_days: {e}")
-                else:
-                    st.warning(
-                        "purchase_date or call date column missing from results, so ownership_period_days "
-                        "could not be computed."
-                    )
+    if "error_indicator" in results_df.columns:
+        st.subheader("Error Indicators (codes / flashing / UI)")
+        ei = results_df["error_indicator"].dropna().astype(str).str.strip()
+        ei = ei[ei != ""]
+        if not ei.empty:
+            top = ei.value_counts().head(20)
+            st.bar_chart(top)
+            st.table(top.to_frame("count"))
+        else:
+            st.info("No error_indicator values.")
 
-            st.success("LLM processing complete. Preview, analyze, and download below.")
+    if "model_number" in results_df.columns:
+        st.subheader("Model Number Mentions")
+        mn = results_df["model_number"].dropna().astype(str).str.strip()
+        mn = mn[(mn != "") & (mn != "unknown")]
+        if not mn.empty:
+            top = mn.value_counts().head(20)
+            st.bar_chart(top)
+            st.table(top.to_frame("count"))
+        else:
+            st.info("No model numbers extracted.")
 
-            # ---------------------------------------------------------
-            # 8️⃣ Quick Analysis of New Data
-            # ---------------------------------------------------------
-            st.header("7️⃣ Quick Analysis of New Data")
+    if "purchase_date" in results_df.columns:
+        st.subheader("Purchases by Year (from `purchase_date`)")
+        pdt = pd.to_datetime(results_df["purchase_date"], errors="coerce").dropna()
+        if not pdt.empty:
+            st.bar_chart(pdt.dt.year.value_counts().sort_index())
+        else:
+            st.info("No valid purchase_date values.")
 
-            st.subheader("Preview of Enriched Dataset")
-            st.dataframe(results_df.head())
+    if call_date_col and call_date_col in results_df.columns:
+        st.subheader(f"Calls Over Time (based on '{call_date_col}')")
+        cdt = pd.to_datetime(results_df[call_date_col], errors="coerce").dropna()
+        if not cdt.empty:
+            by_month = cdt.dt.to_period("M").value_counts().sort_index()
+            by_month.index = by_month.index.astype(str)
+            st.line_chart(by_month)
+        else:
+            st.info("No valid call dates.")
 
-            # Ownership period analysis
-            if "ownership_period_days" in results_df.columns:
-                st.subheader("Ownership Period (Days)")
-                ownership = results_df["ownership_period_days"].dropna()
-                if not ownership.empty:
-                    st.write("Summary statistics:")
-                    st.write(ownership.describe())
+    # Download
+    buffer = BytesIO()
+    results_df.to_excel(buffer, index=False)
+    buffer.seek(0)
+    st.download_button(
+        "⬇️ Download processed file",
+        data=buffer,
+        file_name="processed_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-                    # Bucket ownership into bands
-                    bins = [-1, 30, 90, 180, 365, 730, 3650]
-                    labels = ["0–30", "31–90", "91–180", "181–365", "366–730", ">730"]
-                    binned = pd.cut(ownership, bins=bins, labels=labels)
-                    bucket_counts = binned.value_counts().sort_index()
-                    st.write("Ownership bands (days):")
-                    st.bar_chart(bucket_counts)
-                else:
-                    st.info("No valid ownership_period_days values to analyze.")
-
-            # Symptom distribution
-            if "symptom" in results_df.columns:
-                st.subheader("Symptom Distribution")
-                symptom_series = results_df["symptom"].dropna().astype(str).str.strip()
-                symptom_series = symptom_series[symptom_series != ""]
-                if not symptom_series.empty:
-                    top_symptoms = symptom_series.value_counts().head(15)
-                    st.write("Top 15 symptoms:")
-                    st.bar_chart(top_symptoms)
-                    st.table(top_symptoms.to_frame("count"))
-                else:
-                    st.info("No non-empty symptom values to analyze.")
-
-            # Error indicator distribution
-            if "error_indicator" in results_df.columns:
-                st.subheader("Error Indicators (codes / flashing lights / UI)")
-                ei_series = results_df["error_indicator"].dropna().astype(str).str.strip()
-                ei_series = ei_series[ei_series != ""]
-                if not ei_series.empty:
-                    top_ei = ei_series.value_counts().head(15)
-                    st.write("Top 15 indicators:")
-                    st.bar_chart(top_ei)
-                    st.table(top_ei.to_frame("count"))
-                else:
-                    st.info("No non-empty error_indicator values to analyze.")
-
-            # Purchase date by year
-            if "purchase_date" in results_df.columns:
-                st.subheader("Purchases by Year (from extracted purchase_date)")
-                purchase_dt = pd.to_datetime(results_df["purchase_date"], errors="coerce")
-                purchase_dt = purchase_dt.dropna()
-                if not purchase_dt.empty:
-                    by_year = purchase_dt.dt.year.value_counts().sort_index()
-                    st.bar_chart(by_year)
-                else:
-                    st.info("No valid purchase_date values to analyze.")
-
-            # Call volume by call date if available
-            if call_date_col and call_date_col in results_df.columns:
-                st.subheader(f"Calls Over Time (based on '{call_date_col}')")
-                call_dt = pd.to_datetime(results_df[call_date_col], errors="coerce")
-                call_dt = call_dt.dropna()
-                if not call_dt.empty:
-                    by_month = call_dt.dt.to_period("M").value_counts().sort_index()
-                    by_month.index = by_month.index.astype(str)
-                    st.line_chart(by_month)
-                else:
-                    st.info("No valid call date values to analyze.")
-
-            # ---------------------------------------------------------
-            # Download Output
-            # ---------------------------------------------------------
-            buffer = BytesIO()
-            results_df.to_excel(buffer, index=False)
-            buffer.seek(0)
-
-            st.download_button(
-                "⬇️ Download processed file",
-                data=buffer,
-                file_name="processed_output.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
 
 
