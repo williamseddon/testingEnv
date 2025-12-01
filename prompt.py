@@ -5,7 +5,7 @@ import json
 import time
 from io import BytesIO
 from openai import OpenAI
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -72,9 +72,40 @@ MONTHS = [
 ]
 MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec"]
 
+# Context keywords for separating purchase vs warranty/coverage dates
+WARRANTY_CONTEXT_KEYWORDS = [
+    "warranty",
+    "extended warranty",
+    "expir",         # matches expire, expires, expiration
+    "coverage",
+    "covered",
+    "protection plan",
+    "protection",
+    "guarantee",
+    "guaranteed",
+]
+PURCHASE_CONTEXT_KEYWORDS = [
+    "purchase",
+    "purchased",
+    "bought",
+    "buy",
+    "bought it",
+    "bought this",
+    "purchase date",
+    "purchased on",
+    "order date",
+    "ordered",
+    "i got it",
+    "got it",
+    "have had it since",
+    "owned since",
+    "since i bought",
+]
+
 def infer_year_from_relative(text: str, call_date_str: str) -> Optional[str]:
     """
-    If text says 'last September', infer YYYY-MM-15 using call_date year - 1.
+    If text says 'last September', infer YYYY-MM-15 using call_date year - 1,
+    but skip if that phrase is clearly in warranty/coverage context.
     """
     if not isinstance(text, str) or not text:
         return None
@@ -87,11 +118,25 @@ def infer_year_from_relative(text: str, call_date_str: str) -> Optional[str]:
         return None
 
     t = text.lower()
+    # Full month names
     for i, m in enumerate(MONTHS, start=1):
-        if f"last {m}" in t:
+        pattern = rf"last\s+{m}"
+        for match in re.finditer(pattern, t):
+            ctx_start = max(0, match.start() - 40)
+            ctx_end = min(len(t), match.end() + 40)
+            ctx = t[ctx_start:ctx_end]
+            if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
+                continue
             return f"{call_date.year - 1}-{i:02d}-15"
+    # Abbreviations
     for i, m in enumerate(MONTH_ABBR, start=1):
-        if f"last {m}" in t:
+        pattern = rf"last\s+{m}"
+        for match in re.finditer(pattern, t):
+            ctx_start = max(0, match.start() - 40)
+            ctx_end = min(len(t), match.end() + 40)
+            ctx = t[ctx_start:ctx_end]
+            if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
+                continue
             month_index = min(i, 12)
             return f"{call_date.year - 1}-{month_index:02d}-15"
     return None
@@ -119,6 +164,7 @@ def try_parse_date(text: str) -> Optional[str]:
     """
     Parse first explicit date found into YYYY-MM-DD.
     For month+year (no day), assume day=15 to approximate mid-month.
+    NOTE: This does not look at warranty context; we use it on short strings.
     """
     if not isinstance(text, str) or not text:
         return None
@@ -140,8 +186,8 @@ def try_parse_date(text: str) -> Optional[str]:
 
 def infer_month_only_date(text: str, call_date_str: Optional[str]) -> Optional[str]:
     """
-    If text has a bare month name (e.g. 'in October') with no day/year,
-    assume same year as call_date and day=15.
+    If text has a bare month name (e.g. 'in October') with no explicit day/year,
+    assume same year as call_date and day=15, but skip warranty/coverage contexts.
     """
     if not isinstance(text, str) or not text:
         return None
@@ -151,42 +197,135 @@ def infer_month_only_date(text: str, call_date_str: Optional[str]) -> Optional[s
         call_year = datetime.strptime(call_date_str.split()[0], "%Y-%m-%d").year
     except Exception:
         return None
-    t = text.lower()
+
+    t = text
+    lower = t.lower()
+    # Full month names
     for i, m in enumerate(MONTHS, start=1):
-        if re.search(rf"\b{m}\b", t):
+        for match in re.finditer(rf"\b{m}\b", lower):
+            ctx_start = max(0, match.start() - 40)
+            ctx_end = min(len(lower), match.end() + 40)
+            ctx = lower[ctx_start:ctx_end]
+            if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
+                continue
             return f"{call_year}-{i:02d}-15"
+    # Abbreviations
     for i, m in enumerate(MONTH_ABBR, start=1):
-        if re.search(rf"\b{m}\b", t):
+        for match in re.finditer(rf"\b{m}\b", lower):
+            ctx_start = max(0, match.start() - 40)
+            ctx_end = min(len(lower), match.end() + 40)
+            ctx = lower[ctx_start:ctx_end]
+            if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
+                continue
             month_index = min(i, 12)
             return f"{call_year}-{month_index:02d}-15"
     return None
 
+def extract_date_candidates(text: str, call_date_str: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Extract explicit date candidates with context:
+    - marks if in warranty/coverage context
+    - marks if close to purchase-related wording
+    - marks if clearly in the future vs CALL_DATE (with small buffer)
+    """
+    candidates: List[Dict[str, Any]] = []
+    if not isinstance(text, str) or not text:
+        return candidates
+
+    call_dt = None
+    if isinstance(call_date_str, str) and call_date_str:
+        try:
+            call_dt = datetime.strptime(call_date_str.split()[0], "%Y-%m-%d")
+        except Exception:
+            call_dt = None
+
+    for pat in DATE_PATTERNS:
+        for m in re.finditer(pat, text):
+            chunk = m.group(0)
+            cleaned = re.sub(r"(st|nd|rd|th)", "", chunk, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+            dt = None
+            for fmt in DATE_FORMATS:
+                try:
+                    dt_tmp = datetime.strptime(cleaned, fmt)
+                    if fmt in ("%B %Y", "%b %Y"):
+                        dt_tmp = dt_tmp.replace(day=15)
+                    dt = dt_tmp
+                    break
+                except Exception:
+                    continue
+            if dt is None:
+                continue
+
+            ctx_start = max(0, m.start() - 40)
+            ctx_end = min(len(text), m.end() + 40)
+            ctx = text[ctx_start:ctx_end].lower()
+            is_warranty = any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS)
+            is_purchase_ctx = any(k in ctx for k in PURCHASE_CONTEXT_KEYWORDS)
+
+            is_future = False
+            if call_dt:
+                if dt > call_dt + timedelta(days=7):
+                    is_future = True
+
+            candidates.append(
+                {
+                    "dt": dt,
+                    "is_warranty": is_warranty,
+                    "is_purchase_ctx": is_purchase_ctx,
+                    "is_future": is_future,
+                }
+            )
+    return candidates
+
 def purchase_date_heuristic(text: str, call_date_str: Optional[str]) -> Optional[str]:
     """
-    Heuristic for purchase date:
-    1) explicit date with day,
-    2) 'Month YYYY' → YYYY-MM-15,
-    3) 'last <month>' → previous year, month, day=15,
-    4) bare month (e.g. 'in October') → call_date.year, month, day=15.
+    Smarter heuristic for purchase date:
+    1) Prefer explicit dates not in warranty/coverage context and not obviously in the future.
+    2) Prefer those near purchase-related wording.
+    3) If nothing explicit, use 'last <month>' (non-warranty context) or bare month references.
     """
-    # 1–2: explicit or month+year
-    iso = try_parse_date(text)
-    if iso:
-        return iso
-    # 3: relative
+    # 1) explicit dates with context
+    candidates = extract_date_candidates(text, call_date_str)
+    chosen_dt = None
+
+    if candidates:
+        # remove future & obvious warranty candidates first
+        good = [c for c in candidates if not c["is_warranty"] and not c["is_future"]]
+        if not good:
+            # fallback: allow non-future even if we couldn't classify context cleanly
+            good = [c for c in candidates if not c["is_warranty"]]
+
+        if good:
+            purchase_ctx = [c for c in good if c["is_purchase_ctx"]]
+            if purchase_ctx:
+                purchase_ctx.sort(key=lambda x: x["dt"])
+                chosen_dt = purchase_ctx[0]["dt"]
+            else:
+                # fallback: earliest good date
+                good.sort(key=lambda x: x["dt"])
+                chosen_dt = good[0]["dt"]
+
+    if chosen_dt:
+        return chosen_dt.strftime("%Y-%m-%d")
+
+    # 2) relative language like "last September" (non-warranty context)
     rel = infer_year_from_relative(text, call_date_str or "")
     if rel:
         return rel
-    # 4: bare month
+
+    # 3) month-only references like "in October" (non-warranty context)
     mon_only = infer_month_only_date(text, call_date_str)
     if mon_only:
         return mon_only
+
     return None
 
 def normalize_purchase_date_output(value: Any, call_date_str: Optional[str]) -> str:
     """
     Normalize any purchase_date string into best-guess ISO date if possible.
     Uses same heuristics as above and assumes day=15 when only month present.
+    Drops dates clearly after the call date (interpreted as non-purchase).
     """
     if value is None:
         raw = ""
@@ -195,17 +334,32 @@ def normalize_purchase_date_output(value: Any, call_date_str: Optional[str]) -> 
     if not raw or raw.lower() in ("unknown", "na", "n/a", "none"):
         return "unknown"
 
+    def guard_future(iso_str: str) -> str:
+        if not isinstance(call_date_str, str) or not call_date_str:
+            return iso_str
+        try:
+            call_dt = datetime.strptime(call_date_str.split()[0], "%Y-%m-%d")
+            dt = datetime.strptime(iso_str, "%Y-%m-%d")
+            if dt > call_dt + timedelta(days=7):
+                return "unknown"
+        except Exception:
+            pass
+        return iso_str
+
     # Try parsing the raw string itself
     iso = try_parse_date(raw)
     if iso:
-        return iso
+        return guard_future(iso)
+
+    # Try relative/month-only using call_date
     rel = infer_year_from_relative(raw, call_date_str or "")
     if rel:
-        return rel
-    mon_only = infer_month_only_date(raw, call_date_str)
+        return guard_future(rel)
+    mon_only = infer_month_only_date(raw, call_date_str or "")
     if mon_only:
-        return mon_only
-    # Fallback: keep raw, but ownership calc may fail if not parseable
+        return guard_future(mon_only)
+
+    # Fallback: raw unchanged (may not be parseable)
     return raw
 
 ERROR_CODE_REGEXES = [
@@ -502,7 +656,13 @@ default_purchase_prompt = (
     "- TEXT: A summary or transcript snippet of a customer support call.\n"
     "- CALL_DATE: The date/time of the call.\n"
     "- INFERRED_RELATIVE_DATE_HINT: Optional approximate YYYY-MM-DD derived from phrases like 'last September'.\n\n"
-    "Task: Extract the purchase date. Return YYYY-MM-DD if available, otherwise 'unknown'.\n"
+    "Task: Extract the ORIGINAL PRODUCT PURCHASE DATE.\n\n"
+    "Rules:\n"
+    "- Only return the date the customer originally bought/received the product.\n"
+    "- DO NOT return warranty expiration dates, registration dates, coverage periods, delivery dates, or replacement shipment dates.\n"
+    "- The purchase date must be on or before CALL_DATE.\n"
+    "- If you only see a warranty expiration or any other non-purchase date, return 'unknown'.\n"
+    "- If only a month and year are clear (e.g. 'October 2023'), you may return YYYY-MM-15.\n\n"
     "You MUST return ONLY a JSON object matching the schema."
 )
 default_symptom_prompt = (
@@ -555,7 +715,7 @@ use_purchase = st.checkbox("📅 Purchase date → `purchase_date` (also compute
 purchase_prompt = st.text_area(
     "Purchase preset (editable):",
     value=default_purchase_prompt,
-    height=160,
+    height=180,
 ) if use_purchase else None
 
 use_symptom = st.checkbox("🩺 Primary symptom → `symptom`")
@@ -609,7 +769,7 @@ if use_custom:
             custom_prompts.append(p.strip())
             custom_outcols.append(o.strip())
 
-# ---- AI Prompt Assistant (for custom prompts or even presets) ----
+# ---- AI Prompt Assistant (for custom prompts or presets) ----
 st.subheader("✨ AI Prompt Assistant (optional)")
 use_prompt_assistant = st.checkbox("Use AI to suggest a prompt for you")
 if use_prompt_assistant:
@@ -983,4 +1143,5 @@ else:
         file_name="processed_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
