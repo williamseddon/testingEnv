@@ -13,8 +13,8 @@ from threading import Lock
 # =========================================================
 # App Config
 # =========================================================
-st.set_page_config(page_title="AI QE Assistant — High Throughput", layout="wide")
-st.title("🦈📊 AI QE Assistant — High-Throughput, Big-File Friendly")
+st.set_page_config(page_title="AI QE Assistant", layout="wide")
+st.title("🦈📊")
 
 RUN_STAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
