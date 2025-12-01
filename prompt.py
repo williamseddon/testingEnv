@@ -3,6 +3,7 @@ import pandas as pd
 from io import BytesIO
 from openai import OpenAI
 from datetime import datetime
+from typing import Optional
 import json
 
 # ---------------------------------------------------------
@@ -45,17 +46,19 @@ def infer_year_from_relative(text, call_date_str):
     return None
 
 
-def suggest_text_column(df):
+def suggest_text_column(df: pd.DataFrame) -> Optional[str]:
     """Heuristic suggestion for which column is the main text/summary column."""
     preferred = ["Zoom Summary", "zoom_summary", "Sentiment Text", "Comment", "Customer Issue"]
     for col in preferred:
         if col in df.columns:
             return col
     obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
-    return obj_cols[0] if obj_cols else (df.columns[0] if len(df.columns) else None)
+    if obj_cols:
+        return obj_cols[0]
+    return df.columns[0] if len(df.columns) else None
 
 
-def suggest_date_column(df):
+def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
     """Heuristic suggestion for which column holds the call date/time."""
     preferred = ["Start Time (Date/Time)", "Start Time", "Date Created", "Created At"]
     for col in preferred:
@@ -74,7 +77,7 @@ def get_client(api_key: str):
     return OpenAI(api_key=api_key)
 
 
-def call_llm_free_text(client, model, system_prompt, user_prompt):
+def call_llm_free_text(client, model: str, system_prompt: str, user_prompt: str) -> str:
     """Simple helper for free-text outputs."""
     resp = client.chat.completions.create(
         model=model,
@@ -86,7 +89,8 @@ def call_llm_free_text(client, model, system_prompt, user_prompt):
     return resp.choices[0].message.content
 
 
-def call_llm_json(client, model, system_prompt, user_prompt, schema_name, schema):
+def call_llm_json(client, model: str, system_prompt: str, user_prompt: str,
+                  schema_name: str, schema: dict) -> dict:
     """
     Helper to request strict JSON output using json_schema response_format.
     Returns a dict (parsed JSON) or {'_raw': <content>} if parsing fails.
@@ -119,10 +123,11 @@ def call_llm_json(client, model, system_prompt, user_prompt, schema_name, schema
 st.sidebar.header("🔐 API & Model Settings")
 
 # Try to pull from secrets first
-default_api_key = st.secrets.get("OPENAI_API_KEY", "")
-if default_api_key:
+try:
+    default_api_key = st.secrets["OPENAI_API_KEY"]
     st.sidebar.success("Using OPENAI_API_KEY from Streamlit secrets by default.")
-else:
+except Exception:
+    default_api_key = ""
     st.sidebar.warning("No OPENAI_API_KEY found in secrets. You can paste one below.")
 
 api_key_input = st.sidebar.text_input(
@@ -631,3 +636,4 @@ if st.button("🚀 Run on filtered rows"):
                 file_name="processed_output.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
