@@ -11,6 +11,43 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 # =========================================================
+# Global Arrow-safe wrapper for st.dataframe
+# =========================================================
+_original_st_dataframe = st.dataframe
+
+def _dataframe_arrow_safe(data, *args, **kwargs):
+    """
+    Wrap st.dataframe so that any ArrowTypeError is handled:
+    - First try normal dataframe.
+    - If it fails, convert all columns to string and retry.
+    - If that still fails, fall back to plain-text display.
+    """
+    try:
+        return _original_st_dataframe(data, *args, **kwargs)
+    except Exception:
+        try:
+            # Work on a copy so we don't mutate the original df used elsewhere
+            if isinstance(data, pd.DataFrame):
+                df = data.copy()
+                for col in df.columns:
+                    df[col] = df[col].astype(str)
+                return _original_st_dataframe(df, *args, **kwargs)
+            else:
+                # If it's not a DataFrame, just stringify it
+                return _original_st_dataframe(pd.DataFrame({"value": [str(data)]}), *args, **kwargs)
+        except Exception:
+            st.warning(
+                "Couldn't render DataFrame interactively due to a PyArrow error. "
+                "Showing plain-text preview instead."
+            )
+            st.text(str(data))
+            return None
+
+# Monkey-patch Streamlit's dataframe with our safe version
+st.dataframe = _dataframe_arrow_safe
+
+
+# =========================================================
 # App Config
 # =========================================================
 st.set_page_config(page_title="AI Review Assistant", layout="wide")
