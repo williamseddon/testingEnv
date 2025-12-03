@@ -1173,8 +1173,8 @@ else:
 
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
-detractors_results = analyze_delighters_detractors(filtered, existing_detractor_columns).head(20)
-delighters_results = analyze_delighters_detractors(filtered, existing_delighter_columns).head(20)
+detractors_results = analyze_delighters_detractors(filtered, existing_detractor_columns).head(50)
+delighters_results = analyze_delighters_detractors(filtered, existing_delighter_columns).head(50)
 
 view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
 
