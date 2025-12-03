@@ -141,7 +141,7 @@ def infer_year_from_relative(text: str, date_str: str) -> Optional[str]:
     return None
 
 DATE_PATTERNS = [
-    r"\b(20\d{2}|19\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b",  # YYYY-MM-DD
+    r"\b(20\d{2}|19\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b",
     r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:19|20)?\d{2})\b",
     r"\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-]((?:19|20)?\d{2})\b",
     r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b",
@@ -363,6 +363,54 @@ def normalize_text(x: Any) -> str:
     return " ".join(x.split())
 
 # =========================================================
+# Arrow-safe DataFrame display helpers
+# =========================================================
+def _sanitize_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make a small DataFrame safe for Arrow by coercing problematic object columns to strings.
+    Operates on a copy of the input.
+    """
+    safe_df = df.copy()
+    allowed_scalar_types = (
+        str,
+        int,
+        float,
+        bool,
+        datetime,
+        pd.Timestamp,
+        type(None),
+    )
+
+    for col in safe_df.columns:
+        if safe_df[col].dtype == "object":
+            if not safe_df[col].map(lambda v: isinstance(v, allowed_scalar_types)).all():
+                safe_df[col] = safe_df[col].astype(str)
+    return safe_df
+
+def safe_show_df(df: pd.DataFrame, max_rows: int, label: str = ""):
+    """
+    Safely display a DataFrame in Streamlit, avoiding pyarrow type errors.
+    - First try normal st.dataframe.
+    - If that fails, sanitize object columns.
+    - If it still fails, fall back to plain text.
+    """
+    subset = df.head(max_rows)
+    try:
+        st.dataframe(subset)
+        return
+    except Exception:
+        try:
+            clean = _sanitize_for_streamlit(subset)
+            st.dataframe(clean)
+            return
+        except Exception:
+            st.warning(
+                f"Couldn't render '{label or 'DataFrame'}' as an interactive table "
+                f"(pyarrow issue). Showing plain text preview instead."
+            )
+            st.text(subset.to_string())
+
+# =========================================================
 # LLM wrappers with retry + limiter
 # =========================================================
 def llm_retry_json(client, model, system_prompt, user_prompt, schema_name, schema,
@@ -527,10 +575,13 @@ with cprev1:
     preview_rows = st.slider("Preview rows", 5, 200, 20, 5)
 with cprev2:
     sample_preview = st.checkbox("Random sample for preview (instead of head)")
+
 if sample_preview:
-    st.dataframe(df.sample(min(preview_rows, len(df)), random_state=42))
+    preview_df = df.sample(min(preview_rows, len(df)), random_state=42)
 else:
-    st.dataframe(df.head(preview_rows))
+    preview_df = df.head(preview_rows)
+
+safe_show_df(preview_df, max_rows=preview_rows, label="File preview")
 
 # Optional: memory optimization
 with st.expander("🧠 Optimize in-memory DataFrame"):
@@ -626,7 +677,7 @@ for col in filter_cols:
         filtered_df = filtered_df[filtered_df[col].astype(str).isin(sel)]
 
 st.write("### Filtered Preview")
-st.dataframe(filtered_df.head(min(preview_rows, len(filtered_df))))
+safe_show_df(filtered_df, max_rows=min(preview_rows, len(filtered_df)), label="Filtered preview")
 st.caption(f"Rows selected for processing: {len(filtered_df)} / {len(df)}")
 if filtered_df.empty:
     st.warning("No rows match the filters.")
@@ -1009,7 +1060,7 @@ if results_df is None:
     st.info("Run the processing to see analysis.")
 else:
     st.subheader("Enriched Reviews Preview")
-    st.dataframe(results_df.head(20))
+    safe_show_df(results_df, max_rows=20, label="Enriched reviews")
 
     if "ownership_period_days" in results_df.columns:
         st.subheader("Ownership Period (Days)")
@@ -1100,4 +1151,3 @@ else:
         file_name="processed_reviews_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
