@@ -337,3 +337,4 @@ if uploaded_file is not None:
     )
 else:
     st.info("👆 Upload a file to generate the summary table.")
+
