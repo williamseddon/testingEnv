@@ -90,6 +90,101 @@ def summarise_overall(df: pd.DataFrame) -> pd.DataFrame:
     return summarise_by_model(tmp)
 
 
+def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply interactive filters from the sidebar.
+
+    - Base Model multiselect
+    - Star Rating range
+    - Additional categorical filters (e.g. Seeded, Country, etc.)
+      for columns with a reasonable number of distinct values.
+    """
+    st.sidebar.header("Filters")
+    filtered = df.copy()
+    active_filters = []
+
+    # --- Base Model filter ---
+    if "Base Model" in filtered.columns:
+        models = (
+            filtered["Base Model"]
+            .dropna()
+            .astype(str)
+            .sort_values()
+            .unique()
+            .tolist()
+        )
+        selected_models = st.sidebar.multiselect(
+            "Base Model(s)", options=models, default=models
+        )
+        if selected_models and len(selected_models) < len(models):
+            filtered = filtered[
+                filtered["Base Model"].astype(str).isin(selected_models)
+            ]
+            active_filters.append(
+                "Base Model: " + ", ".join(selected_models)
+            )
+
+    # --- Star Rating range filter (1–5) ---
+    if "Star Rating" in filtered.columns:
+        star_min, star_max = st.sidebar.slider(
+            "Star Rating range (inclusive)",
+            min_value=1,
+            max_value=5,
+            value=(1, 5),
+        )
+        ratings = pd.to_numeric(filtered["Star Rating"], errors="coerce")
+        filtered = filtered[
+            (ratings >= star_min) & (ratings <= star_max)
+        ]
+        active_filters.append(f"Star Rating: {star_min}–{star_max}★")
+
+    # --- Additional categorical filters (Seeded, Country, etc.) ---
+    with st.sidebar.expander("Additional column filters", expanded=False):
+        # Treat columns with relatively few unique values as categorical
+        candidate_cols = []
+        for col in filtered.columns:
+            if col in ("Base Model", "Star Rating"):
+                continue
+            # We only want columns that look categorical, not free-text review bodies
+            if pd.api.types.is_object_dtype(filtered[col]) or pd.api.types.is_categorical_dtype(filtered[col]):
+                nunique = filtered[col].nunique(dropna=True)
+                if 1 < nunique <= 50:
+                    candidate_cols.append(col)
+
+        for col in candidate_cols:
+            values = (
+                filtered[col]
+                .dropna()
+                .astype(str)
+                .sort_values()
+                .unique()
+                .tolist()
+            )
+            # Safety check, but nunique filter above should ensure this anyway
+            if len(values) <= 1:
+                continue
+
+            selected = st.multiselect(
+                f"{col}", options=values, default=values
+            )
+
+            if selected and len(selected) < len(values):
+                filtered = filtered[
+                    filtered[col].astype(str).isin(selected)
+                ]
+                active_filters.append(
+                    f"{col}: {', '.join(selected)}"
+                )
+
+    # Display active filters on the main page
+    if active_filters:
+        st.markdown(
+            "**Active filters:** " + " | ".join(active_filters)
+        )
+
+    return filtered
+
+
 def main():
     st.title("HD600 / HD400 Curl Experience Summary")
 
@@ -143,16 +238,24 @@ def main():
         st.error(f"Problem reading file: {e}")
         return
 
-    # Show some raw data
-    st.subheader("Raw Data Preview")
-    st.dataframe(df.head(50))
+    # Apply filters (Base Model, rating, seeded/country/etc.)
+    filtered_df = apply_filters(df)
 
-    # Build summaries
-    summary_by_model = summarise_by_model(df)
-    overall_summary = summarise_overall(df)
+    if filtered_df.empty:
+        st.warning("No data to summarise after applying your filters. Adjust filters in the sidebar.")
+        return
+
+    # Show some raw/filtered data
+    st.subheader("Filtered Data Preview")
+    st.caption(f"{len(filtered_df)} rows after applying filters.")
+    st.dataframe(filtered_df.head(50), use_container_width=True)
+
+    # Build summaries FROM FILTERED DATA
+    summary_by_model = summarise_by_model(filtered_df)
+    overall_summary = summarise_overall(filtered_df)
 
     if summary_by_model.empty:
-        st.warning("No data to summarise after filtering.")
+        st.warning("No data to summarise after filtering and cleaning Star Ratings.")
         return
 
     percent_cols = [c for c in summary_by_model.columns if c.startswith("%")]
@@ -169,13 +272,14 @@ def main():
         return formatted
 
     st.subheader("Summary by Base Model")
-    st.dataframe(format_percentages(summary_by_model))
+    st.dataframe(format_percentages(summary_by_model), use_container_width=True)
 
     st.subheader("Overall Summary (All Models Combined)")
-    st.dataframe(format_percentages(overall_summary))
+    st.dataframe(format_percentages(overall_summary), use_container_width=True)
 
 
 if __name__ == "__main__":
     main()
+
 
 
