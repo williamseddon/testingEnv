@@ -253,9 +253,11 @@ def convert_to_starwalk(
         else:
             out[out_field] = pd.NA
 
-    # Normalize Star Rating values to numeric-only (e.g., "4 star" -> 4)
-    if "Star Rating" in out.columns:
-        out["Star Rating"] = clean_star_rating_series(out["Star Rating"])
+    # Normalize Star Rating values to numeric-only (e.g., "4 star" -> 4).
+    # Be tolerant to template column quirks (case/spacing/trailing spaces).
+    for c in list(out.columns):
+        if _norm(c) == "starrating":
+            out[c] = clean_star_rating_series(out[c])
 
     split_re = re.compile(split_regex)
     src_cols = list(src_df.columns)
@@ -596,6 +598,11 @@ if build:
         filter_unknown=filter_unknown,
     )
 
+    # Final safety: ensure Star Rating is numeric-only (handles template quirks)
+    for c in list(out_df.columns):
+        if _norm(c) == "starrating":
+            out_df[c] = clean_star_rating_series(out_df[c])
+
     st.success("Conversion complete.")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -632,6 +639,7 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
 
 
