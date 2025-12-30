@@ -14,6 +14,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
+APP_VERSION = "2025-12-30-seeded-yes-v2"  # shows in UI so you can confirm you are running the right file
 
 # Default header (mirrors typical Star Walk workbook)
 DEFAULT_STARWALK_COLUMNS: List[str] = [
@@ -453,6 +454,7 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
 # -----------------------------
 st.set_page_config(page_title="Star Walk Formatter", layout="wide")
 st.title("Star Walk Scrubbed Verbatims Converter")
+st.caption(f"App version: {APP_VERSION}")
 
 st.markdown(
     """
@@ -650,6 +652,16 @@ if build:
         filter_unknown=filter_unknown,
     )
 
+    # Diagnostics: ensure Seeded is only "yes" or blank
+    seeded_col = next((c for c in out_df.columns if _norm(c) == "seeded"), None)
+    if seeded_col:
+        seeded_series = out_df[seeded_col].dropna().astype(str).str.strip()
+        yes_ct = int((seeded_series.str.lower() == "yes").sum())
+        non_yes = seeded_series[seeded_series.str.lower() != "yes"]
+        if len(non_yes) > 0:
+            st.warning("Seeded normalization check: found values that are not \"yes\". Showing a few examples below.")
+            st.write(non_yes.head(10).tolist())
+        st.caption(f"Seeded: {yes_ct} yes / {len(out_df)} rows")
     st.success("Conversion complete.")
 
     # Quick sanity checks for the two fields you care about
