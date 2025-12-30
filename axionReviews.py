@@ -146,7 +146,7 @@ def clean_star_rating_series(series: pd.Series) -> pd.Series:
 
 
 def clean_seeded_value(v):
-    """Map values like ['seeded'] / ["seeded"] / "seeded" / True to 'yes'; otherwise blank."""
+    """Map values like ['SEEDED'] / ["SEEDED"] / "seeded" / True to 'yes'; otherwise blank."""
     if v is None:
         return pd.NA
     try:
