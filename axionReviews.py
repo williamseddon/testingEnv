@@ -15,7 +15,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
-# Default header (mirrors typical Star Walk workbook; includes two trailing blank header columns)
+# Default header (mirrors typical Star Walk workbook)
 DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date",
     "Verbatim Id", "Verbatim", "Star Rating", "Review count per detractor",
@@ -25,6 +25,9 @@ DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Symptom 16", "Symptom 17", "Symptom 18", "Symptom 19", "Symptom 20",
     "Hair Type", "Unnamed: 31", "Unnamed: 32",
 ]
+
+# Used for splitting multi-tag cells like "A; B | C"
+DEFAULT_TAG_SPLIT_RE = re.compile(r"[;\|\n,]+")
 
 
 # -----------------------------
@@ -72,7 +75,7 @@ def dedupe_preserve(items: List[str]) -> List[str]:
     return out
 
 
-def parse_tags(value, split_re: re.Pattern) -> List[str]:
+def parse_tags(value, split_re: re.Pattern = DEFAULT_TAG_SPLIT_RE) -> List[str]:
     """
     Parse a cell that may contain:
       - NaN/empty
@@ -94,19 +97,20 @@ def parse_tags(value, split_re: re.Pattern) -> List[str]:
     # list-like strings
     if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
         inner = s[1:-1].strip()
-        if inner:
-            parts = [p.strip().strip("'\"") for p in inner.split(",")]
-            return dedupe_preserve([p for p in parts if p])
-        return []
+        if not inner:
+            return []
+        parts = [p.strip().strip("'\"") for p in inner.split(",")]
+        return dedupe_preserve([p for p in parts if p])
 
     parts = [p.strip() for p in split_re.split(s) if p and p.strip()]
     return dedupe_preserve(parts)
 
 
-
+# -----------------------------
+# Cleaning: Star Rating & Seeded
+# -----------------------------
 def clean_star_rating_value(v):
     """Coerce star rating into a numeric (int/float) and strip words like 'star(s)'."""
-    # Handle pandas / numpy missing values
     if v is None:
         return pd.NA
     try:
@@ -131,6 +135,7 @@ def clean_star_rating_value(v):
     if not s:
         return pd.NA
 
+    # Pull first number out of strings like "4 star", "4.0 out of 5 stars"
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     if not m:
         return pd.NA
@@ -141,12 +146,16 @@ def clean_star_rating_value(v):
 
 def clean_star_rating_series(series: pd.Series) -> pd.Series:
     """Vector-friendly wrapper to clean the Star Rating column."""
-    # Keep as object so Excel displays whole numbers like 4 (not 4.0) when possible
     return series.apply(clean_star_rating_value).astype("object")
 
 
 def clean_seeded_value(v):
-    """Map values like ['Seeded'] / ["SEEDED"] / "seeded" / True to 'yes'; otherwise blank."""
+    """
+    Map values like ['Seeded'] / ["seeded"] / "Seeded" -> 'yes'; otherwise blank.
+
+    IMPORTANT: We only count a token equal to "seeded" (case-insensitive).
+    This avoids false positives like "Not Seeded".
+    """
     if v is None:
         return pd.NA
     try:
@@ -155,19 +164,27 @@ def clean_seeded_value(v):
     except Exception:
         pass
 
-    # Boolean handling
+    # Booleans / 1-0
     if isinstance(v, (bool, np.bool_)):
         return "yes" if bool(v) else pd.NA
-
-    # List-like containers
-    if isinstance(v, (list, tuple, set)):
-        return "yes" if any(re.search(r"\bseeded\b", str(x), flags=re.IGNORECASE) for x in v) else pd.NA
-
-    s = str(v).strip()
-    if not s:
+    if isinstance(v, (int, np.integer, float, np.floating)):
+        try:
+            if float(v) == 1.0:
+                return "yes"
+        except Exception:
+            pass
         return pd.NA
 
-    return "yes" if re.search(r"\bseeded\b", s, flags=re.IGNORECASE) else pd.NA
+    tokens = parse_tags(v, DEFAULT_TAG_SPLIT_RE)
+    for t in tokens:
+        if _norm(t) in {"seeded", "yes", "true", "y", "1"}:
+            return "yes"
+        if _norm(t) in {"notseeded", "false", "no", "n", "0", "unseeded", "nonseeded"}:
+            return pd.NA
+
+    # If it wasn't list-like or delimited, parse_tags() returns [original string]
+    # so the loop above covers single-string cases too.
+    return pd.NA
 
 
 def clean_seeded_series(series: pd.Series) -> pd.Series:
@@ -175,22 +192,21 @@ def clean_seeded_series(series: pd.Series) -> pd.Series:
     return series.apply(clean_seeded_value).astype("object")
 
 
+# -----------------------------
+# Template helpers
+# -----------------------------
 def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailing_blank_cols: int = 5) -> List[str]:
     """
     Extract header row from an Excel sheet using openpyxl so we don't accidentally
-    drop trailing blank header columns (common in the Star Walk template).
+    drop trailing blank header columns (common in some Star Walk templates).
     """
     wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
     if sheet_name not in wb.sheetnames:
         return DEFAULT_STARWALK_COLUMNS
 
     ws = wb[sheet_name]
-    raw = []
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(1, c).value
-        raw.append(v)
+    raw = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
 
-    # Find last named header cell
     last_named = -1
     for i, v in enumerate(raw):
         if v is not None and str(v).strip() != "":
@@ -228,6 +244,9 @@ def load_allowed_l2_from_template(template_bytes: bytes) -> Tuple[Optional[Set[s
         return None, None
 
 
+# -----------------------------
+# Conversion
+# -----------------------------
 def collect_from_row_tuple(
     row_tup,
     col_idx: Dict[str, int],
@@ -274,24 +293,21 @@ def convert_to_starwalk(
 
     out = pd.DataFrame(index=range(n), columns=base_cols, dtype="object")
 
-    # Copy mapped fields
+    # Copy mapped fields (and clean Star Rating / Seeded at assignment time)
     for out_field, in_field in field_map.items():
         if out_field not in out.columns:
             continue
+
         if in_field and in_field in src_df.columns:
-            out[out_field] = src_df[in_field].values
+            series = src_df[in_field]
+            if _norm(out_field) == "starrating":
+                out[out_field] = clean_star_rating_series(series)
+            elif _norm(out_field) == "seeded":
+                out[out_field] = clean_seeded_series(series)
+            else:
+                out[out_field] = series.values
         else:
             out[out_field] = pd.NA
-
-    # Normalize Star Rating values to numeric-only (e.g., "4 star" -> 4).
-    # Be tolerant to template column quirks (case/spacing/trailing spaces).
-    for c in list(out.columns):
-        if _norm(c) == "starrating":
-            out[c] = clean_star_rating_series(out[c])
-    for c in list(out.columns):
-        if _norm(c) == "seeded":
-            out[c] = clean_seeded_series(out[c])
-
 
     split_re = re.compile(split_regex)
     src_cols = list(src_df.columns)
@@ -361,6 +377,13 @@ def convert_to_starwalk(
             total = detr_count + deli_count
             out["Review count per detractor"] = np.where(total > 0, 1.0 / total, pd.NA)
 
+    # Final safety: in case template uses slightly different headers, clean any matching column names too
+    for c in list(out.columns):
+        if _norm(c) == "starrating":
+            out[c] = clean_star_rating_series(out[c])
+        if _norm(c) == "seeded":
+            out[c] = clean_seeded_series(out[c])
+
     stats = {
         "rows": n,
         "rows_truncated_detractors_gt10": rows_trunc_det,
@@ -400,7 +423,7 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
             header.append(str(v).strip())
 
     # If the sheet is empty (no header), just use df_out's columns and write header
-    if all(h.startswith("Unnamed:") for h in header) and ws.max_row == 1 and ws.max_column == 1 and ws.cell(1,1).value is None:
+    if all(h.startswith("Unnamed:") for h in header) and ws.max_row == 1 and ws.max_column == 1 and ws.cell(1, 1).value is None:
         header = list(df_out.columns)
         for c, name in enumerate(header, start=1):
             ws.cell(1, c).value = name
@@ -420,7 +443,6 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
     for r in dataframe_to_rows(aligned, index=False, header=False):
         ws.append(r)
 
-    # Save to bytes
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -473,11 +495,10 @@ output_mode_options = ["One-sheet output (fast)"]
 if template_file:
     output_mode_options.append("Use template workbook (preserve other tabs/formulas)")
 
-output_mode = st.radio("Output mode", output_mode_options, index=len(output_mode_options)-1)
+output_mode = st.radio("Output mode", output_mode_options, index=len(output_mode_options) - 1)
 
 if template_file:
     tbytes = template_file.getvalue()
-    # Choose sheet whose header defines columns (defaults to the Star Walk sheet if present)
     try:
         txl = pd.ExcelFile(io.BytesIO(tbytes))
         default_idx = txl.sheet_names.index(STARWALK_SHEET_NAME) if STARWALK_SHEET_NAME in txl.sheet_names else 0
@@ -492,7 +513,7 @@ if template_file:
 st.subheader("Field Mapping (optional but recommended)")
 all_src_cols = list(src_df.columns)
 
-# Preferred defaults for the most common "raw website reviews" export schema
+# Defaults from your screenshot
 PREFERRED_CORE_DEFAULTS: Dict[str, List[str]] = {
     "Source": ["Retailer"],
     "Model (SKU)": ["SKU Item"],
@@ -504,19 +525,19 @@ PREFERRED_CORE_DEFAULTS: Dict[str, List[str]] = {
     "Star Rating": ["Rating"],
 }
 
+
 def pick_preferred(field: str) -> Optional[str]:
     prefs = PREFERRED_CORE_DEFAULTS.get(field, [])
-    # Exact (case sensitive)
     for p in prefs:
         if p in all_src_cols:
             return p
-    # Normalized exact (case/spacing tolerant)
     for p in prefs:
         pn = _norm(p)
         for c in all_src_cols:
             if _norm(c) == pn:
                 return c
     return None
+
 
 suggest = {
     "Source": pick_preferred("Source") or best_match("Source", all_src_cols),
@@ -525,14 +546,11 @@ suggest = {
     "Country": pick_preferred("Country") or best_match("Country", all_src_cols),
     "New Review": pick_preferred("New Review") or best_match("New Review", all_src_cols),
     "Review Date": pick_preferred("Review Date") or best_match("Review Date", all_src_cols) or best_match("Date", all_src_cols),
-    # Leave unmapped by default (often not present / not needed for Star Walk)
     "Verbatim Id": None,
     "Verbatim": pick_preferred("Verbatim") or best_match("Verbatim", all_src_cols) or best_match("Review", all_src_cols) or best_match("Review Text", all_src_cols),
     "Star Rating": pick_preferred("Star Rating") or best_match("Star Rating", all_src_cols) or best_match("Rating", all_src_cols) or best_match("Stars", all_src_cols),
-    # Leave unmapped by default unless you have a dedicated Hair Type field
     "Hair Type": None,
 }
-
 
 field_map: Dict[str, Optional[str]] = {}
 core_fields = ["Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date", "Verbatim Id", "Verbatim", "Star Rating", "Hair Type"]
@@ -632,16 +650,19 @@ if build:
         filter_unknown=filter_unknown,
     )
 
-    # Final safety: ensure Star Rating is numeric-only (handles template quirks)
-    for c in list(out_df.columns):
-        if _norm(c) == "starrating":
-            out_df[c] = clean_star_rating_series(out_df[c])
-    for c in list(out_df.columns):
-        if _norm(c) == "seeded":
-            out_df[c] = clean_seeded_series(out_df[c])
-
-
     st.success("Conversion complete.")
+
+    # Quick sanity checks for the two fields you care about
+    if "Seeded" in out_df.columns:
+        bad_seeded = out_df["Seeded"].dropna().astype(str).str.contains(r"\[", regex=True).sum()
+        if bad_seeded > 0:
+            st.warning(f"Seeded cleanup warning: {bad_seeded} rows still look like list-strings (e.g., ['Seeded']).")
+
+    if "Star Rating" in out_df.columns:
+        # if any non-numeric string survived, warn
+        non_numeric = out_df["Star Rating"].dropna().astype(str).str.contains(r"[a-zA-Z]", regex=True).sum()
+        if non_numeric > 0:
+            st.warning(f"Star Rating cleanup warning: {non_numeric} rows still contain letters (e.g., '4 star').")
 
     c1, c2, c3, c4 = st.columns(4)
     detr_counts = out_df[[f"Symptom {i}" for i in range(1, 11)]].notna().sum(axis=1)
@@ -677,4 +698,5 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
