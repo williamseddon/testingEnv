@@ -1,166 +1,366 @@
-# app.py
-import re
+# starwalk_converter_app.py
+# Streamlit app to convert raw website review exports into the
+# "Star Walk scrubbed verbatims" format (Symptom 1–10 detractors, 11–20 delighters).
+
 import io
+import re
+from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
-st.set_page_config(page_title="Star Walk Formatter", layout="wide")
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
-DEFAULT_STARWALK_COLUMNS = [
+# Default header (mirrors typical Star Walk workbook; includes two trailing blank header columns)
+DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date",
     "Verbatim Id", "Verbatim", "Star Rating", "Review count per detractor",
     "Symptom 1", "Symptom 2", "Symptom 3", "Symptom 4", "Symptom 5",
     "Symptom 6", "Symptom 7", "Symptom 8", "Symptom 9", "Symptom 10",
     "Symptom 11", "Symptom 12", "Symptom 13", "Symptom 14", "Symptom 15",
     "Symptom 16", "Symptom 17", "Symptom 18", "Symptom 19", "Symptom 20",
-    "Hair Type", "Unnamed: 31", "Unnamed: 32"
+    "Hair Type", "Unnamed: 31", "Unnamed: 32",
 ]
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
-def best_match(target: str, candidates: list[str]) -> str | None:
-    """Very lightweight fuzzy-ish matcher: exact normalized match > substring match."""
-    t = _norm(target)
+
+def best_match(target: str, candidates: List[str]) -> Optional[str]:
+    """Lightweight matcher: exact normalized match > substring match."""
     if not candidates:
         return None
+    t = _norm(target)
     norm_map = {c: _norm(c) for c in candidates}
-    # exact
+
     for c, nc in norm_map.items():
         if nc == t:
             return c
-    # substring
     for c, nc in norm_map.items():
         if t and (t in nc or nc in t):
             return c
     return None
 
+
 @st.cache_data(show_spinner=False)
-def read_table(file_bytes: bytes, filename: str, sheet: str | None = None) -> pd.DataFrame:
+def read_table(file_bytes: bytes, filename: str, sheet: Optional[str] = None) -> pd.DataFrame:
     if filename.lower().endswith(".csv"):
         return pd.read_csv(io.BytesIO(file_bytes))
     if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
         return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
     raise ValueError("Unsupported file type. Please upload a CSV or Excel file.")
 
-def parse_tags(value, split_regex: str) -> list[str]:
+
+def dedupe_preserve(items: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in items:
+        s = str(x).strip()
+        if not s:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def parse_tags(value, split_re: re.Pattern) -> List[str]:
     """
     Parse a cell that may contain:
-      - NaN / empty
-      - a single tag string
-      - delimited tags (e.g., "A; B | C")
-      - a python-like list string: "['A','B']"
+      - NaN/empty
+      - a single string
+      - delimited strings (e.g., "A; B | C")
+      - stringified list: "['A','B']"
+      - actual python list/tuple/set (rare but possible)
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
+
+    if isinstance(value, (list, tuple, set)):
+        return dedupe_preserve([str(v).strip() for v in value if str(v).strip()])
 
     s = str(value).strip()
     if not s:
         return []
 
-    # Try to handle list-like strings
+    # list-like strings
     if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
         inner = s[1:-1].strip()
         if inner:
             parts = [p.strip().strip("'\"") for p in inner.split(",")]
-            parts = [p for p in parts if p]
-            return dedupe_preserve(parts)
+            return dedupe_preserve([p for p in parts if p])
+        return []
 
-    # Split by configured regex
-    parts = [p.strip() for p in re.split(split_regex, s) if p and p.strip()]
+    parts = [p.strip() for p in split_re.split(s) if p and p.strip()]
     return dedupe_preserve(parts)
 
-def dedupe_preserve(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for x in items:
-        x2 = str(x).strip()
-        if not x2:
-            continue
-        if x2 not in seen:
-            seen.add(x2)
-            out.append(x2)
-    return out
 
-def collect_from_columns(row: pd.Series, cols: list[str], split_regex: str) -> list[str]:
-    all_tags: list[str] = []
+def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailing_blank_cols: int = 5) -> List[str]:
+    """
+    Extract header row from an Excel sheet using openpyxl so we don't accidentally
+    drop trailing blank header columns (common in the Star Walk template).
+    """
+    wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
+    if sheet_name not in wb.sheetnames:
+        return DEFAULT_STARWALK_COLUMNS
+
+    ws = wb[sheet_name]
+    raw = []
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        raw.append(v)
+
+    # Find last named header cell
+    last_named = -1
+    for i, v in enumerate(raw):
+        if v is not None and str(v).strip() != "":
+            last_named = i
+
+    if last_named == -1:
+        return DEFAULT_STARWALK_COLUMNS
+
+    max_keep = min(len(raw), last_named + 1 + keep_trailing_blank_cols)
+    headers: List[str] = []
+    for i in range(max_keep):
+        v = raw[i]
+        if v is None or str(v).strip() == "":
+            headers.append(f"Unnamed: {i}")
+        else:
+            headers.append(str(v).strip())
+    return headers
+
+
+def load_allowed_l2_from_template(template_bytes: bytes) -> Tuple[Optional[Set[str]], Optional[Set[str]]]:
+    """
+    If the template has a 'Symptoms' sheet with columns 'Detractors' and 'Delighters',
+    use it as an allow-list for L2 tags.
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(template_bytes), sheet_name="Symptoms")
+        if "Detractors" not in df.columns or "Delighters" not in df.columns:
+            return None, None
+        det = set(df["Detractors"].dropna().astype(str).str.strip())
+        deli = set(df["Delighters"].dropna().astype(str).str.strip())
+        det = {x for x in det if x}
+        deli = {x for x in deli if x}
+        return det or None, deli or None
+    except Exception:
+        return None, None
+
+
+def collect_from_row_tuple(
+    row_tup,
+    col_idx: Dict[str, int],
+    cols: List[str],
+    split_re: re.Pattern,
+) -> List[str]:
+    tags: List[str] = []
     for c in cols:
-        if c in row.index:
-            all_tags.extend(parse_tags(row[c], split_regex))
-    return dedupe_preserve(all_tags)
+        i = col_idx.get(c)
+        if i is None:
+            continue
+        tags.extend(parse_tags(row_tup[i], split_re))
+    return dedupe_preserve(tags)
 
-def build_output(
-    src: pd.DataFrame,
-    out_cols: list[str],
-    field_map: dict[str, str | None],
-    l2_detractor_cols: list[str],
-    l2_delighter_cols: list[str],
+
+def convert_to_starwalk(
+    src_df: pd.DataFrame,
+    out_cols: List[str],
+    field_map: Dict[str, Optional[str]],
+    l2_det_cols: List[str],
+    l2_del_cols: List[str],
     split_regex: str,
-) -> pd.DataFrame:
-    out = pd.DataFrame(columns=out_cols)
+    weight_mode: str,
+    allowed_det: Optional[Set[str]] = None,
+    allowed_del: Optional[Set[str]] = None,
+    filter_unknown: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Build Star Walk scrubbed verbatims output:
+      - L2 detractors -> Symptom 1-10
+      - L2 delighters -> Symptom 11-20
+    """
+    src_df = src_df.reset_index(drop=True)
+    n = len(src_df)
+
+    # Ensure symptom and weight columns exist in output column list
+    needed_symptoms = [f"Symptom {i}" for i in range(1, 21)]
+    base_cols = list(out_cols)
+    for c in needed_symptoms:
+        if c not in base_cols:
+            base_cols.append(c)
+    if "Review count per detractor" not in base_cols:
+        base_cols.append("Review count per detractor")
+
+    out = pd.DataFrame(index=range(n), columns=base_cols, dtype="object")
 
     # Copy mapped fields
     for out_field, in_field in field_map.items():
-        if out_field in out_cols:
-            if in_field and in_field in src.columns:
-                out[out_field] = src[in_field]
-            else:
-                out[out_field] = pd.NA
+        if out_field not in out.columns:
+            continue
+        if in_field and in_field in src_df.columns:
+            out[out_field] = src_df[in_field].values
+        else:
+            out[out_field] = pd.NA
 
-    # Ensure symptom columns exist
-    for i in range(1, 21):
-        col = f"Symptom {i}"
-        if col not in out.columns:
-            out[col] = pd.NA
+    split_re = re.compile(split_regex)
+    src_cols = list(src_df.columns)
+    col_idx = {c: i for i, c in enumerate(src_cols)}
+
+    detr_matrix = [[pd.NA] * 10 for _ in range(n)]
+    deli_matrix = [[pd.NA] * 10 for _ in range(n)]
+    detr_count = np.zeros(n, dtype=int)
+    deli_count = np.zeros(n, dtype=int)
+
+    rows_trunc_det = 0
+    rows_trunc_del = 0
+    unknown_det_total = 0
+    unknown_del_total = 0
+
+    for r_i, row in enumerate(src_df.itertuples(index=False, name=None)):
+        d_tags = collect_from_row_tuple(row, col_idx, l2_det_cols, split_re)
+        l_tags = collect_from_row_tuple(row, col_idx, l2_del_cols, split_re)
+
+        if allowed_det is not None:
+            unknown = [t for t in d_tags if t not in allowed_det]
+            if unknown:
+                unknown_det_total += len(unknown)
+                if filter_unknown:
+                    d_tags = [t for t in d_tags if t in allowed_det]
+
+        if allowed_del is not None:
+            unknown = [t for t in l_tags if t not in allowed_del]
+            if unknown:
+                unknown_del_total += len(unknown)
+                if filter_unknown:
+                    l_tags = [t for t in l_tags if t in allowed_del]
+
+        if len(d_tags) > 10:
+            rows_trunc_det += 1
+        if len(l_tags) > 10:
+            rows_trunc_del += 1
+
+        d_tags = d_tags[:10]
+        l_tags = l_tags[:10]
+
+        detr_count[r_i] = len(d_tags)
+        deli_count[r_i] = len(l_tags)
+
+        for j, t in enumerate(d_tags):
+            detr_matrix[r_i][j] = t
+        for j, t in enumerate(l_tags):
+            deli_matrix[r_i][j] = t
 
     detr_cols_out = [f"Symptom {i}" for i in range(1, 11)]
     deli_cols_out = [f"Symptom {i}" for i in range(11, 21)]
 
-    detr_counts = []
-    for idx, row in src.iterrows():
-        detr_tags = collect_from_columns(row, l2_detractor_cols, split_regex)[:10]
-        deli_tags = collect_from_columns(row, l2_delighter_cols, split_regex)[:10]
+    out[detr_cols_out] = pd.DataFrame(detr_matrix, columns=detr_cols_out).values
+    out[deli_cols_out] = pd.DataFrame(deli_matrix, columns=deli_cols_out).values
 
-        # Fill detractors into Symptom 1-10
-        for j, c in enumerate(detr_cols_out):
-            out.at[idx, c] = detr_tags[j] if j < len(detr_tags) else pd.NA
-
-        # Fill delighters into Symptom 11-20
-        for j, c in enumerate(deli_cols_out):
-            out.at[idx, c] = deli_tags[j] if j < len(deli_tags) else pd.NA
-
-        detr_counts.append(len(detr_tags))
-
-    # Review count per detractor (common weighting): 1 / (# detractors), else 0 if none
+    # Weight column behavior (configurable)
     if "Review count per detractor" in out.columns:
-        out["Review count per detractor"] = [
-            (1.0 / c) if c > 0 else 0.0 for c in detr_counts
-        ]
+        if weight_mode == "Leave blank":
+            out["Review count per detractor"] = pd.NA
+        elif weight_mode == "Always 1":
+            out["Review count per detractor"] = 1.0
+        elif weight_mode == "1 / # detractor symptoms (if any)":
+            out["Review count per detractor"] = np.where(detr_count > 0, 1.0 / detr_count, pd.NA)
+        elif weight_mode == "1 / # delighter symptoms (if any)":
+            out["Review count per detractor"] = np.where(deli_count > 0, 1.0 / deli_count, pd.NA)
+        else:  # "1 / # total symptoms (detractors + delighters)"
+            total = detr_count + deli_count
+            out["Review count per detractor"] = np.where(total > 0, 1.0 / total, pd.NA)
 
-    return out
+    stats = {
+        "rows": n,
+        "rows_truncated_detractors_gt10": rows_trunc_det,
+        "rows_truncated_delighters_gt10": rows_trunc_del,
+        "unknown_detractor_tags_total": unknown_det_total,
+        "unknown_delighter_tags_total": unknown_del_total,
+    }
+    return out, stats
 
-def to_excel_bytes(df_out: pd.DataFrame, sheet_name: str = STARWALK_SHEET_NAME) -> bytes:
+
+def to_excel_one_sheet(df_out: pd.DataFrame, sheet_name: str = STARWALK_SHEET_NAME) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df_out.to_excel(writer, index=False, sheet_name=sheet_name)
     return buf.getvalue()
 
+
+def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sheet_name: str = STARWALK_SHEET_NAME) -> bytes:
+    """
+    Preserve the full template workbook (other sheets, formulas, pivots, etc.) and
+    replace the Star Walk scrubbed verbatims sheet data (keeping its header row).
+    """
+    wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
+
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+    else:
+        ws = wb.create_sheet(sheet_name)
+
+    # Read template header (row 1) to determine column order we should write
+    header = []
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v is None or str(v).strip() == "":
+            header.append(f"Unnamed: {c-1}")
+        else:
+            header.append(str(v).strip())
+
+    # If the sheet is empty (no header), just use df_out's columns and write header
+    if all(h.startswith("Unnamed:") for h in header) and ws.max_row == 1 and ws.max_column == 1 and ws.cell(1,1).value is None:
+        header = list(df_out.columns)
+        for c, name in enumerate(header, start=1):
+            ws.cell(1, c).value = name
+
+    # Reorder / align df to header columns (extra df cols are dropped; missing are added as NA)
+    aligned = df_out.copy()
+    for col in header:
+        if col not in aligned.columns:
+            aligned[col] = pd.NA
+    aligned = aligned[header]
+
+    # Clear existing rows below header
+    if ws.max_row >= 2:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    # Append new data rows
+    for r in dataframe_to_rows(aligned, index=False, header=False):
+        ws.append(r)
+
+    # Save to bytes
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Star Walk Formatter", layout="wide")
 st.title("Star Walk Scrubbed Verbatims Converter")
 
 st.markdown(
     """
-Upload your **raw website reviews** file and (optionally) a **Star Walk template** workbook.
-This app will output an Excel sheet formatted like **Star Walk scrubbed verbatims** and will place:
+This app converts a raw website review export into the **Star Walk scrubbed verbatims** format.
 
-- **Level 2 Detractors → Symptom 1–10**
-- **Level 2 Delighters → Symptom 11–20**
+It will populate:
+- **Symptom 1–10** with **Level 2 Detractors**
+- **Symptom 11–20** with **Level 2 Delighters**
 """
 )
 
 colA, colB = st.columns(2)
-
 with colA:
     src_file = st.file_uploader("Upload raw website reviews (CSV/XLSX)", type=["csv", "xlsx", "xlsm", "xls"])
 with colB:
@@ -170,42 +370,46 @@ if not src_file:
     st.stop()
 
 src_bytes = src_file.getvalue()
-
-# If Excel, let user choose sheet
 src_sheet = None
 if src_file.name.lower().endswith((".xlsx", ".xlsm", ".xls")):
     try:
         xl = pd.ExcelFile(io.BytesIO(src_bytes))
-        sheets = xl.sheet_names
-        src_sheet = st.selectbox("Select source sheet", sheets, index=0)
+        src_sheet = st.selectbox("Select source sheet", xl.sheet_names, index=0)
     except Exception:
         src_sheet = None
 
 src_df = read_table(src_bytes, src_file.name, sheet=src_sheet)
-st.subheader("Source Preview")
-st.dataframe(src_df.head(25), use_container_width=True)
 
-# Determine output columns from template or default
+st.subheader("Source Preview")
+st.dataframe(src_df.head(50), use_container_width=True)
+
+# Determine output columns
 out_cols = DEFAULT_STARWALK_COLUMNS
-template_sheet = None
+allowed_det = allowed_del = None
+
+output_mode_options = ["One-sheet output (fast)"]
+if template_file:
+    output_mode_options.append("Use template workbook (preserve other tabs/formulas)")
+
+output_mode = st.radio("Output mode", output_mode_options, index=len(output_mode_options)-1)
+
 if template_file:
     tbytes = template_file.getvalue()
+    # Choose sheet whose header defines columns (defaults to the Star Walk sheet if present)
     try:
         txl = pd.ExcelFile(io.BytesIO(tbytes))
-        tsheets = txl.sheet_names
-        default_idx = tsheets.index(STARWALK_SHEET_NAME) if STARWALK_SHEET_NAME in tsheets else 0
-        template_sheet = st.selectbox("Select template sheet to mirror columns", tsheets, index=default_idx)
-        tmp_df = pd.read_excel(io.BytesIO(tbytes), sheet_name=template_sheet, nrows=1)
-        out_cols = list(tmp_df.columns)
+        default_idx = txl.sheet_names.index(STARWALK_SHEET_NAME) if STARWALK_SHEET_NAME in txl.sheet_names else 0
+        template_sheet = st.selectbox("Template sheet to mirror columns", txl.sheet_names, index=default_idx)
+        out_cols = extract_template_header(tbytes, template_sheet)
     except Exception:
-        st.warning("Could not read template columns; using default Star Walk columns.")
+        st.warning("Could not read template; using default Star Walk columns.")
         out_cols = DEFAULT_STARWALK_COLUMNS
 
-st.subheader("Mapping")
+    allowed_det, allowed_del = load_allowed_l2_from_template(tbytes)
 
+st.subheader("Field Mapping (optional but recommended)")
 all_src_cols = list(src_df.columns)
 
-# Auto-suggest common fields
 suggest = {
     "Source": best_match("Source", all_src_cols),
     "Model (SKU)": best_match("Model (SKU)", all_src_cols) or best_match("SKU", all_src_cols) or best_match("Model", all_src_cols),
@@ -219,22 +423,23 @@ suggest = {
     "Hair Type": best_match("Hair Type", all_src_cols),
 }
 
-# Let the user map fields (optional)
-field_map = {}
-with st.expander("Map core fields (optional but recommended)", expanded=True):
-    left, right = st.columns(2)
-    core_fields = ["Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date", "Verbatim Id", "Verbatim", "Star Rating", "Hair Type"]
-    for i, f in enumerate(core_fields):
-        with (left if i < (len(core_fields)+1)//2 else right):
-            field_map[f] = st.selectbox(
-                f"Output '{f}' comes from source column:",
-                options=[None] + all_src_cols,
-                index=([None] + all_src_cols).index(suggest.get(f)) if suggest.get(f) in all_src_cols else 0,
-                key=f"map_{f}",
-            )
+field_map: Dict[str, Optional[str]] = {}
+core_fields = ["Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date", "Verbatim Id", "Verbatim", "Star Rating", "Hair Type"]
+left, right = st.columns(2)
+for i, f in enumerate(core_fields):
+    with (left if i < (len(core_fields) + 1) // 2 else right):
+        options = [None] + all_src_cols
+        default_val = suggest.get(f)
+        default_idx = options.index(default_val) if default_val in all_src_cols else 0
+        field_map[f] = st.selectbox(
+            f"Output '{f}' comes from source column:",
+            options=options,
+            index=default_idx,
+            key=f"map_{f}",
+        )
 
-with st.expander("Select Level 2 detractor/delighter columns (these populate Symptom 1–20)", expanded=True):
-    # Heuristics for L2 columns
+st.subheader("L2 Tag Columns (these populate Symptom 1–20)")
+with st.expander("Select Level 2 detractor/delighter columns", expanded=True):
     l2_det_guess = [c for c in all_src_cols if "l2" in _norm(c) and "detr" in _norm(c)]
     l2_del_guess = [c for c in all_src_cols if "l2" in _norm(c) and ("delight" in _norm(c) or "promot" in _norm(c))]
 
@@ -261,7 +466,6 @@ with st.expander("Select Level 2 detractor/delighter columns (these populate Sym
         index=0,
     )
 
-    # Regex used to split tags
     if split_choice == "Semicolon / Comma / Pipe / Newline (recommended)":
         split_regex = r"[;\|\n,]+"
     elif split_choice == "Semicolon only ;":
@@ -273,38 +477,84 @@ with st.expander("Select Level 2 detractor/delighter columns (these populate Sym
     else:
         split_regex = r"[\n]+"
 
-st.subheader("Build & Download")
+st.subheader("Weight / Count Column")
+weight_mode = st.selectbox(
+    "How should 'Review count per detractor' be filled?",
+    options=[
+        "Leave blank",
+        "1 / # detractor symptoms (if any)",
+        "1 / # delighter symptoms (if any)",
+        "1 / # total symptoms (detractors + delighters)",
+        "Always 1",
+    ],
+    index=0,
+)
+
+validate_l2 = False
+filter_unknown = False
+if template_file and (allowed_det or allowed_del):
+    with st.expander("Optional: Validate L2 tags against template 'Symptoms' list", expanded=False):
+        validate_l2 = st.checkbox("Enable validation (report unknown tags)", value=True)
+        filter_unknown = st.checkbox("Drop tags not in the template list", value=False)
+
+st.subheader("Convert & Download")
 build = st.button("Convert to Star Walk scrubbed verbatims")
 
 if build:
     if not l2_detractor_cols and not l2_delighter_cols:
-        st.warning("You did not select any L2 detractor/delighter columns. Symptoms will be blank unless you select them.")
-    out_df = build_output(
-        src=src_df.reset_index(drop=True),
+        st.error("Please select at least one L2 detractor and/or L2 delighter column.")
+        st.stop()
+
+    used_allowed_det = allowed_det if validate_l2 else None
+    used_allowed_del = allowed_del if validate_l2 else None
+
+    out_df, stats = convert_to_starwalk(
+        src_df=src_df,
         out_cols=out_cols,
         field_map=field_map,
-        l2_detractor_cols=l2_detractor_cols,
-        l2_delighter_cols=l2_delighter_cols,
+        l2_det_cols=l2_detractor_cols,
+        l2_del_cols=l2_delighter_cols,
         split_regex=split_regex,
+        weight_mode=weight_mode,
+        allowed_det=used_allowed_det,
+        allowed_del=used_allowed_del,
+        filter_unknown=filter_unknown,
     )
 
     st.success("Conversion complete.")
-    c1, c2, c3 = st.columns(3)
+
+    c1, c2, c3, c4 = st.columns(4)
     detr_counts = out_df[[f"Symptom {i}" for i in range(1, 11)]].notna().sum(axis=1)
     deli_counts = out_df[[f"Symptom {i}" for i in range(11, 21)]].notna().sum(axis=1)
+
     with c1:
-        st.metric("Rows", len(out_df))
+        st.metric("Rows", stats["rows"])
     with c2:
-        st.metric("Avg detractors (L2) / row", round(float(detr_counts.mean()), 2))
+        st.metric("Avg detractors / row", round(float(detr_counts.mean()), 2))
     with c3:
-        st.metric("Avg delighters (L2) / row", round(float(deli_counts.mean()), 2))
+        st.metric("Avg delighters / row", round(float(deli_counts.mean()), 2))
+    with c4:
+        st.metric("Rows truncated (>10 tags)", stats["rows_truncated_detractors_gt10"] + stats["rows_truncated_delighters_gt10"])
 
-    st.dataframe(out_df.head(50), use_container_width=True)
+    if validate_l2:
+        st.info(
+            f"Unknown tags found — detractors: {stats['unknown_detractor_tags_total']}, "
+            f"delighters: {stats['unknown_delighter_tags_total']}"
+        )
 
-    xbytes = to_excel_bytes(out_df, sheet_name=STARWALK_SHEET_NAME)
+    st.dataframe(out_df.head(100), use_container_width=True)
+
+    if template_file and output_mode.startswith("Use template"):
+        xbytes = write_into_template_workbook(template_file.getvalue(), out_df, sheet_name=STARWALK_SHEET_NAME)
+        fname = "starwalk_converted_TEMPLATE.xlsx"
+    else:
+        xbytes = to_excel_one_sheet(out_df, sheet_name=STARWALK_SHEET_NAME)
+        fname = "starwalk_scrubbed_verbatims_converted.xlsx"
+
     st.download_button(
-        "Download Excel (Star Walk scrubbed verbatims format)",
+        "Download Excel",
         data=xbytes,
-        file_name="starwalk_scrubbed_verbatims_converted.xlsx",
+        file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
