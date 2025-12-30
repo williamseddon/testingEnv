@@ -145,6 +145,36 @@ def clean_star_rating_series(series: pd.Series) -> pd.Series:
     return series.apply(clean_star_rating_value).astype("object")
 
 
+def clean_seeded_value(v):
+    """Map values like ['seeded'] / ["seeded"] / "seeded" / True to 'yes'; otherwise blank."""
+    if v is None:
+        return pd.NA
+    try:
+        if pd.isna(v):
+            return pd.NA
+    except Exception:
+        pass
+
+    # Boolean handling
+    if isinstance(v, (bool, np.bool_)):
+        return "yes" if bool(v) else pd.NA
+
+    # List-like containers
+    if isinstance(v, (list, tuple, set)):
+        return "yes" if any(re.search(r"\bseeded\b", str(x), flags=re.IGNORECASE) for x in v) else pd.NA
+
+    s = str(v).strip()
+    if not s:
+        return pd.NA
+
+    return "yes" if re.search(r"\bseeded\b", s, flags=re.IGNORECASE) else pd.NA
+
+
+def clean_seeded_series(series: pd.Series) -> pd.Series:
+    """Vector-friendly wrapper to clean the Seeded column."""
+    return series.apply(clean_seeded_value).astype("object")
+
+
 def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailing_blank_cols: int = 5) -> List[str]:
     """
     Extract header row from an Excel sheet using openpyxl so we don't accidentally
@@ -258,6 +288,10 @@ def convert_to_starwalk(
     for c in list(out.columns):
         if _norm(c) == "starrating":
             out[c] = clean_star_rating_series(out[c])
+    for c in list(out.columns):
+        if _norm(c) == "seeded":
+            out[c] = clean_seeded_series(out[c])
+
 
     split_re = re.compile(split_regex)
     src_cols = list(src_df.columns)
@@ -602,6 +636,10 @@ if build:
     for c in list(out_df.columns):
         if _norm(c) == "starrating":
             out_df[c] = clean_star_rating_series(out_df[c])
+    for c in list(out_df.columns):
+        if _norm(c) == "seeded":
+            out_df[c] = clean_seeded_series(out_df[c])
+
 
     st.success("Conversion complete.")
 
@@ -639,8 +677,3 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
-
-
-
