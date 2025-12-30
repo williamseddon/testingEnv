@@ -1,10 +1,17 @@
-# starwalk_converter_app_FIXED.py
+# starwalk_converter_app.py
 # Streamlit app to convert raw website review exports into the
 # "Star Walk scrubbed verbatims" format (Symptom 1–10 detractors, 11–20 delighters).
+#
+# FIXED (Seeded): Guaranteed conversion of values like "['Seeded']" -> "yes"
+# - Cleaning is applied at mapping time (cannot be skipped)
+# - Cleaning is idempotent (re-cleaning "yes" stays "yes")
+# - Final safety pass re-enforces the rule before writing
+#
+# FIXED (Star Rating): Guaranteed numeric-only output (e.g., "4 star" -> 4)
 
-import ast
 import io
 import re
+import ast
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -13,8 +20,8 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-APP_VERSION = "2025-12-30-seeded-yes-v4"
 
+APP_VERSION = "2025-12-30-seeded-yes-FIXED"
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
 # Default header (mirrors typical Star Walk workbook; includes two trailing blank header columns)
@@ -28,8 +35,10 @@ DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Hair Type", "Unnamed: 31", "Unnamed: 32",
 ]
 
-# Used for splitting multi-tag cells like "A; B | C"
 DEFAULT_TAG_SPLIT_RE = re.compile(r"[;\|\n,]+")
+
+SEED_TRUE = {"seeded", "yes", "true", "y", "1"}
+SEED_FALSE = {"notseeded", "no", "false", "n", "0", "unseeded", "nonseeded"}
 
 
 # -----------------------------
@@ -53,6 +62,13 @@ def best_match(target: str, candidates: List[str]) -> Optional[str]:
         if t and (t in nc or nc in t):
             return c
     return None
+
+
+def _safe_isna(v) -> bool:
+    try:
+        return pd.isna(v)
+    except Exception:
+        return False
 
 
 @st.cache_data(show_spinner=False)
@@ -84,12 +100,9 @@ def parse_tags(value, split_re: re.Pattern) -> List[str]:
       - a single string
       - delimited strings (e.g., "A; B | C")
       - stringified list: "['A','B']"
-      - actual python list/tuple/set (rare but possible)
-
-    NOTE: We intentionally do NOT treat the whole string "['Seeded']" as a single token.
-    We return ["Seeded"] so downstream normalization can work.
+      - actual list/tuple/set (rare but possible)
     """
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or _safe_isna(value):
         return []
 
     if isinstance(value, (list, tuple, set)):
@@ -99,14 +112,14 @@ def parse_tags(value, split_re: re.Pattern) -> List[str]:
     if not s:
         return []
 
-    # Try safe parsing first for list-like strings
+    # Try literal_eval for list-like strings when possible (more robust than manual split)
     if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
         try:
-            parsed = ast.literal_eval(s)
-            if isinstance(parsed, (list, tuple, set)):
-                return dedupe_preserve([str(v).strip().strip("'\"") for v in parsed if str(v).strip()])
+            obj = ast.literal_eval(s)
+            if isinstance(obj, (list, tuple, set)):
+                return dedupe_preserve([str(v).strip() for v in obj if str(v).strip()])
         except Exception:
-            # Fall back to a simple split if literal_eval fails
+            # Fallback to manual parsing if literal_eval fails
             inner = s[1:-1].strip()
             if inner:
                 parts = [p.strip().strip("'\"") for p in inner.split(",")]
@@ -118,27 +131,20 @@ def parse_tags(value, split_re: re.Pattern) -> List[str]:
 
 
 # -----------------------------
-# Value normalizers
+# Cleaning: Star Rating (numeric only)
 # -----------------------------
 def clean_star_rating_value(v):
     """Coerce star rating into a numeric (int/float) and strip words like 'star(s)'."""
-    if v is None:
+    if v is None or _safe_isna(v):
         return pd.NA
-    try:
-        if pd.isna(v):
-            return pd.NA
-    except Exception:
-        pass
 
+    # Already numeric
     if isinstance(v, (int, np.integer)):
         return int(v)
     if isinstance(v, (float, np.floating)):
-        try:
-            if np.isnan(v):
-                return pd.NA
-        except Exception:
-            pass
         fv = float(v)
+        if np.isnan(fv):
+            return pd.NA
         return int(fv) if fv.is_integer() else fv
 
     s = str(v).strip()
@@ -157,40 +163,40 @@ def clean_star_rating_series(series: pd.Series) -> pd.Series:
     return series.apply(clean_star_rating_value).astype("object")
 
 
+# -----------------------------
+# Cleaning: Seeded -> "yes" only
+# -----------------------------
 def clean_seeded_value(v):
     """
-    Convert any of these to 'yes':
-      - ['Seeded'], ["Seeded"], 'Seeded'  (case-insensitive)
-      - True / 1
+    Convert values like:
+      - ['Seeded'] / ["Seeded"] / 'Seeded' / 'yes' / True -> 'yes'
+    Everything else -> blank (pd.NA)
 
-    Everything else -> blank (pd.NA).
-
-    IMPORTANT: Only counts tokens that EQUAL "seeded" (avoids "Not Seeded").
+    IMPORTANT:
+    - Token-based equality (no substring matching) to avoid false positives.
+    - Idempotent: if it's already 'yes', it stays 'yes'.
     """
-    if v is None:
+    if v is None or _safe_isna(v):
         return pd.NA
-    try:
-        if pd.isna(v):
-            return pd.NA
-    except Exception:
-        pass
 
+    # Boolean / numeric handling
     if isinstance(v, (bool, np.bool_)):
         return "yes" if bool(v) else pd.NA
-
-    if isinstance(v, (int, np.integer, float, np.floating)):
-        try:
-            return "yes" if float(v) == 1.0 else pd.NA
-        except Exception:
+    if isinstance(v, (int, np.integer)):
+        return "yes" if int(v) == 1 else pd.NA
+    if isinstance(v, (float, np.floating)):
+        fv = float(v)
+        if np.isnan(fv):
             return pd.NA
+        return "yes" if fv == 1.0 else pd.NA
 
+    # Parse into tokens (handles "['Seeded']" safely)
     tokens = parse_tags(v, DEFAULT_TAG_SPLIT_RE)
     for t in tokens:
         nt = _norm(t)
-        if nt in {"seeded", "yes", "true", "y", "1"}:
+        if nt in SEED_TRUE:
             return "yes"
-        # Explicit negatives (optional safety)
-        if nt in {"notseeded", "unseeded", "nonseeded", "false", "no", "n", "0"}:
+        if nt in SEED_FALSE:
             return pd.NA
 
     return pd.NA
@@ -200,8 +206,26 @@ def clean_seeded_series(series: pd.Series) -> pd.Series:
     return series.apply(clean_seeded_value).astype("object")
 
 
+def apply_final_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+    """Final safety pass: enforce Seeded + Star Rating rules no matter what."""
+    for c in list(df.columns):
+        nc = _norm(c)
+        if nc == "starrating":
+            df[c] = clean_star_rating_series(df[c])
+        elif nc == "seeded":
+            df[c] = clean_seeded_series(df[c])
+    return df
+
+
+def find_col_by_norm(cols: List[str], target_norm: str) -> Optional[str]:
+    for c in cols:
+        if _norm(c) == target_norm:
+            return c
+    return None
+
+
 # -----------------------------
-# Template helpers
+# Template handling
 # -----------------------------
 def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailing_blank_cols: int = 5) -> List[str]:
     """
@@ -215,8 +239,10 @@ def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailin
     ws = wb[sheet_name]
     raw = []
     for c in range(1, ws.max_column + 1):
-        raw.append(ws.cell(1, c).value)
+        v = ws.cell(1, c).value
+        raw.append(v)
 
+    # Find last named header cell
     last_named = -1
     for i, v in enumerate(raw):
         if v is not None and str(v).strip() != "":
@@ -254,6 +280,9 @@ def load_allowed_l2_from_template(template_bytes: bytes) -> Tuple[Optional[Set[s
         return None, None
 
 
+# -----------------------------
+# Conversion
+# -----------------------------
 def collect_from_row_tuple(
     row_tup,
     col_idx: Dict[str, int],
@@ -269,9 +298,6 @@ def collect_from_row_tuple(
     return dedupe_preserve(tags)
 
 
-# -----------------------------
-# Conversion
-# -----------------------------
 def convert_to_starwalk(
     src_df: pd.DataFrame,
     out_cols: List[str],
@@ -302,12 +328,14 @@ def convert_to_starwalk(
 
     out = pd.DataFrame(index=range(n), columns=base_cols, dtype="object")
 
-    # Copy mapped fields (with special handling for Seeded / Star Rating)
+    # Copy mapped fields (WITH guaranteed cleaning for Seeded and Star Rating)
     for out_field, in_field in field_map.items():
         if out_field not in out.columns:
             continue
+
         if in_field and in_field in src_df.columns:
             series = src_df[in_field]
+
             if _norm(out_field) == "seeded":
                 out[out_field] = clean_seeded_series(series)
             elif _norm(out_field) == "starrating":
@@ -316,13 +344,6 @@ def convert_to_starwalk(
                 out[out_field] = series.values
         else:
             out[out_field] = pd.NA
-
-    # Safety pass (handles template quirks / duplicate header variants)
-    for c in list(out.columns):
-        if _norm(c) == "seeded":
-            out[c] = clean_seeded_series(out[c])
-        if _norm(c) == "starrating":
-            out[c] = clean_star_rating_series(out[c])
 
     split_re = re.compile(split_regex)
     src_cols = list(src_df.columns)
@@ -392,6 +413,9 @@ def convert_to_starwalk(
             total = detr_count + deli_count
             out["Review count per detractor"] = np.where(total > 0, 1.0 / total, pd.NA)
 
+    # FINAL SAFETY: enforce Seeded + Star Rating rules no matter what
+    out = apply_final_cleaning(out)
+
     stats = {
         "rows": n,
         "rows_truncated_detractors_gt10": rows_trunc_det,
@@ -414,9 +438,14 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
     Preserve the full template workbook (other sheets, formulas, pivots, etc.) and
     replace the Star Walk scrubbed verbatims sheet data (keeping its header row).
     """
+    df_out = apply_final_cleaning(df_out.copy())
+
     wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
 
-    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+    else:
+        ws = wb.create_sheet(sheet_name)
 
     # Read template header (row 1) to determine column order we should write
     header = []
@@ -427,22 +456,21 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
         else:
             header.append(str(v).strip())
 
-    # If sheet is empty, write header from df_out
+    # If the sheet is empty, use df_out's columns and write header
     if (ws.max_row == 1 and ws.max_column == 1 and ws.cell(1, 1).value is None):
         header = list(df_out.columns)
         for c, name in enumerate(header, start=1):
             ws.cell(1, c).value = name
 
-    # Align df to header columns
+    # Align df to header columns (extra df cols are dropped; missing are added as NA)
     aligned = df_out.copy()
     for col in header:
         if col not in aligned.columns:
             aligned[col] = pd.NA
     aligned = aligned[header]
 
-    # Replace pandas missing with None (so Excel is truly blank)
-    aligned = aligned.replace({pd.NA: None})
-    aligned = aligned.where(pd.notna(aligned), None)
+    # Re-apply cleaning post-align (in case header name differs)
+    aligned = apply_final_cleaning(aligned)
 
     # Clear existing rows below header
     if ws.max_row >= 2:
@@ -462,7 +490,7 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
 # -----------------------------
 st.set_page_config(page_title="Star Walk Formatter", layout="wide")
 st.title("Star Walk Scrubbed Verbatims Converter")
-st.caption(f"App version: {APP_VERSION}")
+st.caption(f"App version: `{APP_VERSION}`")
 
 st.markdown(
     """
@@ -505,7 +533,7 @@ output_mode_options = ["One-sheet output (fast)"]
 if template_file:
     output_mode_options.append("Use template workbook (preserve other tabs/formulas)")
 
-output_mode = st.radio("Output mode", output_mode_options, index=len(output_mode_options)-1)
+output_mode = st.radio("Output mode", output_mode_options, index=(len(output_mode_options) - 1))
 
 if template_file:
     tbytes = template_file.getvalue()
@@ -549,14 +577,14 @@ def pick_preferred(field: str) -> Optional[str]:
 
 suggest = {
     "Source": pick_preferred("Source") or best_match("Source", all_src_cols),
-    "Model (SKU)": pick_preferred("Model (SKU)") or best_match("Model (SKU)", all_src_cols) or best_match("SKU", all_src_cols) or best_match("Model", all_src_cols),
+    "Model (SKU)": pick_preferred("Model (SKU)") or best_match("Model (SKU)", all_src_cols) or best_match("SKU", all_src_cols),
     "Seeded": pick_preferred("Seeded") or best_match("Seeded", all_src_cols),
     "Country": pick_preferred("Country") or best_match("Country", all_src_cols),
     "New Review": pick_preferred("New Review") or best_match("New Review", all_src_cols),
     "Review Date": pick_preferred("Review Date") or best_match("Review Date", all_src_cols) or best_match("Date", all_src_cols),
     "Verbatim Id": None,
-    "Verbatim": pick_preferred("Verbatim") or best_match("Verbatim", all_src_cols) or best_match("Review", all_src_cols) or best_match("Review Text", all_src_cols),
-    "Star Rating": pick_preferred("Star Rating") or best_match("Star Rating", all_src_cols) or best_match("Rating", all_src_cols) or best_match("Stars", all_src_cols),
+    "Verbatim": pick_preferred("Verbatim") or best_match("Verbatim", all_src_cols) or best_match("Review", all_src_cols),
+    "Star Rating": pick_preferred("Star Rating") or best_match("Star Rating", all_src_cols) or best_match("Rating", all_src_cols),
     "Hair Type": None,
 }
 
@@ -577,8 +605,9 @@ for i, f in enumerate(core_fields):
 
 st.subheader("L2 Tag Columns (these populate Symptom 1–20)")
 with st.expander("Select Level 2 detractor/delighter columns", expanded=True):
+    # Heuristics that work for Axion exports (+ general)
     l2_det_guess = [c for c in all_src_cols if "l2" in _norm(c) and "detr" in _norm(c)]
-    l2_del_guess = [c for c in all_src_cols if "l2" in _norm(c) and "delight" in _norm(c)]
+    l2_del_guess = [c for c in all_src_cols if "l2" in _norm(c) and ("delight" in _norm(c) or "promot" in _norm(c) or "delighter" in _norm(c))]
 
     l2_detractor_cols = st.multiselect(
         "Source column(s) that contain **Level 2 Detractors**",
@@ -658,17 +687,37 @@ if build:
         filter_unknown=filter_unknown,
     )
 
-    # Diagnostics: ensure Seeded is only yes/blank
-    seeded_cols = [c for c in out_df.columns if _norm(c) == "seeded"]
-    if seeded_cols:
-        sc = seeded_cols[0]
-        bad = out_df[~out_df[sc].isna() & (out_df[sc].astype(str).str.lower().str.strip() != "yes")]
-        st.caption(f"Seeded normalization: {int((out_df[sc]=='yes').sum())} yes out of {len(out_df)} rows.")
-        if len(bad) > 0:
-            st.warning("Seeded column still contains non-'yes' values (showing first 10). This indicates an unexpected input format.")
-            st.dataframe(bad[[sc]].head(10), use_container_width=True)
-
     st.success("Conversion complete.")
+
+    # Diagnostics: Seeded normalization must be only "yes" or blank
+    seeded_col = find_col_by_norm(list(out_df.columns), "seeded")
+    if seeded_col:
+        seeded_vals = out_df[seeded_col]
+        seeded_yes = int((seeded_vals == "yes").sum())
+        nonempty = seeded_vals.dropna()
+        bad = nonempty[(nonempty != "yes") & (nonempty.astype(str).str.strip() != "")]
+        st.caption(f"Seeded normalization: **{seeded_yes}** yes out of **{len(out_df)}** rows")
+        if len(bad) > 0:
+            st.error(f"Seeded still contains non-'yes' values (showing first 10): {bad.head(10).tolist()}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    detr_counts = out_df[[f"Symptom {i}" for i in range(1, 11)]].notna().sum(axis=1)
+    deli_counts = out_df[[f"Symptom {i}" for i in range(11, 21)]].notna().sum(axis=1)
+
+    with c1:
+        st.metric("Rows", stats["rows"])
+    with c2:
+        st.metric("Avg detractors / row", round(float(detr_counts.mean()), 2))
+    with c3:
+        st.metric("Avg delighters / row", round(float(deli_counts.mean()), 2))
+    with c4:
+        st.metric("Rows truncated (>10 tags)", stats["rows_truncated_detractors_gt10"] + stats["rows_truncated_delighters_gt10"])
+
+    if validate_l2:
+        st.info(
+            f"Unknown tags found — detractors: {stats['unknown_detractor_tags_total']}, "
+            f"delighters: {stats['unknown_delighter_tags_total']}"
+        )
 
     st.dataframe(out_df.head(100), use_container_width=True)
 
@@ -685,6 +734,7 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
 
 
