@@ -103,6 +103,48 @@ def parse_tags(value, split_re: re.Pattern) -> List[str]:
     return dedupe_preserve(parts)
 
 
+
+def clean_star_rating_value(v):
+    """Coerce star rating into a numeric (int/float) and strip words like 'star(s)'."""
+    # Handle pandas / numpy missing values
+    if v is None:
+        return pd.NA
+    try:
+        if pd.isna(v):
+            return pd.NA
+    except Exception:
+        pass
+
+    # If already numeric
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        try:
+            if np.isnan(v):
+                return pd.NA
+        except Exception:
+            pass
+        fv = float(v)
+        return int(fv) if fv.is_integer() else fv
+
+    s = str(v).strip()
+    if not s:
+        return pd.NA
+
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return pd.NA
+
+    fv = float(m.group(1))
+    return int(fv) if fv.is_integer() else fv
+
+
+def clean_star_rating_series(series: pd.Series) -> pd.Series:
+    """Vector-friendly wrapper to clean the Star Rating column."""
+    # Keep as object so Excel displays whole numbers like 4 (not 4.0) when possible
+    return series.apply(clean_star_rating_value).astype("object")
+
+
 def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailing_blank_cols: int = 5) -> List[str]:
     """
     Extract header row from an Excel sheet using openpyxl so we don't accidentally
@@ -210,6 +252,10 @@ def convert_to_starwalk(
             out[out_field] = src_df[in_field].values
         else:
             out[out_field] = pd.NA
+
+    # Normalize Star Rating values to numeric-only (e.g., "4 star" -> 4)
+    if "Star Rating" in out.columns:
+        out["Star Rating"] = clean_star_rating_series(out["Star Rating"])
 
     split_re = re.compile(split_regex)
     src_cols = list(src_df.columns)
@@ -410,18 +456,47 @@ if template_file:
 st.subheader("Field Mapping (optional but recommended)")
 all_src_cols = list(src_df.columns)
 
-suggest = {
-    "Source": best_match("Source", all_src_cols),
-    "Model (SKU)": best_match("Model (SKU)", all_src_cols) or best_match("SKU", all_src_cols) or best_match("Model", all_src_cols),
-    "Seeded": best_match("Seeded", all_src_cols),
-    "Country": best_match("Country", all_src_cols),
-    "New Review": best_match("New Review", all_src_cols),
-    "Review Date": best_match("Review Date", all_src_cols) or best_match("Date", all_src_cols),
-    "Verbatim Id": best_match("Verbatim Id", all_src_cols) or best_match("Review ID", all_src_cols) or best_match("Id", all_src_cols),
-    "Verbatim": best_match("Verbatim", all_src_cols) or best_match("Review", all_src_cols) or best_match("Review Text", all_src_cols),
-    "Star Rating": best_match("Star Rating", all_src_cols) or best_match("Rating", all_src_cols) or best_match("Stars", all_src_cols),
-    "Hair Type": best_match("Hair Type", all_src_cols),
+# Preferred defaults for the most common "raw website reviews" export schema
+PREFERRED_CORE_DEFAULTS: Dict[str, List[str]] = {
+    "Source": ["Retailer"],
+    "Model (SKU)": ["SKU Item"],
+    "Seeded": ["Seeded Reviews [AX]"],
+    "Country": ["Location"],
+    "New Review": ["Syndicated Reviews [AX]"],
+    "Review Date": ["Opened date", "Opened Date"],
+    "Verbatim": ["Review"],
+    "Star Rating": ["Rating"],
 }
+
+def pick_preferred(field: str) -> Optional[str]:
+    prefs = PREFERRED_CORE_DEFAULTS.get(field, [])
+    # Exact (case sensitive)
+    for p in prefs:
+        if p in all_src_cols:
+            return p
+    # Normalized exact (case/spacing tolerant)
+    for p in prefs:
+        pn = _norm(p)
+        for c in all_src_cols:
+            if _norm(c) == pn:
+                return c
+    return None
+
+suggest = {
+    "Source": pick_preferred("Source") or best_match("Source", all_src_cols),
+    "Model (SKU)": pick_preferred("Model (SKU)") or best_match("Model (SKU)", all_src_cols) or best_match("SKU", all_src_cols) or best_match("Model", all_src_cols),
+    "Seeded": pick_preferred("Seeded") or best_match("Seeded", all_src_cols),
+    "Country": pick_preferred("Country") or best_match("Country", all_src_cols),
+    "New Review": pick_preferred("New Review") or best_match("New Review", all_src_cols),
+    "Review Date": pick_preferred("Review Date") or best_match("Review Date", all_src_cols) or best_match("Date", all_src_cols),
+    # Leave unmapped by default (often not present / not needed for Star Walk)
+    "Verbatim Id": None,
+    "Verbatim": pick_preferred("Verbatim") or best_match("Verbatim", all_src_cols) or best_match("Review", all_src_cols) or best_match("Review Text", all_src_cols),
+    "Star Rating": pick_preferred("Star Rating") or best_match("Star Rating", all_src_cols) or best_match("Rating", all_src_cols) or best_match("Stars", all_src_cols),
+    # Leave unmapped by default unless you have a dedicated Hair Type field
+    "Hair Type": None,
+}
+
 
 field_map: Dict[str, Optional[str]] = {}
 core_fields = ["Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date", "Verbatim Id", "Verbatim", "Star Rating", "Hair Type"]
@@ -557,4 +632,5 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
