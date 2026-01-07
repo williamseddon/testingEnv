@@ -721,7 +721,7 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
         st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
 
 with st.sidebar.expander("🔒 Privacy & AI", expanded=True):
-    ai_enabled = st.toggle("Enable AI (send filtered text to OpenAI)", value=False, key="ai_enabled",
+    ai_enabled = st.toggle("Enable AI (send filtered text to OpenAI)", value=True, key="ai_enabled",
                            help="When on and you ask a question, short masked snippets and embeddings are sent to OpenAI.")
     ai_cap = st.number_input("Max reviews to embed per Q", min_value=200, max_value=5000, value=int(st.session_state.get("ai_cap", 1500)), step=100, key="ai_cap")
     st.caption("Emails/phone numbers are masked before embedding. No remote calls happen until you press Send.")
@@ -1020,7 +1020,7 @@ else:
     with c5:
         show_volume = st.toggle(
             "Show Volume",
-            value=False,
+            value=True,
             help="Adds subtle bars + a right axis showing review count per bucket."
         )
 
