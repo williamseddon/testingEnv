@@ -1004,7 +1004,7 @@ if "Review Date" not in filtered.columns or "Star Rating" not in filtered.column
     st.info("Need 'Review Date' and 'Star Rating' columns to compute this chart.")
 else:
     # Controls
-    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 0.9])
+    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 0.9, 0.9])  # NEW: extra column for Show Volume
     with c1:
         bucket_label = st.selectbox("Bucket size", ["Day", "Week", "Month"], index=2, key="region_bucket")
         _freq_map = {"Day": "D", "Week": "W", "Month": "M"}
@@ -1017,6 +1017,12 @@ else:
         top_n = st.number_input("Top regions by volume", 1, 15, value=5, step=1, key="region_topn")
     with c4:
         organic_only = st.toggle("Organic Only", value=False, help="Exclude reviews where Seeded == YES")
+    with c5:
+        show_volume = st.toggle(  # NEW
+            "Show Volume",
+            value=False,
+            help="Adds subtle bars + a right axis showing review count per bucket."
+        )
 
     if region_col not in filtered.columns or region_col == "(none)":
         st.info("No region column found for this chart.")
@@ -1075,7 +1081,7 @@ else:
                 tmp["cum_cnt"] = tmp.groupby("_region")["bucket_count"].cumsum()
                 tmp["Cumulative Avg ★"] = tmp["cum_sum"] / tmp["cum_cnt"]
 
-                # Overall cumulative line
+                # Overall cumulative line + (also holds per-bucket volume via bucket_count)
                 overall = (
                     d.groupby(pd.Grouper(key="Review Date", freq=freq_eff))["Star Rating"]
                      .agg(bucket_sum="sum", bucket_count="count")
@@ -1085,6 +1091,129 @@ else:
                 overall["cum_sum"] = overall["bucket_sum"].cumsum()
                 overall["cum_cnt"] = overall["bucket_count"].cumsum()
                 overall["Cumulative Avg ★"] = overall["cum_sum"] / overall["cum_cnt"]
+
+                # ---- Plotly chart ----
+                fig = go.Figure()
+
+                # NEW: volume bars on secondary axis (right)
+                # Add first so it renders behind the lines.
+                if show_volume and not overall.empty:
+                    fig.add_trace(go.Bar(
+                        x=overall["Review Date"],
+                        y=overall["bucket_count"],           # per-bucket volume
+                        name="Review volume",
+                        yaxis="y2",
+                        opacity=0.18,                        # subtle
+                        marker=dict(
+                            color="rgba(15, 23, 42, 0.25)",  # soft slate/neutral
+                            line=dict(width=0)
+                        ),
+                        hovertemplate=(
+                            "Review volume<br>"
+                            "Bucket end: %{x|%Y-%m-%d}<br>"
+                            "Reviews: %{y}<extra></extra>"
+                        ),
+                        showlegend=False,                    # keeps legend clean (axis title still explains)
+                    ))
+
+                # Region lines
+                plot_regions = chosen_regions or tmp["_region"].unique().tolist()
+                for reg in plot_regions:
+                    sub = tmp[tmp["_region"] == reg]
+                    if sub.empty:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=sub["Review Date"], y=sub["Cumulative Avg ★"],
+                        mode="lines+markers",
+                        name=str(reg),
+                        line=dict(width=2),
+                        marker=dict(size=5),
+                        hovertemplate=(
+                            f"{region_col}: {reg}<br>"
+                            "Bucket end: %{x|%Y-%m-%d}<br>"
+                            "Cumulative Avg ★: %{y:.3f}<br>"
+                            "Cum. Reviews: %{customdata}<extra></extra>"
+                        ),
+                        customdata=sub["cum_cnt"],
+                    ))
+
+                # Overall dashed line
+                if not overall.empty:
+                    fig.add_trace(go.Scatter(
+                        x=overall["Review Date"], y=overall["Cumulative Avg ★"],
+                        mode="lines",
+                        name="Overall",
+                        line=dict(width=3, dash="dash"),
+                        hovertemplate=(
+                            "Overall<br>"
+                            "Bucket end: %{x|%Y-%m-%d}<br>"
+                            "Cumulative Avg ★: %{y:.3f}<br>"
+                            "Cum. Reviews: %{customdata}<extra></extra>"
+                        ),
+                        customdata=overall["cum_cnt"],
+                    ))
+
+                # Axis formatting based on bucket
+                _tickformat = {"D": "%b %d, %Y", "W": "%b %d, %Y", "M": "%b %Y"}[freq]
+                fig.update_xaxes(tickformat=_tickformat, automargin=True)
+                fig.update_yaxes(automargin=True)
+
+                # Title/legend/layout (legend below x-axis)
+                title_bucket = {"D": "Daily", "W": "Weekly", "M": "Monthly"}[freq]
+                title_org = " • Organic Only" if organic_only else ""
+                fig.update_layout(
+                    title=f"<b>{title_bucket} Cumulative (Weighted) Avg ★ by {region_col}{title_org}</b>",
+                    xaxis=dict(title="Date", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+                    yaxis=dict(title="Cumulative Avg ★", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
+
+                    # NEW: secondary axis (right) for volume — only visible when toggle is on
+                    yaxis2=dict(
+                        title="Review volume",
+                        overlaying="y",
+                        side="right",
+                        showgrid=False,
+                        rangemode="tozero",
+                        visible=bool(show_volume),
+                    ),
+                    barmode="overlay",
+
+                    hovermode="x unified",
+                    plot_bgcolor="white",
+                    template="plotly_white",
+                    margin=dict(l=60, r=(60 if show_volume else 40), t=70, b=100),
+                    legend=dict(
+                        orientation="h",
+                        yanchor="top",
+                        y=-0.28,          # below x-axis
+                        xanchor="center",
+                        x=0.5,
+                        bgcolor="rgba(255,255,255,0)",
+                    ),
+                )
+
+                # Extra spacing / no clipping (IMPORTANT: only compute y-range from rating traces, not volume bars)
+                ys = []
+                for tr in fig.data:
+                    # Only consider primary y-axis traces (rating lines)
+                    if getattr(tr, "yaxis", "y") not in (None, "y"):
+                        continue
+                    if getattr(tr, "y", None) is not None:
+                        try:
+                            ys.extend([float(v) for v in tr.y if v is not None])
+                        except Exception:
+                            pass
+                if ys:
+                    y_min, y_max = min(ys), max(ys)
+                    pad = max(0.1, (y_max - y_min) * 0.08)
+                    lo = max(1.0, y_min - pad)
+                    hi = min(5.2, y_max + pad)
+                    fig.update_yaxes(range=[lo, hi])
+
+                # IMPORTANT: don't apply cliponaxis to Bar traces (would error)
+                fig.update_traces(cliponaxis=False, selector=dict(type="scatter"))
+
+                st.plotly_chart(fig, use_container_width=True)
+
 
                 # ---- Plotly chart ----
                 fig = go.Figure()
