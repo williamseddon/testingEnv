@@ -13,7 +13,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-APP_VERSION = "2025-12-30-seeded-yes-v5"
+APP_VERSION = "2026-01-08-seeded-Yes-no-l2-default-condition-v1"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -182,34 +182,36 @@ _NUMERIC_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*$")
 
 def clean_seeded_value(v):
     """
-    Convert any of these to 'yes':
-      - ['Seeded'], ["Seeded"], 'Seeded'  (case-insensitive)
-      - True / 1
-      - numeric strings like "1" or "1.0"
-      - strings containing seeded, e.g. "Seeded Reviews [AX]" (but NOT "Not Seeded")
+    Convert Seeded inputs into:
+      - "Yes" for seeded-like values (including ['Seeded'])
+      - "no" for anything blank/empty/unseeded/false
 
-    Everything else -> blank (pd.NA).
-
-    IMPORTANT: negatives are checked first (avoids "Not Seeded" being treated as seeded).
+    Rules:
+      - Blank/NaN/None -> "no"
+      - ['Seeded'], "Seeded" (case-insensitive) -> "Yes"
+      - True / 1 / "1" / "1.0" -> "Yes"
+      - negatives like "Not Seeded" / "unseeded" / "false" / 0 -> "no"
+      - strings containing 'seeded' like "Seeded Reviews [AX]" -> "Yes"
     """
+    # Treat blanks as "no"
     if v is None:
-        return pd.NA
+        return "no"
     try:
         if pd.isna(v):
-            return pd.NA
+            return "no"
     except Exception:
         pass
 
     # Bool
     if isinstance(v, (bool, np.bool_)):
-        return "yes" if bool(v) else pd.NA
+        return "Yes" if bool(v) else "no"
 
     # Numeric (int/float)
     if isinstance(v, (int, np.integer, float, np.floating)):
         try:
-            return "yes" if float(v) == 1.0 else pd.NA
+            return "Yes" if float(v) == 1.0 else "no"
         except Exception:
-            return pd.NA
+            return "no"
 
     # Numeric-as-string shortcut (common for exports: "1", "0", "1.0")
     s0 = str(v).strip()
@@ -217,12 +219,13 @@ def clean_seeded_value(v):
         try:
             fv = float(s0)
             if fv == 1.0:
-                return "yes"
+                return "Yes"
             if fv == 0.0:
-                return pd.NA
+                return "no"
         except Exception:
             pass
 
+    # Tokenize (this is what makes "['Seeded']" become ["Seeded"])
     tokens = parse_tags(v, DEFAULT_TAG_SPLIT_RE)
 
     for t in tokens:
@@ -231,21 +234,22 @@ def clean_seeded_value(v):
 
         # negatives first
         if nt in {"notseeded", "unseeded", "nonseeded"} or raw in {"not seeded", "unseeded", "non seeded"}:
-            return pd.NA
+            return "no"
         if nt in {"false", "no", "n", "0"}:
-            return pd.NA
+            return "no"
 
         # exact positives
         if nt in {"seeded", "yes", "true", "y", "1"}:
-            return "yes"
+            return "Yes"
         if raw in {"1.0", "1"}:
-            return "yes"
+            return "Yes"
 
         # permissive "contains seeded" (covers "Seeded Reviews [AX]" etc.)
         if "seeded" in nt:
-            return "yes"
+            return "Yes"
 
-    return pd.NA
+    # default
+    return "no"
 
 
 def clean_seeded_series(series: pd.Series) -> pd.Series:
@@ -646,19 +650,39 @@ with st.expander("Debug: Seeded raw → cleaned preview", expanded=False):
         st.caption("Map a source Seeded column above to see preview here.")
 
 st.subheader("L2 Tag Columns (these populate Symptom 1–20)")
+
+def pick_default_l2_cols(all_cols: List[str], kind: str) -> List[str]:
+    """
+    Choose ONLY ONE default column for each kind (detractor/delighter), preferring:
+      1) 'L2 <kind> Condition [AX]' (contains 'condition')
+      2) otherwise the first column that looks like an L2 <kind> column
+    This avoids preselecting multiple columns like Mode/Component/etc.
+    """
+    kind_n = "detr" if kind == "detractor" else "delight"
+    candidates = [c for c in all_cols if "l2" in _norm(c) and kind_n in _norm(c)]
+    if not candidates:
+        return []
+    # Prefer condition
+    condition = [c for c in candidates if "condition" in _norm(c)]
+    if condition:
+        return [condition[0]]
+    # Else: just the first match
+    return [candidates[0]]
+
 with st.expander("Select Level 2 detractor/delighter columns", expanded=True):
-    l2_det_guess = [c for c in all_src_cols if "l2" in _norm(c) and "detr" in _norm(c)]
-    l2_del_guess = [c for c in all_src_cols if "l2" in _norm(c) and "delight" in _norm(c)]
+    # NEW: only preselect ONE column each, preferring Condition [AX]
+    l2_det_default = pick_default_l2_cols(all_src_cols, "detractor")
+    l2_del_default = pick_default_l2_cols(all_src_cols, "delighter")
 
     l2_detractor_cols = st.multiselect(
         "Source column(s) that contain **Level 2 Detractors**",
         options=all_src_cols,
-        default=l2_det_guess,
+        default=l2_det_default,
     )
     l2_delighter_cols = st.multiselect(
         "Source column(s) that contain **Level 2 Delighters**",
         options=all_src_cols,
-        default=l2_del_guess,
+        default=l2_del_default,
     )
 
     split_choice = st.selectbox(
@@ -728,15 +752,18 @@ if build:
         filter_unknown=filter_unknown,
     )
 
-    # Diagnostics: ensure Seeded is only yes/blank
+    # Diagnostics: ensure Seeded is only Yes/no
     seeded_cols = [c for c in out_df.columns if _norm(c) == "seeded"]
     if seeded_cols:
         sc = seeded_cols[0]
-        yes_mask = out_df[sc].astype(str).str.lower().str.strip().eq("yes")
-        st.caption(f"Seeded normalization: {int(yes_mask.sum())} yes out of {len(out_df)} rows.")
-        bad = out_df[~out_df[sc].isna() & ~yes_mask]
+        norm = out_df[sc].astype(str).str.strip()
+        yes_mask = norm.eq("Yes")
+        no_mask = norm.eq("no")
+
+        st.caption(f"Seeded normalization: {int(yes_mask.sum())} Yes, {int(no_mask.sum())} no out of {len(out_df)} rows.")
+        bad = out_df[~yes_mask & ~no_mask]
         if len(bad) > 0:
-            st.warning("Seeded column still contains non-'yes' values (showing first 10). This indicates an unexpected input format.")
+            st.warning("Seeded column contains values other than 'Yes' or 'no' (showing first 10).")
             st.dataframe(bad[[sc]].head(10), use_container_width=True)
 
     st.success("Conversion complete.")
@@ -755,6 +782,7 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
 
 
