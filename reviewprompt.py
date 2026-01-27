@@ -1,5 +1,4 @@
-from pathlib import Path
-code2 = r'''import streamlit as st
+import streamlit as st
 import pandas as pd
 import re
 import json
@@ -13,16 +12,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 # =========================================================
+# IMPORTANT: Fix for your Streamlit Cloud error
+# =========================================================
+# Do NOT write code files at runtime (no Path.write_text / /mnt/data).
+# This app is a normal Streamlit script you can deploy directly.
+
+# =========================================================
 # Arrow-safe wrapper for st.dataframe
 # =========================================================
 _original_st_dataframe = st.dataframe
 
 def _dataframe_arrow_safe(data, *args, **kwargs):
     """
-    Wrap st.dataframe so that Arrow-related type issues are handled:
-    - First try normal dataframe.
-    - If it fails, coerce object columns to strings and retry.
-    - If it still fails, fall back to plain-text display.
+    Render dataframe; if Arrow type issues occur, coerce object columns to strings.
     """
     try:
         return _original_st_dataframe(data, *args, **kwargs)
@@ -36,18 +38,14 @@ def _dataframe_arrow_safe(data, *args, **kwargs):
                 return _original_st_dataframe(df, *args, **kwargs)
             return _original_st_dataframe(pd.DataFrame({"value": [str(data)]}), *args, **kwargs)
         except Exception:
-            st.warning(
-                "Couldn't render DataFrame interactively due to an Arrow type issue. "
-                "Showing plain-text preview instead."
-            )
+            st.warning("Couldn't render DataFrame interactively (Arrow issue). Showing text preview.")
             st.text(str(data))
             return None
 
-# Monkey-patch Streamlit's dataframe with our safe version
 st.dataframe = _dataframe_arrow_safe
 
 # =========================================================
-# App Config / Visual polish
+# App Config / UI Polish
 # =========================================================
 st.set_page_config(page_title="AI Review Assistant", layout="wide")
 st.markdown(
@@ -63,7 +61,7 @@ hr { margin: 0.8rem 0 1.2rem 0; }
 )
 
 st.title("🦈⭐ AI Review Assistant")
-st.caption("Upload a review file, configure columns, filter rows, run LLM enrichment, and export a processed workbook.")
+st.caption("Upload a review file → filter → enrich with AI → analyze → export. Includes keyword-gated processing + Ask-the-Reviews.")
 
 RUN_STAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -93,8 +91,7 @@ def get_api_key() -> str:
 # =========================================================
 class RateLimiter:
     """
-    Simple leaky-bucket rate limiter based on RPM (requests per minute).
-    Call acquire() before each request.
+    Simple leaky-bucket limiter based on RPM (requests per minute).
     """
     def __init__(self, rpm: int):
         self.rpm = max(0, int(rpm))
@@ -123,16 +120,16 @@ def normalize_text(x: Any) -> str:
 def parse_keywords(raw: str) -> List[str]:
     if not isinstance(raw, str):
         return []
-    parts = re.split(r"[,\\n\\r]+", raw)
+    parts = re.split(r"[,\n\r]+", raw)
     out, seen = [], set()
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        k = p.lower()
-        if k in seen:
+        key = p.lower()
+        if key in seen:
             continue
-        seen.add(k)
+        seen.add(key)
         out.append(p)
     return out
 
@@ -147,15 +144,12 @@ def keyword_mask(
     """
     Boolean mask where each row matches ANY or ALL keywords.
     """
-    if series is None or series.empty:
-        return pd.Series([], dtype=bool)
-
-    flags = 0 if case_sensitive else re.IGNORECASE
     ser = series.fillna("").astype(str)
+    flags = 0 if case_sensitive else re.IGNORECASE
 
     def build_pat(k: str) -> str:
         pat = k if use_regex else re.escape(k)
-        return rf"\\b{pat}\\b" if whole_word else pat
+        return rf"\b{pat}\b" if whole_word else pat
 
     pats = [build_pat(k) for k in keywords if k]
     if not pats:
@@ -164,104 +158,81 @@ def keyword_mask(
     if mode_any:
         big = "(" + "|".join(pats) + ")"
         return ser.str.contains(big, regex=True, flags=flags, na=False)
+
     m = pd.Series([True] * len(ser), index=ser.index)
     for p in pats:
         m = m & ser.str.contains(p, regex=True, flags=flags, na=False)
     return m
 
+def safe_show_df(df: pd.DataFrame, max_rows: int, label: str = ""):
+    subset = df.head(max_rows)
+    try:
+        st.dataframe(subset)
+    except Exception:
+        st.warning(f"Couldn't render '{label or 'DataFrame'}' as interactive table. Showing text preview.")
+        st.text(subset.to_string())
+
+def normalize_predicted_rating(value: Any) -> Any:
+    """
+    Normalize into int 1-5 or pd.NA
+    """
+    if value is None:
+        return pd.NA
+    try:
+        v = int(str(value).strip())
+        return v if 1 <= v <= 5 else pd.NA
+    except Exception:
+        return pd.NA
+
 # =========================================================
-# Heuristics & Parsing (purchase dates, error indicators, model numbers)
+# Heuristics (purchase date, error indicator, model number, predicted rating)
 # =========================================================
-MONTHS = [
-    "january","february","march","april","may","june",
-    "july","august","september","october","november","december"
-]
+MONTHS = ["january","february","march","april","may","june","july","august","september","october","november","december"]
 MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec"]
 
-WARRANTY_CONTEXT_KEYWORDS = [
-    "warranty",
-    "extended warranty",
-    "expir",
-    "coverage",
-    "covered",
-    "protection plan",
-    "protection",
-    "guarantee",
-    "guaranteed",
-]
-PURCHASE_CONTEXT_KEYWORDS = [
-    "purchase",
-    "purchased",
-    "bought",
-    "buy",
-    "bought it",
-    "bought this",
-    "purchase date",
-    "purchased on",
-    "order date",
-    "ordered",
-    "i got it",
-    "got it",
-    "have had it since",
-    "owned since",
-    "since i bought",
-]
+WARRANTY_CONTEXT_KEYWORDS = ["warranty","extended warranty","expir","coverage","covered","protection plan","protection","guarantee","guaranteed"]
+PURCHASE_CONTEXT_KEYWORDS = ["purchase","purchased","bought","buy","purchase date","purchased on","order date","ordered","i got it","got it","have had it since","owned since","since i bought"]
 
 def infer_year_from_relative(text: str, date_str: str) -> Optional[str]:
-    """
-    If text says 'last September', infer YYYY-MM-15 using date_str year - 1,
-    but skip if that phrase is clearly in warranty/coverage context.
-    """
     if not isinstance(text, str) or not text:
         return None
     if not isinstance(date_str, str) or not date_str:
         return None
     try:
-        first_token = date_str.split()[0]
-        base_date = datetime.strptime(first_token, "%Y-%m-%d")
+        base_date = datetime.strptime(date_str.split()[0], "%Y-%m-%d")
     except Exception:
         return None
 
     t = text.lower()
-    # Full month names
     for i, m in enumerate(MONTHS, start=1):
-        pattern = rf"last\\s+{m}"
-        for match in re.finditer(pattern, t):
-            ctx_start = max(0, match.start() - 40)
-            ctx_end = min(len(t), match.end() + 40)
-            ctx = t[ctx_start:ctx_end]
+        for match in re.finditer(rf"last\s+{m}", t):
+            ctx = t[max(0, match.start()-40):min(len(t), match.end()+40)]
             if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
                 continue
             return f"{base_date.year - 1}-{i:02d}-15"
-    # Abbreviations
+
     for i, m in enumerate(MONTH_ABBR, start=1):
-        pattern = rf"last\\s+{m}"
-        for match in re.finditer(pattern, t):
-            ctx_start = max(0, match.start() - 40)
-            ctx_end = min(len(t), match.end() + 40)
-            ctx = t[ctx_start:ctx_end]
+        for match in re.finditer(rf"last\s+{m}", t):
+            ctx = t[max(0, match.start()-40):min(len(t), match.end()+40)]
             if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
                 continue
-            month_index = min(i, 12)
-            return f"{base_date.year - 1}-{month_index:02d}-15"
+            return f"{base_date.year - 1}-{min(i,12):02d}-15"
     return None
 
 DATE_PATTERNS = [
-    r"\\b(20\\d{2}|19\\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])\\b",
-    r"\\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\\d|3[01])[/-]((?:19|20)?\\d{2})\\b",
-    r"\\b(0?[1-9]|[12]\\d|3[01])[/-](0?[1-9]|1[0-2])[/-]((?:19|20)?\\d{2})\\b",
-    r"\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?[,]?\\s+\\d{4}\\b",
-    r"\\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2}(?:st|nd|rd|th)?[,]?\\s+\\d{4}\\b",
-    r"\\b\\d{1,2}\\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}\\b",
-    r"\\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}\\b",
-    r"\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\\.?\\s+\\d{4}\\b",
+    r"\b(20\d{2}|19\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b",
+    r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:19|20)?\d{2})\b",
+    r"\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-]((?:19|20)?\d{2})\b",
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b",
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b",
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{4}\b",
 ]
 DATE_FORMATS = [
     "%Y-%m-%d",
     "%m/%d/%Y", "%m/%d/%y",
     "%d/%m/%Y", "%d/%m/%y",
     "%b %d, %Y", "%B %d, %Y",
-    "%d %B %Y", "%d %b %Y",
     "%B %Y", "%b %Y",
 ]
 
@@ -270,9 +241,8 @@ def try_parse_date(text: str) -> Optional[str]:
         return None
     for pat in DATE_PATTERNS:
         for m in re.finditer(pat, text):
-            chunk = m.group(0)
-            chunk = re.sub(r"(st|nd|rd|th)", "", chunk, flags=re.IGNORECASE)
-            chunk = re.sub(r"\\s{2,}", " ", chunk).strip()
+            chunk = re.sub(r"(st|nd|rd|th)", "", m.group(0), flags=re.IGNORECASE).strip()
+            chunk = re.sub(r"\s{2,}", " ", chunk)
             for fmt in DATE_FORMATS:
                 try:
                     dt = datetime.strptime(chunk, fmt)
@@ -283,127 +253,13 @@ def try_parse_date(text: str) -> Optional[str]:
                     continue
     return None
 
-def infer_month_only_date(text: str, date_str: Optional[str]) -> Optional[str]:
-    if not isinstance(text, str) or not text:
-        return None
-    if not isinstance(date_str, str) or not date_str:
-        return None
-    try:
-        year = datetime.strptime(date_str.split()[0], "%Y-%m-%d").year
-    except Exception:
-        return None
-
-    lower = text.lower()
-    for i, m in enumerate(MONTHS, start=1):
-        for match in re.finditer(rf"\\b{m}\\b", lower):
-            ctx_start = max(0, match.start() - 40)
-            ctx_end = min(len(lower), match.end() + 40)
-            ctx = lower[ctx_start:ctx_end]
-            if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
-                continue
-            return f"{year}-{i:02d}-15"
-    for i, m in enumerate(MONTH_ABBR, start=1):
-        for match in re.finditer(rf"\\b{m}\\b", lower):
-            ctx_start = max(0, match.start() - 40)
-            ctx_end = min(len(lower), match.end() + 40)
-            ctx = lower[ctx_start:ctx_end]
-            if any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS):
-                continue
-            month_index = min(i, 12)
-            return f"{year}-{month_index:02d}-15"
-    return None
-
-def extract_date_candidates(text: str, date_str: Optional[str]) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    if not isinstance(text, str) or not text:
-        return candidates
-
-    base_dt = None
-    if isinstance(date_str, str) and date_str:
-        try:
-            base_dt = datetime.strptime(date_str.split()[0], "%Y-%m-%d")
-        except Exception:
-            base_dt = None
-
-    for pat in DATE_PATTERNS:
-        for m in re.finditer(pat, text):
-            chunk = m.group(0)
-            cleaned = re.sub(r"(st|nd|rd|th)", "", chunk, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\\s{2,}", " ", cleaned).strip()
-            dt = None
-            for fmt in DATE_FORMATS:
-                try:
-                    dt_tmp = datetime.strptime(cleaned, fmt)
-                    if fmt in ("%B %Y", "%b %Y"):
-                        dt_tmp = dt_tmp.replace(day=15)
-                    dt = dt_tmp
-                    break
-                except Exception:
-                    continue
-            if dt is None:
-                continue
-
-            ctx_start = max(0, m.start() - 40)
-            ctx_end = min(len(text), m.end() + 40)
-            ctx = text[ctx_start:ctx_end].lower()
-            is_warranty = any(k in ctx for k in WARRANTY_CONTEXT_KEYWORDS)
-            is_purchase_ctx = any(k in ctx for k in PURCHASE_CONTEXT_KEYWORDS)
-
-            is_future = False
-            if base_dt and dt > base_dt + timedelta(days=7):
-                is_future = True
-
-            candidates.append(
-                {
-                    "dt": dt,
-                    "is_warranty": is_warranty,
-                    "is_purchase_ctx": is_purchase_ctx,
-                    "is_future": is_future,
-                }
-            )
-    return candidates
-
-def purchase_date_heuristic(text: str, date_str: Optional[str]) -> Optional[str]:
-    candidates = extract_date_candidates(text, date_str)
-    chosen_dt = None
-
-    if candidates:
-        good = [c for c in candidates if not c["is_warranty"] and not c["is_future"]]
-        if not good:
-            good = [c for c in candidates if not c["is_warranty"]]
-
-        if good:
-            purchase_ctx = [c for c in good if c["is_purchase_ctx"]]
-            if purchase_ctx:
-                purchase_ctx.sort(key=lambda x: x["dt"])
-                chosen_dt = purchase_ctx[0]["dt"]
-            else:
-                good.sort(key=lambda x: x["dt"])
-                chosen_dt = good[0]["dt"]
-
-    if chosen_dt:
-        return chosen_dt.strftime("%Y-%m-%d")
-
-    rel = infer_year_from_relative(text, date_str or "")
-    if rel:
-        return rel
-
-    mon_only = infer_month_only_date(text, date_str)
-    if mon_only:
-        return mon_only
-
-    return None
-
 def normalize_purchase_date_output(value: Any, date_str: Optional[str]) -> str:
-    if value is None:
-        raw = ""
-    else:
-        raw = str(value).strip()
+    raw = "" if value is None else str(value).strip()
     if not raw or raw.lower() in ("unknown", "na", "n/a", "none"):
         return "unknown"
 
     def guard_future(iso_str: str) -> str:
-        if not isinstance(date_str, str) or not date_str:
+        if not date_str:
             return iso_str
         try:
             base_dt = datetime.strptime(date_str.split()[0], "%Y-%m-%d")
@@ -421,20 +277,17 @@ def normalize_purchase_date_output(value: Any, date_str: Optional[str]) -> str:
     rel = infer_year_from_relative(raw, date_str or "")
     if rel:
         return guard_future(rel)
-    mon_only = infer_month_only_date(raw, date_str or "")
-    if mon_only:
-        return guard_future(mon_only)
 
     return raw
 
 ERROR_CODE_REGEXES = [
-    r"\\b[Ee]rr(?:or)?\\s?[-:]?\\s?\\d{1,4}\\b",
-    r"\\b[Ee]\\s?[-:]?\\s?\\d{1,4}\\b",
-    r"\\b[Cc]ode\\s?[-:]?\\s?\\d{1,4}\\b",
-    r"\\b[Ff]\\s?[-:]?\\s?\\d{1,4}\\b",
+    r"\b[Ee]rr(?:or)?\s?[-:]?\s?\d{1,4}\b",
+    r"\b[Ee]\s?[-:]?\s?\d{1,4}\b",
+    r"\b[Cc]ode\s?[-:]?\s?\d{1,4}\b",
+    r"\b[Ff]\s?[-:]?\s?\d{1,4}\b",
 ]
-FLASHING_TERMS = ["flashing", "blinking", "blinks", "blink", "flash", "strobing", "strobe", "pulsing", "pulse"]
-UI_TERMS = ["red light", "blue light", "filter icon", "warning light", "led", "indicator", "icon", "display error"]
+FLASHING_TERMS = ["flashing","blinking","blinks","blink","flash","strobing","strobe","pulsing","pulse"]
+UI_TERMS = ["red light","blue light","filter icon","warning light","led","indicator","icon","display error"]
 
 def heuristic_error_indicator(text: str) -> Optional[str]:
     if not isinstance(text, str) or not text:
@@ -444,15 +297,10 @@ def heuristic_error_indicator(text: str) -> Optional[str]:
         m = re.search(rx, t)
         if m:
             return m.group(0)
-    found_terms = []
-    for term in FLASHING_TERMS + UI_TERMS:
-        if term in t:
-            found_terms.append(term)
-    if found_terms:
-        return ", ".join(sorted(set(found_terms))[:3])
-    return None
+    hits = [term for term in (FLASHING_TERMS + UI_TERMS) if term in t]
+    return ", ".join(sorted(set(hits))[:3]) if hits else None
 
-MODEL_TOKEN = re.compile(r"\\b([A-Z]{1,3}\\d{2,4}[A-Z0-9\\-]*)\\b")
+MODEL_TOKEN = re.compile(r"\b([A-Z]{1,3}\d{2,4}[A-Z0-9\-]*)\b")
 def heuristic_model_number(text: str) -> Optional[str]:
     if not isinstance(text, str) or not text:
         return None
@@ -463,19 +311,36 @@ def heuristic_model_number(text: str) -> Optional[str]:
     prioritized = [m for m in matches if m.startswith(prefixes)]
     return prioritized[0] if prioritized else matches[0]
 
-# =========================================================
-# Arrow-safe DataFrame display helper
-# =========================================================
-def safe_show_df(df: pd.DataFrame, max_rows: int, label: str = ""):
-    subset = df.head(max_rows)
-    try:
-        st.dataframe(subset)
-    except Exception:
-        st.warning(
-            f"Couldn't render '{label or 'DataFrame'}' as an interactive table. "
-            f"Showing plain text preview instead."
-        )
-        st.text(subset.to_string())
+# NEW: quick heuristic for predicted rating (optional pre-LLM)
+POS_HINTS = [
+    "love", "loved", "amazing", "excellent", "perfect", "great", "works great", "highly recommend",
+    "fantastic", "awesome", "best", "so good", "super happy", "five stars", "5 stars",
+]
+NEG_HINTS = [
+    "hate", "hated", "terrible", "awful", "worst", "broken", "doesn't work", "didn't work", "stopped working",
+    "disappointed", "waste", "refund", "returned", "returning", "noisy", "loud", "1 star", "one star",
+]
+
+def heuristic_predicted_rating(text: str) -> Optional[int]:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    t = text.lower()
+    pos = sum(1 for w in POS_HINTS if w in t)
+    neg = sum(1 for w in NEG_HINTS if w in t)
+
+    if pos == 0 and neg == 0:
+        return None
+
+    net = pos - neg
+    if net >= 3:
+        return 5
+    if net == 2:
+        return 4
+    if net in (0, 1, -1):
+        return 3
+    if net == -2:
+        return 2
+    return 1
 
 # =========================================================
 # LLM wrappers with retry + limiter
@@ -485,7 +350,8 @@ def llm_retry_json(client, model, system_prompt, user_prompt, schema_name, schem
     last_err = None
     for attempt in range(retries):
         try:
-            if limiter: limiter.acquire()
+            if limiter:
+                limiter.acquire()
             return client.chat.completions.create(
                 model=model,
                 messages=[
@@ -508,7 +374,8 @@ def llm_retry_text(client, model, system_prompt, user_prompt,
     last_err = None
     for attempt in range(retries):
         try:
-            if limiter: limiter.acquire()
+            if limiter:
+                limiter.acquire()
             return client.chat.completions.create(
                 model=model,
                 messages=[
@@ -528,6 +395,7 @@ def call_llm_json_safe(client, model, system_prompt, user_prompt, schema_name, s
         resp = llm_retry_json(client, model, system_prompt, user_prompt, schema_name, schema, limiter)
         return json.loads(resp.choices[0].message.content)
     except Exception:
+        # fallback: try plain text and parse
         try:
             resp2 = llm_retry_text(client, model, system_prompt, user_prompt, limiter)
             return json.loads(resp2.choices[0].message.content)
@@ -539,7 +407,7 @@ def call_llm_text(client, model, system_prompt, user_prompt, limiter: Optional[R
     return resp.choices[0].message.content
 
 # =========================================================
-# Cached Loading + Big-file Options
+# Cached loading
 # =========================================================
 @st.cache_data(show_spinner=False)
 def load_csv_cached(file_bytes: bytes, use_pyarrow: bool, usecols: Optional[List[str]] = None) -> pd.DataFrame:
@@ -578,35 +446,31 @@ def optimize_dataframe(df: pd.DataFrame, downcast_numeric=True, to_category=True
     return out
 
 # =========================================================
-# Sidebar — Global controls
+# Sidebar (global)
 # =========================================================
 st.sidebar.header("🔐 API & Model")
 api_key = get_api_key()
-model_choice = st.sidebar.selectbox(
-    "Model",
-    ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"],
-    index=0,
-)
+model_choice = st.sidebar.selectbox("Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"], index=0)
 
 st.sidebar.divider()
 st.sidebar.header("⚙️ Throughput")
-threads = st.sidebar.slider("Concurrency (parallel requests)", min_value=1, max_value=16, value=6)
-target_rpm = st.sidebar.slider("Target Requests Per Minute (RPM)", min_value=0, max_value=600, value=120, help="0 = no throttling")
-skip_short = st.sidebar.checkbox("Skip very short texts (≤ 10 chars)", value=True)
-use_heuristics = st.sidebar.checkbox("Use heuristics before LLM (faster/cheaper)", value=True)
-only_missing = st.sidebar.checkbox("Only process rows where outputs are missing", value=True)
+threads = st.sidebar.slider("Concurrency", 1, 16, 6)
+target_rpm = st.sidebar.slider("Target RPM", 0, 600, 120, help="0 = no throttling")
+skip_short = st.sidebar.checkbox("Skip very short texts (≤10 chars)", True)
+use_heuristics = st.sidebar.checkbox("Use heuristics before LLM", True)
+only_missing = st.sidebar.checkbox("Only process rows where outputs are missing", True)
 
 st.sidebar.divider()
-with st.sidebar.expander("🧹 Session controls", expanded=False):
+with st.sidebar.expander("🧹 Session", expanded=False):
     if st.button("Reset session state"):
-        for k in ["df", "results_df", "memo_cache", "file_sig"]:
+        for k in ["df","results_df","memo_cache","file_sig","cfg","filtered_df","process_df","task_cfg","keyword_gate"]:
             st.session_state.pop(k, None)
         st.rerun()
 
 # =========================================================
 # Tabs
 # =========================================================
-tabs = st.tabs(["📥 Load", "🧩 Configure", "🔎 Filter", "🧰 Tasks", "🚀 Run", "📈 Analyze", "⬇️ Export"])
+tabs = st.tabs(["📥 Load", "🧩 Configure", "🔎 Filter", "🧰 Tasks", "🚀 Run", "💬 Ask", "📈 Analyze", "⬇️ Export"])
 
 # =========================================================
 # 1) LOAD
@@ -615,6 +479,7 @@ with tabs[0]:
     st.subheader("1) Upload your reviews file")
     uploaded_file = st.file_uploader("Upload an Excel or CSV file of reviews", type=["xlsx", "csv"])
     if not uploaded_file:
+        st.info("Upload a file to begin.")
         st.stop()
 
     file_bytes = uploaded_file.getvalue()
@@ -624,14 +489,13 @@ with tabs[0]:
     file_sig = (uploaded_file.name, len(file_bytes), hashlib.md5(file_bytes[:2048]).hexdigest())
     if st.session_state.get("file_sig") != file_sig:
         st.session_state["file_sig"] = file_sig
-        st.session_state.pop("df", None)
-        st.session_state.pop("results_df", None)
-        st.session_state.pop("memo_cache", None)
+        for k in ["df","results_df","memo_cache","cfg","filtered_df","process_df","task_cfg","keyword_gate"]:
+            st.session_state.pop(k, None)
 
     with st.expander("⚡ Loader options", expanded=False):
         if is_csv:
-            use_pyarrow = st.checkbox("Use pyarrow CSV engine (faster if available)", value=True)
-            if st.checkbox("Load only selected columns for CSV", value=False):
+            use_pyarrow = st.checkbox("Use pyarrow CSV engine", value=True)
+            if st.checkbox("Load only selected columns", value=False):
                 import io
                 hdr_df = pd.read_csv(io.BytesIO(file_bytes), nrows=0)
                 chosen_cols = st.multiselect("Columns to load", options=list(hdr_df.columns), default=list(hdr_df.columns))
@@ -669,12 +533,12 @@ with tabs[0]:
     sample_preview = st.checkbox("Random sample preview (instead of head)")
     df = st.session_state["df"]
     if sample_preview:
-        safe_show_df(df.sample(min(preview_rows, len(df)), random_state=42), max_rows=preview_rows, label="Preview sample")
+        safe_show_df(df.sample(min(preview_rows, len(df)), random_state=42), preview_rows, "Preview sample")
     else:
-        safe_show_df(df, max_rows=preview_rows, label="Preview")
+        safe_show_df(df, preview_rows, "Preview")
 
 # =========================================================
-# 2) CONFIGURE COLUMNS
+# 2) CONFIGURE
 # =========================================================
 with tabs[1]:
     st.subheader("2) Configure columns")
@@ -684,26 +548,15 @@ with tabs[1]:
         st.stop()
 
     def suggest_text_column(df: pd.DataFrame) -> Optional[str]:
-        preferred = [
-            "Verbatim",
-            "Review Text",
-            "Review",
-            "Review Body",
-            "Comment",
-            "Customer Review",
-            "Zoom Summary",
-            "zoom_summary",
-            "Sentiment Text",
-            "Customer Issue",
-        ]
+        preferred = ["Verbatim","Review Text","Review","Review Body","Comment","Customer Review","Text","Body"]
         for c in preferred:
             if c in df.columns:
                 return c
-        obj = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        obj = df.select_dtypes(include=["object","category"]).columns.tolist()
         return obj[0] if obj else (df.columns[0] if len(df.columns) else None)
 
     def suggest_date_column(df: pd.DataFrame) -> Optional[str]:
-        preferred = ["Review Date", "Date", "Created At", "Date Created", "Start Time (Date/Time)", "Start Time"]
+        preferred = ["Review Date","Date","Created At","Date Created","Submitted At","Timestamp"]
         for c in preferred:
             if c in df.columns:
                 return c
@@ -713,30 +566,39 @@ with tabs[1]:
                 return c
         return None
 
+    def suggest_rating_column(df: pd.DataFrame) -> Optional[str]:
+        preferred = ["Star Rating","Rating","Stars","Score","Overall Rating"]
+        for c in preferred:
+            if c in df.columns:
+                return c
+        return None
+
     text_suggest = suggest_text_column(df)
     text_col = st.selectbox(
         "Text column (review text sent to LLM)",
         options=df.columns,
         index=(list(df.columns).index(text_suggest) if text_suggest in df.columns else 0),
-        help="This column is what gets sent row-by-row to the model.",
     )
 
     date_suggest = suggest_date_column(df)
     date_opts = ["<none>"] + list(df.columns)
     date_idx = date_opts.index(date_suggest) if (date_suggest and date_suggest in df.columns) else 0
-    call_date_col = st.selectbox(
-        "Review date/time column (optional, for relative dates & ownership period)",
-        options=date_opts,
-        index=date_idx,
-    )
-    if call_date_col == "<none>":
-        call_date_col = None
+    review_date_col = st.selectbox("Review date/time column (optional)", options=date_opts, index=date_idx)
+    if review_date_col == "<none>":
+        review_date_col = None
 
-    st.session_state["cfg"] = {"text_col": text_col, "call_date_col": call_date_col}
+    rating_suggest = suggest_rating_column(df)
+    rating_opts = ["<none>"] + list(df.columns)
+    rating_idx = rating_opts.index(rating_suggest) if (rating_suggest and rating_suggest in df.columns) else 0
+    rating_col = st.selectbox("Actual rating column (optional, for comparison)", options=rating_opts, index=rating_idx)
+    if rating_col == "<none>":
+        rating_col = None
+
+    st.session_state["cfg"] = {"text_col": text_col, "review_date_col": review_date_col, "rating_col": rating_col}
 
     st.markdown(
-        "<div class='small-muted'>Selected text column feeds all prompts. "
-        "The review date helps infer relative purchase dates and compute ownership period.</div>",
+        "<div class='small-muted'>Text column is what gets sent to the model row-by-row. "
+        "Review date helps with purchase-date logic. Rating column helps compare predicted vs actual.</div>",
         unsafe_allow_html=True,
     )
 
@@ -748,21 +610,29 @@ with tabs[2]:
     df = st.session_state.get("df")
     cfg = st.session_state.get("cfg", {})
     if df is None or not cfg:
-        st.info("Upload a file and configure columns first.")
+        st.info("Complete Load → Configure first.")
         st.stop()
 
     text_col = cfg["text_col"]
+    rating_col = cfg.get("rating_col")
 
     filtered_df = df.copy()
 
-    # Quick rating filter if column exists
-    q_low = st.checkbox("Quick Filter: Star Rating ≤ 3 (detractors)")
-    if q_low and "Star Rating" in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df["Star Rating"] <= 3]
-
-    q_high = st.checkbox("Quick Filter: Star Rating ≥ 4 (positive/advocates)")
-    if q_high and "Star Rating" in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df["Star Rating"] >= 4]
+    # Quick rating filters (if actual rating exists)
+    if rating_col and rating_col in filtered_df.columns:
+        cA, cB = st.columns(2)
+        with cA:
+            q_low = st.checkbox("Quick Filter: Actual rating ≤ 3 (detractors)")
+        with cB:
+            q_high = st.checkbox("Quick Filter: Actual rating ≥ 4 (positive/advocates)")
+        if q_low and q_high:
+            st.warning("Choose only one of the quick rating filters.")
+        elif q_low:
+            filtered_df = filtered_df[pd.to_numeric(filtered_df[rating_col], errors="coerce") <= 3]
+        elif q_high:
+            filtered_df = filtered_df[pd.to_numeric(filtered_df[rating_col], errors="coerce") >= 4]
+    else:
+        st.info("No actual rating column selected (Configure tab). Quick rating filters are hidden.")
 
     with st.expander("Custom filters (exact match)", expanded=True):
         filter_cols = st.multiselect("Select columns to filter on", options=df.columns)
@@ -782,9 +652,8 @@ with tabs[2]:
 
     st.divider()
 
-    # NEW: Keyword gate for processing only
-    st.markdown("#### ✅ Processing keyword gate (NEW)")
-    st.caption("This does **not** change your filtered view. It only limits which rows get sent to the model when you run processing.")
+    # Keyword gate for processing only
+    st.markdown("#### ✅ Processing keyword gate (only affects what gets sent to the model)")
     kw_enabled = st.checkbox("Enable keyword gate for processing", value=False)
     kw_raw = st.text_area("Keywords (comma or newline separated)", value="", height=70, placeholder="e.g., loud, noisy, error, filter, blockage")
     kw_mode = st.radio("Match rule", ["Any keyword", "All keywords"], horizontal=True, index=0)
@@ -805,7 +674,6 @@ with tabs[2]:
         )
         process_df = process_df.loc[m]
 
-    # Store
     st.session_state["filtered_df"] = filtered_df
     st.session_state["process_df"] = process_df
     st.session_state["keyword_gate"] = {
@@ -826,7 +694,7 @@ with tabs[2]:
 # 4) TASKS
 # =========================================================
 with tabs[3]:
-    st.subheader("4) Select tasks / prompts")
+    st.subheader("4) Select tasks / presets")
     df = st.session_state.get("df")
     cfg = st.session_state.get("cfg", {})
     filtered_df = st.session_state.get("filtered_df")
@@ -836,65 +704,84 @@ with tabs[3]:
         st.stop()
 
     text_col = cfg["text_col"]
-    call_date_col = cfg.get("call_date_col")
+    review_date_col = cfg.get("review_date_col")
 
-    # Preset prompts (editable)
+    # Preset prompts
     default_purchase_prompt = (
-        "You are given:\\n"
-        "- TEXT: A customer product review (verbatim text from an online review or survey).\\n"
-        "- REVIEW_DATE: The date/time when the review was written.\\n"
-        "- INFERRED_RELATIVE_DATE_HINT: Optional approximate YYYY-MM-DD derived from phrases like 'last September'.\\n\\n"
-        "Task: Extract the ORIGINAL PRODUCT PURCHASE DATE.\\n\\n"
-        "Rules:\\n"
-        "- Only return the date the customer originally bought/received the product.\\n"
-        "- DO NOT return warranty expiration dates, registration dates, coverage periods, delivery dates, or replacement shipment dates.\\n"
-        "- The purchase date must be on or before REVIEW_DATE.\\n"
-        "- If you only see a warranty expiration or any other non-purchase date, return 'unknown'.\\n"
-        "- If only a month and year are clear (e.g. 'October 2023'), you may return YYYY-MM-15.\\n\\n"
-        "You MUST return ONLY a JSON object matching the schema."
+        "You are given:\n"
+        "- TEXT: A customer product review.\n"
+        "- REVIEW_DATE: When the review was written.\n"
+        "- INFERRED_RELATIVE_DATE_HINT: Optional YYYY-MM-DD derived from phrases like 'last September'.\n\n"
+        "Task: Extract the ORIGINAL PRODUCT PURCHASE DATE.\n\n"
+        "Rules:\n"
+        "- Only return when the customer bought/received the product.\n"
+        "- DO NOT return warranty expiration, registration, delivery, replacement shipment, etc.\n"
+        "- The purchase date must be on or before REVIEW_DATE.\n"
+        "- If unclear or only non-purchase dates, return 'unknown'.\n"
+        "- If only month+year are clear, return YYYY-MM-15.\n\n"
+        "Return ONLY a JSON object matching the schema."
     )
     default_symptom_prompt = (
         "Given TEXT (a customer review), identify the PRIMARY technical/functional symptom "
-        "(e.g., 'no power', 'weak airflow', 'overheating', 'burning smell', "
-        "'unit shuts off', 'error code'). Be concise.\\n\\n"
+        "(e.g., 'no power', 'weak airflow', 'overheating', 'burning smell', 'unit shuts off', 'error code'). "
+        "Be concise.\n\n"
         "Return ONLY a JSON object matching the schema."
     )
     default_error_indicator_prompt = (
         "Given TEXT (a customer review), detect any explicit error code, flashing/blinking lights, "
-        "or on-product/on-screen error icons or messages.\\n"
-        "If present, return a concise phrase (e.g., 'E02', 'red light flashing', 'filter icon flashing'); "
-        "else 'none'.\\n\\n"
+        "or on-product/on-screen error icons/messages.\n"
+        "If present, return a concise phrase (e.g., 'E02', 'red light flashing'); else 'none'.\n\n"
         "Return ONLY a JSON object matching the schema."
     )
     default_model_number_prompt = (
-        "Given TEXT (a customer review), extract the MODEL NUMBER of the product if mentioned "
-        "(e.g., NV356E, ZU62, HZ2000, HT300). "
-        "If multiple are mentioned, return the most specific. If none, return 'unknown'.\\n\\n"
+        "Given TEXT (a customer review), extract the MODEL NUMBER if mentioned (e.g., NV356E, ZU62, HZ2000, HT300). "
+        "If multiple, return the most specific. If none, return 'unknown'.\n\n"
         "Return ONLY a JSON object matching the schema."
     )
 
+    # NEW preset: predicted rating 1-5
+    default_predicted_rating_prompt = (
+        "Given TEXT (a customer review), predict the star rating the customer likely gave on a 1–5 scale.\n\n"
+        "Guidance:\n"
+        "- 5 = very positive, enthusiastic, strongly recommends, no meaningful issues.\n"
+        "- 4 = positive overall with minor complaints.\n"
+        "- 3 = mixed / neutral / some pros and cons.\n"
+        "- 2 = negative, significant issues, dissatisfaction.\n"
+        "- 1 = extremely negative, angry, product failure, return/refund likely.\n\n"
+        "Return ONLY a JSON object matching the schema with an integer 1–5."
+    )
+
     purchase_system = "You extract structured purchase dates from noisy customer review text."
-    symptom_system = "You classify customer reviews by primary technical symptom."
-    error_system   = "You extract error codes and UI/LED indicators from customer reviews."
-    model_system   = "You extract product model numbers (e.g., NV356E, ZU62, AZ2000, HT300) from review text."
+    symptom_system  = "You classify customer reviews by primary technical symptom."
+    error_system    = "You extract error codes and UI/LED indicators from customer reviews."
+    model_system    = "You extract product model numbers from review text."
+    rating_system   = "You predict 1-5 star ratings from review text sentiment and content."
 
     purchase_schema = {"type": "object", "properties": {"purchase_date": {"type": "string"}}, "required": ["purchase_date"], "additionalProperties": False}
-    symptom_schema = {"type": "object", "properties": {"symptom": {"type": "string"}}, "required": ["symptom"], "additionalProperties": False}
-    error_schema = {"type": "object", "properties": {"error_indicator": {"type": "string"}}, "required": ["error_indicator"], "additionalProperties": False}
-    model_schema = {"type": "object", "properties": {"model_number": {"type": "string"}}, "required": ["model_number"], "additionalProperties": False}
+    symptom_schema  = {"type": "object", "properties": {"symptom": {"type": "string"}}, "required": ["symptom"], "additionalProperties": False}
+    error_schema    = {"type": "object", "properties": {"error_indicator": {"type": "string"}}, "required": ["error_indicator"], "additionalProperties": False}
+    model_schema    = {"type": "object", "properties": {"model_number": {"type": "string"}}, "required": ["model_number"], "additionalProperties": False}
+    rating_schema   = {
+        "type": "object",
+        "properties": {"predicted_rating": {"type": "integer", "minimum": 1, "maximum": 5}},
+        "required": ["predicted_rating"],
+        "additionalProperties": False
+    }
 
-    st.markdown("#### Presets (checkboxes)")
-    c1, c2, c3, c4 = st.columns(4)
-    use_purchase = c1.checkbox("📅 purchase_date (+ ownership_period_days)", value=True)
-    use_symptom = c2.checkbox("🩺 symptom", value=True)
-    use_error = c3.checkbox("💡 error_indicator", value=True)
-    use_modelnum = c4.checkbox("🔢 model_number", value=True)
+    st.markdown("#### Presets")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    use_purchase  = c1.checkbox("📅 purchase_date", value=False)
+    use_symptom   = c2.checkbox("🩺 symptom", value=True)
+    use_error     = c3.checkbox("💡 error_indicator", value=True)
+    use_modelnum  = c4.checkbox("🔢 model_number", value=False)
+    use_pred_rate = c5.checkbox("⭐ predicted_rating (1–5)", value=True)
 
     with st.expander("✏️ Edit preset prompts", expanded=False):
-        purchase_prompt = st.text_area("Purchase prompt", value=default_purchase_prompt, height=190, disabled=not use_purchase) if use_purchase else None
+        purchase_prompt = st.text_area("Purchase prompt", value=default_purchase_prompt, height=180, disabled=not use_purchase) if use_purchase else None
         symptom_prompt  = st.text_area("Symptom prompt", value=default_symptom_prompt, height=140, disabled=not use_symptom) if use_symptom else None
         error_prompt    = st.text_area("Error prompt", value=default_error_indicator_prompt, height=140, disabled=not use_error) if use_error else None
         model_prompt    = st.text_area("Model prompt", value=default_model_number_prompt, height=140, disabled=not use_modelnum) if use_modelnum else None
+        pred_prompt     = st.text_area("Predicted rating prompt", value=default_predicted_rating_prompt, height=170, disabled=not use_pred_rate) if use_pred_rate else None
 
     st.markdown("#### Custom prompts (free-form text output)")
     use_custom = st.checkbox("Enable custom prompts", value=False)
@@ -927,14 +814,14 @@ with tabs[3]:
                 client = get_client(api_key)
                 series = filtered_df[text_col].dropna().astype(str)
                 if series.empty:
-                    st.warning("No non-empty values in the selected text column to show as examples.")
+                    st.warning("No non-empty values in the selected text column.")
                 else:
                     examples = series.sample(min(sample_n, len(series)), random_state=42)
-                    example_block = "\\n".join(f"- {normalize_text(t)[:400]}" for t in examples)
+                    example_block = "\n".join(f"- {normalize_text(t)[:400]}" for t in examples)
                     system_msg = "You are an expert prompt engineer for LLMs analyzing customer product reviews row-by-row."
                     user_msg = (
-                        f"The analyst wants the model to do the following:\\n{desc}\\n\\n"
-                        f"Here are sample values from the text column '{text_col}':\\n{example_block}\\n\\n"
+                        f"The analyst wants the model to do the following:\n{desc}\n\n"
+                        f"Here are sample values from the text column '{text_col}':\n{example_block}\n\n"
                         "Write ONE reusable prompt they can apply row-by-row. "
                         "Do not include examples in the output, just the final prompt."
                     )
@@ -945,9 +832,10 @@ with tabs[3]:
                     except Exception as e:
                         st.error(f"Error generating prompt suggestion: {e}")
 
-    # Save task config for Run tab
+    # Build task config
     PRESETS = []
     active_cols: List[str] = []
+
     if use_purchase:
         PRESETS.append(("purchase_date", purchase_system, purchase_prompt, purchase_schema))
         active_cols.append("purchase_date")
@@ -960,6 +848,10 @@ with tabs[3]:
     if use_modelnum:
         PRESETS.append(("model_number", model_system, model_prompt, model_schema))
         active_cols.append("model_number")
+    if use_pred_rate:
+        PRESETS.append(("predicted_rating", rating_system, pred_prompt, rating_schema))
+        active_cols.append("predicted_rating")
+
     active_cols += custom_outcols
 
     st.session_state["task_cfg"] = {
@@ -969,7 +861,6 @@ with tabs[3]:
         "active_cols": active_cols,
     }
 
-    # Metrics for user confidence
     mx1, mx2, mx3, mx4 = st.columns(4)
     mx1.metric("View rows", f"{len(filtered_df):,}")
     mx2.metric("Process rows", f"{len(process_df):,}")
@@ -986,13 +877,13 @@ with tabs[4]:
     task_cfg = st.session_state.get("task_cfg")
     filtered_df = st.session_state.get("filtered_df")
     process_df = st.session_state.get("process_df")
+
     if df is None or not cfg or task_cfg is None or filtered_df is None or process_df is None:
         st.info("Complete Load → Configure → Filter → Tasks first.")
         st.stop()
 
     text_col = cfg["text_col"]
-    call_date_col = cfg.get("call_date_col")
-
+    review_date_col = cfg.get("review_date_col")
     PRESETS = task_cfg["presets"]
     custom_prompts = task_cfg["custom_prompts"]
     custom_outcols = task_cfg["custom_outcols"]
@@ -1001,7 +892,7 @@ with tabs[4]:
     if "memo_cache" not in st.session_state:
         st.session_state.memo_cache = {}
 
-    max_rows = st.number_input("Max rows to process (this run)", min_value=1, max_value=len(process_df), value=min(len(process_df), 2000))
+    max_rows = st.number_input("Max rows to process (this run)", min_value=1, max_value=max(1, len(process_df)), value=min(len(process_df), 2000))
     dry_run = st.checkbox("Dry run (no API calls)", value=False)
 
     # Determine rows to process
@@ -1017,18 +908,16 @@ with tabs[4]:
             results_df[c] = pd.NA
 
     # Only missing
-    if only_missing and active_cols:
+    if only_missing and active_cols and not rows.empty:
         sub = results_df.loc[rows.index, active_cols]
         miss_mask = sub.apply(lambda col: col.isna() | (col.astype(str).str.strip() == ""), axis=1)
         need_mask = miss_mask.any(axis=1)
         rows = rows.loc[need_mask]
 
-    # Plan
     est_calls = len(rows) * (len(PRESETS) + len(custom_prompts))
     st.info(
-        f"Queued rows: **{len(rows):,}** (from process_df={len(process_df):,}). "
-        f"Selected outputs: **{len(active_cols)}**. "
-        f"Upper-bound API calls: **{est_calls:,}**."
+        f"Queued rows: **{len(rows):,}** (process_df={len(process_df):,}). "
+        f"Outputs: **{len(active_cols)}**. Upper-bound API calls: **{est_calls:,}**."
     )
 
     def process_row(
@@ -1040,16 +929,16 @@ with tabs[4]:
         custom_prompts,
         custom_outcols,
         text_col: str,
-        call_date_col: Optional[str],
+        review_date_col: Optional[str],
         use_heuristics: bool,
         skip_short: bool,
-        memo: Dict[Tuple[str, str], str],
+        memo: Dict[Tuple[str, str], Any],
         limiter: Optional[RateLimiter],
     ) -> Tuple[int, Dict[str, Any]]:
         out: Dict[str, Any] = {}
         text_val = normalize_text(row.get(text_col, ""))
-        date_val = str(row.get(call_date_col, "")) if call_date_col else ""
-        hint = infer_year_from_relative(text_val, date_val) if call_date_col else None
+        date_val = str(row.get(review_date_col, "")) if review_date_col else ""
+        hint = infer_year_from_relative(text_val, date_val) if review_date_col else None
 
         if skip_short and len(text_val.strip()) <= 10:
             for c in active_cols:
@@ -1062,18 +951,19 @@ with tabs[4]:
                 value = memo[key]
             else:
                 value = None
+
                 if use_heuristics:
-                    if col == "purchase_date":
-                        value = purchase_date_heuristic(text_val, date_val)
-                    elif col == "error_indicator":
+                    if col == "error_indicator":
                         value = heuristic_error_indicator(text_val)
                     elif col == "model_number":
                         value = heuristic_model_number(text_val)
+                    elif col == "predicted_rating":
+                        value = heuristic_predicted_rating(text_val)
 
                 if value is None:
-                    user_prompt = (prompt or "") + f"\\n\\nTEXT:\\n{text_val}\\n"
+                    user_prompt = (prompt or "") + f"\n\nTEXT:\n{text_val}\n"
                     if col == "purchase_date":
-                        user_prompt += f"\\nREVIEW_DATE: {date_val}\\nINFERRED_RELATIVE_DATE_HINT: {hint}"
+                        user_prompt += f"\nREVIEW_DATE: {date_val}\nINFERRED_RELATIVE_DATE_HINT: {hint}"
                     data = call_llm_json_safe(
                         client,
                         model,
@@ -1083,27 +973,30 @@ with tabs[4]:
                         schema,
                         limiter,
                     )
-                    value = data.get(col) or data.get("_raw") or (
-                        "unknown" if col in ("purchase_date", "model_number") else ""
-                    )
+                    value = data.get(col) if isinstance(data, dict) else None
+                    if value is None and isinstance(data, dict):
+                        value = data.get("_raw")
+
+                # normalize
                 if col == "purchase_date":
                     value = normalize_purchase_date_output(value, date_val)
+                elif col == "predicted_rating":
+                    value = normalize_predicted_rating(value)
+                elif col == "error_indicator":
+                    if value is None:
+                        value = "none"
+
                 memo[key] = value
             out[col] = value
 
+        # Custom prompts
         for p, c in zip(custom_prompts, custom_outcols):
             key = (text_val, f"custom::{c}")
             if key in memo:
                 out[c] = memo[key]
             else:
-                user_prompt = f"TEXT:\\n{text_val}\\n\\nREVIEW_DATE: {date_val}\\n\\nTASK:\\n{p}"
-                val = call_llm_text(
-                    client,
-                    model,
-                    "You analyze customer product review text precisely.",
-                    user_prompt,
-                    limiter,
-                )
+                user_prompt = f"TEXT:\n{text_val}\n\nTASK:\n{p}"
+                val = call_llm_text(client, model, "You analyze customer product review text precisely.", user_prompt, limiter)
                 memo[key] = val
                 out[c] = val
 
@@ -1112,7 +1005,7 @@ with tabs[4]:
     if st.button("🚀 Run"):
         if dry_run:
             st.success("Dry run complete ✅ (no API calls made)")
-            st.dataframe(rows.head(25))
+            safe_show_df(rows, max_rows=min(50, len(rows)), label="Dry run rows")
         else:
             if not api_key:
                 st.error("No API key configured.")
@@ -1142,13 +1035,14 @@ with tabs[4]:
                                 custom_prompts,
                                 custom_outcols,
                                 text_col,
-                                call_date_col,
+                                review_date_col,
                                 use_heuristics,
                                 skip_short,
                                 memo,
                                 limiter,
                             )
                         )
+
                     done = 0
                     for fut in as_completed(futures):
                         idx, out = fut.result()
@@ -1158,59 +1052,186 @@ with tabs[4]:
                         progress.progress(done / len(futures))
                         status.write(f"Processed {done}/{len(futures)} rows...")
 
-                if "purchase_date" in results_df.columns and call_date_col:
+                # Derived ownership period if both exist
+                if "purchase_date" in results_df.columns and review_date_col and review_date_col in results_df.columns:
                     try:
                         pd_purchase = pd.to_datetime(results_df["purchase_date"], errors="coerce")
-                        pd_call = pd.to_datetime(results_df[call_date_col], errors="coerce")
-                        results_df["ownership_period_days"] = (pd_call - pd_purchase).dt.days
+                        pd_review = pd.to_datetime(results_df[review_date_col], errors="coerce")
+                        results_df["ownership_period_days"] = (pd_review - pd_purchase).dt.days
                     except Exception as e:
                         st.warning(f"Ownership calculation issue: {e}")
 
                 st.session_state["results_df"] = results_df
                 st.success("Processing complete ✅")
 
-    st.markdown("### Current enriched preview (view rows)")
+    st.markdown("### Current enriched preview (filtered view)")
     results_df = st.session_state.get("results_df")
     if results_df is None:
         st.info("Run processing to see enriched outputs.")
     else:
         view = results_df.loc[filtered_df.index]
-        cols_to_show = [text_col] + [c for c in active_cols if c in view.columns]
-        if call_date_col and call_date_col in view.columns:
-            cols_to_show = [call_date_col] + cols_to_show
-        safe_show_df(view[cols_to_show], max_rows=30, label="Enriched preview")
+        cols = [text_col] + [c for c in (active_cols or []) if c in view.columns]
+        if review_date_col and review_date_col in view.columns:
+            cols = [review_date_col] + cols
+        safe_show_df(view[cols], max_rows=30, label="Enriched preview")
 
 # =========================================================
-# 6) ANALYZE
+# 6) ASK (dataset Q&A)
 # =========================================================
 with tabs[5]:
-    st.subheader("6) Analyze & visualize")
+    st.subheader("6) Ask the Reviews (Q&A)")
+    st.caption("Asks are answered from the most relevant reviews (simple retrieval) + the model. The answer cites review IDs (row index).")
+
+    df = st.session_state.get("df")
+    cfg = st.session_state.get("cfg", {})
+    filtered_df = st.session_state.get("filtered_df")
+    process_df = st.session_state.get("process_df")
+    results_df = st.session_state.get("results_df")
+
+    if df is None or not cfg or filtered_df is None or process_df is None:
+        st.info("Complete Load → Configure → Filter first.")
+        st.stop()
+
+    text_col = cfg["text_col"]
+    rating_col = cfg.get("rating_col")
+    review_date_col = cfg.get("review_date_col")
+
+    base = results_df if results_df is not None else df
+
+    scope = st.radio("Scope", ["Filtered view", "Process queue", "All rows"], horizontal=True, index=0)
+    if scope == "Filtered view":
+        scope_idx = filtered_df.index
+    elif scope == "Process queue":
+        scope_idx = process_df.index
+    else:
+        scope_idx = base.index
+
+    question = st.text_input("Question", placeholder="Example: Which setting is the most loud? What do users complain about most?")
+    top_k = st.slider("How many matching reviews to use as evidence", 5, 60, 20, 5)
+    max_chars = st.slider("Max chars per review in context", 120, 600, 280, 20)
+
+    def get_top_matches(query: str, series: pd.Series, k: int) -> pd.Index:
+        q = (query or "").strip().lower()
+        if not q:
+            return series.sample(min(k, len(series)), random_state=42).index
+
+        terms = re.findall(r"[a-z0-9']{3,}", q)
+        terms = list(dict.fromkeys(terms))[:20]
+        if not terms:
+            return series.sample(min(k, len(series)), random_state=42).index
+
+        s = series.fillna("").astype(str).str.lower()
+        scores = pd.Series(0, index=s.index, dtype="int")
+        for t in terms:
+            scores += s.str.contains(re.escape(t), regex=True, na=False).astype(int)
+
+        scored = scores[scores > 0].sort_values(ascending=False)
+        if scored.empty:
+            return series.sample(min(k, len(series)), random_state=42).index
+        return scored.head(k).index
+
+    if st.button("Answer"):
+        if not api_key:
+            st.error("Add your API key (secrets or override) to answer questions.")
+        elif not question.strip():
+            st.warning("Type a question first.")
+        else:
+            scope_df = base.loc[scope_idx]
+            text_series = scope_df[text_col].astype(str)
+
+            top_idx = get_top_matches(question, text_series, top_k)
+            evidence_df = scope_df.loc[top_idx].copy()
+
+            # Build evidence block with IDs
+            lines = []
+            for rid, r in evidence_df.iterrows():
+                meta = []
+                if rating_col and rating_col in evidence_df.columns:
+                    meta.append(f"actual_rating={r.get(rating_col)}")
+                if "predicted_rating" in evidence_df.columns:
+                    meta.append(f"pred_rating={r.get('predicted_rating')}")
+                if review_date_col and review_date_col in evidence_df.columns:
+                    meta.append(f"date={r.get(review_date_col)}")
+                meta_s = (" | " + ", ".join(meta)) if meta else ""
+                txt = normalize_text(r.get(text_col, ""))[:max_chars]
+                lines.append(f"[RID {rid}]{meta_s}: {txt}")
+
+            evidence_block = "\n".join(lines)
+
+            system_msg = (
+                "You are a product quality analyst. Answer using ONLY the provided review excerpts. "
+                "If the evidence is insufficient, say what is missing. "
+                "When making claims, cite the relevant RIDs."
+            )
+            user_msg = (
+                f"QUESTION:\n{question}\n\n"
+                f"EVIDENCE (review excerpts):\n{evidence_block}\n\n"
+                "Answer clearly. Provide:\n"
+                "1) Direct answer\n"
+                "2) Supporting evidence with RID citations\n"
+                "3) If relevant, quick summary of patterns\n"
+            )
+
+            client = get_client(api_key)
+            try:
+                ans = call_llm_text(client, model_choice, system_msg, user_msg, limiter=None)
+                st.markdown("### Answer")
+                st.write(ans)
+
+                st.markdown("### Evidence used")
+                show_cols = [text_col]
+                if rating_col and rating_col in evidence_df.columns:
+                    show_cols = [rating_col] + show_cols
+                if "predicted_rating" in evidence_df.columns:
+                    show_cols = ["predicted_rating"] + show_cols
+                if review_date_col and review_date_col in evidence_df.columns:
+                    show_cols = [review_date_col] + show_cols
+                safe_show_df(evidence_df[show_cols], max_rows=min(40, len(evidence_df)), label="Evidence table")
+            except Exception as e:
+                st.error(f"Error answering: {e}")
+
+# =========================================================
+# 7) ANALYZE
+# =========================================================
+with tabs[6]:
+    st.subheader("7) Analyze")
     results_df = st.session_state.get("results_df")
     cfg = st.session_state.get("cfg", {})
     filtered_df = st.session_state.get("filtered_df")
+
     if results_df is None or not cfg or filtered_df is None:
         st.info("Run processing first.")
         st.stop()
 
     text_col = cfg["text_col"]
-    call_date_col = cfg.get("call_date_col")
+    rating_col = cfg.get("rating_col")
+    review_date_col = cfg.get("review_date_col")
 
     view = results_df.loc[filtered_df.index]
 
-    st.markdown("### Enriched Reviews Preview")
+    st.markdown("### Enriched preview")
     safe_show_df(view, max_rows=25, label="Enriched view preview")
 
-    if "ownership_period_days" in view.columns:
-        st.markdown("### Ownership Period (Days)")
-        series = view["ownership_period_days"].dropna()
-        if not series.empty:
-            st.write(series.describe())
-            bins = [-1, 30, 90, 180, 365, 730, 3650]
-            labels = ["0–30", "31–90", "91–180", "181–365", "366–730", ">730"]
-            bands = pd.cut(series, bins=bins, labels=labels)
-            st.bar_chart(bands.value_counts().sort_index())
+    if "predicted_rating" in view.columns:
+        st.markdown("### Predicted Rating Distribution (1–5)")
+        pr = pd.to_numeric(view["predicted_rating"], errors="coerce").dropna()
+        if not pr.empty:
+            st.bar_chart(pr.value_counts().sort_index())
         else:
-            st.info("No ownership period values.")
+            st.info("No predicted_rating values yet.")
+
+    if rating_col and rating_col in view.columns and "predicted_rating" in view.columns:
+        st.markdown("### Predicted vs Actual (if available)")
+        a = pd.to_numeric(view[rating_col], errors="coerce")
+        p = pd.to_numeric(view["predicted_rating"], errors="coerce")
+        both = pd.DataFrame({"actual": a, "pred": p}).dropna()
+        if both.empty:
+            st.info("No rows have both actual and predicted ratings.")
+        else:
+            ct = pd.crosstab(both["actual"].astype(int), both["pred"].astype(int), rownames=["Actual"], colnames=["Predicted"])
+            st.dataframe(ct)
+            both["diff"] = both["pred"] - both["actual"]
+            st.write("Mean (pred - actual):", float(both["diff"].mean()))
 
     if "symptom" in view.columns:
         st.markdown("### Symptom Distribution")
@@ -1224,9 +1245,9 @@ with tabs[5]:
             st.info("No symptom values.")
 
     if "error_indicator" in view.columns:
-        st.markdown("### Error Indicators (codes / flashing / UI)")
+        st.markdown("### Error Indicators")
         ei = view["error_indicator"].dropna().astype(str).str.strip()
-        ei = ei[(ei != "") & (ei.lower() != "none")]
+        ei = ei[(ei != "") & (ei.str.lower() != "none")]
         if not ei.empty:
             top = ei.value_counts().head(25)
             st.bar_chart(top)
@@ -1234,28 +1255,9 @@ with tabs[5]:
         else:
             st.info("No error indicators extracted.")
 
-    if "model_number" in view.columns:
-        st.markdown("### Model Number Mentions")
-        mn = view["model_number"].dropna().astype(str).str.strip()
-        mn = mn[(mn != "") & (mn.lower() != "unknown")]
-        if not mn.empty:
-            top = mn.value_counts().head(25)
-            st.bar_chart(top)
-            st.dataframe(top.to_frame("count"))
-        else:
-            st.info("No model numbers extracted.")
-
-    if "purchase_date" in view.columns:
-        st.markdown("### Purchases by Year (from purchase_date)")
-        pdt = pd.to_datetime(view["purchase_date"], errors="coerce").dropna()
-        if not pdt.empty:
-            st.bar_chart(pdt.dt.year.value_counts().sort_index())
-        else:
-            st.info("No valid purchase_date values.")
-
-    if call_date_col and call_date_col in view.columns:
-        st.markdown(f"### Reviews Over Time (based on '{call_date_col}')")
-        cdt = pd.to_datetime(view[call_date_col], errors="coerce").dropna()
+    if review_date_col and review_date_col in view.columns:
+        st.markdown(f"### Reviews Over Time (based on '{review_date_col}')")
+        cdt = pd.to_datetime(view[review_date_col], errors="coerce").dropna()
         if not cdt.empty:
             by_month = cdt.dt.to_period("M").value_counts().sort_index()
             by_month.index = by_month.index.astype(str)
@@ -1264,10 +1266,10 @@ with tabs[5]:
             st.info("No valid review dates.")
 
 # =========================================================
-# 7) EXPORT
+# 8) EXPORT
 # =========================================================
-with tabs[6]:
-    st.subheader("7) Export")
+with tabs[7]:
+    st.subheader("8) Export")
     results_df = st.session_state.get("results_df")
     if results_df is None:
         st.info("Run processing first to create an enriched dataset.")
@@ -1292,8 +1294,3 @@ with tabs[6]:
                 "tasks": list((st.session_state.get("task_cfg") or {}).get("active_cols", [])),
             }
         )
-'''
-path2 = Path("/mnt/data/ai_review_assistant_ui_v2.py")
-path2.write_text(code2, encoding="utf-8")
-str(path2)
-
