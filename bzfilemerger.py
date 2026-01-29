@@ -13,15 +13,32 @@ try:
 except Exception:
     HAS_POLARS = False
 
-st.set_page_config(page_title="Bazaarvoice Merger (Stable + Fast)", layout="wide")
-st.title("🧱⚡ Bazaarvoice Merger (Stable + Fast)")
+st.set_page_config(page_title="Bazaarvoice Merger (Stable + Fast + Base SKU)", layout="wide")
+st.title("🧱⚡ Bazaarvoice Merger (Stable + Fast + Base SKU + Locale/Boolean Tools)")
 st.caption(
-    "Optimized to avoid crashes: loads/merges only on click, avoids rendering huge tables, "
-    "and writes downloads to disk (not big in-memory bytes)."
+    "Crash-resistant: loads/merges only on click, avoids rendering huge tables, "
+    "and writes downloads to disk (no giant in-memory blobs)."
 )
 
 REQUIRED_HEADERS = ("Review ID", "Review Submission Date")
 EXCEL_CELL_LIMIT = 32767  # Excel hard limit per cell (characters)
+
+DEFAULT_LOCALES = [
+    "en_GB",
+    "de_DE",
+    "fr_FR",
+    "pl_PL",
+    "nl_NL",
+    "es_ES",
+    "nl_BE",
+    "it_IT",
+    "da_DK",
+    "sv_SE",
+    "fr_BE",
+    "no_NO",
+    "en_US",
+    "en_CA",
+]
 
 # ----------------------------
 # Utilities
@@ -50,7 +67,6 @@ def find_header_row_from_preview(preview: pd.DataFrame) -> int:
             return i
     raise ValueError(f"Could not find header row containing: {REQUIRED_HEADERS}")
 
-@st.cache_data(show_spinner=False)
 def load_excel_pandas(file_bytes: bytes, region: str, header_hint: int | None = None, usecols=None):
     """
     Optimized Excel reader:
@@ -122,7 +138,225 @@ def make_excel_safe_inplace(df: pd.DataFrame):
                 trimmed[col] = n
     return trimmed
 
+# ----------------------------
+# Base SKU mapping
+# ----------------------------
+def load_mapping_excel(mapping_bytes: bytes):
+    """
+    Load Base SKU mapping file. Expects columns:
+      - SKU
+      - Master Item
+    Returns mapping_df (pandas) and a lookup dict {SKU: Master Item}.
+    """
+    m = pd.read_excel(BytesIO(mapping_bytes), engine="openpyxl")
+    m.columns = [str(c).strip() for c in m.columns]
+
+    if "SKU" not in m.columns or "Master Item" not in m.columns:
+        raise ValueError("Mapping file must contain columns named exactly: 'SKU' and 'Master Item'.")
+
+    sku = m["SKU"].astype("string").str.strip()
+    base = m["Master Item"].astype("string").str.strip()
+
+    lookup = dict(zip(sku, base))
+    return m, lookup
+
+def apply_base_sku_lookup_pandas(merged_df: pd.DataFrame, lookup: dict) -> tuple[pd.DataFrame, int]:
+    """
+    Adds 'Base SKU' column by mapping merged_df['Product ID'] -> lookup[SKU] = Master Item.
+    Places 'Base SKU' next to 'Product ID' when present.
+    Returns (updated_df, matched_count).
+    """
+    if "Product ID" not in merged_df.columns:
+        merged_df["Base SKU"] = pd.NA
+        return merged_df, 0
+
+    pid = merged_df["Product ID"].astype("string").str.strip()
+    merged_df["Base SKU"] = pid.map(lookup)
+
+    matched = int(merged_df["Base SKU"].notna().sum())
+
+    # Move Base SKU next to Product ID
+    cols = list(merged_df.columns)
+    cols.remove("Base SKU")
+    pid_idx = cols.index("Product ID")
+    cols.insert(pid_idx + 1, "Base SKU")
+    merged_df = merged_df[cols]
+
+    return merged_df, matched
+
+def apply_base_sku_lookup_polars(merged_pl: "pl.DataFrame", mapping_df: pd.DataFrame) -> tuple["pl.DataFrame", int]:
+    """
+    Polars join approach:
+    left join on Product ID == SKU, output Base SKU = Master Item.
+    Returns (updated_pl, matched_count).
+    """
+    if "Product ID" not in merged_pl.columns:
+        merged_pl = merged_pl.with_columns(pl.lit(None).alias("Base SKU"))
+        return merged_pl, 0
+
+    map_pl = pl.from_pandas(
+        mapping_df[["SKU", "Master Item"]].copy(),
+        include_index=False
+    ).with_columns([
+        pl.col("SKU").cast(pl.Utf8).str.strip_chars(),
+        pl.col("Master Item").cast(pl.Utf8).str.strip_chars()
+    ])
+
+    merged_pl = merged_pl.with_columns(
+        pl.col("Product ID").cast(pl.Utf8).str.strip_chars()
+    )
+
+    joined = merged_pl.join(map_pl, left_on="Product ID", right_on="SKU", how="left")
+    joined = joined.rename({"Master Item": "Base SKU"}).drop("SKU")
+
+    matched = int(joined.select(pl.col("Base SKU").is_not_null().sum()).item())
+
+    # Reorder Base SKU next to Product ID
+    cols = joined.columns
+    if "Base SKU" in cols and "Product ID" in cols:
+        cols2 = [c for c in cols if c != "Base SKU"]
+        pid_idx = cols2.index("Product ID")
+        cols2.insert(pid_idx + 1, "Base SKU")
+        joined = joined.select(cols2)
+
+    return joined, matched
+
+# ----------------------------
+# Incentivized boolean normalization
+# ----------------------------
+TRUE_STRINGS = {"yes", "true", "1", "y", "t"}
+
+def find_incentivized_col(columns: list[str]) -> str | None:
+    # Prefer exact-ish common name, else first contains "incentiv"
+    preferred = [
+        "IncentivizedReview (CDV)",
+        "Incentivized Review",
+        "Incentivized",
+    ]
+    cols_set = {c: c for c in columns}
+    for p in preferred:
+        if p in cols_set:
+            return p
+    for c in columns:
+        if "incentiv" in c.lower():
+            return c
+    return None
+
+def normalize_incentivized_pandas(df: pd.DataFrame, col: str) -> tuple[pd.DataFrame, int, int]:
+    """
+    Convert Incentivized column to boolean:
+    - Yes/True -> True
+    - blanks/No/False/anything else -> False
+    Returns (df, true_count, total_count)
+    """
+    if col not in df.columns:
+        return df, 0, 0
+
+    # Robust: cast to string, lower, strip; bools become "True"/"False"
+    s = df[col].astype("string").str.strip().str.lower()
+    out = s.isin(TRUE_STRINGS)  # <NA> becomes False
+    df[col] = out
+
+    true_count = int(out.sum())
+    total_count = int(len(df))
+    return df, true_count, total_count
+
+def normalize_incentivized_polars(df: "pl.DataFrame", col: str) -> tuple["pl.DataFrame", int, int]:
+    if col not in df.columns:
+        return df, 0, 0
+
+    expr = (
+        pl.col(col)
+        .cast(pl.Utf8)
+        .str.strip_chars()
+        .str.to_lowercase()
+        .is_in(list(TRUE_STRINGS))
+        .fill_null(False)
+        .alias(col)
+    )
+    df = df.with_columns(expr)
+    true_count = int(df.select(pl.col(col).sum()).item())  # True treated as 1
+    total_count = int(df.height)
+    return df, true_count, total_count
+
+# ----------------------------
+# Locale filter + Country column
+# ----------------------------
+def add_country_from_locale_pandas(df: pd.DataFrame, locale_col: str = "Review Display Locale") -> pd.DataFrame:
+    if locale_col not in df.columns:
+        df["Country"] = pd.NA
+        return df
+
+    loc = df[locale_col].astype("string").str.strip()
+    country = loc.str.split("_").str[-1].str.upper()
+    country = country.replace({"GB": "UK"})  # friendlier grouping
+    df["Country"] = country
+
+    # Place Country next to locale col
+    cols = list(df.columns)
+    cols.remove("Country")
+    idx = cols.index(locale_col)
+    cols.insert(idx + 1, "Country")
+    return df[cols]
+
+def filter_locales_pandas(df: pd.DataFrame, selected_locales: list[str], locale_col: str = "Review Display Locale") -> tuple[pd.DataFrame, int, int]:
+    if locale_col not in df.columns:
+        return df, len(df), len(df)
+
+    before = len(df)
+    loc = df[locale_col].astype("string").str.strip()
+    df = df[loc.isin(selected_locales)]
+    after = len(df)
+    return df, before, after
+
+def add_country_from_locale_polars(df: "pl.DataFrame", locale_col: str = "Review Display Locale") -> "pl.DataFrame":
+    if locale_col not in df.columns:
+        return df.with_columns(pl.lit(None).alias("Country"))
+
+    country_expr = (
+        pl.col(locale_col)
+        .cast(pl.Utf8)
+        .str.strip_chars()
+        .str.split("_")
+        .list.get(-1)
+        .cast(pl.Utf8)
+        .str.to_uppercase()
+    )
+
+    country_expr = (
+        pl.when(country_expr == "GB").then(pl.lit("UK")).otherwise(country_expr).alias("Country")
+    )
+
+    df = df.with_columns(country_expr)
+
+    # Reorder Country next to locale_col
+    cols = df.columns
+    if "Country" in cols:
+        cols2 = [c for c in cols if c != "Country"]
+        idx = cols2.index(locale_col)
+        cols2.insert(idx + 1, "Country")
+        df = df.select(cols2)
+    return df
+
+def filter_locales_polars(df: "pl.DataFrame", selected_locales: list[str], locale_col: str = "Review Display Locale") -> tuple["pl.DataFrame", int, int]:
+    if locale_col not in df.columns:
+        return df, int(df.height), int(df.height)
+
+    before = int(df.height)
+    keep_expr = (
+        pl.col(locale_col)
+        .cast(pl.Utf8)
+        .str.strip_chars()
+        .is_in(selected_locales)
+        .fill_null(False)
+    )
+    df = df.filter(keep_expr)
+    after = int(df.height)
+    return df, before, after
+
+# ----------------------------
 # Disk-backed writers (avoid huge in-memory bytes)
+# ----------------------------
 def write_csv_disk(merged, kind: str, out_path: str):
     if kind == "polars":
         merged.write_csv(out_path)
@@ -159,7 +393,7 @@ with c1:
     header_hint_1 = st.number_input(
         "Header hint (0-based) file 1",
         min_value=0, max_value=200, value=5, step=1,
-        help="For your EU/UK export this is typically 5 (Excel row 6)."
+        help="For typical EU/UK BV export this is often 5 (Excel row 6)."
     )
 with c2:
     f2 = st.file_uploader("Upload USA Excel export", type=["xlsx"], key="us")
@@ -167,8 +401,39 @@ with c2:
     header_hint_2 = st.number_input(
         "Header hint (0-based) file 2",
         min_value=0, max_value=200, value=6, step=1,
-        help="For your USA export this is typically 6 (Excel row 7)."
+        help="For typical USA BV export this is often 6 (Excel row 7)."
     )
+
+st.divider()
+
+# Optional mapping upload
+mapping_file = st.file_uploader(
+    "Optional: Upload Base SKU mapping file (must include columns 'SKU' and 'Master Item')",
+    type=["xlsx"],
+    key="mapping"
+)
+
+# NEW: Incentivized normalization (prechecked)
+normalize_incentivized = st.checkbox(
+    "Normalize Incentivized column to TRUE/FALSE (Yes/True → True; blanks/No → False)",
+    value=True
+)
+
+# NEW: Locale filter + Country (both prechecked)
+apply_locale_filter = st.checkbox(
+    "Filter to selected Review Display Locale values",
+    value=True
+)
+selected_locales = st.multiselect(
+    "Review Display Locale values to include",
+    options=DEFAULT_LOCALES,
+    default=DEFAULT_LOCALES,
+    disabled=not apply_locale_filter
+)
+add_country_col = st.checkbox(
+    "Add a 'Country' column derived from Review Display Locale (e.g., en_GB → UK, de_DE → DE)",
+    value=True
+)
 
 st.divider()
 
@@ -189,7 +454,11 @@ cols_text = None
 if usecols_mode == "Select columns (faster / smaller)":
     cols_text = st.text_input(
         "Columns to load (comma-separated, exact names). Leave blank for all.",
-        value="Review ID, Review Submission Date, Product ID, Rating, Review Title, Review Text",
+        value=(
+            "Review ID, Review Submission Date, Product ID, Overall Rating, "
+            "IncentivizedReview (CDV), Review Display Locale, Review Title, Review Text"
+        ),
+        help="Tip: Keep Product ID for Base SKU and Review Display Locale for locale/country tools."
     )
 
 def parse_usecols(text):
@@ -207,10 +476,14 @@ if "merged" not in st.session_state:
     st.session_state.merged = None
     st.session_state.merged_kind = None
     st.session_state.meta = None
+    st.session_state.run_id = 0
 
 load_btn = st.button("🚀 Load & Merge", type="primary", disabled=not (f1 and f2))
 
 if load_btn:
+    st.session_state.run_id += 1
+    run_id = st.session_state.run_id
+
     b1 = f1.getvalue()
     b2 = f2.getvalue()
 
@@ -221,24 +494,83 @@ if load_btn:
 
     use_polars = (engine == "Auto (recommended)") and HAS_POLARS
 
+    # Merge
     if use_polars:
         with st.spinner("Converting to Polars + merging…"):
             p1 = pandas_to_polars(df1)
             p2 = pandas_to_polars(df2)
             merged = pl.concat([p1, p2], how="diagonal")  # safe for mismatched columns
         merged_kind = "polars"
-        total_rows, total_cols = merged.height, merged.width
         cols1, cols2 = df1.columns.tolist(), df2.columns.tolist()
     else:
         with st.spinner("Merging with Pandas…"):
             merged = pd.concat([df1, df2], ignore_index=True, sort=False)
         merged_kind = "pandas"
-        total_rows, total_cols = len(merged), merged.shape[1]
         cols1, cols2 = df1.columns.tolist(), df2.columns.tolist()
+
+    # Apply locale filter (prechecked)
+    locale_filter_info = None
+    if apply_locale_filter and selected_locales:
+        if merged_kind == "polars":
+            merged, before_n, after_n = filter_locales_polars(merged, selected_locales)
+        else:
+            merged, before_n, after_n = filter_locales_pandas(merged, selected_locales)
+        locale_filter_info = (before_n, after_n)
+
+    # Add Country column (prechecked)
+    if add_country_col:
+        if merged_kind == "polars":
+            merged = add_country_from_locale_polars(merged)
+        else:
+            merged = add_country_from_locale_pandas(merged)
+
+    # Incentivized normalization (prechecked)
+    incent_info = None
+    if normalize_incentivized:
+        if merged_kind == "polars":
+            incent_col = find_incentivized_col(merged.columns)
+            if incent_col:
+                merged, tcnt, tot = normalize_incentivized_polars(merged, incent_col)
+                incent_info = (incent_col, tcnt, tot)
+        else:
+            incent_col = find_incentivized_col(list(merged.columns))
+            if incent_col:
+                merged, tcnt, tot = normalize_incentivized_pandas(merged, incent_col)
+                incent_info = (incent_col, tcnt, tot)
+
+    # Optional Base SKU lookup
+    base_sku_matched = None
+    base_sku_enabled = False
+    mapping_cols_ok = None
+    mapping_err = None
+
+    if mapping_file is not None:
+        try:
+            with st.spinner("Loading mapping + applying Base SKU lookup…"):
+                mbytes = mapping_file.getvalue()
+                mapping_df, lookup = load_mapping_excel(mbytes)
+                base_sku_enabled = True
+                mapping_cols_ok = True
+
+                if merged_kind == "polars":
+                    merged, base_sku_matched = apply_base_sku_lookup_polars(merged, mapping_df)
+                else:
+                    merged, base_sku_matched = apply_base_sku_lookup_pandas(merged, lookup)
+
+        except Exception as e:
+            mapping_err = str(e)
+            mapping_cols_ok = False
+
+    # Sizes for display
+    if merged_kind == "polars":
+        total_rows, total_cols = int(merged.height), int(merged.width)
+    else:
+        total_rows, total_cols = int(len(merged)), int(merged.shape[1])
 
     st.session_state.merged = merged
     st.session_state.merged_kind = merged_kind
     st.session_state.meta = {
+        "run_id": run_id,
         "rows_1": len(df1),
         "rows_2": len(df2),
         "hdr1": hdr1,
@@ -251,13 +583,19 @@ if load_btn:
         "total_cols": total_cols,
         "region1": region1,
         "region2": region2,
+        "base_sku_enabled": base_sku_enabled,
+        "base_sku_matched": base_sku_matched,
+        "mapping_ok": mapping_cols_ok,
+        "mapping_err": mapping_err,
+        "locale_filter_info": locale_filter_info,
+        "incent_info": incent_info,
     }
 
 # ----------------------------
 # Results + download
 # ----------------------------
 if st.session_state.merged is None:
-    st.info("Upload both files and click **Load & Merge**.")
+    st.info("Upload both files (and optional mapping), then click **Load & Merge**.")
     st.stop()
 
 merged = st.session_state.merged
@@ -265,8 +603,8 @@ kind = st.session_state.merged_kind
 meta = st.session_state.meta
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric(f"{meta['region1']} rows", f"{meta['rows_1']:,}")
-m2.metric(f"{meta['region2']} rows", f"{meta['rows_2']:,}")
+m1.metric(f"{meta['region1']} rows (input)", f"{meta['rows_1']:,}")
+m2.metric(f"{meta['region2']} rows (input)", f"{meta['rows_2']:,}")
 m3.metric("Header row file 1", f"{meta['hdr1']} (Excel row {meta['hdr1']+1})")
 m4.metric("Header row file 2", f"{meta['hdr2']} (Excel row {meta['hdr2']+1})")
 
@@ -288,11 +626,30 @@ if only_1 or only_2:
 else:
     st.success("Columns match exactly across both files.")
 
+# Locale filter info
+if meta.get("locale_filter_info"):
+    before_n, after_n = meta["locale_filter_info"]
+    st.success(f"Locale filter applied: {before_n:,} → {after_n:,} rows kept.")
+
+# Incentivized info
+if meta.get("incent_info"):
+    col, tcnt, tot = meta["incent_info"]
+    st.success(f"Incentivized normalized in '{col}': True = {tcnt:,} / {tot:,} rows.")
+elif normalize_incentivized:
+    st.warning("Incentivized normalization enabled, but no Incentivized column was found in the loaded columns.")
+
+# Mapping status
+if meta.get("mapping_ok") is False:
+    st.error(f"Base SKU mapping was uploaded but could not be applied: {meta.get('mapping_err')}")
+elif meta.get("base_sku_enabled"):
+    st.success(f"Base SKU lookup applied. Matches found: {meta.get('base_sku_matched', 0):,}")
+
 st.subheader("Sample rows (first 25)")
 if kind == "polars":
     st.dataframe(merged.head(25).to_pandas(), use_container_width=True)
 else:
     st.dataframe(merged.head(25), use_container_width=True)
+
 st.caption(f"Merged size: {meta['total_rows']:,} rows × {meta['total_cols']:,} columns | Engine: {kind}")
 
 st.divider()
@@ -304,12 +661,13 @@ out_format = st.selectbox(
 )
 
 temp_dir = ensure_temp_dir()
-csv_path  = os.path.join(temp_dir, "merged_reviews.csv")
-gz_path   = os.path.join(temp_dir, "merged_reviews.csv.gz")
-pq_path   = os.path.join(temp_dir, "merged_reviews.parquet")
-xlsx_path = os.path.join(temp_dir, "merged_reviews.xlsx")
+run_id = meta["run_id"]
 
-# Build step separated from download to avoid rebuild on reruns
+csv_path  = os.path.join(temp_dir, f"merged_reviews_{run_id}.csv")
+gz_path   = os.path.join(temp_dir, f"merged_reviews_{run_id}.csv.gz")
+pq_path   = os.path.join(temp_dir, f"merged_reviews_{run_id}.parquet")
+xlsx_path = os.path.join(temp_dir, f"merged_reviews_{run_id}.xlsx")
+
 build_btn_label = {
     "CSV (recommended)": "Build CSV",
     "CSV (.gz) (smaller)": "Build compressed CSV (.gz)",
@@ -319,7 +677,7 @@ build_btn_label = {
 
 if out_format.startswith("Excel"):
     st.warning(
-        "XLSX export is the most likely to crash for ~400k-row text-heavy exports. "
+        "XLSX export is the most likely to crash for large, text-heavy exports. "
         "Prefer CSV/Parquet when possible."
     )
     proceed = st.checkbox("I understand; try XLSX anyway", value=False)
@@ -391,7 +749,12 @@ elif out_format.startswith("Excel") and os.path.exists(xlsx_path):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-st.caption("Tip: If downloads still crash, use Parquet or CSV (.gz). XLSX is the most memory-intensive.")
+st.caption(
+    "Base SKU lookup: Product ID (reviews) → SKU (mapping) → Master Item (output as Base SKU). "
+    "Locale tools: filter by Review Display Locale + add Country derived from locale. "
+    "Incentivized tool: Yes/True → True; blanks/No → False."
+)
+
 
 
 
