@@ -754,8 +754,3 @@ st.caption(
     "Locale tools: filter by Review Display Locale + add Country derived from locale. "
     "Incentivized tool: Yes/True → True; blanks/No → False."
 )
-
-
-
-
-
