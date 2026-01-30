@@ -1,12 +1,20 @@
-
-# starwalk_ui_v7_5_knowledge_plus.py — Evidence-Locked Labeling + Product Knowledge Prelearn + Canonical Theme Merge
-# Adds: Prelearn w/ ETA + real-time status, semantic merge, alias-suggestion inbox, stronger dedupe/singularization, cost tracking
+# starwalk_ui_v7_6_knowledge_plus_stable.py — v7.5 + Stability/Performance Hardening
+# Evidence-Locked Labeling + Product Knowledge Prelearn + Canonical Theme Merge
+# Adds (stability):
+#   - Persist df + run artifacts in st.session_state (no progress loss on reruns)
+#   - Vectorized detect_missing (big speedup on large sheets)
+#   - OpenAI timeout + retries + JSON salvage
+#   - UI log cap (prevents browser/Streamlit from freezing on huge runs)
+#   - Lazy XLSX export (only build file when user clicks “Prepare export”)
+#   - Optional undo snapshots toggle (RAM guard)
+#   - Periodic gc to reduce long-run memory creep
+#
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 # Optional: numpy, scikit-learn (for better clustering), tiktoken (for better token counts)
 
 import streamlit as st
 import pandas as pd
-import io, os, json, difflib, time, re, html, math, random
+import io, os, json, difflib, time, re, html, math, random, hashlib, traceback, gc
 from typing import List, Dict, Tuple, Optional, Set, Any, Iterable
 
 # Optional: OpenAI
@@ -47,13 +55,13 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.5")
-st.title("✨ Review Symptomizer — v7.5")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.6 (Stable)")
+st.title("✨ Review Symptomizer — v7.6 (Stable)")
 st.caption(
-    "Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo • "
+    "Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo (optional) • "
     "Product Knowledge Prelearn (recommended) • Strong canonical merging • "
     "Similarity/semantic guard • Evidence-locked labeling • In-session cache • "
-    "🟡 Inbox: New Symptoms + Alias Suggestions"
+    "🟡 Inbox: New Symptoms + Alias Suggestions • ✅ Stability hardening"
 )
 
 # ------------------- Global CSS -------------------
@@ -124,7 +132,8 @@ def _fmt_money(x: float) -> str:
 
 def _fmt_secs(sec: float) -> str:
     sec = float(sec or 0.0)
-    if sec < 0: sec = 0
+    if sec < 0:
+        sec = 0
     m = int(sec // 60)
     s = int(round(sec - m * 60))
     return f"{m}:{s:02d}"
@@ -209,7 +218,6 @@ def _extract_usage(resp: Any) -> Tuple[int, int]:
         return (0, 0)
     usage = getattr(resp, "usage", None)
     if usage is None:
-        # Sometimes responses nest usage differently
         try:
             usage = resp.get("usage")  # type: ignore
         except Exception:
@@ -224,7 +232,6 @@ def _extract_usage(resp: Any) -> Tuple[int, int]:
 
     pt = _get(usage, "prompt_tokens", "input_tokens")
     ct = _get(usage, "completion_tokens", "output_tokens")
-    # embeddings often only have prompt_tokens / total_tokens
     if (pt or 0) == 0:
         pt = _get(usage, "total_tokens", "prompt_tokens")
     return (int(pt or 0), int(ct or 0))
@@ -242,6 +249,18 @@ def _estimate_tokens(text: str, model_id: str = "gpt-4o-mini") -> int:
         except Exception:
             pass
     return int(max(1, math.ceil(len(s) / 4)))
+
+# ------------------- Cached workbook loaders (stability) -------------------
+@st.cache_data(show_spinner=False)
+def _load_reviews_df(file_bytes: bytes) -> pd.DataFrame:
+    bio = io.BytesIO(file_bytes)
+    try:
+        df0 = pd.read_excel(bio, sheet_name="Star Walk scrubbed verbatims")
+    except Exception:
+        bio.seek(0)
+        df0 = pd.read_excel(bio)
+    df0.columns = [str(c).strip() for c in df0.columns]
+    return df0
 
 # ------------------- Symptoms sheet parsing -------------------
 @st.cache_data(show_spinner=False)
@@ -302,6 +321,7 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 # Canonicalization helpers
 def _canon(s: str) -> str:
     return " ".join(str(s).split()).lower().strip()
+
 def _canon_simple(s: str) -> str:
     return "".join(ch for ch in _canon(s) if ch.isalnum())
 
@@ -309,7 +329,8 @@ def _canon_simple(s: str) -> str:
 def highlight_text(text: str, terms: List[str]) -> str:
     safe = html.escape(str(text))
     terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
-    if not terms: return safe
+    if not terms:
+        return safe
     uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
     try:
         pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
@@ -331,18 +352,28 @@ def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
         "ai_delighters": ai_del,
     }
 
-def row_has_any(row: pd.Series, columns: List[str]) -> bool:
-    if not columns: return False
-    for c in columns:
-        if c in row and is_filled(row[c]): return True
-    return False
+# Vectorized missing detection (replaces apply(axis=1) loops)
+def _filled_mask(df_in: pd.DataFrame, cols: List[str]) -> pd.Series:
+    """Vectorized 'is_filled' across multiple columns."""
+    if not cols:
+        return pd.Series(False, index=df_in.index)
+
+    mask = pd.Series(False, index=df_in.index)
+    for c in cols:
+        if c not in df_in.columns:
+            continue
+        s = df_in[c].fillna("").astype(str).str.strip()
+        s_up = s.str.upper()
+        mask |= (s != "") & (~s_up.isin(NON_VALUES))
+    return mask
 
 def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFrame:
     det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
     del_cols = colmap["manual_delighters"] + colmap["ai_delighters"]
+
     out = df.copy()
-    out["Has_Detractors"] = out.apply(lambda r: row_has_any(r, det_cols), axis=1)
-    out["Has_Delighters"] = out.apply(lambda r: row_has_any(r, del_cols), axis=1)
+    out["Has_Detractors"] = _filled_mask(out, det_cols)
+    out["Has_Delighters"] = _filled_mask(out, del_cols)
     out["Needs_Detractors"] = ~out["Has_Detractors"]
     out["Needs_Delighters"] = ~out["Has_Delighters"]
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
@@ -399,7 +430,6 @@ SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
 def _symptom_list_version(delighters: List[str], detractors: List[str], aliases: Dict[str, List[str]]) -> str:
     payload = json.dumps({"del": delighters, "det": detractors, "ali": aliases}, sort_keys=True, ensure_ascii=False)
     try:
-        import hashlib
         return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
     except Exception:
         return str(len(delighters)) + "_" + str(len(detractors))
@@ -410,7 +440,6 @@ def _ensure_label_cache():
     return st.session_state["_label_cache"]
 
 # ------------------- Theme normalization (Stronger + plural/synonym handling) -------------------
-# Goal: stop "Comfortable fit" vs "Comfortable design" vs "Comfortable use" and "issue/issues".
 THEME_RULES = [
     # detractors (hair/heat/noise/battery from v7.3)
     (re.compile(r"\b(pulls?|pulled|pulling).{0,12}\bhair\b|\bhair\s+(?:loss|fall(?:ing)?|coming\s+out|pulled)\b", re.I),
@@ -449,9 +478,7 @@ THEME_RULES = [
      {"del": "Comfort"}),
 ]
 
-# Extra canonical synonym map (deterministic). Helps unify variants that slip through.
 CANONICAL_SYNONYMS = [
-    # canonical, side, patterns (any hit -> canonical)
     ("Comfort", "del", [r"\bcomfortable\b", r"\bcomfort\b", r"\bcomfy\b", r"\bconfortable\b", r"\bconfort\b", r"\bcomftable\b", r"\bcomfort\s*(fit|use|design|feel)\b"]),
     ("Cooling Pad Issue", "det", [r"\bcooling\s+pad\b.*\b(issue|problem|broken|fail)", r"\b(issue|problem)s?\b.*\bcooling\s+pad\b"]),
     ("Learning Curve", "det", [r"\blearning\s+curve\b", r"\bnot\s+intuitive\b", r"\bhard\s+to\s+learn\b", r"\bconfusing\s+at\s+first\b", r"\binitially\s+complicated\b"]),
@@ -469,7 +496,6 @@ def _short_title(s: str) -> str:
     s = re.sub(r"[\s\-_/]+", " ", str(s).strip())
     s = re.sub(r"[^\w\s+/]", "", s)
     s = re.sub(r"\s+", " ", s)
-    # Title Case but keep slashes segments
     parts = []
     for token in s.split(" "):
         if "/" in token:
@@ -558,7 +584,6 @@ def _known_learned_labels(side: str) -> List[str]:
     ls = _ensure_learned_store()
     side = "Delighter" if str(side).lower().startswith("del") else "Detractor"
     items = list(ls["labels"][side].keys())
-    # highest frequency first
     items.sort(key=lambda k: -int(ls["labels"][side].get(k, {}).get("count", 0)))
     return items
 
@@ -580,7 +605,6 @@ def _embed_text(text: str, client, model_id: str, component: str) -> Optional[Li
         return cache[key]
     try:
         resp = client.embeddings.create(model=model_id, input=[t])
-        # usage may show prompt_tokens
         pt, _ = _extract_usage(resp)
         if pt:
             _track(component, model_id, in_tok=pt, out_tok=0, embed=True)
@@ -593,7 +617,6 @@ def _embed_text(text: str, client, model_id: str, component: str) -> Optional[Li
 def _cos_sim(a: List[float], b: List[float]) -> float:
     if (not a) or (not b):
         return 0.0
-    # Manual cosine to avoid numpy dependency
     dot = 0.0
     na = 0.0
     nb = 0.0
@@ -660,18 +683,15 @@ def resolve_candidate_to_canonical(
     cand_canon = _canon(cand_theme)
     cand_key = _canon_simple(cand_theme)
 
-    # Also consider the raw phrase BEFORE normalization for exact matches
     raw_key = _canon_simple(str(candidate_raw or "").strip())
     raw_canon = _canon(str(candidate_raw or "").strip())
 
-    # 0) exact existing (raw or normalized)
     allowed_keys = {_canon_simple(x): x for x in allowed}
     if raw_key in allowed_keys:
         return {"canonical": allowed_keys[raw_key], "kind": "exact_existing", "target": allowed_keys[raw_key], "score": 1.0}
     if cand_key in allowed_keys:
         return {"canonical": allowed_keys[cand_key], "kind": "exact_existing", "target": allowed_keys[cand_key], "score": 1.0}
 
-    # 1) alias match (raw or normalized)
     if raw_canon in alias_to_label:
         tgt = alias_to_label[raw_canon]
         return {"canonical": tgt, "kind": "alias_to_existing", "target": tgt, "score": 1.0}
@@ -679,7 +699,6 @@ def resolve_candidate_to_canonical(
         tgt = alias_to_label[cand_canon]
         return {"canonical": tgt, "kind": "alias_to_existing", "target": tgt, "score": 1.0}
 
-    # 2) lexical similarity to allowed
     try:
         m = difflib.get_close_matches(cand_theme, allowed, n=1, cutoff=float(sim_threshold_lex))
         if m:
@@ -688,7 +707,6 @@ def resolve_candidate_to_canonical(
     except Exception:
         pass
 
-    # 3) lexical similarity to learned labels (within-run)
     learned_labels = list(learned_store.get("labels", {}).get(side_norm, {}).keys())
     try:
         m2 = difflib.get_close_matches(cand_theme, learned_labels, n=1, cutoff=float(sim_threshold_lex))
@@ -698,16 +716,13 @@ def resolve_candidate_to_canonical(
     except Exception:
         pass
 
-    # 4) semantic similarity (optional) to allowed, then learned
     score_used = 0.0
     if client is not None and embed_model:
-        # Prepare embedding pools
         pool_emb_allowed = learned_store.setdefault("_emb_allowed", {})
         pool_emb_learned = learned_store.setdefault("_emb_learned", {})
         best_a, score_a = _best_semantic_match(cand_theme, allowed, pool_emb_allowed, client, embed_model, component="embed-merge")
         best_l, score_l = _best_semantic_match(cand_theme, learned_labels, pool_emb_learned, client, embed_model, component="embed-merge")
 
-        # pick best
         best_lab, best_score, best_kind = None, 0.0, ""
         if best_a and score_a >= best_score:
             best_lab, best_score, best_kind = best_a, score_a, "alias_to_existing"
@@ -718,7 +733,6 @@ def resolve_candidate_to_canonical(
             score_used = float(best_score)
             return {"canonical": best_lab, "kind": best_kind, "target": best_lab, "score": score_used}
 
-    # 5) new theme
     return {"canonical": cand_theme, "kind": "new", "target": "", "score": score_used}
 
 # ------------------- Product Knowledge Prelearn -------------------
@@ -744,7 +758,6 @@ def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
     df2 = df_in.copy()
     if n >= len(df2):
         return df2
-    # stratify by star rating if present
     if "Star Rating" in df2.columns:
         try:
             rng = random.Random(seed)
@@ -754,12 +767,77 @@ def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
                 take = max(1, int(round(n * (len(gidx) / len(df2)))))
                 rng.shuffle(gidx)
                 out_idx.extend(gidx[:take])
-            # trim if overshoot
             out_idx = out_idx[:n]
             return df2.loc[out_idx]
         except Exception:
             pass
     return df2.sample(n=n, random_state=seed)
+
+# ---------- JSON salvage + retry wrappers (stability) ----------
+def _safe_json_load(s: str) -> Dict[str, Any]:
+    """Parse JSON, with a salvage attempt if there's extra text."""
+    s = (s or "").strip()
+    if not s:
+        return {}
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        i = s.find("{")
+        j = s.rfind("}")
+        if i >= 0 and j > i:
+            return json.loads(s[i:j+1])
+    except Exception:
+        return {}
+    return {}
+
+def _chat_json_with_retries(
+    client,
+    *,
+    model: str,
+    temperature: float,
+    messages: List[Dict[str, str]],
+    component: str,
+    response_format: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Call chat.completions.create and return parsed JSON dict; retries JSON issues/transient failures."""
+    if client is None:
+        return {}
+
+    attempts = 1 + int(st.session_state.get("app_json_retries", 2) or 0)
+    last_err = None
+
+    for a in range(1, attempts + 1):
+        try:
+            kwargs: Dict[str, Any] = dict(
+                model=model,
+                temperature=float(temperature),
+                messages=messages,
+            )
+            if response_format:
+                kwargs["response_format"] = response_format
+
+            resp = client.chat.completions.create(**kwargs)
+            pt, ct = _extract_usage(resp)
+            if pt or ct:
+                _track(component, model, in_tok=pt, out_tok=ct, embed=False)
+
+            content = resp.choices[0].message.content or "{}"
+            data = _safe_json_load(content)
+            if data:
+                return data
+
+            last_err = RuntimeError("Invalid/empty JSON response")
+        except Exception as e:
+            last_err = e
+
+        if a < attempts:
+            time.sleep(min((2 ** (a - 1)) + random.random(), 20))
+
+    # Optionally: surface error details for debugging (kept quiet by default)
+    _ = last_err
+    return {}
 
 def _prelearn_llm_batch_mine(
     texts: List[str],
@@ -776,12 +854,11 @@ def _prelearn_llm_batch_mine(
     if client is None:
         return {"detractors": [], "delighters": [], "product_profile": ""}
 
-    # Keep prompts compact – use known themes to discourage duplicates
     sys = "\n".join([
         "You analyze consumer product reviews to extract CONSISTENT THEMES.",
         "Return STRICT JSON with schema:",
-        '{"product_profile":"<1-2 sentence product summary>",',
-        ' "detractors":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}],',
+        '{"product_profile":"<1-2 sentence product summary>",'
+        ' "detractors":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}],'
         ' "delighters":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}]}',
         "",
         "Rules:",
@@ -793,24 +870,20 @@ def _prelearn_llm_batch_mine(
     ])
 
     payload = {
-        "reviews": texts[:40],  # cap per batch
+        "reviews": texts[:40],
         "known_detractor_themes": known_themes.get("Detractor", [])[:60],
         "known_delighter_themes": known_themes.get("Delighter", [])[:60],
     }
-    resp = client.chat.completions.create(
+
+    data = _chat_json_with_retries(
+        client,
         model=model,
         temperature=float(temperature),
         messages=[{"role":"system","content":sys},{"role":"user","content":json.dumps(payload)}],
+        component="prelearn-mine",
         response_format={"type":"json_object"},
     )
-    pt, ct = _extract_usage(resp)
-    if pt or ct:
-        _track("prelearn-mine", model, in_tok=pt, out_tok=ct, embed=False)
 
-    try:
-        data = json.loads(resp.choices[0].message.content or "{}")
-    except Exception:
-        data = {}
     return {
         "product_profile": str(data.get("product_profile","") or "").strip(),
         "detractors": data.get("detractors", []) or [],
@@ -846,12 +919,10 @@ def _consolidate_themes_semantic(
         return themes
 
     labels = list(themes[side].keys())
-    # quick lexical merge by canon_simple (handles Cooling Pad Issue(s) etc after normalization)
     key_to_lab: Dict[str, str] = {}
     for lab in labels:
         k = _canon_simple(normalize_theme_label(lab, side))
         if k in key_to_lab and key_to_lab[k] != lab:
-            # merge into existing
             tgt = key_to_lab[k]
             themes[side][tgt]["count"] += themes[side][lab]["count"]
             themes[side][tgt]["keywords"] |= themes[side][lab]["keywords"]
@@ -863,19 +934,15 @@ def _consolidate_themes_semantic(
     if client is None or not embed_model or len(labels) < 2:
         return themes
 
-    # compute embeddings for labels
     store = _ensure_learned_store()
-    pool_emb = store["emb"][side]  # reuse store
+    pool_emb = store["emb"][side]
     for lab in labels:
         if lab not in pool_emb:
             v = _embed_text(lab, client, embed_model, component="prelearn-embed-themes")
             if v:
                 pool_emb[lab] = v
 
-    # greedy merge: sort by count desc; merge smaller into larger if similar
     labels_sorted = sorted(labels, key=lambda x: -int(themes[side][x]["count"]))
-    merged_into: Dict[str, str] = {}
-
     for i, a in enumerate(labels_sorted):
         if a not in themes[side]:
             continue
@@ -891,13 +958,10 @@ def _consolidate_themes_semantic(
             if not vb:
                 continue
             sim = _cos_sim(va, vb)
-            # also merge if one label is substring of another (strong lexical)
             lex_sub = (_canon(a) in _canon(b)) or (_canon(b) in _canon(a))
             if sim >= float(sem_merge_threshold) or lex_sub:
-                # merge b -> a (keep bigger count label 'a')
                 themes[side][a]["count"] += themes[side][b]["count"]
                 themes[side][a]["keywords"] |= themes[side][b]["keywords"]
-                merged_into[b] = a
                 del themes[side][b]
     return themes
 
@@ -919,19 +983,16 @@ def run_prelearn(
     t0 = time.perf_counter()
     learned = _ensure_learned_store()
 
-    # 1) Sample
     status_box.markdown("🔎 **Prelearn:** Sampling reviews…")
     df_s = _sample_reviews(df_in, n=int(sample_n))
     reviews = [str(x) for x in df_s["Verbatim"].tolist() if str(x).strip()]
     prog_bar.progress(0.05)
 
-    # 2) Cheap glossary
     status_box.markdown("🧠 **Prelearn:** Building quick product glossary (no API)…")
     terms = _top_terms(reviews, top_n=40)
     learned["glossary_terms"] = terms
     prog_bar.progress(0.12)
 
-    # 3) Batch theme mining with ETA
     themes: Dict[str, Dict[str, Any]] = {"Delighter": {}, "Detractor": {}}
     profiles: List[str] = []
     n = len(reviews)
@@ -946,7 +1007,6 @@ def run_prelearn(
     start_batch_time = time.perf_counter()
 
     for bi, chunk in enumerate(batches, start=1):
-        # ETA based on average batch duration
         elapsed = time.perf_counter() - start_batch_time
         avg = (elapsed / max(1, bi-1)) if bi > 1 else 0.0
         rem = (total_batches - bi + 1) * avg
@@ -970,7 +1030,7 @@ def run_prelearn(
         )
         if data.get("product_profile"):
             profiles.append(str(data["product_profile"]))
-        # merge mined
+
         for obj in data.get("delighters", []) or []:
             lab = normalize_theme_label(obj.get("label",""), "Delighter")
             kws = obj.get("keywords", []) or []
@@ -980,11 +1040,9 @@ def run_prelearn(
             kws = obj.get("keywords", []) or []
             _merge_theme_dict(themes, "Detractor", lab, kws, count_inc=1)
 
-        # progress (0.12 -> 0.78)
         prog = 0.12 + 0.66 * (bi / max(1, total_batches))
         prog_bar.progress(min(0.78, max(0.12, prog)))
 
-        # Budget guard (session-level)
         try:
             budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
         except Exception:
@@ -998,13 +1056,14 @@ def run_prelearn(
                 )
                 break
 
-    # 4) Consolidate themes to be mutually exclusive
+        if bi % 5 == 0:
+            gc.collect()
+
     status_box.markdown("🧩 **Prelearn:** Consolidating themes (dedupe + semantic merge)…")
     themes = _consolidate_themes_semantic("Delighter", themes, client, embed_model, sem_merge_threshold=float(sem_merge_threshold))
     themes = _consolidate_themes_semantic("Detractor", themes, client, embed_model, sem_merge_threshold=float(sem_merge_threshold))
     prog_bar.progress(0.90)
 
-    # 5) Save into learned store
     learned["labels"] = {"Delighter": {}, "Detractor": {}}
     for side in ("Delighter","Detractor"):
         for lab, rec in sorted(themes.get(side, {}).items(), key=lambda kv: (-int(kv[1]["count"]), kv[0])):
@@ -1081,21 +1140,17 @@ def _openai_labeler_unified(
         "known_unlisted_delighter_themes": (known_theme_hints.get("Delighter") or [])[:60],
     }
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=float(temperature),
-            messages=[{"role": "system", "content": sys},
-                      {"role": "user", "content": json.dumps(user_payload)}],
-            response_format={"type": "json_object"},
-        )
-        pt, ct = _extract_usage(resp)
-        if pt or ct:
-            _track("symptomize-label", model, in_tok=pt, out_tok=ct, embed=False)
+    data = _chat_json_with_retries(
+        client,
+        model=model,
+        temperature=float(temperature),
+        messages=[{"role": "system", "content": sys},
+                  {"role": "user", "content": json.dumps(user_payload)}],
+        component="symptomize-label",
+        response_format={"type": "json_object"},
+    )
 
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
-    except Exception:
+    if not data:
         return {
             "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
             "ev_del_map": {}, "ev_det_map": {},
@@ -1107,7 +1162,6 @@ def _openai_labeler_unified(
     unl_dels = [x for x in (data.get("unlisted_delighters", []) or []) if isinstance(x, str) and x.strip()][:10]
     unl_dets = [x for x in (data.get("unlisted_detractors", []) or []) if isinstance(x, str) and x.strip()][:10]
 
-    # meta
     s = str(data.get("safety", "Not Mentioned")).strip()
     r = str(data.get("reliability", "Not Mentioned")).strip()
     n = str(data.get("sessions", "Unknown")).strip()
@@ -1115,7 +1169,6 @@ def _openai_labeler_unified(
     r = r if r in RELIABILITY_ENUM else "Not Mentioned"
     n = n if n in SESSIONS_ENUM else "Unknown"
 
-    # normalize allowed-label evidence maps
     def _extract_allowed(objs: Iterable[Any], allowed: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
         out_labels: List[str] = []
         ev_map: Dict[str, List[str]] = {}
@@ -1150,16 +1203,15 @@ def _openai_labeler_unified(
     cache[key] = out
     return out
 
-# ------------------- Export helpers -------------------
+# ------------------- Export helpers (LAZY export: take bytes) -------------------
 def generate_template_workbook_bytes(
-    original_file,
+    original_bytes: bytes,
     updated_df: pd.DataFrame,
     processed_idx: Optional[Set[int]] = None,
     overwrite_processed_slots: bool = False,
 ) -> bytes:
     """Return workbook bytes with K–T (dets), U–AD (dels), and AE/AF/AG meta (headers preserved)."""
-    original_file.seek(0)
-    wb = load_workbook(original_file)
+    wb = load_workbook(io.BytesIO(original_bytes))
     sheet_name = "Star Walk scrubbed verbatims"
     if sheet_name not in wb.sheetnames:
         sheet_name = wb.sheetnames[0]
@@ -1191,12 +1243,14 @@ def generate_template_workbook_bytes(
             val = r.get(f"AI Symptom Detractor {j}")
             cv = None if (pd.isna(val) or str(val).strip() == "") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
-            if cv is not None: cell.fill = fill_red
+            if cv is not None:
+                cell.fill = fill_red
         for j, col_idx in enumerate(DEL_INDEXES, start=1):
             val = r.get(f"AI Symptom Delighter {j}")
             cv = None if (pd.isna(val) or str(val).strip() == "") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
-            if cv is not None: cell.fill = fill_green
+            if cv is not None:
+                cell.fill = fill_green
         safety = r.get("AI Safety"); reliab = r.get("AI Reliability"); sess = r.get("AI # of Sessions")
         if is_filled(safety):
             c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety)); c.fill = fill_yel
@@ -1206,15 +1260,17 @@ def generate_template_workbook_bytes(
             c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess)); c.fill = fill_pur
 
     for c in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
-        try: ws.column_dimensions[get_column_letter(c)].width = 28
-        except Exception: pass
+        try:
+            ws.column_dimensions[get_column_letter(c)].width = 28
+        except Exception:
+            pass
 
-    out = io.BytesIO(); wb.save(out)
+    out = io.BytesIO()
+    wb.save(out)
     return out.getvalue()
 
-# ------------------- Helpers: apply inbox updates (new symptoms + alias additions) -------------------
 def apply_symptoms_updates_to_workbook(
-    original_file,
+    original_bytes: bytes,
     new_symptoms: List[Tuple[str, str]],
     alias_additions: List[Tuple[str, str]],
 ) -> bytes:
@@ -1223,8 +1279,7 @@ def apply_symptoms_updates_to_workbook(
       - append new symptom rows (label, type)
       - append alias strings to existing label rows
     """
-    original_file.seek(0)
-    wb = load_workbook(original_file)
+    wb = load_workbook(io.BytesIO(original_bytes))
 
     if "Symptoms" not in wb.sheetnames:
         ws = wb.create_sheet("Symptoms")
@@ -1249,19 +1304,21 @@ def apply_symptoms_updates_to_workbook(
                 used_cols.add(idx); return idx
         max_col = int(getattr(ws, "max_column", 0) or 0)
         idx = preferred_index if (preferred_index and preferred_index > 0) else (max_col + 1 if max_col > 0 else 1)
-        while idx in used_cols: idx += 1
+        while idx in used_cols:
+            idx += 1
         ws.cell(row=1, column=idx, value=name); used_cols.add(idx); return idx
 
     col_label = _ensure_header("Symptom", ["symptom", "label", "name", "item"], preferred_index=1)
     col_type  = _ensure_header("Type", ["type", "polarity", "category", "side"], preferred_index=2)
     col_alias = _ensure_header("Aliases", ["aliases", "alias"], preferred_index=3)
 
-    # Build lookup of existing labels -> row index and existing aliases
     existing_row: Dict[str, int] = {}
     existing_aliases: Dict[str, Set[str]] = {}
 
-    try: last_row = int(getattr(ws, "max_row", 0) or 0)
-    except Exception: last_row = 0
+    try:
+        last_row = int(getattr(ws, "max_row", 0) or 0)
+    except Exception:
+        last_row = 0
 
     for r_i in range(2, last_row + 1):
         v = ws.cell(row=r_i, column=col_label).value
@@ -1276,7 +1333,6 @@ def apply_symptoms_updates_to_workbook(
             aset = {a.strip() for a in als_norm.split("|") if a.strip()}
         existing_aliases[lab] = aset
 
-    # 1) new symptoms
     for label, side in new_symptoms:
         lab = str(label).strip()
         if not lab:
@@ -1289,7 +1345,6 @@ def apply_symptoms_updates_to_workbook(
         existing_row[lab] = rnew
         existing_aliases[lab] = set()
 
-    # 2) alias additions
     for tgt_label, alias in alias_additions:
         tgt = str(tgt_label).strip()
         als = str(alias).strip()
@@ -1298,47 +1353,75 @@ def apply_symptoms_updates_to_workbook(
         if tgt not in existing_row:
             continue
         aset = existing_aliases.setdefault(tgt, set())
-        # suppress exact/near duplicates (case-insensitive)
         if _canon_simple(als) == _canon_simple(tgt):
             continue
         if any(_canon_simple(als) == _canon_simple(a) for a in aset):
             continue
         aset.add(als)
         r_i = existing_row[tgt]
-        # write back as " | " list
         ws.cell(row=r_i, column=col_alias, value=" | ".join(sorted(aset)))
 
-    out = io.BytesIO(); wb.save(out); out.seek(0)
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
     return out.getvalue()
 
-# ------------------- File Upload -------------------
+# ------------------- File Upload (SESSION-PERSISTED) -------------------
 uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
 if not uploaded_file:
     st.stop()
 
-uploaded_bytes = uploaded_file.read(); uploaded_file.seek(0)
-try:
-    df = pd.read_excel(uploaded_file, sheet_name="Star Walk scrubbed verbatims")
-except ValueError:
-    uploaded_file.seek(0)
-    df = pd.read_excel(uploaded_file)
+uploaded_bytes = uploaded_file.getvalue()
+file_sig = hashlib.md5(uploaded_bytes).hexdigest()
 
-if "Verbatim" not in df.columns:
-    st.error("Missing 'Verbatim' column.")
-    st.stop()
+if st.session_state.get("_file_sig") != file_sig:
+    st.session_state["_file_sig"] = file_sig
+    st.session_state["uploaded_bytes"] = uploaded_bytes
 
-# Normalize
-df.columns = [str(c).strip() for c in df.columns]
-df["Verbatim"] = df["Verbatim"].map(clean_text)
+    df0 = _load_reviews_df(uploaded_bytes)
+    if "Verbatim" not in df0.columns:
+        st.error("Missing 'Verbatim' column.")
+        st.stop()
 
-# Load Symptoms
-DELIGHTERS, DETRACTORS, ALIASES = get_symptom_whitelists(uploaded_bytes)
+    df0["Verbatim"] = df0["Verbatim"].map(clean_text)
+    st.session_state["df_work"] = ensure_ai_columns(df0)
+
+    d, t, a = get_symptom_whitelists(uploaded_bytes)
+    st.session_state["DELIGHTERS"] = d
+    st.session_state["DETRACTORS"] = t
+    st.session_state["ALIASES"] = a
+
+    # Reset run artifacts when workbook changes
+    st.session_state["undo_stack"] = []
+    st.session_state["processed_rows"] = []
+    st.session_state["processed_idx_set"] = set()
+    st.session_state["new_symptom_candidates"] = {}
+    st.session_state["alias_suggestion_candidates"] = {}
+    st.session_state["last_run_processed_count"] = 0
+    st.session_state["ev_cov_num"] = 0
+    st.session_state["ev_cov_den"] = 0
+
+    st.session_state["_label_cache"] = {}
+    st.session_state["_embed_cache"] = {}
+    st.session_state["_usage"] = {
+        "chat_in": 0, "chat_out": 0, "embed_in": 0,
+        "cost_chat": 0.0, "cost_embed": 0.0, "by_component": {}
+    }
+    st.session_state.pop("export_bytes", None)
+
+    st.session_state.pop("learned", None)
+    _ensure_learned_store()
+
+df = st.session_state["df_work"]
+DELIGHTERS = st.session_state.get("DELIGHTERS", [])
+DETRACTORS = st.session_state.get("DETRACTORS", [])
+ALIASES = st.session_state.get("ALIASES", {}) or {}
+
 if not DELIGHTERS and not DETRACTORS:
     st.warning("⚠️ No Symptoms found in 'Symptoms' tab. Prelearn can bootstrap themes.")
 else:
     st.success(f"Loaded {len(DELIGHTERS)} Delighters, {len(DETRACTORS)} Detractors from Symptoms tab.")
 
-# Canonical maps
 DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
 
 # ------------------- Detection & KPIs -------------------
@@ -1364,19 +1447,46 @@ st.markdown(f"""
 # ------------------- LLM & Similarity Settings -------------------
 st.sidebar.header("🤖 LLM Settings")
 
+# Stability controls
+st.sidebar.subheader("🛡️ Stability")
+request_timeout_s = st.sidebar.number_input("OpenAI request timeout (sec)", 10, 300, 60, 10)
+sdk_max_retries = st.sidebar.number_input("OpenAI SDK retries (per request)", 0, 10, 3, 1)
+app_json_retries = st.sidebar.number_input("App JSON retries (parse/format)", 0, 6, 2, 1)
+ui_log_limit = st.sidebar.slider(
+    "Show last N processed reviews in UI",
+    0, 200, 40, 10,
+    help="0 = fastest (no per-review expanders). Prevents UI from freezing on huge runs."
+)
+enable_undo = st.sidebar.checkbox("Enable undo snapshots (uses RAM)", value=True)
+
+st.session_state["ui_log_limit"] = int(ui_log_limit)
+st.session_state["enable_undo"] = bool(enable_undo)
+st.session_state["app_json_retries"] = int(app_json_retries)
+
 MODEL_CHOICES = {
     "Fast – GPT-4o-mini (default)": "gpt-4o-mini",
     "Balanced – GPT-4.1": "gpt-4.1",
     "Balanced – GPT-4o": "gpt-4o",
     "Advanced – GPT-5": "gpt-5",
 }
-# Default: mini
 model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=0)
 selected_model = MODEL_CHOICES[model_label]
 temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
 
+def _make_openai_client(api_key: str, timeout_s: float, max_retries: int):
+    if not (_HAS_OPENAI and api_key):
+        return None
+    try:
+        return OpenAI(api_key=api_key, timeout=float(timeout_s), max_retries=int(max_retries))
+    except TypeError:
+        # Fallback for older SDKs
+        try:
+            return OpenAI(api_key=api_key)
+        except Exception:
+            return None
+
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-client = OpenAI(api_key=api_key) if (_HAS_OPENAI and api_key) else None
+client = _make_openai_client(api_key, request_timeout_s, sdk_max_retries)
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
 
@@ -1408,13 +1518,13 @@ st.sidebar.subheader("🧠 Product Knowledge Prelearn (recommended)")
 prelearn_enabled = st.sidebar.checkbox(
     "Auto-run Product Knowledge Prelearn before symptomizing",
     value=True,
-    help="Runs a fast pre-pass to learn product glossary + canonical themes to reduce duplicates (Comfortable fit/use/design etc.)."
+    help="Runs a fast pre-pass to learn product glossary + canonical themes to reduce duplicates."
 )
 prelearn_model = st.sidebar.selectbox(
     "Prelearn model (cheap recommended)",
     ["gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5"],
     index=0,
-    help="This model is used only for the prelearn mining step."
+    help="Used only for the prelearn mining step."
 )
 embed_model = st.sidebar.selectbox(
     "Embedding model",
@@ -1429,12 +1539,11 @@ prelearn_merge_threshold = st.sidebar.slider("Prelearn theme merge threshold", 0
 use_learned_as_allowed = st.sidebar.checkbox(
     "Use learned themes as temporary allowed list (helps when Symptoms tab is incomplete)",
     value=True,
-    help="When ON, the labeler can tag using learned themes in addition to the Symptoms tab. Keeps output consistent."
+    help="When ON, the labeler can tag using learned themes in addition to the Symptoms tab."
 )
 
 # Cost panel
 st.sidebar.subheader("💰 Cost (this session)")
-# Allow optional runtime overrides in case OpenAI pricing changes
 if "_pricing_overrides" not in st.session_state:
     st.session_state["_pricing_overrides"] = {"models": {}, "embeddings": {}}
 
@@ -1483,7 +1592,6 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-# Optional budget guard
 budget_limit = st.sidebar.number_input(
     "Stop runs if session spend exceeds (USD)",
     min_value=0.0,
@@ -1501,8 +1609,7 @@ with prelearn_colA:
 with prelearn_colB:
     st.markdown(
         "<div class='tiny'>Prelearn builds a product glossary + canonical theme list so the system stops suggesting duplicates "
-        "like “Comfortable fit / comfortable use / comfortable design” and merges synonyms into one theme. "
-        "It also improves the 🟡 Inbox by routing near-duplicates as <b>Alias Suggestions</b> instead of new symptoms.</div>",
+        "like “Comfortable fit / comfortable use / comfortable design” and merges synonyms into one theme.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1514,7 +1621,7 @@ if run_prelearn_btn and client is not None:
         df_in=df,
         client=client,
         prelearn_model=prelearn_model,
-        temperature=0.0,  # deterministic
+        temperature=0.0,
         embed_model=embed_model,
         sample_n=int(prelearn_sample_n),
         batch_size=int(prelearn_batch_size),
@@ -1524,7 +1631,6 @@ if run_prelearn_btn and client is not None:
     )
     st.session_state["learned"] = learned
 
-# Show current learned summary (if exists)
 learned_store = _ensure_learned_store()
 if learned_store.get("labels", {}).get("Delighter") or learned_store.get("labels", {}).get("Detractor"):
     with st.expander("See learned product knowledge", expanded=False):
@@ -1568,16 +1674,32 @@ with st.expander("Preview in-scope rows", expanded=False):
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
     st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# ------------------- Controls -------------------
-processed_rows: List[Dict] = []
-processed_idx_set: Set[int] = set()
+# ------------------- Controls (SESSION-PERSISTED) -------------------
+st.session_state.setdefault("processed_rows", [])
+st.session_state.setdefault("processed_idx_set", set())
+st.session_state.setdefault("new_symptom_candidates", {})
+st.session_state.setdefault("alias_suggestion_candidates", {})
+st.session_state.setdefault("undo_stack", [])
+st.session_state.setdefault("last_run_processed_count", 0)
+st.session_state.setdefault("ev_cov_num", 0)
+st.session_state.setdefault("ev_cov_den", 0)
 
-# Global maps for inbox aggregation
-new_symptom_candidates: Dict[Tuple[str, str], List[int]] = {}      # (label, side) -> [row_idx...]
-alias_suggestion_candidates: Dict[Tuple[str, str, str], List[int]] = {}  # (target_label, alias, side) -> [row_idx...]
+processed_rows: List[Dict[str, Any]] = st.session_state["processed_rows"]
+processed_idx_set: Set[int] = st.session_state["processed_idx_set"]
 
-if "undo_stack" not in st.session_state:
-    st.session_state["undo_stack"] = []
+# Candidate stores (count + small sample of indices)
+#   new_symptom_candidates[(label, side)] = {"count": int, "refs": [idx...]}
+#   alias_suggestion_candidates[(tgt, alias, side)] = {"count": int, "refs": [idx...]}
+new_symptom_candidates: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state["new_symptom_candidates"]
+alias_suggestion_candidates: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state["alias_suggestion_candidates"]
+
+def _agg_candidate(d: Dict, key: Tuple, idx: int, max_refs: int = 50):
+    rec = d.setdefault(key, {"count": 0, "refs": []})
+    rec["count"] = int(rec.get("count", 0)) + 1
+    refs = rec.get("refs", [])
+    if isinstance(refs, list) and len(refs) < max_refs:
+        refs.append(int(idx))
+        rec["refs"] = refs
 
 # Row 1: actions
 r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
@@ -1587,7 +1709,6 @@ with r1c: overwrite_btn = st.button("🧹 Overwrite & Symptomize ALL (start at r
 with r1d: run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
 with r1e: undo_btn = st.button("↩️ Undo last run", use_container_width=True)
 
-# Small spacer
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
 # Row 2: batch size + presets
@@ -1632,11 +1753,8 @@ def _active_allowed_lists() -> Tuple[List[str], List[str]]:
     dets = list(DETRACTORS)
 
     if use_learned_as_allowed:
-        ls = _ensure_learned_store()
-        # top themes only (avoid runaway)
         learned_dels = _known_learned_labels("Delighter")[:60]
         learned_dets = _known_learned_labels("Detractor")[:60]
-        # union preserving order
         for x in learned_dels:
             if x not in dels:
                 dels.append(x)
@@ -1646,7 +1764,23 @@ def _active_allowed_lists() -> Tuple[List[str], List[str]]:
     return dels, dets
 
 def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
-    global df
+    global df, new_symptom_candidates, alias_suggestion_candidates
+
+    # Clear per-run artifacts (keeps app responsive)
+    st.session_state["processed_rows"] = []
+    st.session_state["processed_idx_set"] = set()
+    st.session_state["new_symptom_candidates"] = {}
+    st.session_state["alias_suggestion_candidates"] = {}
+    st.session_state["last_run_processed_count"] = 0
+    st.session_state["ev_cov_num"] = 0
+    st.session_state["ev_cov_den"] = 0
+    st.session_state.pop("export_bytes", None)
+
+    processed_rows_local: List[Dict[str, Any]] = st.session_state["processed_rows"]
+    processed_idx_set_local: Set[int] = st.session_state["processed_idx_set"]
+    new_symptom_candidates = st.session_state["new_symptom_candidates"]
+    alias_suggestion_candidates = st.session_state["alias_suggestion_candidates"]
+
     prog = st.progress(0.0)
     eta_box = st.empty()
     status_box = st.empty()
@@ -1672,40 +1806,54 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             )
             pre_box.empty(); pre_prog.empty()
 
-    # snapshot for undo
+    df = ensure_ai_columns(df)
+
     snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
+    do_undo = bool(st.session_state.get("enable_undo", True))
 
     if overwrite_mode:
-        df = ensure_ai_columns(df)
         idxs = rows_df.index.tolist()
         for idx_clear in idxs:
-            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
-            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
-            old_vals.update({"AI Safety": df.loc[idx_clear, "AI Safety"] if "AI Safety" in df.columns else None,
-                             "AI Reliability": df.loc[idx_clear, "AI Reliability"] if "AI Reliability" in df.columns else None,
-                             "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None})
-            snapshot.append((int(idx_clear), old_vals))
+            if do_undo:
+                old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] for j in range(1,11)}
+                old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] for j in range(1,11)})
+                old_vals.update({
+                    "AI Safety": df.loc[idx_clear, "AI Safety"],
+                    "AI Reliability": df.loc[idx_clear, "AI Reliability"],
+                    "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"]
+                })
+                snapshot.append((int(idx_clear), old_vals))
+
             for j in range(1, 11):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
+            df.loc[idx_clear, "AI Safety"] = None
+            df.loc[idx_clear, "AI Reliability"] = None
+            df.loc[idx_clear, "AI # of Sessions"] = None
 
     total_n = max(1, len(rows_df))
     t0 = time.perf_counter()
 
-    # for dynamic cost estimate
     cost_start = float(_ensure_usage_tracker()["cost_chat"] + _ensure_usage_tracker()["cost_embed"])
+
+    cov_num = 0
+    cov_den = 0
+
+    ui_keep = int(st.session_state.get("ui_log_limit", 40))
 
     for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
         vb = row.get("Verbatim", "")
         needs_deli = bool(row.get("Needs_Delighters", False))
         needs_detr = bool(row.get("Needs_Detractors", False))
 
-        if not overwrite_mode:
-            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] if f"AI Symptom Detractor {j}" in df.columns else None for j in range(1,11)}
-            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] if f"AI Symptom Delighter {j}" in df.columns else None for j in range(1,11)})
-            old_vals.update({"AI Safety": df.loc[idx, "AI Safety"] if "AI Safety" in df.columns else None,
-                             "AI Reliability": df.loc[idx, "AI Reliability"] if "AI Reliability" in df.columns else None,
-                             "AI # of Sessions": df.loc[idx, "AI # of Sessions"] if "AI # of Sessions" in df.columns else None})
+        if not overwrite_mode and do_undo:
+            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] for j in range(1,11)}
+            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] for j in range(1,11)})
+            old_vals.update({
+                "AI Safety": df.loc[idx, "AI Safety"],
+                "AI Reliability": df.loc[idx, "AI Reliability"],
+                "AI # of Sessions": df.loc[idx, "AI # of Sessions"]
+            })
             snapshot.append((int(idx), old_vals))
 
         status_box.markdown(f"🔄 **Row {int(idx)}** • labeling + extracting meta…")
@@ -1716,35 +1864,27 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             "Detractor": _known_learned_labels("Detractor")[:60],
         }
 
-        try:
-            out = _openai_labeler_unified(
-                verbatim=vb,
-                client=client,
-                model=selected_model,
-                temperature=temperature,
-                allowed_delighters=allowed_dels,
-                allowed_detractors=allowed_dets,
-                known_theme_hints=known_hints,
-                max_ev_per_label=max_ev_per_label,
-                max_ev_chars=max_ev_chars,
-            ) if client else {
-                "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
-                "ev_del_map": {}, "ev_det_map": {},
-                "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
-            }
-        except Exception:
-            out = {
-                "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
-                "ev_del_map": {}, "ev_det_map": {},
-                "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
-            }
+        out = _openai_labeler_unified(
+            verbatim=str(vb),
+            client=client,
+            model=selected_model,
+            temperature=temperature,
+            allowed_delighters=allowed_dels,
+            allowed_detractors=allowed_dets,
+            known_theme_hints=known_hints,
+            max_ev_per_label=max_ev_per_label,
+            max_ev_chars=max_ev_chars,
+        ) if client else {
+            "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
+            "ev_del_map": {}, "ev_det_map": {},
+            "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
+        }
 
         dels = out["dels"]; dets = out["dets"]
         unl_dels = out["unl_dels"]; unl_dets = out["unl_dets"]
         ev_del_map = out["ev_del_map"]; ev_det_map = out["ev_det_map"]
         safety, reliability, sessions = out["safety"], out["reliability"], out["sessions"]
 
-        df = ensure_ai_columns(df)
         wrote_dets, wrote_dels = [], []
         ev_written_det: Dict[str, List[str]] = {}
         ev_written_del: Dict[str, List[str]] = {}
@@ -1755,20 +1895,17 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
             return len(evs) > 0
 
-        # Write allowed labels only (from active list)
         if needs_detr and dets:
             dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
             for j, lab in enumerate(dets_to_write):
-                col = f"AI Symptom Detractor {j+1}"
-                df.loc[idx, col] = lab
+                df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
                 ev_written_det[lab] = ev_det_map.get(lab, [])
             wrote_dets = dets_to_write
 
         if needs_deli and dels:
             dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
             for j, lab in enumerate(dels_to_write):
-                col = f"AI Symptom Delighter {j+1}"
-                df.loc[idx, col] = lab
+                df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
                 ev_written_del[lab] = ev_del_map.get(lab, [])
             wrote_dels = dels_to_write
 
@@ -1776,11 +1913,10 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         df.loc[idx, "AI Reliability"] = reliability
         df.loc[idx, "AI # of Sessions"] = sessions
 
-        # Handle unlisted: canonicalize + route into New Symptoms vs Alias Suggestions
         learned = _ensure_learned_store()
         new_unl_dels: List[str] = []
         new_unl_dets: List[str] = []
-        alias_sugs_for_row: List[Tuple[str, str, str, float]] = []  # (target, alias, side, score)
+        alias_sugs_for_row: List[Tuple[str, str, str, float]] = []
 
         def _handle_unlisted_list(items: List[str], side_label: str):
             nonlocal new_unl_dels, new_unl_dets, alias_sugs_for_row
@@ -1805,18 +1941,13 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                 tgt = str(res.get("target", "") or "").strip()
                 score = float(res.get("score", 0.0) or 0.0)
 
-                # Update learned store to improve future merges
                 _update_learned(side_label, canon, synonym=raw2)
 
                 if kind in {"exact_existing", "alias_to_existing"} and tgt:
-                    # alias suggestion (only if alias isn't already present)
-                    if tgt in (DELIGHTERS + DETRACTORS):
-                        alias_sugs_for_row.append((tgt, raw2, side_label, score))
+                    alias_sugs_for_row.append((tgt, raw2, side_label, score))
                 elif kind == "synonym_to_learned":
-                    # don't create a new candidate
                     pass
                 else:
-                    # new canonical symptom candidate
                     if side_label.lower().startswith("del"):
                         new_unl_dels.append(canon)
                     else:
@@ -1825,55 +1956,62 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         _handle_unlisted_list(unl_dels, "Delighter")
         _handle_unlisted_list(unl_dets, "Detractor")
 
-        # Deduplicate per row (canon_simple)
         def _dedupe_keep_order(lst: List[str]) -> List[str]:
-            out, seen = [], set()
+            out2, seen = [], set()
             for x in lst:
-                k = _canon_simple(x)
-                if not x or k in seen:
+                k2 = _canon_simple(x)
+                if not x or k2 in seen:
                     continue
-                seen.add(k); out.append(x)
-            return out
+                seen.add(k2); out2.append(x)
+            return out2
 
         new_unl_dels = _dedupe_keep_order([normalize_theme_label(x, "Delighter") for x in new_unl_dels])
         new_unl_dets = _dedupe_keep_order([normalize_theme_label(x, "Detractor") for x in new_unl_dets])
 
-        # Aggregate for inbox (counts + examples)
+        # Aggregate for inbox with counts + small sample refs
         for lab in new_unl_dels:
-            new_symptom_candidates.setdefault((lab, "Delighter"), []).append(int(idx))
+            _agg_candidate(new_symptom_candidates, (lab, "Delighter"), int(idx))
         for lab in new_unl_dets:
-            new_symptom_candidates.setdefault((lab, "Detractor"), []).append(int(idx))
+            _agg_candidate(new_symptom_candidates, (lab, "Detractor"), int(idx))
         for tgt, alias, side_label, score in alias_sugs_for_row:
-            alias_suggestion_candidates.setdefault((tgt, alias, "Delighter" if side_label.lower().startswith("del") else "Detractor"), []).append(int(idx))
+            side_norm = "Delighter" if side_label.lower().startswith("del") else "Detractor"
+            _agg_candidate(alias_suggestion_candidates, (tgt, alias, side_norm), int(idx))
 
-        # Evidence coverage for this row
+        # Evidence coverage counters
         total_labels = len(wrote_dets) + len(wrote_dels)
         labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, []))>0) + \
                          sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, []))>0)
+        cov_num += labels_with_ev
+        cov_den += total_labels
+
         row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
 
-        processed_rows.append({
-            "Index": int(idx),
-            "Verbatim": str(vb),
-            "Added_Detractors": wrote_dets,
-            "Added_Delighters": wrote_dels,
-            "Evidence_Detractors": ev_written_det,
-            "Evidence_Delighters": ev_written_del,
-            "NewCand_Detractors": new_unl_dets,
-            "NewCand_Delighters": new_unl_dels,
-            "AliasSuggestions": alias_sugs_for_row,
-            ">10 Detractors Detected": len(dets) > 10,
-            ">10 Delighters Detected": len(dels) > 10,
-            "Safety": safety,
-            "Reliability": reliability,
-            "Sessions": sessions,
-            "Evidence_Coverage": row_ev_cov,
-        })
-        processed_idx_set.add(int(idx))
+        # Store UI log (bounded)
+        if ui_keep > 0:
+            processed_rows_local.append({
+                "Index": int(idx),
+                "Verbatim": str(vb)[:4000],
+                "Added_Detractors": wrote_dets,
+                "Added_Delighters": wrote_dels,
+                "Evidence_Detractors": ev_written_det,
+                "Evidence_Delighters": ev_written_del,
+                "NewCand_Detractors": new_unl_dets,
+                "NewCand_Delighters": new_unl_dels,
+                "AliasSuggestions": alias_sugs_for_row,
+                ">10 Detractors Detected": len(dets) > 10,
+                ">10 Delighters Detected": len(dels) > 10,
+                "Safety": safety,
+                "Reliability": reliability,
+                "Sessions": sessions,
+                "Evidence_Coverage": row_ev_cov,
+            })
+            if len(processed_rows_local) > ui_keep:
+                del processed_rows_local[:len(processed_rows_local) - ui_keep]
+
+        processed_idx_set_local.add(int(idx))
 
         prog.progress(k/total_n)
 
-        # ETA + cost update
         elapsed = time.perf_counter() - t0
         rate = (k / elapsed) if elapsed > 0 else 0.0
         rem = total_n - k
@@ -1889,7 +2027,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             f"**Spend:** {_fmt_money(spent)} • **Est total:** {_fmt_money(est_total)}"
         )
 
-        # Budget guard (session-level)
         try:
             budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
         except Exception:
@@ -1901,9 +2038,25 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             )
             break
 
+        if k % 25 == 0:
+            gc.collect()
 
     status_box.markdown("✅ Done.")
-    st.session_state["undo_stack"].append({"rows": snapshot})
+
+    if do_undo and snapshot:
+        st.session_state["undo_stack"].append({"rows": snapshot})
+
+    # Persist everything back into session_state
+    st.session_state["processed_rows"] = processed_rows_local
+    st.session_state["processed_idx_set"] = processed_idx_set_local
+    st.session_state["new_symptom_candidates"] = new_symptom_candidates
+    st.session_state["alias_suggestion_candidates"] = alias_suggestion_candidates
+    st.session_state["last_run_processed_count"] = len(processed_idx_set_local)
+    st.session_state["ev_cov_num"] = int(cov_num)
+    st.session_state["ev_cov_den"] = int(cov_den)
+
+    st.session_state["df_work"] = df
+    st.session_state.pop("export_bytes", None)
 
 # ------------------- Execute by buttons (updated overwrite-all logic) -------------------
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
@@ -1912,14 +2065,10 @@ if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_miss
         _run_symptomize(rows_iter, overwrite_mode=False)
 
     elif overwrite_btn:
-        # FULL RESET: clear every AI slot in the entire df, recompute, then process ALL rows from row 1
         df = clear_all_ai_slots_in_df(df)
-
-        # Recompute column map and needs after clearing
+        st.session_state["df_work"] = df
         colmap = detect_symptom_columns(df)
         work = detect_missing(df, colmap)
-
-        # Process ALL rows, top-to-bottom (index order)
         rows_iter = work.sort_index()
         _run_symptomize(rows_iter, overwrite_mode=False)
 
@@ -1930,29 +2079,34 @@ if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_miss
             rows_iter = target.sort_index().head(int(st.session_state.get("n_to_process", 10)))
         _run_symptomize(rows_iter, overwrite_mode=False)
 
-    st.success(f"Symptomized {len(processed_rows)} review(s).")
+    st.success(f"Symptomized {int(st.session_state.get('last_run_processed_count', 0))} review(s).")
 
 # Undo last run
 def _undo_last_run():
     global df
-    if not st.session_state["undo_stack"]:
-        st.info("Nothing to undo."); return
+    if not st.session_state.get("undo_stack"):
+        st.info("Nothing to undo.")
+        return
     snap = st.session_state["undo_stack"].pop()
     for idx, old_vals in snap.get("rows", []):
         for col, val in old_vals.items():
             if col not in df.columns:
                 df[col] = None
             df.loc[idx, col] = val
+    st.session_state["df_work"] = df
+    st.session_state.pop("export_bytes", None)
     st.success("Reverted last run.")
 
 if undo_btn:
     _undo_last_run()
 
 # ------------------- Processed Reviews (chips + highlighted evidence) -------------------
-if processed_rows:
-    st.subheader("🧾 Processed Reviews (this run)")
-    ev_cov_vals = [float(r.get("Evidence_Coverage", 0.0)) for r in processed_rows]
-    overall_cov = (sum(ev_cov_vals)/len(ev_cov_vals)) if ev_cov_vals else 0.0
+processed_rows = st.session_state.get("processed_rows", []) or []
+if processed_rows and int(st.session_state.get("ui_log_limit", 40)) > 0:
+    st.subheader("🧾 Processed Reviews (this run — UI-capped)")
+    cov_num = int(st.session_state.get("ev_cov_num", 0) or 0)
+    cov_den = int(st.session_state.get("ev_cov_den", 0) or 0)
+    overall_cov = (cov_num / cov_den) if cov_den else 0.0
     st.caption(f"**Evidence Coverage (this run):** {overall_cov*100:.1f}% of written labels include ≥1 snippet.")
 
     def _esc(s: str) -> str:
@@ -1997,7 +2151,6 @@ if processed_rows:
             del_html += "</div>"
             st.markdown(del_html, unsafe_allow_html=True)
 
-            # New candidates + alias suggestions
             if rec.get("NewCand_Delighters") or rec.get("NewCand_Detractors"):
                 st.markdown("**New symptom candidates (deduped & canonicalized)**")
                 chips = "<div class='chip-wrap'>"
@@ -2020,14 +2173,17 @@ if processed_rows:
                 if rec.get("Evidence_Detractors"):
                     st.markdown("**Detractor evidence**")
                     for lab, evs in rec["Evidence_Detractors"].items():
-                        for e in evs: st.write(f"- {e}")
+                        for e in evs:
+                            st.write(f"- {e}")
                 if rec.get("Evidence_Delighters"):
                     st.markdown("**Delighter evidence**")
                     for lab, evs in rec["Evidence_Delighters"].items():
-                        for e in evs: st.write(f"- {e}")
+                        for e in evs:
+                            st.write(f"- {e}")
+elif int(st.session_state.get("ui_log_limit", 40)) == 0:
+    st.info("UI log is disabled (Show last N processed reviews in UI = 0). This is the fastest mode for very large runs.")
 
 # ------------------- 🟡 Inbox: New Symptoms + Alias Suggestions -------------------
-# Strengthen: suppress items already in Symptoms or aliases (case-insensitive canon), plus near-dupes in both inboxes.
 whitelist_all = set(DELIGHTERS + DETRACTORS)
 alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
 wl_canon = {_canon_simple(x) for x in whitelist_all}
@@ -2037,75 +2193,83 @@ def _is_existing_label_or_alias(s: str) -> bool:
     k = _canon_simple(s)
     return (k in wl_canon) or (k in ali_canon)
 
-def _filter_new_symptom_candidates(cands: Dict[Tuple[str, str], List[int]]) -> Dict[Tuple[str, str], List[int]]:
-    out: Dict[Tuple[str, str], List[int]] = {}
-    for (lab, side), refs in cands.items():
+def _filter_new_symptom_candidates(
+    cands: Dict[Tuple[str, str], Dict[str, Any]]
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for (lab, side), rec in cands.items():
         lab2 = normalize_theme_label(lab, side)
         if not lab2:
             continue
         if _is_existing_label_or_alias(lab2):
-            # existing already; don't show as new symptom
             continue
-        out.setdefault((lab2, side), []).extend(refs)
-    # merge same canon_simple key (singular/plural etc)
-    merged: Dict[Tuple[str, str], List[int]] = {}
+        out[(lab2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
     seen: Dict[Tuple[str, str], str] = {}
-    for (lab, side), refs in out.items():
+    for (lab, side), rec in out.items():
         key = _canon_simple(lab)
         k2 = (key, side)
         if k2 in seen:
-            merged[(seen[k2], side)].extend(refs)
+            prev_lab = seen[k2]
+            mrec = merged.setdefault((prev_lab, side), {"count": 0, "refs": []})
+            mrec["count"] += int(rec.get("count", 0))
+            # merge sample refs
+            for ridx in rec.get("refs", [])[:50]:
+                if len(mrec["refs"]) < 50 and ridx not in mrec["refs"]:
+                    mrec["refs"].append(ridx)
         else:
-            merged[(lab, side)] = list(refs); seen[k2] = lab
-    # near-dupe suppression vs whitelist
-    final: Dict[Tuple[str, str], List[int]] = {}
-    for (lab, side), refs in merged.items():
+            merged[(lab, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+            seen[k2] = lab
+
+    final: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for (lab, side), rec in merged.items():
         try:
             m = difflib.get_close_matches(lab, list(whitelist_all), n=1, cutoff=float(sim_threshold_lex))
             if m:
-                # route to alias suggestions instead of new symptom (handled separately)
                 continue
         except Exception:
             pass
-        final[(lab, side)] = refs
+        final[(lab, side)] = rec
     return final
 
-def _filter_alias_candidates(cands: Dict[Tuple[str, str, str], List[int]]) -> Dict[Tuple[str, str, str], List[int]]:
-    out: Dict[Tuple[str, str, str], List[int]] = {}
-    for (tgt, alias, side), refs in cands.items():
+def _filter_alias_candidates(
+    cands: Dict[Tuple[str, str, str], Dict[str, Any]]
+) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for (tgt, alias, side), rec in cands.items():
         tgt2 = str(tgt).strip()
-        alias2 = normalize_theme_label(alias, side, singularize=True)  # normalize alias phrase too
+        alias2 = normalize_theme_label(alias, side, singularize=True)
         if not tgt2 or not alias2:
             continue
-        # suppress if alias equals label or already an alias
         if _canon_simple(alias2) == _canon_simple(tgt2):
             continue
         if _is_existing_label_or_alias(alias2):
-            # already exists as label or alias somewhere; don't add
             continue
-        out.setdefault((tgt2, alias2, side), []).extend(refs)
-    # merge identical canon alias per target
-    merged: Dict[Tuple[str, str, str], List[int]] = {}
+        out[(tgt2, alias2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+
+    merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     seen: Set[Tuple[str, str, str]] = set()
-    for k, refs in out.items():
-        tgt, alias, side = k
+    for (tgt, alias, side), rec in out.items():
         key = (tgt, _canon_simple(alias), side)
         if key in seen:
-            # find existing
             for kk in list(merged.keys()):
                 if kk[0] == tgt and _canon_simple(kk[1]) == _canon_simple(alias) and kk[2] == side:
-                    merged[kk].extend(refs)
+                    merged[kk]["count"] += int(rec.get("count", 0))
+                    for ridx in rec.get("refs", [])[:50]:
+                        if len(merged[kk]["refs"]) < 50 and ridx not in merged[kk]["refs"]:
+                            merged[kk]["refs"].append(ridx)
                     break
         else:
-            merged[k] = list(refs); seen.add(key)
+            merged[(tgt, alias, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+            seen.add(key)
     return merged
 
-new_symptom_candidates_f = _filter_new_symptom_candidates(new_symptom_candidates)
-alias_suggestion_candidates_f = _filter_alias_candidates(alias_suggestion_candidates)
+new_symptom_candidates_f = _filter_new_symptom_candidates(st.session_state.get("new_symptom_candidates", {}) or {})
+alias_suggestion_candidates_f = _filter_alias_candidates(st.session_state.get("alias_suggestion_candidates", {}) or {})
 
 if new_symptom_candidates_f or alias_suggestion_candidates_f:
     st.subheader("🟡 Inbox: New Symptoms + Alias Suggestions")
-
     tabs_inbox = st.tabs(["New Symptoms", "Alias Suggestions"])
 
     def _mk_examples(refs: List[int], n: int = 3) -> str:
@@ -2120,13 +2284,13 @@ if new_symptom_candidates_f or alias_suggestion_candidates_f:
     with tabs_inbox[0]:
         st.markdown("**New symptom candidates** (deduped, canonical, excludes existing Symptoms + existing Aliases)")
         rows_tbl = []
-        for (lab, side), refs in sorted(new_symptom_candidates_f.items(), key=lambda kv: (-len(kv[1]), kv[0][0])):
+        for (lab, side), rec in sorted(new_symptom_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0])):
             rows_tbl.append({
                 "Add": False,
                 "Label": lab,
                 "Side": side,
-                "Count": int(len(refs)),
-                "Examples": _mk_examples(refs),
+                "Count": int(rec.get("count", 0)),
+                "Examples": _mk_examples(list(rec.get("refs", []))),
             })
         tbl_new = pd.DataFrame(rows_tbl) if rows_tbl else pd.DataFrame(columns=["Add","Label","Side","Count","Examples"])
         editor_new = st.data_editor(
@@ -2146,14 +2310,14 @@ if new_symptom_candidates_f or alias_suggestion_candidates_f:
     with tabs_inbox[1]:
         st.markdown("**Alias suggestions** (routes near-duplicate phrasing to an existing symptom label)")
         rows_tbl2 = []
-        for (tgt, alias, side), refs in sorted(alias_suggestion_candidates_f.items(), key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1])):
+        for (tgt, alias, side), rec in sorted(alias_suggestion_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0], kv[0][1])):
             rows_tbl2.append({
                 "Add": False,
                 "Target Symptom": tgt,
                 "Alias": alias,
                 "Side": side,
-                "Count": int(len(refs)),
-                "Examples": _mk_examples(refs),
+                "Count": int(rec.get("count", 0)),
+                "Examples": _mk_examples(list(rec.get("refs", []))),
             })
         tbl_alias = pd.DataFrame(rows_tbl2) if rows_tbl2 else pd.DataFrame(columns=["Add","Target Symptom","Alias","Side","Count","Examples"])
         editor_alias = st.data_editor(
@@ -2178,7 +2342,7 @@ if new_symptom_candidates_f or alias_suggestion_candidates_f:
     if apply_btn:
         new_to_add: List[Tuple[str, str]] = []
         alias_to_add: List[Tuple[str, str]] = []
-        # new
+
         try:
             if isinstance(editor_new, pd.DataFrame) and not editor_new.empty:
                 for _, r_ in editor_new.iterrows():
@@ -2189,7 +2353,7 @@ if new_symptom_candidates_f or alias_suggestion_candidates_f:
                             new_to_add.append((lab, side))
         except Exception:
             pass
-        # alias
+
         try:
             if isinstance(editor_alias, pd.DataFrame) and not editor_alias.empty:
                 for _, r_ in editor_alias.iterrows():
@@ -2203,7 +2367,7 @@ if new_symptom_candidates_f or alias_suggestion_candidates_f:
 
         if new_to_add or alias_to_add:
             updated_bytes = apply_symptoms_updates_to_workbook(
-                uploaded_file,
+                st.session_state["uploaded_bytes"],
                 new_symptoms=new_to_add,
                 alias_additions=alias_to_add,
             )
@@ -2217,25 +2381,31 @@ if new_symptom_candidates_f or alias_suggestion_candidates_f:
         else:
             st.info("No updates selected.")
 
-# ------------------- Download Symptomized Workbook -------------------
+# ------------------- Download Symptomized Workbook (LAZY BUILD) -------------------
 st.subheader("📦 Download Symptomized Workbook")
 try:
     file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
 except Exception:
     file_base = 'Reviews'
 
-export_bytes = generate_template_workbook_bytes(
-    uploaded_file,
-    df,
-    processed_idx=processed_idx_set if processed_idx_set else None,
-    overwrite_processed_slots=False,
-)
+prep = st.button("🧾 Prepare XLSX export (build file now)", use_container_width=True)
+if prep:
+    with st.spinner("Building XLSX export..."):
+        st.session_state["export_bytes"] = generate_template_workbook_bytes(
+            st.session_state["uploaded_bytes"],
+            df,
+            processed_idx=st.session_state.get("processed_idx_set", set()) or None,
+            overwrite_processed_slots=False,
+        )
+    st.success("Export prepared — click download below.")
 
+export_bytes = st.session_state.get("export_bytes", None)
 st.download_button(
     "⬇️ Download symptomized workbook (XLSX)",
-    data=export_bytes,
+    data=(export_bytes or b""),
     file_name=f"{file_base}_Symptomized.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    disabled=(export_bytes is None),
 )
 
 # ------------------- Symptoms Catalog quick export -------------------
@@ -2342,9 +2512,10 @@ with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
 # Footer
 st.divider()
 st.caption(
-    "v7.5 — Evidence-locked labeling + Product Knowledge Prelearn + canonical merging + 🟡 Inbox: New Symptoms + Alias Suggestions. "
-    "Exports: K–T/U–AD, meta: AE/AF/AG."
+    "v7.6 (Stable) — Evidence-locked labeling + Product Knowledge Prelearn + canonical merging + 🟡 Inbox: New Symptoms + Alias Suggestions. "
+    "Exports: K–T/U–AD, meta: AE/AF/AG. Stability: session persistence + vectorized detection + retries + lazy export."
 )
+
 
 
 
