@@ -1,13 +1,11 @@
-# starwalk_ui_v7_6_knowledge_plus_stable.py — v7.5 + Stability/Performance Hardening
-# Evidence-Locked Labeling + Product Knowledge Prelearn + Canonical Theme Merge
-# Adds (stability):
-#   - Persist df + run artifacts in st.session_state (no progress loss on reruns)
-#   - Vectorized detect_missing (big speedup on large sheets)
-#   - OpenAI timeout + retries + JSON salvage
-#   - UI log cap (prevents browser/Streamlit from freezing on huge runs)
-#   - Lazy XLSX export (only build file when user clicks “Prepare export”)
-#   - Optional undo snapshots toggle (RAM guard)
-#   - Periodic gc to reduce long-run memory creep
+# starwalk_ui_v7_7_knowledge_plus_stable_fast.py — v7.7
+# v7.6 (Stable) + FAST batching + Subset Filters + Optional Throttle
+#
+# Key upgrades:
+#   - ✅ Batch symptomization: multiple reviews per OpenAI request (big speedup, fewer 429s)
+#   - ✅ Subset selection filters: Source / Model (SKU) / Seeded / Country / New Review / Review Date / Star Rating
+#   - ✅ Optional RPM/TPM throttle (coarse) to reduce rate limit hits
+#   - ✅ Keeps evidence-locked labeling, canonical merging, inbox, lazy export, session persistence, retries, etc.
 #
 # Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
 # Optional: numpy, scikit-learn (for better clustering), tiktoken (for better token counts)
@@ -55,13 +53,13 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.6 (Stable)")
-st.title("✨ Review Symptomizer — v7.6 (Stable)")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.7 (Fast+Stable)")
+st.title("✨ Review Symptomizer — v7.7 (Fast+Stable)")
 st.caption(
     "Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo (optional) • "
     "Product Knowledge Prelearn (recommended) • Strong canonical merging • "
     "Similarity/semantic guard • Evidence-locked labeling • In-session cache • "
-    "🟡 Inbox: New Symptoms + Alias Suggestions • ✅ Stability hardening"
+    "🟡 Inbox: New Symptoms + Alias Suggestions • ✅ Stability hardening • ⚡ Batch speedups • 🔎 Filters"
 )
 
 # ------------------- Global CSS -------------------
@@ -138,9 +136,126 @@ def _fmt_secs(sec: float) -> str:
     s = int(round(sec - m * 60))
     return f"{m}:{s:02d}"
 
+# ------------------- Column helpers + filter normalization -------------------
+def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Best-effort resolver for column names (case-insensitive + partial match)."""
+    if df is None or df.empty:
+        return None
+    low = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        key = str(cand).strip().lower()
+        if key in low:
+            return low[key]
+    for cand in candidates:
+        key = str(cand).strip().lower()
+        for lc, orig in low.items():
+            if key and (key == lc or key in lc):
+                return orig
+    return None
+
+_BOOL_TRUE = {"true","t","yes","y","1","seeded"}
+_BOOL_FALSE = {"false","f","no","n","0","non-seeded","nonseeded","not seeded","unseeded"}
+
+def _boolish(x: Any) -> Optional[bool]:
+    if pd.isna(x):
+        return None
+    s = str(x).strip().lower()
+    if s in _BOOL_TRUE:
+        return True
+    if s in _BOOL_FALSE:
+        return False
+    return None
+
+def _coerce_datetime_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
+    if col and col in df_in.columns:
+        try:
+            if not pd.api.types.is_datetime64_any_dtype(df_in[col]):
+                df_in[col] = pd.to_datetime(df_in[col], errors="coerce")
+        except Exception:
+            pass
+
+def _coerce_numeric_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
+    if col and col in df_in.columns:
+        try:
+            if not pd.api.types.is_numeric_dtype(df_in[col]):
+                df_in[col] = pd.to_numeric(df_in[col], errors="coerce")
+        except Exception:
+            pass
+
+def _unique_sorted_str(series: pd.Series, limit: int = 5000) -> List[str]:
+    if series is None:
+        return []
+    try:
+        vals = series.dropna().astype(str).map(str.strip)
+        vals = vals[vals != ""]
+        uniq = list(pd.unique(vals))
+        if len(uniq) > limit:
+            uniq = uniq[:limit]
+        uniq.sort()
+        return uniq
+    except Exception:
+        return []
+
+# ------------------- Simple throttle (RPM + estimated TPM) -------------------
+def _throttle(kind: str, est_in_tokens: int) -> None:
+    """
+    Coarse throttling to reduce rate-limit hits.
+    Uses session_state:
+      - throttle_rpm (0 disables)
+      - throttle_tpm (0 disables)
+    """
+    rpm = int(st.session_state.get("throttle_rpm", 0) or 0)
+    tpm = int(st.session_state.get("throttle_tpm", 0) or 0)
+    if rpm <= 0 and tpm <= 0:
+        return
+
+    now = float(time.time())
+    key = f"_throttle_{kind}"
+    bucket = st.session_state.get(key) or {"events": []}
+    events = bucket.get("events") or []
+
+    pruned = []
+    for e in events:
+        try:
+            ts, tok = float(e[0]), int(e[1])
+        except Exception:
+            continue
+        if (now - ts) < 60.0:
+            pruned.append((ts, tok))
+    pruned.sort(key=lambda x: x[0])
+
+    if rpm > 0 and len(pruned) >= rpm:
+        sleep_sec = 60.0 - (now - pruned[0][0]) + 0.05
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+            now = float(time.time())
+            pruned = [(ts, tok) for ts, tok in pruned if (now - ts) < 60.0]
+
+    if tpm > 0:
+        tok_sum = sum(tok for _, tok in pruned)
+        need = int(est_in_tokens)
+        if tok_sum + need > tpm and pruned:
+            running = tok_sum
+            sleep_until_ts: Optional[float] = None
+            for ts, tok in pruned:
+                running -= tok
+                if running + need <= tpm:
+                    sleep_until_ts = ts
+                    break
+            if sleep_until_ts is None:
+                sleep_until_ts = pruned[0][0]
+            sleep_sec = 60.0 - (now - float(sleep_until_ts)) + 0.05
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+                now = float(time.time())
+                pruned = [(ts, tok) for ts, tok in pruned if (now - ts) < 60.0]
+
+    pruned.append((now, int(est_in_tokens)))
+    bucket["events"] = pruned
+    st.session_state[key] = bucket
+
 # ------------------- Pricing & Cost Tracking -------------------
-# Prices per 1M tokens (text). Source-of-truth should be OpenAI model pages; update as needed.
-# Defaults (as of Jan 2026) pulled from OpenAI model pages.
+# Prices per 1M tokens (text). Update as needed.
 MODEL_PRICING_PER_1M = {
     "gpt-4o-mini": {"in": 0.15, "out": 0.60},
     "gpt-4o": {"in": 2.50, "out": 10.00},
@@ -152,7 +267,6 @@ EMBEDDING_PRICING_PER_1M = {
 }
 
 def _price_for_model(model_id: str) -> Tuple[float, float]:
-    # Allow runtime overrides (pricing can change over time)
     try:
         ov = st.session_state.get("_pricing_overrides", {}).get("models", {})
         if model_id in ov:
@@ -189,7 +303,7 @@ def _ensure_usage_tracker():
             "embed_in": 0,
             "cost_chat": 0.0,
             "cost_embed": 0.0,
-            "by_component": {},  # component -> dict tokens/cost
+            "by_component": {},
         }
     return st.session_state["_usage"]
 
@@ -352,7 +466,7 @@ def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
         "ai_delighters": ai_del,
     }
 
-# Vectorized missing detection (replaces apply(axis=1) loops)
+# Vectorized missing detection
 def _filled_mask(df_in: pd.DataFrame, cols: List[str]) -> pd.Series:
     """Vectorized 'is_filled' across multiple columns."""
     if not cols:
@@ -385,7 +499,6 @@ DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
 DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
 DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
 
-# Optional meta columns after AD (headers only if blank)
 META_ORDER = [("Safety", "AE"),("Reliability", "AF"),("# of Sessions", "AG")]
 META_INDEXES = {name: column_index_from_string(col) for name, col in META_ORDER}
 
@@ -400,10 +513,6 @@ def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
     return df_in
 
 def clear_all_ai_slots_in_df(df_in: pd.DataFrame) -> pd.DataFrame:
-    """
-    Hard-reset ALL AI symptom and meta columns across the entire dataframe.
-    Returns a new dataframe with cleared columns.
-    """
     df2 = ensure_ai_columns(df_in.copy())
     for j in range(1, 11):
         df2[f"AI Symptom Detractor {j}"] = None
@@ -441,7 +550,6 @@ def _ensure_label_cache():
 
 # ------------------- Theme normalization (Stronger + plural/synonym handling) -------------------
 THEME_RULES = [
-    # detractors (hair/heat/noise/battery from v7.3)
     (re.compile(r"\b(pulls?|pulled|pulling).{0,12}\bhair\b|\bhair\s+(?:loss|fall(?:ing)?|coming\s+out|pulled)\b", re.I),
      {"det": "Hair Loss/Pull"}),
     (re.compile(r"\b(snags?|tangles?|catches?)\s+(?:hair|strands?)\b", re.I),
@@ -453,7 +561,6 @@ THEME_RULES = [
     (re.compile(r"\b(battery|charge|runtime)\b.+\b(poor|short|bad|low)\b|\b(poor|short|bad|low)\b.+\b(battery|charge|runtime)\b", re.I),
      {"det": "Battery Life: Short"}),
 
-    # NEW detractor normalizers
     (re.compile(r"\b(cooling\s+pad)\b.*\b(issue|issues|problem|problems|fail|failed|broken)\b|\b(issue|issues|problem|problems)\b.*\b(cooling\s+pad)\b", re.I),
      {"det": "Cooling Pad Issue"}),
     (re.compile(r"\b(learning\s+curve|hard\s+to\s+learn|takes\s+time\s+to\s+learn|not\s+intuitive)\b", re.I),
@@ -461,7 +568,6 @@ THEME_RULES = [
     (re.compile(r"\b(initially|at\s+first)\b.*\b(complicated|confusing|hard)\b|\b(complicated|confusing|hard)\b.*\b(at\s+first|initially)\b", re.I),
      {"det": "Learning Curve"}),
 
-    # delighters
     (re.compile(r"\b(absolutely|totally|really)?\s*love(s|d)?\b|\bworks\s+(amazing|great|fantastic|perfect)\b|\boverall\b.+\b(great|good|positive|happy)\b", re.I),
      {"del": "Overall Satisfaction"}),
     (re.compile(r"\b(easy|quick|simple)\s+to\s+(use|clean|attach|remove)\b|\buser[-\s]?friendly\b|\bintuitive\b", re.I),
@@ -473,7 +579,6 @@ THEME_RULES = [
     (re.compile(r"\b(attachments?|accessories?)\b.+\b(handy|useful|versatile|helpful)\b", re.I),
      {"del": "Attachment Usability"}),
 
-    # NEW delighter normalizers
     (re.compile(r"\b(comfortable|comfort|comfy)\b", re.I),
      {"del": "Comfort"}),
 ]
@@ -519,12 +624,10 @@ def _singularize_last_word(label: str) -> str:
     return s
 
 def normalize_theme_label(raw: str, side_hint: str = "", singularize: bool = True) -> str:
-    """Deterministically normalize candidate labels to reduce duplicates."""
     txt = str(raw or "").strip()
     if not txt:
         return ""
 
-    # 1) Apply rules first (fast)
     for rx, mapping in THEME_RULES:
         if rx.search(txt):
             if side_hint.lower().startswith("del") and mapping.get("del"):
@@ -536,7 +639,6 @@ def normalize_theme_label(raw: str, side_hint: str = "", singularize: bool = Tru
             out = mapping.get("del") or mapping.get("det") or _short_title(txt[:32])
             return _singularize_last_word(out) if singularize else out
 
-    # 2) Canonical synonyms (regex)
     low = txt.lower()
     for canon, side, pats in CANONICAL_SYNONYMS:
         if side_hint.lower().startswith("del") and side != "del":
@@ -547,23 +649,20 @@ def normalize_theme_label(raw: str, side_hint: str = "", singularize: bool = Tru
             if re.search(p, low, flags=re.I):
                 return _singularize_last_word(canon) if singularize else canon
 
-    # 3) Heuristic cleanup
     out = _short_title(txt[:60])
     if singularize:
         out = _singularize_last_word(out)
 
-    # 4) Last-mile: unify trailing "Issue(s)" forms
     if out.endswith(" Issues"):
         out = out[:-7] + " Issue"
     return out.strip()
 
 # ------------------- Learned Themes / Candidate Resolution -------------------
 def _ensure_learned_store() -> Dict[str, Any]:
-    """Session store for learned themes & embeddings, used to merge new symptom phrases as we go."""
     if "learned" not in st.session_state:
         st.session_state["learned"] = {
-            "labels": {"Delighter": {}, "Detractor": {}},  # canonical -> {"synonyms": set(), "count": int}
-            "emb": {"Delighter": {}, "Detractor": {}},     # canonical -> embedding vector
+            "labels": {"Delighter": {}, "Detractor": {}},
+            "emb": {"Delighter": {}, "Detractor": {}},
             "keywords": {"Delighter": {}, "Detractor": {}},
             "product_profile": "",
             "glossary_terms": [],
@@ -593,7 +692,6 @@ def _ensure_embed_cache():
     return st.session_state["_embed_cache"]
 
 def _embed_text(text: str, client, model_id: str, component: str) -> Optional[List[float]]:
-    """Embedding with in-session cache."""
     if client is None:
         return None
     t = str(text or "").strip()
@@ -604,6 +702,7 @@ def _embed_text(text: str, client, model_id: str, component: str) -> Optional[Li
     if key in cache:
         return cache[key]
     try:
+        _throttle("embed", _estimate_tokens(t, model_id="gpt-4o-mini"))
         resp = client.embeddings.create(model=model_id, input=[t])
         pt, _ = _extract_usage(resp)
         if pt:
@@ -636,7 +735,6 @@ def _best_semantic_match(
     embed_model: str,
     component: str,
 ) -> Tuple[Optional[str], float]:
-    """Return (best_label, similarity) using embeddings."""
     cand_vec = _embed_text(candidate, client, embed_model, component=component)
     if not cand_vec:
         return (None, 0.0)
@@ -666,16 +764,6 @@ def resolve_candidate_to_canonical(
     client,
     embed_model: str,
 ) -> Dict[str, Any]:
-    """
-    Canonicalize a candidate phrase.
-    Returns dict:
-      {
-        "canonical": <label>,
-        "kind": "new" | "alias_to_existing" | "synonym_to_learned" | "exact_existing",
-        "target": <existing label if alias>,
-        "score": float (semantic score if used else 0),
-      }
-    """
     side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
     allowed = delighters if side_norm == "Delighter" else detractors
 
@@ -775,7 +863,6 @@ def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
 
 # ---------- JSON salvage + retry wrappers (stability) ----------
 def _safe_json_load(s: str) -> Dict[str, Any]:
-    """Parse JSON, with a salvage attempt if there's extra text."""
     s = (s or "").strip()
     if not s:
         return {}
@@ -801,7 +888,6 @@ def _chat_json_with_retries(
     component: str,
     response_format: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Call chat.completions.create and return parsed JSON dict; retries JSON issues/transient failures."""
     if client is None:
         return {}
 
@@ -817,6 +903,14 @@ def _chat_json_with_retries(
             )
             if response_format:
                 kwargs["response_format"] = response_format
+
+            # Throttle (coarse) to reduce rate-limit hits
+            est = 0
+            try:
+                est = sum(_estimate_tokens(m.get("content", ""), model_id=model) for m in (messages or []))
+            except Exception:
+                est = 0
+            _throttle("chat", est)
 
             resp = client.chat.completions.create(**kwargs)
             pt, ct = _extract_usage(resp)
@@ -835,7 +929,6 @@ def _chat_json_with_retries(
         if a < attempts:
             time.sleep(min((2 ** (a - 1)) + random.random(), 20))
 
-    # Optionally: surface error details for debugging (kept quiet by default)
     _ = last_err
     return {}
 
@@ -847,10 +940,6 @@ def _prelearn_llm_batch_mine(
     known_themes: Dict[str, List[str]],
     max_themes: int = 30,
 ) -> Dict[str, Any]:
-    """
-    Mine themes from a batch of reviews.
-    Returns dict {detractors:[{label,keywords}], delighters:[...], product_profile:"..."}
-    """
     if client is None:
         return {"detractors": [], "delighters": [], "product_profile": ""}
 
@@ -912,9 +1001,6 @@ def _consolidate_themes_semantic(
     embed_model: str,
     sem_merge_threshold: float = 0.92,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    Merge very similar theme labels into one canonical label using embeddings + lexical heuristic.
-    """
     if not themes.get(side):
         return themes
 
@@ -977,9 +1063,6 @@ def run_prelearn(
     status_box,
     prog_bar,
 ) -> Dict[str, Any]:
-    """
-    Full prelearn pipeline with real-time status + ETA.
-    """
     t0 = time.perf_counter()
     learned = _ensure_learned_store()
 
@@ -1078,7 +1161,7 @@ def run_prelearn(
     status_box.markdown(f"✅ **Prelearn complete** in {_fmt_secs(dt)} • Learned {len(learned['labels']['Delighter'])} delighter themes, {len(learned['labels']['Detractor'])} detractor themes.")
     return learned
 
-# ------------------- Unified Labeler (labels + meta in one call) -------------------
+# ------------------- Unified Labeler (single) -------------------
 def _openai_labeler_unified(
     verbatim: str,
     client,
@@ -1090,10 +1173,6 @@ def _openai_labeler_unified(
     max_ev_per_label: int = 2,
     max_ev_chars: int = 120,
 ) -> Dict[str, Any]:
-    """
-    Evidence-locked + meta. Returns dict with:
-      dels, dets, unl_dels, unl_dets, ev_del_map, ev_det_map, safety, reliability, sessions
-    """
     if (client is None) or (not verbatim or not verbatim.strip()):
         return {
             "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
@@ -1203,6 +1282,219 @@ def _openai_labeler_unified(
     cache[key] = out
     return out
 
+# ------------------- Unified Labeler (BATCH: fast) -------------------
+_LABELER_DEFAULT = {
+    "dels": [], "dets": [],
+    "unl_dels": [], "unl_dets": [],
+    "ev_del_map": {}, "ev_det_map": {},
+    "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
+}
+
+def _label_cache_key(
+    verbatim: str,
+    model: str,
+    temperature: float,
+    allowed_delighters: List[str],
+    allowed_detractors: List[str],
+    known_theme_hints: Dict[str, List[str]],
+    max_ev_per_label: int,
+    max_ev_chars: int,
+) -> Tuple[Any, ...]:
+    return (
+        "lab2",
+        _canon(verbatim),
+        model,
+        f"{float(temperature):.2f}",
+        _symptom_list_version(allowed_delighters, allowed_detractors, {}),
+        int(max_ev_per_label),
+        int(max_ev_chars),
+        json.dumps(known_theme_hints, sort_keys=True)[:2000],
+    )
+
+def _normalize_unified_output(
+    data: Any,
+    allowed_delighters: List[str],
+    allowed_detractors: List[str],
+    max_ev_per_label: int,
+    max_ev_chars: int,
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        data = {}
+
+    raw_dels = data.get("delighters", []) or []
+    raw_dets = data.get("detractors", []) or []
+    unl_dels = [x for x in (data.get("unlisted_delighters", []) or []) if isinstance(x, str) and x.strip()][:10]
+    unl_dets = [x for x in (data.get("unlisted_detractors", []) or []) if isinstance(x, str) and x.strip()][:10]
+
+    s = str(data.get("safety", "Not Mentioned")).strip()
+    r = str(data.get("reliability", "Not Mentioned")).strip()
+    n = str(data.get("sessions", "Unknown")).strip()
+    s = s if s in SAFETY_ENUM else "Not Mentioned"
+    r = r if r in RELIABILITY_ENUM else "Not Mentioned"
+    n = n if n in SESSIONS_ENUM else "Unknown"
+
+    def _extract_allowed(objs: Iterable[Any], allowed: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+        out_labels: List[str] = []
+        ev_map: Dict[str, List[str]] = {}
+        allowed_set = set(allowed)
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            lbl = str(obj.get("label", "")).strip()
+            evs_raw = obj.get("evidence", []) or []
+            evs = []
+            for e in evs_raw:
+                if isinstance(e, str) and e.strip():
+                    evs.append(str(e)[:max_ev_chars])
+            if lbl in allowed_set and lbl not in out_labels:
+                out_labels.append(lbl)
+                ev_map[lbl] = evs[:max_ev_per_label]
+            if len(out_labels) >= 10:
+                break
+        return out_labels, ev_map
+
+    dels, ev_del_map = _extract_allowed(raw_dels, allowed_delighters)
+    dets, ev_det_map = _extract_allowed(raw_dets, allowed_detractors)
+
+    return {
+        "dels": dels,
+        "dets": dets,
+        "unl_dels": unl_dels,
+        "unl_dets": unl_dets,
+        "ev_del_map": ev_del_map,
+        "ev_det_map": ev_det_map,
+        "safety": s,
+        "reliability": r,
+        "sessions": n,
+    }
+
+def _openai_labeler_unified_batch(
+    items: List[Dict[str, Any]],
+    client,
+    model: str,
+    temperature: float,
+    allowed_delighters: List[str],
+    allowed_detractors: List[str],
+    known_theme_hints: Dict[str, List[str]],
+    max_ev_per_label: int = 2,
+    max_ev_chars: int = 120,
+    product_profile: str = "",
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Batch label N reviews in ONE request.
+    items: [{"idx": int, "review": str, "needs_del": bool, "needs_det": bool}, ...]
+    Returns: idx -> normalized output dict.
+    """
+    out_by_idx: Dict[int, Dict[str, Any]] = {}
+    if client is None or not items:
+        return out_by_idx
+
+    cache = _ensure_label_cache()
+    to_send: List[Tuple[int, str, bool, bool, Tuple[Any, ...]]] = []
+
+    for it in items:
+        idx = int(it.get("idx"))
+        review = str(it.get("review") or "")
+        needs_del = bool(it.get("needs_del", True))
+        needs_det = bool(it.get("needs_det", True))
+
+        if not review.strip():
+            out_by_idx[idx] = dict(_LABELER_DEFAULT)
+            continue
+
+        key = _label_cache_key(
+            review, model, float(temperature),
+            allowed_delighters, allowed_detractors,
+            known_theme_hints, int(max_ev_per_label), int(max_ev_chars)
+        )
+        if key in cache:
+            out_by_idx[idx] = cache[key]
+        else:
+            to_send.append((idx, review, needs_del, needs_det, key))
+
+    if not to_send:
+        return out_by_idx
+
+    sys_lines = [
+        "You label consumer reviews with predefined symptom lists and extract 3 meta fields.",
+        "You will receive MULTIPLE reviews at once; treat each independently.",
+        "Return STRICT JSON with schema:",
+        '{"items":['
+        '{"id":"<id>",'
+        '"detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring>", "..."]}],'
+        ' "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}],'
+        ' "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."],'
+        ' "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"}'
+        ']}',
+        "",
+        "Rules:",
+        f"- Evidence MUST be exact substrings from THAT review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
+        "- Only include a label if there is clear textual support in the review.",
+        "- Use ONLY allowed lists for 'detractors' and 'delighters'.",
+        "- For unlisted_* items, return a SHORT THEME (1–3 words), Title Case, no punctuation except slashes.",
+        "- Avoid duplicates and near-duplicates (plural vs singular, synonyms). Prefer reusing known themes if provided.",
+        "- Cap to maximum 10 detractors and 10 delighters. Cap to 10 unlisted per side.",
+        "- Always return ALL keys for every item (use empty lists / Not Mentioned if none).",
+        "",
+        "Meta enums:",
+        "SAFETY one of: ['Not Mentioned','Concern','Positive']",
+        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
+        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
+    ]
+    if product_profile and str(product_profile).strip():
+        sys_lines.insert(2, f"Product context (brief): {str(product_profile).strip()[:600]}")
+
+    payload = {
+        "items": [
+            {
+                "id": str(idx),
+                "review": review,
+                "needs_delighters": bool(needs_del),
+                "needs_detractors": bool(needs_det),
+            }
+            for (idx, review, needs_del, needs_det, _) in to_send
+        ],
+        "allowed_delighters": allowed_delighters,
+        "allowed_detractors": allowed_detractors,
+        "known_unlisted_detractor_themes": (known_theme_hints.get("Detractor") or [])[:60],
+        "known_unlisted_delighter_themes": (known_theme_hints.get("Delighter") or [])[:60],
+    }
+
+    data = _chat_json_with_retries(
+        client,
+        model=model,
+        temperature=float(temperature),
+        messages=[
+            {"role": "system", "content": "\n".join(sys_lines)},
+            {"role": "user", "content": json.dumps(payload)}
+        ],
+        component="symptomize-label-batch",
+        response_format={"type": "json_object"},
+    )
+
+    items_out = []
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        items_out = data["items"]
+    elif isinstance(data, list):
+        items_out = data
+    else:
+        items_out = []
+
+    by_id: Dict[str, Any] = {}
+    for obj in items_out:
+        if isinstance(obj, dict) and "id" in obj:
+            by_id[str(obj.get("id"))] = obj
+
+    for (idx, review, needs_del, needs_det, key) in to_send:
+        obj = by_id.get(str(idx), {}) or {}
+        norm = _normalize_unified_output(
+            obj, allowed_delighters, allowed_detractors, int(max_ev_per_label), int(max_ev_chars)
+        )
+        out_by_idx[idx] = norm
+        cache[key] = norm
+
+    return out_by_idx
+
 # ------------------- Export helpers (LAZY export: take bytes) -------------------
 def generate_template_workbook_bytes(
     original_bytes: bytes,
@@ -1210,7 +1502,6 @@ def generate_template_workbook_bytes(
     processed_idx: Optional[Set[int]] = None,
     overwrite_processed_slots: bool = False,
 ) -> bytes:
-    """Return workbook bytes with K–T (dets), U–AD (dels), and AE/AF/AG meta (headers preserved)."""
     wb = load_workbook(io.BytesIO(original_bytes))
     sheet_name = "Star Walk scrubbed verbatims"
     if sheet_name not in wb.sheetnames:
@@ -1274,11 +1565,6 @@ def apply_symptoms_updates_to_workbook(
     new_symptoms: List[Tuple[str, str]],
     alias_additions: List[Tuple[str, str]],
 ) -> bytes:
-    """
-    Update the 'Symptoms' sheet:
-      - append new symptom rows (label, type)
-      - append alias strings to existing label rows
-    """
     wb = load_workbook(io.BytesIO(original_bytes))
 
     if "Symptoms" not in wb.sheetnames:
@@ -1386,12 +1672,17 @@ if st.session_state.get("_file_sig") != file_sig:
     df0["Verbatim"] = df0["Verbatim"].map(clean_text)
     st.session_state["df_work"] = ensure_ai_columns(df0)
 
+    # Normalize common filter columns once per upload
+    c_date = _find_col(st.session_state["df_work"], ["Review Date"])
+    c_star = _find_col(st.session_state["df_work"], ["Star Rating", "star rating", "Rating"])
+    _coerce_datetime_inplace(st.session_state["df_work"], c_date)
+    _coerce_numeric_inplace(st.session_state["df_work"], c_star)
+
     d, t, a = get_symptom_whitelists(uploaded_bytes)
     st.session_state["DELIGHTERS"] = d
     st.session_state["DETRACTORS"] = t
     st.session_state["ALIASES"] = a
 
-    # Reset run artifacts when workbook changes
     st.session_state["undo_stack"] = []
     st.session_state["processed_rows"] = []
     st.session_state["processed_idx_set"] = set()
@@ -1479,7 +1770,6 @@ def _make_openai_client(api_key: str, timeout_s: float, max_retries: int):
     try:
         return OpenAI(api_key=api_key, timeout=float(timeout_s), max_retries=int(max_retries))
     except TypeError:
-        # Fallback for older SDKs
         try:
             return OpenAI(api_key=api_key)
         except Exception:
@@ -1489,6 +1779,36 @@ api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 client = _make_openai_client(api_key, request_timeout_s, sdk_max_retries)
 if client is None:
     st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
+
+# ⚡ Speed / Rate-limit (NEW)
+st.sidebar.subheader("⚡ Speed / Rate-limit")
+
+llm_batch_size = st.sidebar.slider(
+    "LLM batch size (reviews per request)",
+    1, 12, 6, 1,
+    help="Batches multiple reviews into one API call. Much faster + fewer requests."
+)
+batch_token_budget = st.sidebar.slider(
+    "Batch token budget (approx prompt tokens)",
+    5000, 100000, 35000, 1000,
+    help="Caps how much text we pack into a single request (keeps quality stable)."
+)
+
+throttle_rpm = st.sidebar.number_input(
+    "Throttle: max chat requests/min (0 = off)",
+    0, 600, 0, 10,
+    help="Set this if you know your org RPM limit. Helps avoid 429s."
+)
+throttle_tpm = st.sidebar.number_input(
+    "Throttle: max estimated input tokens/min (0 = off)",
+    0, 2_000_000, 0, 10_000,
+    help="Coarse guard for TPM limits; uses estimated prompt tokens."
+)
+
+st.session_state["llm_batch_size"] = int(llm_batch_size)
+st.session_state["batch_token_budget"] = int(batch_token_budget)
+st.session_state["throttle_rpm"] = int(throttle_rpm)
+st.session_state["throttle_tpm"] = int(throttle_tpm)
 
 # Similarity guards
 st.sidebar.subheader("🧩 Consistency & Dedupe")
@@ -1651,6 +1971,131 @@ if learned_store.get("labels", {}).get("Delighter") or learned_store.get("labels
         d2 = list(learned_store.get("labels", {}).get("Detractor", {}).keys())[:40]
         st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{html.escape(x)}</span>" for x in d2]) + "</div>", unsafe_allow_html=True)
 
+# ------------------- Review Filters (subset selection) -------------------
+st.subheader("🔎 Review Filters (optional)")
+
+# Resolve columns best-effort
+c_source  = _find_col(work, ["Source"])
+c_model   = _find_col(work, ["Model (SKU)", "Model", "SKU"])
+c_seeded  = _find_col(work, ["Seeded"])
+c_country = _find_col(work, ["Country", "Region"])
+c_newrev  = _find_col(work, ["New Review", "New"])
+c_rdate   = _find_col(work, ["Review Date"])
+c_rating  = _find_col(work, ["Star Rating", "star rating", "Rating"])
+
+_coerce_datetime_inplace(work, c_rdate)
+_coerce_numeric_inplace(work, c_rating)
+
+with st.expander("Choose a subset to symptomize (Source / SKU / Seeded / Country / New Review / Date / Rating)", expanded=False):
+    row1 = st.columns(3)
+    with row1[0]:
+        if c_source:
+            st.multiselect("Source", options=_unique_sorted_str(work[c_source]), key="f_source_sel")
+        else:
+            st.caption("Source: (column not found)")
+    with row1[1]:
+        if c_model:
+            st.multiselect("Model (SKU)", options=_unique_sorted_str(work[c_model]), key="f_model_sel")
+        else:
+            st.caption("Model (SKU): (column not found)")
+    with row1[2]:
+        if c_country:
+            st.multiselect("Country", options=_unique_sorted_str(work[c_country]), key="f_country_sel")
+        else:
+            st.caption("Country: (column not found)")
+
+    row2 = st.columns(3)
+    with row2[0]:
+        if c_seeded:
+            st.selectbox("Seeded", ["All", "Seeded only", "Non-seeded only"], index=0, key="f_seeded_mode")
+        else:
+            st.caption("Seeded: (column not found)")
+    with row2[1]:
+        if c_newrev:
+            st.selectbox("New Review", ["All", "New only", "Not new only"], index=0, key="f_new_mode")
+        else:
+            st.caption("New Review: (column not found)")
+    with row2[2]:
+        if c_rating:
+            vals = work[c_rating].dropna().tolist()
+            opts = sorted({int(v) if isinstance(v, (int, float)) and float(v).is_integer() else v for v in vals})
+            if opts:
+                st.multiselect("Star Rating", options=opts, default=opts, key="f_rating_sel")
+            else:
+                st.caption("Star Rating: (no values)")
+        else:
+            st.caption("Star Rating: (column not found)")
+
+    if c_rdate and work[c_rdate].notna().any():
+        try:
+            dmin = pd.to_datetime(work[c_rdate].min()).date()
+            dmax = pd.to_datetime(work[c_rdate].max()).date()
+            st.date_input("Review Date range", value=(dmin, dmax), key="f_date_range")
+        except Exception:
+            st.caption("Review Date: (could not parse dates)")
+
+def _apply_filters_to_work(work_df: pd.DataFrame) -> pd.DataFrame:
+    out = work_df
+
+    c_source  = _find_col(out, ["Source"])
+    c_model   = _find_col(out, ["Model (SKU)", "Model", "SKU"])
+    c_seeded  = _find_col(out, ["Seeded"])
+    c_country = _find_col(out, ["Country", "Region"])
+    c_newrev  = _find_col(out, ["New Review", "New"])
+    c_rdate   = _find_col(out, ["Review Date"])
+    c_rating  = _find_col(out, ["Star Rating", "star rating", "Rating"])
+
+    src_sel = st.session_state.get("f_source_sel", []) or []
+    if c_source and src_sel:
+        out = out[out[c_source].astype(str).isin([str(x) for x in src_sel])]
+
+    model_sel = st.session_state.get("f_model_sel", []) or []
+    if c_model and model_sel:
+        out = out[out[c_model].astype(str).isin([str(x) for x in model_sel])]
+
+    country_sel = st.session_state.get("f_country_sel", []) or []
+    if c_country and country_sel:
+        out = out[out[c_country].astype(str).isin([str(x) for x in country_sel])]
+
+    seeded_mode = str(st.session_state.get("f_seeded_mode", "All"))
+    if c_seeded and seeded_mode != "All":
+        b = out[c_seeded].map(_boolish)
+        if seeded_mode == "Seeded only":
+            out = out[b == True]
+        elif seeded_mode == "Non-seeded only":
+            out = out[b == False]
+
+    new_mode = str(st.session_state.get("f_new_mode", "All"))
+    if c_newrev and new_mode != "All":
+        b = out[c_newrev].map(_boolish)
+        if new_mode == "New only":
+            out = out[b == True]
+        elif new_mode == "Not new only":
+            out = out[b == False]
+
+    date_range = st.session_state.get("f_date_range", None)
+    if c_rdate and date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        try:
+            _coerce_datetime_inplace(out, c_rdate)
+            start = pd.Timestamp(date_range[0])
+            end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+            out = out[(out[c_rdate] >= start) & (out[c_rdate] <= end)]
+        except Exception:
+            pass
+
+    rating_sel = st.session_state.get("f_rating_sel", None)
+    if c_rating and rating_sel is not None and len(rating_sel) > 0:
+        try:
+            _coerce_numeric_inplace(out, c_rating)
+            out = out[out[c_rating].isin(list(rating_sel))]
+        except Exception:
+            out = out[out[c_rating].astype(str).isin([str(x) for x in rating_sel])]
+
+    return out
+
+work_filtered = _apply_filters_to_work(work)
+st.caption(f"Filters active: **{len(work_filtered):,} / {len(work):,}** reviews eligible.")
+
 # ------------------- Scope & Preview -------------------
 st.subheader("🧪 Symptomize")
 scope = st.selectbox(
@@ -1659,16 +2104,18 @@ scope = st.selectbox(
     index=0,
 )
 
-if scope == "Missing both":
-    target = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
-elif scope == "Missing delighters only":
-    target = work[(work["Needs_Delighters"]) & (~work["Needs_Detractors"])]
-elif scope == "Missing detractors only":
-    target = work[(~work["Needs_Delighters"]) & (work["Needs_Detractors"])]
-else:
-    target = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
+base = work_filtered
 
-st.write(f"🔎 **{len(target):,} reviews** match the selected scope.")
+if scope == "Missing both":
+    target = base[(base["Needs_Delighters"]) & (base["Needs_Detractors"])]
+elif scope == "Missing delighters only":
+    target = base[(base["Needs_Delighters"]) & (~base["Needs_Detractors"])]
+elif scope == "Missing detractors only":
+    target = base[(~base["Needs_Delighters"]) & (base["Needs_Detractors"])]
+else:
+    target = base[(base["Needs_Delighters"]) | (base["Needs_Detractors"])]
+
+st.write(f"🔎 **{len(target):,} reviews** match the selected scope (and filters).")
 with st.expander("Preview in-scope rows", expanded=False):
     preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
     extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
@@ -1687,9 +2134,6 @@ st.session_state.setdefault("ev_cov_den", 0)
 processed_rows: List[Dict[str, Any]] = st.session_state["processed_rows"]
 processed_idx_set: Set[int] = st.session_state["processed_idx_set"]
 
-# Candidate stores (count + small sample of indices)
-#   new_symptom_candidates[(label, side)] = {"count": int, "refs": [idx...]}
-#   alias_suggestion_candidates[(tgt, alias, side)] = {"count": int, "refs": [idx...]}
 new_symptom_candidates: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state["new_symptom_candidates"]
 alias_suggestion_candidates: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state["alias_suggestion_candidates"]
 
@@ -1743,12 +2187,8 @@ with cC: st.button("25",  use_container_width=True, on_click=_set_n, args=(25,))
 with cD: st.button("50",  use_container_width=True, on_click=_set_n, args=(50,))
 with cE: st.button("100", use_container_width=True, on_click=_set_n, args=(100,))
 
-# ------------------- Runner -------------------
+# ------------------- Runner helpers -------------------
 def _active_allowed_lists() -> Tuple[List[str], List[str]]:
-    """
-    Return allowed lists that the labeler will use.
-    If use_learned_as_allowed is on, we union learned themes (top N) in addition to Symptoms tab.
-    """
     dels = list(DELIGHTERS)
     dets = list(DETRACTORS)
 
@@ -1763,10 +2203,10 @@ def _active_allowed_lists() -> Tuple[List[str], List[str]]:
                 dets.append(x)
     return dels, dets
 
+# ------------------- FAST batched runner -------------------
 def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     global df, new_symptom_candidates, alias_suggestion_candidates
 
-    # Clear per-run artifacts (keeps app responsive)
     st.session_state["processed_rows"] = []
     st.session_state["processed_idx_set"] = set()
     st.session_state["new_symptom_candidates"] = {}
@@ -1785,7 +2225,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     eta_box = st.empty()
     status_box = st.empty()
 
-    # Auto prelearn if enabled and not yet run
+    # Auto prelearn
     if prelearn_enabled and client is not None:
         ls = _ensure_learned_store()
         if not (ls.get("labels", {}).get("Delighter") or ls.get("labels", {}).get("Detractor")):
@@ -1804,7 +2244,8 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                 status_box=pre_box,
                 prog_bar=pre_prog,
             )
-            pre_box.empty(); pre_prog.empty()
+            pre_box.empty()
+            pre_prog.empty()
 
     df = ensure_ai_columns(df)
 
@@ -1815,15 +2256,14 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
         idxs = rows_df.index.tolist()
         for idx_clear in idxs:
             if do_undo:
-                old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] for j in range(1,11)}
-                old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] for j in range(1,11)})
+                old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
+                old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
                 old_vals.update({
                     "AI Safety": df.loc[idx_clear, "AI Safety"],
                     "AI Reliability": df.loc[idx_clear, "AI Reliability"],
-                    "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"]
+                    "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"],
                 })
                 snapshot.append((int(idx_clear), old_vals))
-
             for j in range(1, 11):
                 df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
                 df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
@@ -1833,197 +2273,255 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
 
     total_n = max(1, len(rows_df))
     t0 = time.perf_counter()
-
     cost_start = float(_ensure_usage_tracker()["cost_chat"] + _ensure_usage_tracker()["cost_embed"])
-
     cov_num = 0
     cov_den = 0
-
     ui_keep = int(st.session_state.get("ui_log_limit", 40))
 
-    for k, (idx, row) in enumerate(rows_df.iterrows(), start=1):
-        vb = row.get("Verbatim", "")
-        needs_deli = bool(row.get("Needs_Delighters", False))
-        needs_detr = bool(row.get("Needs_Detractors", False))
+    allowed_dels, allowed_dets = _active_allowed_lists()
+    known_hints = {
+        "Delighter": _known_learned_labels("Delighter")[:60],
+        "Detractor": _known_learned_labels("Detractor")[:60],
+    }
+    product_profile = str(_ensure_learned_store().get("product_profile", "") or "").strip()
 
-        if not overwrite_mode and do_undo:
-            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] for j in range(1,11)}
-            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] for j in range(1,11)})
-            old_vals.update({
-                "AI Safety": df.loc[idx, "AI Safety"],
-                "AI Reliability": df.loc[idx, "AI Reliability"],
-                "AI # of Sessions": df.loc[idx, "AI # of Sessions"]
-            })
-            snapshot.append((int(idx), old_vals))
+    batch_size = int(st.session_state.get("llm_batch_size", 6) or 1)
+    batch_budget = int(st.session_state.get("batch_token_budget", 35000) or 35000)
 
-        status_box.markdown(f"🔄 **Row {int(idx)}** • labeling + extracting meta…")
+    try:
+        overhead_est = _estimate_tokens(
+            json.dumps(
+                {
+                    "allowed_delighters": allowed_dels,
+                    "allowed_detractors": allowed_dets,
+                    "known": known_hints,
+                    "profile": product_profile[:600],
+                }
+            ),
+            model_id=selected_model,
+        ) + 800
+    except Exception:
+        overhead_est = 2000
 
-        allowed_dels, allowed_dets = _active_allowed_lists()
-        known_hints = {
-            "Delighter": _known_learned_labels("Delighter")[:60],
-            "Detractor": _known_learned_labels("Detractor")[:60],
-        }
+    rows_list = list(rows_df.iterrows())
+    batches: List[List[Tuple[int, pd.Series]]] = []
+    cur: List[Tuple[int, pd.Series]] = []
+    cur_tok = 0
 
-        out = _openai_labeler_unified(
-            verbatim=str(vb),
-            client=client,
-            model=selected_model,
-            temperature=temperature,
-            allowed_delighters=allowed_dels,
-            allowed_detractors=allowed_dets,
-            known_theme_hints=known_hints,
-            max_ev_per_label=max_ev_per_label,
-            max_ev_chars=max_ev_chars,
-        ) if client else {
-            "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
-            "ev_del_map": {}, "ev_det_map": {},
-            "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
-        }
+    for idx, row in rows_list:
+        vb = str(row.get("Verbatim", "") or "")
+        try:
+            t_est = _estimate_tokens(vb, model_id=selected_model)
+        except Exception:
+            t_est = max(1, len(vb) // 4)
 
-        dels = out["dels"]; dets = out["dets"]
-        unl_dels = out["unl_dels"]; unl_dets = out["unl_dets"]
-        ev_del_map = out["ev_del_map"]; ev_det_map = out["ev_det_map"]
-        safety, reliability, sessions = out["safety"], out["reliability"], out["sessions"]
+        if cur and ((len(cur) >= batch_size) or (overhead_est + cur_tok + t_est > batch_budget)):
+            batches.append(cur)
+            cur = []
+            cur_tok = 0
 
-        wrote_dets, wrote_dels = [], []
-        ev_written_det: Dict[str, List[str]] = {}
-        ev_written_del: Dict[str, List[str]] = {}
+        cur.append((int(idx), row))
+        cur_tok += int(t_est)
 
-        def _label_allowed(label: str, side: str) -> bool:
-            if not require_evidence:
-                return True
-            evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
-            return len(evs) > 0
+        if overhead_est + cur_tok > batch_budget and len(cur) == 1:
+            batches.append(cur)
+            cur = []
+            cur_tok = 0
 
-        if needs_detr and dets:
-            dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
-            for j, lab in enumerate(dets_to_write):
-                df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
-                ev_written_det[lab] = ev_det_map.get(lab, [])
-            wrote_dets = dets_to_write
+    if cur:
+        batches.append(cur)
 
-        if needs_deli and dels:
-            dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
-            for j, lab in enumerate(dels_to_write):
-                df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
-                ev_written_del[lab] = ev_del_map.get(lab, [])
-            wrote_dels = dels_to_write
+    done = 0
 
-        df.loc[idx, "AI Safety"] = safety
-        df.loc[idx, "AI Reliability"] = reliability
-        df.loc[idx, "AI # of Sessions"] = sessions
+    for bi, batch_rows in enumerate(batches, start=1):
+        items = []
+        for idx, row in batch_rows:
+            vb = str(row.get("Verbatim", "") or "")
+            needs_del = bool(row.get("Needs_Delighters", False))
+            needs_det = bool(row.get("Needs_Detractors", False))
+            items.append({"idx": int(idx), "review": vb, "needs_del": needs_del, "needs_det": needs_det})
 
-        learned = _ensure_learned_store()
-        new_unl_dels: List[str] = []
-        new_unl_dets: List[str] = []
-        alias_sugs_for_row: List[Tuple[str, str, str, float]] = []
+            if not overwrite_mode and do_undo:
+                old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
+                old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
+                old_vals.update({
+                    "AI Safety": df.loc[idx, "AI Safety"],
+                    "AI Reliability": df.loc[idx, "AI Reliability"],
+                    "AI # of Sessions": df.loc[idx, "AI # of Sessions"],
+                })
+                snapshot.append((int(idx), old_vals))
 
-        def _handle_unlisted_list(items: List[str], side_label: str):
-            nonlocal new_unl_dels, new_unl_dets, alias_sugs_for_row
-            for raw in items or []:
-                raw2 = str(raw).strip()
-                if not raw2:
-                    continue
-                res = resolve_candidate_to_canonical(
-                    candidate_raw=raw2,
-                    side=side_label,
-                    delighters=DELIGHTERS,
-                    detractors=DETRACTORS,
-                    alias_to_label=ALIAS_TO_LABEL,
-                    learned_store=learned,
-                    sim_threshold_lex=float(sim_threshold_lex),
-                    sim_threshold_sem=float(sim_threshold_sem),
-                    client=client if client is not None else None,
-                    embed_model=embed_model,
-                )
-                canon = str(res["canonical"]).strip()
-                kind = res.get("kind", "new")
-                tgt = str(res.get("target", "") or "").strip()
-                score = float(res.get("score", 0.0) or 0.0)
+        status_box.markdown(f"🔄 **Batch {bi}/{len(batches)}** • labeling + meta…")
 
-                _update_learned(side_label, canon, synonym=raw2)
+        outs_by_idx = {}
+        if client:
+            outs_by_idx = _openai_labeler_unified_batch(
+                items=items,
+                client=client,
+                model=selected_model,
+                temperature=temperature,
+                allowed_delighters=allowed_dels,
+                allowed_detractors=allowed_dets,
+                known_theme_hints=known_hints,
+                max_ev_per_label=max_ev_per_label,
+                max_ev_chars=max_ev_chars,
+                product_profile=product_profile,
+            )
 
-                if kind in {"exact_existing", "alias_to_existing"} and tgt:
-                    alias_sugs_for_row.append((tgt, raw2, side_label, score))
-                elif kind == "synonym_to_learned":
-                    pass
-                else:
-                    if side_label.lower().startswith("del"):
-                        new_unl_dels.append(canon)
+        for it in items:
+            idx = int(it["idx"])
+            vb = str(it["review"] or "")
+            needs_deli = bool(it["needs_del"])
+            needs_detr = bool(it["needs_det"])
+
+            out = outs_by_idx.get(idx, dict(_LABELER_DEFAULT))
+
+            dels = out.get("dels", []) or []
+            dets = out.get("dets", []) or []
+            unl_dels = out.get("unl_dels", []) or []
+            unl_dets = out.get("unl_dets", []) or []
+            ev_del_map = out.get("ev_del_map", {}) or {}
+            ev_det_map = out.get("ev_det_map", {}) or {}
+            safety = out.get("safety", "Not Mentioned")
+            reliability = out.get("reliability", "Not Mentioned")
+            sessions = out.get("sessions", "Unknown")
+
+            wrote_dets, wrote_dels = [], []
+            ev_written_det: Dict[str, List[str]] = {}
+            ev_written_del: Dict[str, List[str]] = {}
+
+            def _label_allowed(label: str, side: str) -> bool:
+                if not require_evidence:
+                    return True
+                evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
+                return len(evs) > 0
+
+            if needs_detr and dets:
+                dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
+                for j, lab in enumerate(dets_to_write):
+                    df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
+                    ev_written_det[lab] = ev_det_map.get(lab, [])
+                wrote_dets = dets_to_write
+
+            if needs_deli and dels:
+                dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
+                for j, lab in enumerate(dels_to_write):
+                    df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
+                    ev_written_del[lab] = ev_del_map.get(lab, [])
+                wrote_dels = dels_to_write
+
+            df.loc[idx, "AI Safety"] = safety
+            df.loc[idx, "AI Reliability"] = reliability
+            df.loc[idx, "AI # of Sessions"] = sessions
+
+            learned = _ensure_learned_store()
+            new_unl_dels: List[str] = []
+            new_unl_dets: List[str] = []
+            alias_sugs_for_row: List[Tuple[str, str, str, float]] = []
+
+            def _handle_unlisted_list(items2: List[str], side_label: str):
+                nonlocal new_unl_dels, new_unl_dets, alias_sugs_for_row
+                for raw in items2 or []:
+                    raw2 = str(raw).strip()
+                    if not raw2:
+                        continue
+                    res = resolve_candidate_to_canonical(
+                        candidate_raw=raw2,
+                        side=side_label,
+                        delighters=DELIGHTERS,
+                        detractors=DETRACTORS,
+                        alias_to_label=ALIAS_TO_LABEL,
+                        learned_store=learned,
+                        sim_threshold_lex=float(sim_threshold_lex),
+                        sim_threshold_sem=float(sim_threshold_sem),
+                        client=client if client is not None else None,
+                        embed_model=embed_model,
+                    )
+                    canon = str(res["canonical"]).strip()
+                    kind = res.get("kind", "new")
+                    tgt = str(res.get("target", "") or "").strip()
+                    score = float(res.get("score", 0.0) or 0.0)
+
+                    _update_learned(side_label, canon, synonym=raw2)
+
+                    if kind in {"exact_existing", "alias_to_existing"} and tgt:
+                        alias_sugs_for_row.append((tgt, raw2, side_label, score))
+                    elif kind == "synonym_to_learned":
+                        pass
                     else:
-                        new_unl_dets.append(canon)
+                        if side_label.lower().startswith("del"):
+                            new_unl_dels.append(canon)
+                        else:
+                            new_unl_dets.append(canon)
 
-        _handle_unlisted_list(unl_dels, "Delighter")
-        _handle_unlisted_list(unl_dets, "Detractor")
+            _handle_unlisted_list(unl_dels, "Delighter")
+            _handle_unlisted_list(unl_dets, "Detractor")
 
-        def _dedupe_keep_order(lst: List[str]) -> List[str]:
-            out2, seen = [], set()
-            for x in lst:
-                k2 = _canon_simple(x)
-                if not x or k2 in seen:
-                    continue
-                seen.add(k2); out2.append(x)
-            return out2
+            def _dedupe_keep_order(lst: List[str]) -> List[str]:
+                out2, seen = [], set()
+                for x in lst:
+                    k2 = _canon_simple(x)
+                    if not x or k2 in seen:
+                        continue
+                    seen.add(k2); out2.append(x)
+                return out2
 
-        new_unl_dels = _dedupe_keep_order([normalize_theme_label(x, "Delighter") for x in new_unl_dels])
-        new_unl_dets = _dedupe_keep_order([normalize_theme_label(x, "Detractor") for x in new_unl_dets])
+            new_unl_dels = _dedupe_keep_order([normalize_theme_label(x, "Delighter") for x in new_unl_dels])
+            new_unl_dets = _dedupe_keep_order([normalize_theme_label(x, "Detractor") for x in new_unl_dets])
 
-        # Aggregate for inbox with counts + small sample refs
-        for lab in new_unl_dels:
-            _agg_candidate(new_symptom_candidates, (lab, "Delighter"), int(idx))
-        for lab in new_unl_dets:
-            _agg_candidate(new_symptom_candidates, (lab, "Detractor"), int(idx))
-        for tgt, alias, side_label, score in alias_sugs_for_row:
-            side_norm = "Delighter" if side_label.lower().startswith("del") else "Detractor"
-            _agg_candidate(alias_suggestion_candidates, (tgt, alias, side_norm), int(idx))
+            for lab in new_unl_dels:
+                _agg_candidate(new_symptom_candidates, (lab, "Delighter"), int(idx))
+            for lab in new_unl_dets:
+                _agg_candidate(new_symptom_candidates, (lab, "Detractor"), int(idx))
+            for tgt, alias, side_label, score in alias_sugs_for_row:
+                side_norm = "Delighter" if side_label.lower().startswith("del") else "Detractor"
+                _agg_candidate(alias_suggestion_candidates, (tgt, alias, side_norm), int(idx))
 
-        # Evidence coverage counters
-        total_labels = len(wrote_dets) + len(wrote_dels)
-        labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, []))>0) + \
-                         sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, []))>0)
-        cov_num += labels_with_ev
-        cov_den += total_labels
+            total_labels = len(wrote_dets) + len(wrote_dels)
+            labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, [])) > 0) + \
+                             sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, [])) > 0)
+            cov_num += labels_with_ev
+            cov_den += total_labels
+            row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
 
-        row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
+            if ui_keep > 0:
+                processed_rows_local.append({
+                    "Index": int(idx),
+                    "Verbatim": str(vb)[:4000],
+                    "Added_Detractors": wrote_dets,
+                    "Added_Delighters": wrote_dels,
+                    "Evidence_Detractors": ev_written_det,
+                    "Evidence_Delighters": ev_written_del,
+                    "NewCand_Detractors": new_unl_dets,
+                    "NewCand_Delighters": new_unl_dels,
+                    "AliasSuggestions": alias_sugs_for_row,
+                    ">10 Detractors Detected": len(dets) > 10,
+                    ">10 Delighters Detected": len(dels) > 10,
+                    "Safety": safety,
+                    "Reliability": reliability,
+                    "Sessions": sessions,
+                    "Evidence_Coverage": row_ev_cov,
+                })
+                if len(processed_rows_local) > ui_keep:
+                    del processed_rows_local[:len(processed_rows_local) - ui_keep]
 
-        # Store UI log (bounded)
-        if ui_keep > 0:
-            processed_rows_local.append({
-                "Index": int(idx),
-                "Verbatim": str(vb)[:4000],
-                "Added_Detractors": wrote_dets,
-                "Added_Delighters": wrote_dels,
-                "Evidence_Detractors": ev_written_det,
-                "Evidence_Delighters": ev_written_del,
-                "NewCand_Detractors": new_unl_dets,
-                "NewCand_Delighters": new_unl_dels,
-                "AliasSuggestions": alias_sugs_for_row,
-                ">10 Detractors Detected": len(dets) > 10,
-                ">10 Delighters Detected": len(dels) > 10,
-                "Safety": safety,
-                "Reliability": reliability,
-                "Sessions": sessions,
-                "Evidence_Coverage": row_ev_cov,
-            })
-            if len(processed_rows_local) > ui_keep:
-                del processed_rows_local[:len(processed_rows_local) - ui_keep]
+            processed_idx_set_local.add(int(idx))
+            done += 1
 
-        processed_idx_set_local.add(int(idx))
-
-        prog.progress(k/total_n)
+        prog.progress(done / total_n)
 
         elapsed = time.perf_counter() - t0
-        rate = (k / elapsed) if elapsed > 0 else 0.0
-        rem = total_n - k
+        rate = (done / elapsed) if elapsed > 0 else 0.0
+        rem = total_n - done
         eta_sec = (rem / rate) if rate > 0 else 0.0
 
         tr2 = _ensure_usage_tracker()
         spent = float(tr2["cost_chat"] + tr2["cost_embed"]) - cost_start
-        avg_per = (spent / k) if k else 0.0
+        avg_per = (spent / done) if done else 0.0
         est_total = avg_per * total_n
 
         eta_box.markdown(
-            f"**Progress:** {k}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min • "
+            f"**Progress:** {done}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min • "
             f"**Spend:** {_fmt_money(spent)} • **Est total:** {_fmt_money(est_total)}"
         )
 
@@ -2038,7 +2536,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             )
             break
 
-        if k % 25 == 0:
+        if done % 50 == 0:
             gc.collect()
 
     status_box.markdown("✅ Done.")
@@ -2046,7 +2544,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     if do_undo and snapshot:
         st.session_state["undo_stack"].append({"rows": snapshot})
 
-    # Persist everything back into session_state
     st.session_state["processed_rows"] = processed_rows_local
     st.session_state["processed_idx_set"] = processed_idx_set_local
     st.session_state["new_symptom_candidates"] = new_symptom_candidates
@@ -2058,10 +2555,10 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
     st.session_state["df_work"] = df
     st.session_state.pop("export_bytes", None)
 
-# ------------------- Execute by buttons (updated overwrite-all logic) -------------------
+# ------------------- Execute by buttons -------------------
 if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
     if run_missing_both_btn:
-        rows_iter = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])].sort_index()
+        rows_iter = work_filtered[(work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])].sort_index()
         _run_symptomize(rows_iter, overwrite_mode=False)
 
     elif overwrite_btn:
@@ -2069,6 +2566,7 @@ if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_miss
         st.session_state["df_work"] = df
         colmap = detect_symptom_columns(df)
         work = detect_missing(df, colmap)
+        work = _apply_filters_to_work(work)   # ✅ respect filters
         rows_iter = work.sort_index()
         _run_symptomize(rows_iter, overwrite_mode=False)
 
@@ -2214,7 +2712,6 @@ def _filter_new_symptom_candidates(
             prev_lab = seen[k2]
             mrec = merged.setdefault((prev_lab, side), {"count": 0, "refs": []})
             mrec["count"] += int(rec.get("count", 0))
-            # merge sample refs
             for ridx in rec.get("refs", [])[:50]:
                 if len(mrec["refs"]) < 50 and ridx not in mrec["refs"]:
                     mrec["refs"].append(ridx)
@@ -2430,91 +2927,14 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# ------------------- View Symptoms from Excel Workbook (expander) -------------------
-st.subheader("📘 View Symptoms from Excel Workbook")
-with st.expander("📘 View Symptoms from Excel Workbook", expanded=False):
-    st.markdown("This reflects the **Symptoms** sheet as loaded; use the inbox above to propose additions.")
-
-    tabs = st.tabs(["Delighters", "Detractors", "Aliases", "Meta", "Cost Breakdown"])
-
-    def _esc2(s: str) -> str:
-        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    def _chips(items, color: str):
-        items_sorted = sorted({str(x).strip() for x in (items or []) if str(x).strip()})
-        if not items_sorted:
-            st.write("(none)")
-        else:
-            htmlchips = "<div class='chip-wrap'>" + "".join([f"<span class='chip {color}'>{_esc2(x)}</span>" for x in items_sorted]) + "</div>"
-            st.markdown(htmlchips, unsafe_allow_html=True)
-
-    with tabs[0]:
-        st.markdown("**Delighter labels from workbook**")
-        _chips(DELIGHTERS, "green")
-    with tabs[1]:
-        st.markdown("**Detractor labels from workbook**")
-        _chips(DETRACTORS, "red")
-    with tabs[2]:
-        st.markdown("**Aliases (if present)**")
-        if ALIASES:
-            alias_rows = [{"Label": k, "Aliases": " | ".join(v)} for k, v in sorted(ALIASES.items())]
-            st.dataframe(pd.DataFrame(alias_rows), use_container_width=True, hide_index=True)
-        else:
-            st.write("(no aliases defined)")
-    with tabs[3]:
-        st.markdown("**Meta fields usage (from this dataset)**")
-        df_meta = ensure_ai_columns(df.copy())
-
-        def _count(col: str, order: List[str]) -> pd.DataFrame:
-            if col not in df_meta.columns:
-                return pd.DataFrame({"Value": order, "Count": [0] * len(order)})
-            vc = df_meta[col].fillna("Not Mentioned").astype(str).value_counts().reindex(order, fill_value=0)
-            return vc.rename_axis("Value").reset_index(name="Count")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Safety**")
-            df_s = _count("AI Safety", SAFETY_ENUM)
-            st.bar_chart(df_s.set_index("Value")["Count"])
-        with c2:
-            st.markdown("**Reliability**")
-            df_r = _count("AI Reliability", RELIABILITY_ENUM)
-            st.bar_chart(df_r.set_index("Value")["Count"])
-        with c3:
-            st.markdown("**# of Sessions**")
-            df_n = _count("AI # of Sessions", SESSIONS_ENUM)
-            st.bar_chart(df_n.set_index("Value")["Count"])
-    with tabs[4]:
-        st.markdown("**OpenAI cost breakdown (this session)**")
-        tr = _ensure_usage_tracker()
-        st.write({
-            "chat_input_tokens": int(tr["chat_in"]),
-            "chat_output_tokens": int(tr["chat_out"]),
-            "embedding_tokens": int(tr["embed_in"]),
-            "chat_cost_usd": float(tr["cost_chat"]),
-            "embedding_cost_usd": float(tr["cost_embed"]),
-            "total_cost_usd": float(tr["cost_chat"] + tr["cost_embed"]),
-        })
-        comp_rows = []
-        for comp, d in (tr.get("by_component", {}) or {}).items():
-            comp_rows.append({
-                "Component": comp,
-                "Chat in": int(d.get("chat_in", 0)),
-                "Chat out": int(d.get("chat_out", 0)),
-                "Embed in": int(d.get("embed_in", 0)),
-                "Cost (USD)": float(d.get("cost", 0.0)),
-            })
-        if comp_rows:
-            st.dataframe(pd.DataFrame(comp_rows).sort_values("Cost (USD)", ascending=False), use_container_width=True, hide_index=True)
-        else:
-            st.write("(no usage recorded)")
-
 # Footer
 st.divider()
 st.caption(
-    "v7.6 (Stable) — Evidence-locked labeling + Product Knowledge Prelearn + canonical merging + 🟡 Inbox: New Symptoms + Alias Suggestions. "
+    "v7.7 (Fast+Stable) — Evidence-locked labeling + Product Knowledge Prelearn + canonical merging + "
+    "🟡 Inbox: New Symptoms + Alias Suggestions + ⚡ Batch symptomization + 🔎 Subset filters + Optional throttle. "
     "Exports: K–T/U–AD, meta: AE/AF/AG. Stability: session persistence + vectorized detection + retries + lazy export."
 )
+
 
 
 
