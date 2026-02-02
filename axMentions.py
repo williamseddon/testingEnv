@@ -1,14 +1,22 @@
 # app.py
-# Streamlit Review Benchmark Dashboard
+# Streamlit Review Benchmark Dashboard (Enhanced)
 #
-# Works with your "processed output" format:
+# ✅ Adds:
+# - % mentions per pillar (by product)
+# - Average star rating per pillar (by product), incl.:
+#     - avg stars among mentions (label != "not mentioned")
+#     - avg stars by sentiment label (positive/negative/neutral/not mentioned)
+# - Stronger product-vs-product comparison views
+#
+# Works with your processed output "wide" format:
 # - One row = one review
-# - One column = Product Name (you mentioned column AX; in files it will be a header like "Product Name")
-# - Pillar columns (Noise level, Ease of use, Dry time, etc.) contain one of:
+# - One column = Product Name (you said AX in Excel; here we select the header)
+# - Pillar columns contain exactly one of:
 #     positive / negative / neutral / not mentioned
+# - Optional star rating column (e.g., Stars, Rating, Star Rating, etc.)
 #
-# Also supports a "long" format if your file already has columns like:
-#   Product Name | Pillar | Label  (or Theme/Attribute instead of Pillar)
+# Also supports "long" format:
+#   Product Name | Pillar | Label | (optional) Stars | (optional) Review Text
 #
 # Run:
 #   pip install streamlit pandas plotly openpyxl numpy
@@ -27,9 +35,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-
 # -----------------------------
-# Config / constants
+# Constants
 # -----------------------------
 VALID_LABELS = ["positive", "negative", "neutral", "not mentioned"]
 LABEL_ORDER = ["positive", "neutral", "negative", "not mentioned"]
@@ -49,7 +56,6 @@ DEFAULT_PILLARS = [
     "Price",
 ]
 
-# Common alternate header spellings
 ALT_PILLAR_HEADERS = {
     "frizz": "Frizz reduction",
     "frizz_reduction": "Frizz reduction",
@@ -68,7 +74,6 @@ ALT_PILLAR_HEADERS = {
     "value": "Price",
 }
 
-# Label normalization map
 LABEL_MAP = {
     "pos": "positive",
     "+": "positive",
@@ -92,13 +97,23 @@ LABEL_MAP = {
     "": "not mentioned",
 }
 
+STAR_GUESS_CANDIDATES = [
+    "stars", "star", "rating", "star rating", "star_rating",
+    "overall rating", "overall_rating", "review rating", "review_rating",
+    "score",
+]
 
+# -----------------------------
+# Data containers
+# -----------------------------
 @dataclass
 class SummaryTables:
-    counts: pd.DataFrame          # product x pillar x label counts
-    percents_total: pd.DataFrame  # % of total (includes not mentioned)
-    percents_mention: pd.DataFrame  # % among mentions only (excludes not mentioned)
-    metrics: pd.DataFrame         # mention rate, net sentiment, neg share, polarization
+    counts: pd.DataFrame                 # product x pillar with count columns per label
+    percents_total: pd.DataFrame         # product x pillar with % of total columns per label (incl not mentioned)
+    percents_mention: pd.DataFrame        # product x pillar with % among mentions (excl not mentioned)
+    metrics: pd.DataFrame                # mention_rate, net_sentiment, neg_share_mentions, polarization + counts
+    stars_metrics: Optional[pd.DataFrame] # avg stars among mentions + by label, per product/pillar
+    product_stars: Optional[pd.DataFrame] # avg stars overall per product (all reviews)
 
 
 # -----------------------------
@@ -107,7 +122,6 @@ class SummaryTables:
 def _clean_colname(c: str) -> str:
     c2 = (c or "").strip()
     c2 = re.sub(r"\s+", " ", c2)
-    # Normalize common variants for matching, but keep original display elsewhere
     return c2
 
 
@@ -122,12 +136,9 @@ def _normalize_label(x) -> str:
         return "not mentioned"
     s = str(x).strip().lower()
     s = re.sub(r"\s+", " ", s)
-    s = s.replace("notmentioned", "not mentioned")
-    s = s.replace("not_mentioned", "not mentioned")
-    # Sometimes people include punctuation
+    s = s.replace("notmentioned", "not mentioned").replace("not_mentioned", "not mentioned")
     s = re.sub(r"[^\w\s/+:-]", "", s).strip()
     s = LABEL_MAP.get(s, s)
-    # If still not valid, attempt fuzzy containment
     if "not" in s and "mention" in s:
         return "not mentioned"
     if "posit" in s:
@@ -136,8 +147,25 @@ def _normalize_label(x) -> str:
         return "negative"
     if "neutral" in s:
         return "neutral"
-    # Unknown -> treat as not mentioned but surface in QA
-    return s
+    return s  # unknown kept for QA
+
+
+def _parse_stars(x) -> float:
+    """Parse star rating into float. Returns np.nan if not parseable."""
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        v = float(x)
+        return v if np.isfinite(v) else np.nan
+    s = str(x).strip().lower()
+    # extract first float-like number
+    m = re.findall(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return np.nan
+    try:
+        return float(m[0])
+    except Exception:
+        return np.nan
 
 
 def _is_long_format(df: pd.DataFrame) -> bool:
@@ -166,8 +194,21 @@ def _guess_review_text_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _guess_star_column(df: pd.DataFrame) -> Optional[str]:
+    lower_map = {c.lower(): c for c in df.columns}
+    for cand in STAR_GUESS_CANDIDATES:
+        if cand in lower_map:
+            return lower_map[cand]
+    # Heuristic: numeric column mostly 1-5
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            s = df[c].dropna()
+            if len(s) >= 10 and s.between(1, 5).mean() > 0.85:
+                return c
+    return None
+
+
 def _validate_labels(long_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (bad_rows_sample, label_frequencies)"""
     freq = (
         long_df.groupby(["pillar", "label"])["label"]
         .count()
@@ -185,7 +226,6 @@ def load_file(uploaded) -> pd.DataFrame:
     data = uploaded.getvalue()
 
     if name.endswith(".csv") or name.endswith(".tsv") or name.endswith(".txt"):
-        # try to infer delimiter
         sample = data[:2048].decode("utf-8", errors="ignore")
         sep = "\t" if sample.count("\t") > sample.count(",") else ","
         return pd.read_csv(io.BytesIO(data), sep=sep)
@@ -200,14 +240,16 @@ def to_long(
     pillar_cols: List[str],
     review_text_col: Optional[str] = None,
     review_id_col: Optional[str] = None,
+    stars_col: Optional[str] = None,
 ) -> pd.DataFrame:
     id_vars = [product_col]
     if review_id_col and review_id_col in df.columns:
         id_vars.append(review_id_col)
     if review_text_col and review_text_col in df.columns:
         id_vars.append(review_text_col)
+    if stars_col and stars_col in df.columns:
+        id_vars.append(stars_col)
 
-    # Melt wide -> long
     long_df = df.melt(
         id_vars=id_vars,
         value_vars=pillar_cols,
@@ -218,32 +260,54 @@ def to_long(
     long_df["pillar"] = long_df["pillar"].map(_canonicalize_header)
     long_df["label"] = long_df["label_raw"].map(_normalize_label)
 
-    # Standardize product column name for downstream
-    long_df = long_df.rename(columns={product_col: "product"})
+    # Standardize column names
+    rename_map = {product_col: "product"}
     if review_text_col and review_text_col in long_df.columns:
-        long_df = long_df.rename(columns={review_text_col: "review_text"})
+        rename_map[review_text_col] = "review_text"
     if review_id_col and review_id_col in long_df.columns:
-        long_df = long_df.rename(columns={review_id_col: "review_id"})
+        rename_map[review_id_col] = "review_id"
+    if stars_col and stars_col in long_df.columns:
+        rename_map[stars_col] = "stars"
 
-    return long_df.drop(columns=["label_raw"])
+    long_df = long_df.rename(columns=rename_map).drop(columns=["label_raw"])
+
+    if "stars" in long_df.columns:
+        long_df["stars"] = long_df["stars"].map(_parse_stars)
+
+    return long_df
 
 
-def from_long(df: pd.DataFrame, product_col: str, pillar_col: str, label_col: str,
-              review_text_col: Optional[str] = None, review_id_col: Optional[str] = None) -> pd.DataFrame:
+def from_long(
+    df: pd.DataFrame,
+    product_col: str,
+    pillar_col: str,
+    label_col: str,
+    review_text_col: Optional[str] = None,
+    review_id_col: Optional[str] = None,
+    stars_col: Optional[str] = None,
+) -> pd.DataFrame:
     out = df.copy()
-    out = out.rename(columns={
+    rename_map = {
         product_col: "product",
         pillar_col: "pillar",
         label_col: "label_raw",
-    })
+    }
     if review_text_col and review_text_col in out.columns:
-        out = out.rename(columns={review_text_col: "review_text"})
+        rename_map[review_text_col] = "review_text"
     if review_id_col and review_id_col in out.columns:
-        out = out.rename(columns={review_id_col: "review_id"})
+        rename_map[review_id_col] = "review_id"
+    if stars_col and stars_col in out.columns:
+        rename_map[stars_col] = "stars"
 
+    out = out.rename(columns=rename_map)
     out["pillar"] = out["pillar"].map(_canonicalize_header)
     out["label"] = out["label_raw"].map(_normalize_label)
-    return out.drop(columns=["label_raw"])
+    out = out.drop(columns=["label_raw"])
+
+    if "stars" in out.columns:
+        out["stars"] = out["stars"].map(_parse_stars)
+
+    return out
 
 
 def compute_summary(long_df: pd.DataFrame) -> SummaryTables:
@@ -255,22 +319,20 @@ def compute_summary(long_df: pd.DataFrame) -> SummaryTables:
         .reset_index()
     )
 
-    # Full grid to ensure missing labels appear as zeros
     products = sorted(long_df["product"].dropna().unique().tolist())
     pillars = sorted(long_df["pillar"].dropna().unique().tolist())
     grid = pd.MultiIndex.from_product([products, pillars, VALID_LABELS], names=["product", "pillar", "label"])
+
     counts_full = (
         counts.set_index(["product", "pillar", "label"])
         .reindex(grid, fill_value=0)
         .reset_index()
     )
 
-    # Totals
     totals = counts_full.groupby(["product", "pillar"])["count"].sum().rename("total").reset_index()
     merged = counts_full.merge(totals, on=["product", "pillar"], how="left")
     merged["pct_total"] = np.where(merged["total"] > 0, merged["count"] / merged["total"], 0.0)
 
-    # Mention-only denominator (exclude not mentioned)
     mention_totals = (
         merged[merged["label"] != "not mentioned"]
         .groupby(["product", "pillar"])["count"]
@@ -280,62 +342,107 @@ def compute_summary(long_df: pd.DataFrame) -> SummaryTables:
     )
     merged = merged.merge(mention_totals, on=["product", "pillar"], how="left")
     merged["mentions"] = merged["mentions"].fillna(0).astype(int)
+
     merged["pct_mentions"] = np.where(
         (merged["label"] != "not mentioned") & (merged["mentions"] > 0),
         merged["count"] / merged["mentions"],
-        np.where(merged["label"] == "not mentioned", np.nan, 0.0)
+        np.where(merged["label"] == "not mentioned", np.nan, 0.0),
     )
 
-    # Pivot tables
-    pivot_counts = merged.pivot_table(index=["product", "pillar"], columns="label", values="count", fill_value=0)
-    pivot_pct_total = merged.pivot_table(index=["product", "pillar"], columns="label", values="pct_total", fill_value=0.0)
+    pivot_counts = merged.pivot_table(index=["product", "pillar"], columns="label", values="count", fill_value=0).reset_index()
+    pivot_pct_total = merged.pivot_table(index=["product", "pillar"], columns="label", values="pct_total", fill_value=0.0).reset_index()
 
-    # pct among mentions only (exclude not mentioned column)
     mention_view = merged[merged["label"] != "not mentioned"].copy()
-    pivot_pct_mentions = mention_view.pivot_table(index=["product", "pillar"], columns="label", values="pct_mentions", fill_value=0.0)
+    pivot_pct_mentions = mention_view.pivot_table(index=["product", "pillar"], columns="label", values="pct_mentions", fill_value=0.0).reset_index()
 
-    # Metrics
-    def safe_div(a, b):
-        return np.where(b > 0, a / b, 0.0)
-
-    pos = pivot_counts.get("positive", 0)
-    neg = pivot_counts.get("negative", 0)
-    neu = pivot_counts.get("neutral", 0)
-    nm = pivot_counts.get("not mentioned", 0)
+    # Metrics: mention rate + net sentiment etc.
+    pc = pivot_counts.set_index(["product", "pillar"])
+    pos = pc.get("positive", 0)
+    neg = pc.get("negative", 0)
+    neu = pc.get("neutral", 0)
+    nm = pc.get("not mentioned", 0)
 
     total = pos + neg + neu + nm
     mentions = pos + neg + neu
 
-    mention_rate = safe_div(mentions, total)
-    net_sentiment = safe_div((pos - neg), mentions)  # -1..+1 among mentions
-    neg_share_mentions = safe_div(neg, mentions)
-    polarization = safe_div((pos + neg), mentions)  # 0..1 among mentions
+    def safe_div(a, b):
+        return np.where(b > 0, a / b, 0.0)
+
+    mention_rate = safe_div(mentions, total)               # % mentioned (signal strength)
+    net_sentiment = safe_div((pos - neg), mentions)        # -1..+1 among mentions
+    neg_share_mentions = safe_div(neg, mentions)           # complaint concentration
+    polarization = safe_div((pos + neg), mentions)         # love/hate intensity
 
     metrics = pd.DataFrame({
         "mentions": mentions.astype(int),
-        "total": total.astype(int),
+        "total_reviews": total.astype(int),
         "mention_rate": mention_rate.astype(float),
         "net_sentiment": net_sentiment.astype(float),
         "neg_share_mentions": neg_share_mentions.astype(float),
         "polarization": polarization.astype(float),
+        "pos_count": pos.astype(int),
+        "neu_count": neu.astype(int),
+        "neg_count": neg.astype(int),
+        "not_mentioned_count": nm.astype(int),
     }).reset_index()
 
+    # Stars metrics (optional)
+    stars_metrics = None
+    product_stars = None
+    if "stars" in long_df.columns and long_df["stars"].notna().any():
+        # avg stars overall per product (dedupe reviews if review_id exists)
+        if "review_id" in long_df.columns:
+            # one star per review id
+            tmp = long_df[["product", "review_id", "stars"]].dropna().drop_duplicates(subset=["product", "review_id"])
+            product_stars = tmp.groupby("product")["stars"].mean().rename("avg_stars_overall").reset_index()
+            product_stars["n_reviews_with_stars"] = tmp.groupby("product")["stars"].size().values
+        else:
+            # best effort: average stars of raw rows collapsed to unique review_text if present
+            if "review_text" in long_df.columns:
+                tmp = long_df[["product", "review_text", "stars"]].dropna().drop_duplicates(subset=["product", "review_text"])
+                product_stars = tmp.groupby("product")["stars"].mean().rename("avg_stars_overall").reset_index()
+                product_stars["n_reviews_with_stars"] = tmp.groupby("product")["stars"].size().values
+            else:
+                # last resort: average stars on original rows (may overweight if duplicated)
+                product_stars = long_df.groupby("product")["stars"].mean().rename("avg_stars_overall").reset_index()
+                product_stars["n_reviews_with_stars"] = long_df.groupby("product")["stars"].apply(lambda s: s.notna().sum()).values
+
+        # avg stars among mentions per product/pillar
+        mention_rows = long_df[(long_df["label"].isin(VALID_LABELS)) & (long_df["label"] != "not mentioned") & long_df["stars"].notna()].copy()
+        avg_mentions = (
+            mention_rows.groupby(["product", "pillar"])["stars"]
+            .mean()
+            .rename("avg_stars_mentions")
+            .reset_index()
+        )
+
+        # avg stars by label per product/pillar/label
+        label_rows = long_df[(long_df["label"].isin(VALID_LABELS)) & long_df["stars"].notna()].copy()
+        avg_by_label = (
+            label_rows.groupby(["product", "pillar", "label"])["stars"]
+            .mean()
+            .rename("avg_stars")
+            .reset_index()
+        )
+        avg_by_label_pivot = avg_by_label.pivot_table(index=["product", "pillar"], columns="label", values="avg_stars").reset_index()
+
+        # merge
+        stars_metrics = avg_by_label_pivot.merge(avg_mentions, on=["product", "pillar"], how="left")
+
     return SummaryTables(
-        counts=pivot_counts.reset_index(),
-        percents_total=pivot_pct_total.reset_index(),
-        percents_mention=pivot_pct_mentions.reset_index(),
+        counts=pivot_counts,
+        percents_total=pivot_pct_total,
+        percents_mention=pivot_pct_mentions,
         metrics=metrics,
+        stars_metrics=stars_metrics,
+        product_stars=product_stars,
     )
 
 
-def top_differences(metrics: pd.DataFrame, products: List[str], top_n: int = 8) -> pd.DataFrame:
-    df = metrics.copy()
-    df = df[df["product"].isin(products)]
-    # pivot net sentiment per pillar
+def top_differences(metrics: pd.DataFrame, products: List[str], top_n: int = 10) -> pd.DataFrame:
+    df = metrics[metrics["product"].isin(products)].copy()
     pivot = df.pivot_table(index="pillar", columns="product", values="net_sentiment", aggfunc="mean")
-    # compute range across products per pillar
     diff = (pivot.max(axis=1) - pivot.min(axis=1)).rename("net_gap").to_frame()
-    # identify best/worst
     diff["winner"] = pivot.idxmax(axis=1)
     diff["loser"] = pivot.idxmin(axis=1)
     diff["winner_net"] = pivot.max(axis=1)
@@ -353,44 +460,40 @@ def fmt_score(x: float) -> str:
 
 
 # -----------------------------
-# UI
+# Streamlit UI
 # -----------------------------
-st.set_page_config(
-    page_title="Review Benchmark Explorer",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Review Benchmark Explorer", layout="wide", initial_sidebar_state="expanded")
 
-st.title("🧪 Review Benchmark Explorer (Processed Output)")
+st.title("🧪 Review Benchmark Explorer (with % Mentions + Avg Stars)")
 st.caption(
-    "Upload your processed review labeling file and benchmark products across themes (Noise, Dry Time, Reliability, etc.). "
-    "Built for wide tables (one pillar per column) and also supports long format."
+    "Upload your processed output and benchmark products across themes (Noise, Dry Time, Reliability, Price, etc.). "
+    "Now includes % mentions and average star rating per theme (if a stars column exists)."
 )
 
 uploaded = st.sidebar.file_uploader("Upload processed output (CSV/Excel)", type=["csv", "tsv", "txt", "xlsx", "xls"])
 
 if not uploaded:
-    st.info("Upload a file to begin. Your pillar columns should contain: positive / negative / neutral / not mentioned.")
+    st.info("Upload a file to begin. Pillar cells should be: positive / negative / neutral / not mentioned.")
     st.stop()
 
 df_raw = load_file(uploaded)
 df_raw.columns = [_clean_colname(c) for c in df_raw.columns]
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Format + columns")
-
-# Detect long vs wide
 long_detected = _is_long_format(df_raw)
-
 review_text_guess = _guess_review_text_column(df_raw)
+stars_guess = _guess_star_column(df_raw)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Columns")
 
 if long_detected:
     st.sidebar.success("Detected LONG format (Product + Pillar + Label).")
-    # pick product/pillar/label cols
     cols = df_raw.columns.tolist()
+
     product_col = st.sidebar.selectbox("Product column", cols, index=cols.index("Product Name") if "Product Name" in cols else 0)
     pillar_candidates = [c for c in cols if c.lower() in ["pillar", "theme", "attribute", "benchmark", "category"]]
     label_candidates = [c for c in cols if c.lower() in ["label", "sentiment", "classification", "value"]]
+
     pillar_col = st.sidebar.selectbox("Pillar column", cols, index=cols.index(pillar_candidates[0]) if pillar_candidates else 0)
     label_col = st.sidebar.selectbox("Label column", cols, index=cols.index(label_candidates[0]) if label_candidates else 0)
 
@@ -404,13 +507,19 @@ if long_detected:
     review_id_col = st.sidebar.selectbox("Optional: review id column", ["(none)"] + cols, index=0)
     review_id_col = None if review_id_col == "(none)" else review_id_col
 
-    long_df = from_long(df_raw, product_col, pillar_col, label_col, review_text_col, review_id_col)
+    stars_col = st.sidebar.selectbox(
+        "Optional: stars/rating column",
+        ["(none)"] + cols,
+        index=(["(none)"] + cols).index(stars_guess) if stars_guess in cols else 0,
+    )
+    stars_col = None if stars_col == "(none)" else stars_col
+
+    long_df = from_long(df_raw, product_col, pillar_col, label_col, review_text_col, review_id_col, stars_col)
 
 else:
     st.sidebar.success("Detected WIDE format (Product column + pillar columns).")
     cols = df_raw.columns.tolist()
 
-    # Guess product col
     product_guess = None
     for cand in ["Product Name", "Product", "product", "Model", "SKU"]:
         if cand in cols:
@@ -427,13 +536,25 @@ else:
     default_selected = []
     for p in DEFAULT_PILLARS:
         if p in rev_map:
-            # pick the first matching original column
             default_selected.append(rev_map[p][0])
+
+    # Stars selector
+    stars_col = st.sidebar.selectbox(
+        "Optional: stars/rating column",
+        ["(none)"] + cols,
+        index=(["(none)"] + cols).index(stars_guess) if stars_guess in cols else 0,
+    )
+    stars_col = None if stars_col == "(none)" else stars_col
+
+    # Pillar columns (exclude product + stars + optional text/id later)
+    excluded = {product_col}
+    if stars_col:
+        excluded.add(stars_col)
 
     pillar_cols = st.sidebar.multiselect(
         "Pillar columns",
-        options=[c for c in cols if c != product_col],
-        default=default_selected if default_selected else [c for c in cols if c != product_col],
+        options=[c for c in cols if c not in excluded],
+        default=default_selected if default_selected else [c for c in cols if c not in excluded],
     )
 
     review_text_col = st.sidebar.selectbox(
@@ -446,207 +567,322 @@ else:
     review_id_col = st.sidebar.selectbox("Optional: review id column", ["(none)"] + cols, index=0)
     review_id_col = None if review_id_col == "(none)" else review_id_col
 
-    long_df = to_long(df_raw, product_col, pillar_cols, review_text_col, review_id_col)
+    long_df = to_long(df_raw, product_col, pillar_cols, review_text_col, review_id_col, stars_col)
 
-# Normalize labels into 4 options; keep a QA view for unknowns
+# QA labels
 bad_rows, label_freq = _validate_labels(long_df)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data QA")
-
 with st.sidebar.expander("Label frequency (by pillar)", expanded=False):
-    st.dataframe(label_freq, use_container_width=True, height=300)
+    st.dataframe(label_freq, use_container_width=True, height=260)
 
 if len(bad_rows):
     st.sidebar.warning(f"Found {len(long_df[~long_df['label'].isin(VALID_LABELS)])} rows with non-standard labels.")
-    with st.sidebar.expander("Show sample of non-standard labels", expanded=False):
+    with st.sidebar.expander("Sample of non-standard labels", expanded=False):
         st.dataframe(bad_rows, use_container_width=True)
-    st.sidebar.info("Those labels are kept as-is for QA. You can fix upstream or map them in LABEL_MAP in the app.")
+    st.sidebar.info("Fix upstream or map variants in LABEL_MAP in this app.")
 
-# Filter to valid labels for benchmark metrics (keeps the 4-class contract)
 bench_df = long_df[long_df["label"].isin(VALID_LABELS)].copy()
 
-# Compute summary
 summary = compute_summary(bench_df)
 
-# Sidebar filters
+# Filters
 st.sidebar.markdown("---")
 st.sidebar.subheader("Benchmark controls")
 
 all_products = sorted(summary.metrics["product"].unique().tolist())
-selected_products = st.sidebar.multiselect("Products to include", all_products, default=all_products[:3] if len(all_products) >= 3 else all_products)
+default_products = all_products[:3] if len(all_products) >= 3 else all_products
+selected_products = st.sidebar.multiselect("Products to include", all_products, default=default_products)
 
 all_pillars = sorted(summary.metrics["pillar"].unique().tolist())
-# Keep your preferred ordering when possible
 preferred_order = [p for p in DEFAULT_PILLARS if p in all_pillars]
 remaining = [p for p in all_pillars if p not in preferred_order]
 pillar_order = preferred_order + remaining
-
 selected_pillars = st.sidebar.multiselect("Pillars to include", pillar_order, default=pillar_order)
 
-metric_choice = st.sidebar.selectbox(
-    "Primary score (heatmap)",
-    [
-        "net_sentiment (pos-neg among mentions)",
-        "mention_rate (talked about vs not mentioned)",
-        "neg_share_mentions (complaints concentration)",
-        "polarization (love/hate intensity)",
-    ],
-    index=0,
-)
-
-# Filter metric table
+# Build metrics subset
 m = summary.metrics.copy()
 m = m[m["product"].isin(selected_products) & m["pillar"].isin(selected_pillars)].copy()
 
-# -----------------------------
-# Top-level KPI cards
-# -----------------------------
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+# Join stars metrics if present
+has_stars = summary.stars_metrics is not None and len(summary.stars_metrics) > 0
+if has_stars:
+    sm = summary.stars_metrics.copy()
+    sm = sm[sm["product"].isin(selected_products) & sm["pillar"].isin(selected_pillars)].copy()
+    m = m.merge(sm, on=["product", "pillar"], how="left")
 
-overall = m.copy()
-overall_mentions = int(overall["mentions"].sum())
-overall_total = int(overall["total"].sum())
-overall_mention_rate = overall_mentions / overall_total if overall_total else 0.0
-overall_net = np.average(overall["net_sentiment"], weights=overall["mentions"].clip(lower=0)) if overall_mentions else 0.0
-overall_neg = np.average(overall["neg_share_mentions"], weights=overall["mentions"].clip(lower=0)) if overall_mentions else 0.0
-overall_pol = np.average(overall["polarization"], weights=overall["mentions"].clip(lower=0)) if overall_mentions else 0.0
-
-kpi1.metric("Total reviews x pillars", f"{overall_total:,}")
-kpi2.metric("Mention rate (overall)", fmt_pct(overall_mention_rate))
-kpi3.metric("Net sentiment (overall)", fmt_score(overall_net))
-kpi4.metric("Neg share among mentions", fmt_pct(overall_neg))
-
-st.markdown("---")
+# Tabs for stronger comparisons
+tab_overview, tab_compare, tab_pillar, tab_drill, tab_download = st.tabs(
+    ["Overview", "Compare Products", "Pillar Deep Dive", "Drilldown", "Downloads"]
+)
 
 # -----------------------------
-# Heatmaps
+# Overview tab
 # -----------------------------
-def metric_to_matrix(df_metrics: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    mat = df_metrics.pivot_table(index="product", columns="pillar", values=value_col, aggfunc="mean")
-    # order
-    mat = mat.reindex(index=selected_products)
-    mat = mat.reindex(columns=selected_pillars)
-    return mat
+with tab_overview:
+    st.subheader("📌 Portfolio overview")
 
+    # KPI cards
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
 
-metric_map = {
-    "net_sentiment (pos-neg among mentions)": "net_sentiment",
-    "mention_rate (talked about vs not mentioned)": "mention_rate",
-    "neg_share_mentions (complaints concentration)": "neg_share_mentions",
-    "polarization (love/hate intensity)": "polarization",
-}
-value_col = metric_map[metric_choice]
-mat = metric_to_matrix(m, value_col)
+    overall_total = int(m["total_reviews"].sum())
+    overall_mentions = int(m["mentions"].sum())
+    overall_mention_rate = (overall_mentions / overall_total) if overall_total else 0.0
 
-left, right = st.columns([1.4, 1])
+    overall_net = np.average(m["net_sentiment"], weights=m["mentions"].clip(lower=0)) if overall_mentions else 0.0
+    overall_neg_share = np.average(m["neg_share_mentions"], weights=m["mentions"].clip(lower=0)) if overall_mentions else 0.0
+    overall_pol = np.average(m["polarization"], weights=m["mentions"].clip(lower=0)) if overall_mentions else 0.0
 
-with left:
-    st.subheader("📌 Benchmark heatmap")
-    if value_col == "net_sentiment":
-        color_scale = "RdYlGn"
-        zmin, zmax = -1, 1
+    c1.metric("Total (reviews×pillars)", f"{overall_total:,}")
+    c2.metric("% Mentions (overall)", fmt_pct(overall_mention_rate))
+    c3.metric("Net sentiment (overall)", fmt_score(overall_net))
+    c4.metric("Neg share (among mentions)", fmt_pct(overall_neg_share))
+    c5.metric("Polarization", fmt_pct(overall_pol))
+
+    if has_stars and summary.product_stars is not None:
+        ps = summary.product_stars.copy()
+        ps = ps[ps["product"].isin(selected_products)]
+        st.markdown("#### ⭐ Average star rating by product (overall)")
+        st.dataframe(ps.sort_values("avg_stars_overall", ascending=False), use_container_width=True, height=220)
+
+    st.markdown("---")
+
+    # Heatmap selector (includes avg stars if available)
+    metric_options = [
+        "net_sentiment",
+        "mention_rate",
+        "neg_share_mentions",
+        "polarization",
+    ]
+    if has_stars:
+        metric_options += ["avg_stars_mentions", "positive", "negative", "neutral", "not mentioned"]
+        # Note: those last four (positive/negative/neutral/not mentioned) will only be present in stars_metrics as avg stars by label
+
+    heat_metric = st.selectbox(
+        "Heatmap metric",
+        metric_options,
+        index=metric_options.index("net_sentiment"),
+        help="avg_stars_mentions = average stars for reviews that mention the pillar (label != not mentioned).",
+    )
+
+    # Prepare heatmap matrix
+    def matrix_for(metric: str) -> pd.DataFrame:
+        tmp = m.copy()
+        mat = tmp.pivot_table(index="product", columns="pillar", values=metric, aggfunc="mean")
+        mat = mat.reindex(index=selected_products)
+        mat = mat.reindex(columns=selected_pillars)
+        return mat
+
+    mat = matrix_for(heat_metric)
+
+    if heat_metric == "net_sentiment":
+        colors = "RdYlGn"; zmin, zmax = -1, 1
         title = "Net sentiment (positive − negative) among mentions"
-    elif value_col in ["mention_rate", "neg_share_mentions", "polarization"]:
-        color_scale = "Blues" if value_col == "mention_rate" else "Reds"
-        zmin, zmax = 0, 1
-        title = metric_choice
+    elif heat_metric in ["mention_rate", "polarization"]:
+        colors = "Blues"; zmin, zmax = 0, 1
+        title = heat_metric
+    elif heat_metric == "neg_share_mentions":
+        colors = "Reds"; zmin, zmax = 0, 1
+        title = "Neg share among mentions"
+    elif heat_metric == "avg_stars_mentions":
+        colors = "YlGnBu"; zmin, zmax = 1, 5
+        title = "Average star rating among mentions"
+    elif heat_metric in ["positive", "negative", "neutral", "not mentioned"]:
+        colors = "Cividis"; zmin, zmax = 1, 5
+        title = f"Average stars when label = '{heat_metric}'"
     else:
-        color_scale = "Viridis"
-        zmin, zmax = None, None
-        title = metric_choice
+        colors = "Viridis"; zmin, zmax = None, None
+        title = heat_metric
 
     fig = px.imshow(
         mat,
         aspect="auto",
-        color_continuous_scale=color_scale,
+        color_continuous_scale=colors,
         zmin=zmin,
         zmax=zmax,
-        labels=dict(x="Pillar", y="Product", color=value_col),
-    )
-    fig.update_layout(
-        height=520,
-        margin=dict(l=10, r=10, t=50, b=10),
+        labels=dict(x="Pillar", y="Product", color=heat_metric),
         title=title,
     )
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=60, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-with right:
-    st.subheader("🏁 Biggest differentiators")
+    st.markdown("#### 🏁 Biggest differentiators (Net sentiment gap)")
     if len(selected_products) >= 2:
-        diffs = top_differences(m, selected_products, top_n=10)
-        if len(diffs):
-            # make it more readable
-            diffs_display = diffs.copy()
-            diffs_display["winner_net"] = diffs_display["winner_net"].map(fmt_score)
-            diffs_display["loser_net"] = diffs_display["loser_net"].map(fmt_score)
-            diffs_display["net_gap"] = diffs_display["net_gap"].map(lambda x: f"{x:.2f}")
-            st.dataframe(diffs_display, use_container_width=True, height=320)
-        else:
-            st.info("Not enough data to compute differentiators.")
+        diffs = top_differences(summary.metrics[summary.metrics["pillar"].isin(selected_pillars)], selected_products, top_n=12)
+        diffs["winner_net"] = diffs["winner_net"].map(lambda x: f"{x:+.2f}")
+        diffs["loser_net"] = diffs["loser_net"].map(lambda x: f"{x:+.2f}")
+        diffs["net_gap"] = diffs["net_gap"].map(lambda x: f"{x:.2f}")
+        st.dataframe(diffs, use_container_width=True, height=320)
     else:
         st.info("Select at least 2 products to compute differentiators.")
 
-    st.markdown("### Quick interpretation")
-    st.write(
-        "- **Net sentiment**: +1 means all-positive mentions; -1 means all-negative mentions.\n"
-        "- **Mention rate**: how often people talk about this theme at all.\n"
-        "- **Neg share**: within mentions, how complaint-heavy the theme is.\n"
-        "- **Polarization**: higher means stronger love/hate vs mostly neutral."
+# -----------------------------
+# Compare Products tab (heavier benchmarking)
+# -----------------------------
+with tab_compare:
+    st.subheader("⚔️ Compare products (side-by-side)")
+
+    compare_pillar = st.selectbox("Choose a pillar to compare", selected_pillars, index=selected_pillars.index("Noise level") if "Noise level" in selected_pillars else 0)
+
+    cmp = m[m["pillar"] == compare_pillar].copy()
+    cmp = cmp.sort_values(["mention_rate", "net_sentiment"], ascending=[False, False])
+
+    # Add clearer presentation columns
+    cmp_view = cmp[[
+        "product",
+        "mentions",
+        "total_reviews",
+        "mention_rate",
+        "net_sentiment",
+        "neg_share_mentions",
+        "polarization",
+        "pos_count",
+        "neu_count",
+        "neg_count",
+        "not_mentioned_count",
+    ]].copy()
+
+    if has_stars:
+        for col in ["avg_stars_mentions", "positive", "negative", "neutral", "not mentioned"]:
+            if col in cmp.columns:
+                cmp_view[col] = cmp[col]
+
+    # Format
+    fmt_cols_pct = ["mention_rate", "neg_share_mentions", "polarization"]
+    for c in fmt_cols_pct:
+        cmp_view[c] = (cmp_view[c] * 100).round(1)
+
+    cmp_view["net_sentiment"] = cmp_view["net_sentiment"].round(2)
+    if has_stars:
+        for c in ["avg_stars_mentions", "positive", "negative", "neutral", "not mentioned"]:
+            if c in cmp_view.columns:
+                cmp_view[c] = cmp_view[c].round(2)
+
+    st.dataframe(cmp_view, use_container_width=True, height=360)
+
+    st.markdown("#### Visual compare")
+    v1, v2 = st.columns(2)
+
+    with v1:
+        fig_a = px.scatter(
+            cmp,
+            x="mention_rate",
+            y="net_sentiment",
+            size="mentions",
+            color="product",
+            hover_data={"mentions": True, "total_reviews": True, "neg_share_mentions": True, "polarization": True},
+            title=f"{compare_pillar}: Mention rate vs Net sentiment",
+        )
+        fig_a.update_layout(height=420, xaxis_tickformat=".0%", yaxis_range=[-1, 1])
+        st.plotly_chart(fig_a, use_container_width=True)
+
+    with v2:
+        if has_stars and "avg_stars_mentions" in cmp.columns:
+            fig_b = px.scatter(
+                cmp,
+                x="mention_rate",
+                y="avg_stars_mentions",
+                size="mentions",
+                color="product",
+                hover_data={"mentions": True, "net_sentiment": True, "neg_share_mentions": True},
+                title=f"{compare_pillar}: Mention rate vs Avg stars (mentions)",
+            )
+            fig_b.update_layout(height=420, xaxis_tickformat=".0%", yaxis_range=[1, 5])
+            st.plotly_chart(fig_b, use_container_width=True)
+        else:
+            st.info("Upload/select a stars column to enable Avg Stars comparisons.")
+
+    st.markdown("---")
+    st.markdown("### 🧾 Full benchmark table (all pillars × products)")
+    # Wide pivot of key metrics for easier comparison
+    metric_pick = st.multiselect(
+        "Metrics to include in the comparison table",
+        ["mention_rate", "net_sentiment", "neg_share_mentions", "polarization"] + (["avg_stars_mentions"] if has_stars else []),
+        default=["mention_rate", "net_sentiment"] + (["avg_stars_mentions"] if has_stars else []),
     )
 
-st.markdown("---")
+    # Create a wide table: Pillar rows, Product columns for each metric (multiindex flattened)
+    wide_blocks = []
+    for met in metric_pick:
+        piv = m.pivot_table(index="pillar", columns="product", values=met, aggfunc="mean").reindex(index=selected_pillars)
+        piv.columns = [f"{met} | {c}" for c in piv.columns]
+        wide_blocks.append(piv)
+    wide = pd.concat(wide_blocks, axis=1)
+
+    # Pretty formatting
+    pretty = wide.copy()
+    for c in pretty.columns:
+        if c.startswith("mention_rate") or c.startswith("neg_share") or c.startswith("polarization"):
+            pretty[c] = (pretty[c] * 100).round(1).astype(str) + "%"
+        elif c.startswith("net_sentiment"):
+            pretty[c] = pretty[c].round(2).map(lambda x: f"{x:+.2f}")
+        elif c.startswith("avg_stars"):
+            pretty[c] = pretty[c].round(2)
+
+    st.dataframe(pretty, use_container_width=True, height=520)
 
 # -----------------------------
-# Pillar deep dive
+# Pillar Deep Dive tab
 # -----------------------------
-st.subheader("🔎 Pillar deep dive")
-col1, col2, col3 = st.columns([1, 1, 1.2])
+with tab_pillar:
+    st.subheader("🔎 Pillar distribution (labels + % mentions + stars)")
 
-with col1:
-    pillar = st.selectbox("Choose a pillar", selected_pillars, index=selected_pillars.index("Noise level") if "Noise level" in selected_pillars else 0)
-with col2:
-    view = st.selectbox("View", ["% of total (includes not mentioned)", "% among mentions only", "Counts"], index=0)
-with col3:
-    normalize = st.selectbox("Chart style", ["Stacked bar", "Grouped bar"], index=0)
+    pillar = st.selectbox("Choose a pillar", selected_pillars, index=selected_pillars.index("Noise level") if "Noise level" in selected_pillars else 0, key="deep_pillar")
 
-# Build distribution table for the pillar
-counts = summary.counts.copy()
-counts = counts[counts["product"].isin(selected_products) & (counts["pillar"] == pillar)].copy()
+    # Distribution table (% of total) per product
+    pct_total = summary.percents_total.copy()
+    pct_total = pct_total[pct_total["product"].isin(selected_products) & (pct_total["pillar"] == pillar)].copy()
 
-pct_total = summary.percents_total.copy()
-pct_total = pct_total[pct_total["product"].isin(selected_products) & (pct_total["pillar"] == pillar)].copy()
+    # Ensure all label columns exist
+    for lbl in VALID_LABELS:
+        if lbl not in pct_total.columns:
+            pct_total[lbl] = 0.0
 
-pct_mentions = summary.percents_mention.copy()
-pct_mentions = pct_mentions[pct_mentions["product"].isin(selected_products) & (pct_mentions["pillar"] == pillar)].copy()
+    # Add mention rate and net sentiment
+    base = m[m["pillar"] == pillar][["product", "mention_rate", "net_sentiment", "neg_share_mentions", "polarization", "mentions", "total_reviews"]].copy()
+    out = pct_total.merge(base, on="product", how="left")
 
-def wide_to_long_for_plot(df_wide: pd.DataFrame, value_name: str) -> pd.DataFrame:
-    cols = [c for c in VALID_LABELS if c in df_wide.columns]
-    out = df_wide.melt(id_vars=["product", "pillar"], value_vars=cols, var_name="label", value_name=value_name)
-    out["label"] = pd.Categorical(out["label"], categories=LABEL_ORDER, ordered=True)
-    return out.sort_values(["product", "label"])
+    # Add stars
+    if has_stars:
+        out = out.merge(summary.stars_metrics[summary.stars_metrics["pillar"] == pillar], on=["product", "pillar"], how="left")
 
-if view.startswith("% of total"):
-    plot_df = wide_to_long_for_plot(pct_total, "value")
-    ytitle = "Percent of total reviews"
-    plot_df["value"] = plot_df["value"] * 100
-elif view.startswith("% among mentions"):
-    plot_df = wide_to_long_for_plot(pct_mentions, "value")
-    ytitle = "Percent among mentions"
-    plot_df["value"] = plot_df["value"] * 100
-else:
-    plot_df = wide_to_long_for_plot(counts, "value")
-    ytitle = "Count"
+    # Format for display
+    display = out[["product"] + VALID_LABELS + ["mention_rate", "net_sentiment", "neg_share_mentions", "polarization"]].copy()
+    if has_stars:
+        if "avg_stars_mentions" in out.columns:
+            display["avg_stars_mentions"] = out["avg_stars_mentions"]
+        # avg stars by label if present
+        for lbl in ["positive", "negative", "neutral", "not mentioned"]:
+            if lbl in out.columns:
+                display[f"avg_stars | {lbl}"] = out[lbl]
 
-# Ensure product order
-plot_df["product"] = pd.Categorical(plot_df["product"], categories=selected_products, ordered=True)
-plot_df = plot_df.sort_values(["product", "label"])
+    for lbl in VALID_LABELS:
+        display[lbl] = (display[lbl] * 100).round(1).astype(str) + "%"
+    display["mention_rate"] = (display["mention_rate"] * 100).round(1).astype(str) + "%"
+    display["neg_share_mentions"] = (display["neg_share_mentions"] * 100).round(1).astype(str) + "%"
+    display["polarization"] = (display["polarization"] * 100).round(1).astype(str) + "%"
+    display["net_sentiment"] = display["net_sentiment"].round(2).map(lambda x: f"{x:+.2f}")
 
-if normalize == "Stacked bar":
-    fig2 = px.bar(
+    if has_stars:
+        if "avg_stars_mentions" in display.columns:
+            display["avg_stars_mentions"] = pd.to_numeric(display["avg_stars_mentions"], errors="coerce").round(2)
+        for c in [c for c in display.columns if c.startswith("avg_stars |")]:
+            display[c] = pd.to_numeric(display[c], errors="coerce").round(2)
+
+    st.dataframe(display.sort_values("product"), use_container_width=True, height=320)
+
+    # Stacked bar chart of label distribution
+    plot_df = out.melt(id_vars=["product"], value_vars=VALID_LABELS, var_name="label", value_name="pct_total")
+    plot_df["label"] = pd.Categorical(plot_df["label"], categories=LABEL_ORDER, ordered=True)
+    plot_df["pct_total"] = plot_df["pct_total"] * 100
+    plot_df["product"] = pd.Categorical(plot_df["product"], categories=selected_products, ordered=True)
+    plot_df = plot_df.sort_values(["product", "label"])
+
+    fig = px.bar(
         plot_df,
         x="product",
-        y="value",
+        y="pct_total",
         color="label",
         barmode="stack",
         category_orders={"label": LABEL_ORDER, "product": selected_products},
@@ -656,134 +892,97 @@ if normalize == "Stacked bar":
             "negative": "#e74c3c",
             "not mentioned": "#bdc3c7",
         },
-        title=f"{pillar} distribution by product",
+        title=f"{pillar}: label distribution (% of total reviews)",
     )
-else:
-    fig2 = px.bar(
-        plot_df,
-        x="product",
-        y="value",
-        color="label",
-        barmode="group",
-        category_orders={"label": LABEL_ORDER, "product": selected_products},
-        color_discrete_map={
-            "positive": "#2ecc71",
-            "neutral": "#95a5a6",
-            "negative": "#e74c3c",
-            "not mentioned": "#bdc3c7",
-        },
-        title=f"{pillar} distribution by product",
-    )
-
-fig2.update_layout(height=420, yaxis_title=ytitle, xaxis_title="Product", margin=dict(l=10, r=10, t=50, b=10))
-st.plotly_chart(fig2, use_container_width=True)
+    fig.update_layout(height=420, yaxis_title="% of total reviews", xaxis_title="Product", margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
-# Product profile radar
+# Drilldown tab
 # -----------------------------
-st.subheader("🧭 Product profiles")
-c1, c2 = st.columns([1, 2])
+with tab_drill:
+    st.subheader("🧷 Drilldown to underlying rows")
 
-with c1:
-    product_focus = st.selectbox("Choose a product", selected_products, index=0)
-    radar_metric = st.selectbox(
-        "Radar metric",
-        ["net_sentiment", "mention_rate", "neg_share_mentions", "polarization"],
-        index=0,
+    d1, d2, d3, d4 = st.columns([1, 1, 1, 1.2])
+    with d1:
+        drill_product = st.selectbox("Product", selected_products, index=0, key="drill_product")
+    with d2:
+        drill_pillar = st.selectbox("Pillar", selected_pillars, index=0, key="drill_pillar")
+    with d3:
+        drill_label = st.selectbox("Label", VALID_LABELS, index=0, key="drill_label")
+    with d4:
+        max_rows = st.slider("Max rows to show", 10, 500, 100, step=10)
+
+    drill = bench_df[
+        (bench_df["product"] == drill_product)
+        & (bench_df["pillar"] == drill_pillar)
+        & (bench_df["label"] == drill_label)
+    ].copy()
+
+    # Show highest-signal rows first if stars exist (e.g., lowest stars for negative)
+    if "stars" in drill.columns and drill["stars"].notna().any():
+        if drill_label == "negative":
+            drill = drill.sort_values("stars", ascending=True)
+        elif drill_label == "positive":
+            drill = drill.sort_values("stars", ascending=False)
+
+    drill = drill.head(max_rows)
+
+    cols_to_show = ["product", "pillar", "label"]
+    if "stars" in drill.columns:
+        cols_to_show.append("stars")
+    if "review_id" in drill.columns:
+        cols_to_show.insert(0, "review_id")
+    if "review_text" in drill.columns:
+        cols_to_show.append("review_text")
+
+    if len(drill) == 0:
+        st.info("No rows match this drilldown selection.")
+    else:
+        st.dataframe(drill[cols_to_show], use_container_width=True, height=360)
+
+# -----------------------------
+# Downloads tab
+# -----------------------------
+with tab_download:
+    st.subheader("⬇️ Downloads")
+
+    def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=False).encode("utf-8")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.download_button(
+            "Download metrics (CSV)",
+            data=df_to_csv_bytes(summary.metrics),
+            file_name="benchmark_metrics.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with d2:
+        dist = summary.percents_total.merge(summary.counts, on=["product", "pillar"], suffixes=("_pct_total", "_count"))
+        if has_stars:
+            dist = dist.merge(summary.stars_metrics, on=["product", "pillar"], how="left")
+        st.download_button(
+            "Download distributions + stars (CSV)",
+            data=df_to_csv_bytes(dist),
+            file_name="benchmark_distributions_with_stars.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with d3:
+        st.download_button(
+            "Download cleaned long format (CSV)",
+            data=df_to_csv_bytes(bench_df),
+            file_name="bench_long_clean.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.caption(
+        "If your Product Name is in Excel column AX, that’s fine—Excel letters don’t carry into CSV/XLSX parsing. "
+        "Select the correct header in the sidebar."
     )
 
-prof = m[m["product"] == product_focus].copy()
-prof = prof.set_index("pillar").reindex(selected_pillars).reset_index()
-
-# Radar values
-r = prof[radar_metric].fillna(0).astype(float).tolist()
-theta = prof["pillar"].tolist()
-
-radar = go.Figure()
-radar.add_trace(go.Scatterpolar(
-    r=r + [r[0]] if len(r) else r,
-    theta=theta + [theta[0]] if len(theta) else theta,
-    fill="toself",
-    name=product_focus,
-))
-radar.update_layout(
-    polar=dict(
-        radialaxis=dict(visible=True, range=[-1, 1] if radar_metric == "net_sentiment" else [0, 1])
-    ),
-    showlegend=False,
-    height=520,
-    margin=dict(l=10, r=10, t=30, b=10),
-)
-with c2:
-    st.plotly_chart(radar, use_container_width=True)
-
-# -----------------------------
-# Drilldown: show underlying rows
-# -----------------------------
-st.subheader("🧷 Drilldown to rows (optional review text)")
-d1, d2, d3, d4 = st.columns([1, 1, 1, 1.2])
-
-with d1:
-    drill_product = st.selectbox("Product", selected_products, index=0, key="drill_product")
-with d2:
-    drill_pillar = st.selectbox("Pillar", selected_pillars, index=0, key="drill_pillar")
-with d3:
-    drill_label = st.selectbox("Label", VALID_LABELS, index=0, key="drill_label")
-with d4:
-    max_rows = st.slider("Max rows to show", 10, 500, 100, step=10)
-
-drill = bench_df[(bench_df["product"] == drill_product) & (bench_df["pillar"] == drill_pillar) & (bench_df["label"] == drill_label)].copy()
-drill = drill.head(max_rows)
-
-cols_to_show = ["product", "pillar", "label"]
-if "review_id" in drill.columns:
-    cols_to_show.insert(0, "review_id")
-if "review_text" in drill.columns:
-    cols_to_show.append("review_text")
-
-if len(drill) == 0:
-    st.info("No rows match this drilldown selection.")
-else:
-    st.dataframe(drill[cols_to_show], use_container_width=True, height=320)
-
-# -----------------------------
-# Downloads
-# -----------------------------
-st.markdown("---")
-st.subheader("⬇️ Download benchmark tables")
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-dl1, dl2, dl3 = st.columns(3)
-with dl1:
-    st.download_button(
-        "Download metrics (CSV)",
-        data=df_to_csv_bytes(summary.metrics),
-        file_name="benchmark_metrics.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-with dl2:
-    # Long-form distribution (counts and pct_total)
-    dist = summary.percents_total.merge(summary.counts, on=["product", "pillar"], suffixes=("_pct_total", "_count"))
-    st.download_button(
-        "Download distributions (CSV)",
-        data=df_to_csv_bytes(dist),
-        file_name="benchmark_distributions.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-with dl3:
-    st.download_button(
-        "Download cleaned long format (CSV)",
-        data=df_to_csv_bytes(bench_df),
-        file_name="bench_long_clean.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-st.caption(
-    "Tip: If your Product Name column is truly AX in Excel, that’s fine—Excel letters don’t carry into CSV/XLSX parsing. "
-    "Just select the correct header in the sidebar."
-)
