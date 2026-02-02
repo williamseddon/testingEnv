@@ -982,5 +982,3 @@ with tab_download:
         "Excel column letters (e.g., AX) don’t carry into CSV/XLSX parsing. "
         "Just select the correct header in the sidebar."
     )
-
-
