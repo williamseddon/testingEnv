@@ -65,7 +65,7 @@ DEFAULT_PILLARS = [
     "Dry time",
     "Ease of use",
     "Noise level",
-    "Price",
+    "Price / Value",
 ]
 
 DEFAULT_PRODUCT_COL = "Product Name [AX]"
