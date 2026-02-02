@@ -741,9 +741,9 @@ def bubble_line_story(
 # -----------------------------
 # Streamlit App
 # -----------------------------
-st.set_page_config(page_title="AX Pillar Benchmark — Best in Class", layout="wide")
+st.set_page_config(page_title="AX Pillar Benchmark", layout="wide")
 
-st.title("🏁 AX Product Pillar Benchmark — Best‑in‑Class")
+st.title("Product Pillar Benchmarking")
 st.caption("Designed for fast, clean comparisons across products and pillars.")
 
 uploaded = st.sidebar.file_uploader("Upload processed output (CSV/Excel)", type=["csv", "tsv", "txt", "xlsx", "xls"])
