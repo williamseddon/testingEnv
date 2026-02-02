@@ -1,13 +1,29 @@
 # axMentions.py
 # ------------------------------------------------------------
-# FAST + BEST‑IN‑CLASS Product × Pillar Storytelling Dashboard
-# Focus: Product Name [AX]
+# AX Product Pillar Benchmark — Best‑in‑Class (FAST + CLEAN)
 #
-# FIXES:
-# ✅ Robust renaming after reset_index() (pandas versions differ) -> prevents KeyError
-# ✅ Seeded filter applied BEFORE compute
-# ✅ compute_key includes seeded_mode + included row count -> graphs update
-# ✅ Reset button clears computed cache
+# ✅ Fixes stale graphs:
+#   - df_base immutable
+#   - Seeded filter applied BEFORE compute
+#   - compute_key includes seeded_mode + rowcount (and more)
+#   - Reset button clears computed cache
+#
+# ✅ Fixes KeyError across pandas versions:
+#   - Robust rename_first_col() after reset_index()
+#
+# ✅ Strong visuals:
+#   - Scorecards per product
+#   - Heatmap: Conversation focus (share of product mentions)
+#   - Heatmap: Net sentiment
+#   - Bubble-line storyline chart (ONE chart): lines + circles sized & colored
+#   - Stacked bars (counts OR % of product total mentions)
+#   - Pillar faceoff
+#   - Differentiators + Opportunity leaderboard
+#   - Health check (labels, stars, seeded)
+#
+# Run:
+#   pip install streamlit pandas plotly openpyxl numpy
+#   streamlit run axMentions.py
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -16,13 +32,14 @@ import hashlib
 import io
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.colors import qualitative
 import streamlit as st
-
 
 # -----------------------------
 # Constants
@@ -79,9 +96,17 @@ LABEL_MAP = {
 }
 
 STAR_COL_CANDIDATES = [
-    "stars", "star", "rating", "star rating", "star_rating",
-    "overall rating", "overall_rating", "score",
+    "stars",
+    "star",
+    "rating",
+    "star rating",
+    "star_rating",
+    "overall rating",
+    "overall_rating",
+    "score",
 ]
+
+REMOVE_BRANDS_DEFAULT = ["Dyson", "Shark"]
 
 
 # -----------------------------
@@ -97,11 +122,11 @@ def md5_bytes(b: bytes) -> str:
 
 def load_file_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
     name = filename.lower()
-    if name.endswith(".csv") or name.endswith(".tsv") or name.endswith(".txt"):
+    if name.endswith((".csv", ".tsv", ".txt")):
         sample = file_bytes[:2048].decode("utf-8", errors="ignore")
         sep = "\t" if sample.count("\t") > sample.count(",") else ","
         return pd.read_csv(io.BytesIO(file_bytes), sep=sep)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
+    if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(file_bytes))
     raise ValueError("Unsupported file type. Upload CSV/TSV/TXT or Excel.")
 
@@ -111,6 +136,8 @@ def guess_stars_col(df: pd.DataFrame) -> Optional[str]:
     for cand in STAR_COL_CANDIDATES:
         if cand in lower_map:
             return lower_map[cand]
+
+    # heuristic: numeric mostly 1-5
     for c in df.columns:
         if pd.api.types.is_numeric_dtype(df[c]):
             s = df[c].dropna()
@@ -120,6 +147,7 @@ def guess_stars_col(df: pd.DataFrame) -> Optional[str]:
 
 
 def parse_stars_series(s: pd.Series) -> pd.Series:
+    """Vectorized parse stars -> float."""
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
     extracted = s.astype("string").str.extract(r"(\d+(?:\.\d+)?)", expand=False)
@@ -127,6 +155,7 @@ def parse_stars_series(s: pd.Series) -> pd.Series:
 
 
 def normalize_label_series(s: pd.Series) -> pd.Series:
+    """Vectorized normalization. Unknowns preserved (for QA); caller can coerce if needed."""
     out = s.astype("string").fillna("not mentioned")
     out = out.str.strip().str.lower()
     out = out.str.replace(r"\s+", " ", regex=True)
@@ -180,6 +209,7 @@ def make_unique_display_map(full_names: List[str], remove_words: List[str]) -> D
 
 
 def to_seeded_bool(seed: pd.Series) -> pd.Series:
+    """Normalize seeded flag into boolean (True = seeded)."""
     if pd.api.types.is_bool_dtype(seed):
         return seed.fillna(False)
 
@@ -192,7 +222,6 @@ def to_seeded_bool(seed: pd.Series) -> pd.Series:
     s = seed.astype("string").str.strip().str.lower()
     true_set = {"1", "true", "t", "yes", "y", "seeded", "incentivized", "gifted", "paid"}
     seeded.loc[~mask_num] = s.loc[~mask_num].isin(true_set)
-
     return seeded.fillna(False)
 
 
@@ -217,8 +246,18 @@ def rename_first_col(df: pd.DataFrame, new_name: str) -> pd.DataFrame:
     return df.rename(columns={df.columns[0]: new_name})
 
 
+def scale_bubble_sizes(values: pd.Series, min_size: int = 7, max_size: int = 28) -> np.ndarray:
+    """Sqrt scale so huge products don't dominate; stable and clean."""
+    v = pd.to_numeric(values, errors="coerce").fillna(0).clip(lower=0).to_numpy(dtype=float)
+    v = np.sqrt(v)
+    vmax = float(np.nanmax(v)) if len(v) else 0.0
+    if vmax <= 0:
+        return np.full(len(v), min_size, dtype=float)
+    return min_size + (v / vmax) * (max_size - min_size)
+
+
 # -----------------------------
-# Compute (FAST; no huge melt)
+# Compute (FAST)
 # -----------------------------
 @dataclass
 class DataPack:
@@ -239,22 +278,22 @@ def compute_fast_summary(
     cols = [product_col] + pillar_cols + ([stars_col] if stars_col else [])
     work = df[cols].copy()
 
-    # product series
+    # Product
     work[product_col] = work[product_col].astype("string").fillna("Unknown").str.strip()
     product = work[product_col].astype(str)
 
-    # stars parsed once
+    # Stars parsed once
     if stars_col:
         stars = parse_stars_series(work[stars_col])
     else:
         stars = pd.Series(np.nan, index=work.index)
 
-    # name mapping
+    # Product mapping
     full_products = sorted(product.dropna().unique().tolist())
     mapping = make_unique_display_map(full_products, remove_words=remove_words) if shorten_names else {p: p for p in full_products}
     name_map_df = pd.DataFrame({"product_full": list(mapping.keys()), "product_display": list(mapping.values())}).sort_values("product_display")
 
-    # product summary (ROBUST: rename first col not just "index")
+    # Product summary (counts + overall stars)
     prod = product.value_counts(dropna=False).rename("review_count").reset_index()
     prod = rename_first_col(prod, "product_full")
 
@@ -274,6 +313,7 @@ def compute_fast_summary(
     out_rows = []
     invalid_rows = []
 
+    # Per pillar: crosstab (fast) + stars among mentions
     for pillar in pillar_cols:
         lbl_norm = normalize_label_series(work[pillar])
 
@@ -283,10 +323,8 @@ def compute_fast_summary(
             for val, cnt in vc.items():
                 invalid_rows.append({"pillar": pillar, "invalid_value": str(val), "count": int(cnt)})
 
-        # coerce invalid -> not mentioned for stable compute
         lbl_clean = lbl_norm.where(lbl_norm.isin(VALID_LABELS), "not mentioned")
 
-        # counts per product (ROBUST: rename first column after reset_index)
         ct = pd.crosstab(product, lbl_clean.astype(str), dropna=False)
         ct = ct.reindex(columns=VALID_LABELS, fill_value=0).reset_index()
         ct = rename_first_col(ct, "product_full")
@@ -308,7 +346,7 @@ def compute_fast_summary(
         ct["pos_share_mentions"] = safe_div(ct["positive_count"], ct["mentions"])
         ct["neu_share_mentions"] = safe_div(ct["neutral_count"], ct["mentions"])
 
-        # avg stars among mentions (label != not mentioned)
+        # avg stars for reviews that mention this pillar
         if stars_col:
             mask = (lbl_clean != "not mentioned") & stars.notna()
             sum_stars = stars.where(mask).groupby(product).sum(min_count=1)
@@ -327,9 +365,10 @@ def compute_fast_summary(
     summary = pd.concat(out_rows, ignore_index=True)
     summary["product_display"] = summary["product_full"].map(mapping).fillna(summary["product_full"])
 
-    # mentions total per product -> share
+    # Mentions totals per product + share per pillar
     prod_mentions_total = summary.groupby("product_full", dropna=False)["mentions"].sum().rename("product_mentions_total").reset_index()
     summary = summary.merge(prod_mentions_total, on="product_full", how="left")
+
     summary["mention_share_of_product_mentions"] = np.where(
         summary["product_mentions_total"] > 0,
         summary["mentions"] / summary["product_mentions_total"],
@@ -337,13 +376,12 @@ def compute_fast_summary(
     )
     summary["opportunity_score"] = summary["mention_share_of_product_mentions"] * pd.Series(summary["neg_share_mentions"]).fillna(0)
 
-    # product-level mention sentiment
+    # Product-level mention sentiment (across all pillars)
     prod_agg = summary.groupby("product_full", dropna=False).agg(
         pos_mentions=("positive_count", "sum"),
         neg_mentions=("negative_count", "sum"),
         total_mentions=("mentions", "sum"),
     ).reset_index()
-
     prod_agg["overall_net_sentiment_mentions"] = np.where(
         prod_agg["total_mentions"] > 0,
         (prod_agg["pos_mentions"] - prod_agg["neg_mentions"]) / prod_agg["total_mentions"],
@@ -362,7 +400,7 @@ def compute_fast_summary(
     )
     prod["product_mentions_total"] = prod["product_mentions_total"].fillna(0).astype(int)
 
-    # top pillars strings
+    # Top mentioned pillars
     def top_pillars_str(g: pd.DataFrame, k: int = 3) -> str:
         gg = g.sort_values("mention_share_of_product_mentions", ascending=False).head(k)
         return ", ".join([f"{r.pillar} ({r.mention_share_of_product_mentions*100:.0f}%)" for r in gg.itertuples()])
@@ -371,7 +409,7 @@ def compute_fast_summary(
     top3 = rename_first_col(top3, "product_full")
     prod = prod.merge(top3, on="product_full", how="left")
 
-    # top opportunity pillar per product
+    # Top opportunity pillar per product
     tops = []
     for pfull, g in summary.groupby("product_full"):
         g2 = g.copy()
@@ -391,12 +429,12 @@ def compute_fast_summary(
 
 
 # -----------------------------
-# Streamlit App
+# App
 # -----------------------------
-st.set_page_config(page_title="AX Pillar Bench — Best in Class", layout="wide")
+st.set_page_config(page_title="AX Pillar Benchmark — Best in Class", layout="wide")
 
 st.title("🏁 AX Product Pillar Benchmark — Best‑in‑Class")
-st.caption("Fast updates + impactful visuals for comparing products across key pillars.")
+st.caption("Fast, stable recompute + clean visuals to compare products across key pillars.")
 
 uploaded = st.sidebar.file_uploader("Upload processed output (CSV/Excel)", type=["csv", "tsv", "txt", "xlsx", "xls"])
 if not uploaded:
@@ -406,7 +444,7 @@ if not uploaded:
 file_bytes = uploaded.getvalue()
 file_id = md5_bytes(file_bytes)
 
-# Load base df once per file
+# Load df_base once per file
 if st.session_state.get("file_id") != file_id:
     df_base = load_file_bytes(file_bytes, uploaded.name)
     df_base.columns = [clean_col(c) for c in df_base.columns]
@@ -419,7 +457,7 @@ else:
 
 cols = df_base.columns.tolist()
 
-# Column mapping
+# Sidebar: mapping
 st.sidebar.subheader("Column mapping")
 product_col = st.sidebar.selectbox(
     "Product column",
@@ -428,17 +466,25 @@ product_col = st.sidebar.selectbox(
 )
 
 stars_guess = guess_stars_col(df_base)
-stars_col = st.sidebar.selectbox(
+stars_col_choice = st.sidebar.selectbox(
     "Stars column (optional)",
     ["(none)"] + cols,
     index=(["(none)"] + cols).index(stars_guess) if stars_guess in cols else 0,
 )
-stars_col = None if stars_col == "(none)" else stars_col
+stars_col = None if stars_col_choice == "(none)" else stars_col_choice
+
+seeded_col = st.sidebar.selectbox(
+    "Seeded flag column (optional)",
+    ["(none)"] + cols,
+    index=(["(none)"] + cols).index(DEFAULT_SEEDED_COL) if DEFAULT_SEEDED_COL in cols else 0,
+)
+seeded_col = None if seeded_col == "(none)" else seeded_col
 
 excluded = {product_col}
 if stars_col:
     excluded.add(stars_col)
-excluded.add(DEFAULT_SEEDED_COL)
+if seeded_col:
+    excluded.add(seeded_col)
 
 default_pillars_present = [p for p in DEFAULT_PILLARS if p in cols]
 pillar_cols = st.sidebar.multiselect(
@@ -450,38 +496,39 @@ if not pillar_cols:
     st.error("Select at least one pillar column.")
     st.stop()
 
-# Seeded filter (apply BEFORE compute)
+# Sidebar: filters
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data filters")
-seeded_col_present = DEFAULT_SEEDED_COL in df_base.columns
+
 seeded_mode = "Include all"
 seeded_bool = pd.Series(False, index=df_base.index)
 seeded_count = 0
 
-if seeded_col_present:
+if seeded_col and seeded_col in df_base.columns:
     seeded_mode = st.sidebar.selectbox(
         "Seeded reviews",
         ["Include all", "Exclude seeded", "Only seeded"],
         index=1,
-        help="Filters using 'Seeded Flag' BEFORE computing charts.",
+        help="Applied BEFORE computing charts.",
     )
-    seeded_bool = to_seeded_bool(df_base[DEFAULT_SEEDED_COL])
+    seeded_bool = to_seeded_bool(df_base[seeded_col])
     seeded_count = int(seeded_bool.sum())
 else:
-    st.sidebar.caption("Seeded Flag column not found.")
+    st.sidebar.caption("No seeded flag column selected.")
 
-if seeded_col_present and seeded_mode == "Exclude seeded":
+if seeded_col and seeded_mode == "Exclude seeded":
     df_work = df_base.loc[~seeded_bool].copy()
-elif seeded_col_present and seeded_mode == "Only seeded":
+elif seeded_col and seeded_mode == "Only seeded":
     df_work = df_base.loc[seeded_bool].copy()
 else:
     df_work = df_base.copy()
 
-# Presentation controls
+# Sidebar: presentation
 st.sidebar.markdown("---")
 st.sidebar.subheader("Presentation")
+
 shorten_names = st.sidebar.checkbox("Shorten product names (remove Dyson/Shark)", value=True)
-remove_words = ["Dyson", "Shark"]
+remove_words = REMOVE_BRANDS_DEFAULT
 
 theme = st.sidebar.radio("Theme", ["Light", "Dark"], index=0)
 template = "plotly_white" if theme == "Light" else "plotly_dark"
@@ -497,17 +544,18 @@ if st.sidebar.button("🔄 Reset / Clear computed cache"):
     st.session_state.pop("pack", None)
     st.rerun()
 
-# Compute key must include seeded_mode + included row count
+# Compute key includes seeded state + df_work shape to ensure fresh charts
 compute_key = (
     file_id,
     product_col,
     tuple(pillar_cols),
     stars_col,
+    seeded_col,
+    seeded_mode,
+    df_work.shape[0],
+    df_work[product_col].nunique(),
     shorten_names,
     tuple(remove_words),
-    seeded_col_present,
-    seeded_mode,
-    len(df_work),
 )
 
 if st.session_state.get("compute_key") != compute_key:
@@ -528,9 +576,10 @@ else:
 summary = pack.summary.copy()
 prod = pack.product_summary.copy()
 
-# View filters
+# Sidebar: view filters
 st.sidebar.markdown("---")
 st.sidebar.subheader("View filters")
+
 display_by_full = dict(zip(prod["product_full"], prod["product_display"]))
 
 selected_products_full = st.sidebar.multiselect(
@@ -540,45 +589,49 @@ selected_products_full = st.sidebar.multiselect(
     format_func=lambda x: display_by_full.get(x, x),
 )
 
-all_pillars = sorted(summary["pillar"].unique().tolist(), key=lambda p: DEFAULT_PILLARS.index(p) if p in DEFAULT_PILLARS else 10_000)
+all_pillars = sorted(
+    summary["pillar"].astype(str).unique().tolist(),
+    key=lambda p: DEFAULT_PILLARS.index(p) if p in DEFAULT_PILLARS else 10_000
+)
 selected_pillars = st.sidebar.multiselect("Pillars", options=all_pillars, default=all_pillars)
 
-summary = summary[summary["product_full"].isin(selected_products_full) & summary["pillar"].isin(selected_pillars)].copy()
+summary = summary[summary["product_full"].isin(selected_products_full) & summary["pillar"].astype(str).isin(selected_pillars)].copy()
 prod = prod[prod["product_full"].isin(selected_products_full)].copy().sort_values("product_display")
+
 product_order = prod["product_display"].tolist()
 
-def pillar_order(df: pd.DataFrame) -> List[str]:
+def get_pillar_order(df: pd.DataFrame) -> List[str]:
     pillars = df["pillar"].astype(str).unique().tolist()
     if pillar_order_mode == "Default":
         base = [p for p in DEFAULT_PILLARS if p in pillars]
         rest = [p for p in pillars if p not in base]
         return base + sorted(rest)
     if pillar_order_mode == "Most mentioned":
-        return df.groupby("pillar")["mentions"].sum().sort_values(ascending=False).index.tolist()
+        return df.groupby(df["pillar"].astype(str))["mentions"].sum().sort_values(ascending=False).index.tolist()
     if pillar_order_mode == "Most negative":
         tmp = df.copy()
-        tmp["wneg"] = pd.to_numeric(tmp["neg_share_mentions"], errors="coerce").fillna(0) * tmp["mentions"].fillna(0)
-        agg = (tmp.groupby("pillar")["wneg"].sum() / tmp.groupby("pillar")["mentions"].sum().replace(0, np.nan)).sort_values(ascending=False)
+        tmp["_wneg"] = pd.to_numeric(tmp["neg_share_mentions"], errors="coerce").fillna(0) * tmp["mentions"].fillna(0)
+        agg = (tmp.groupby(tmp["pillar"].astype(str))["_wneg"].sum() / tmp.groupby(tmp["pillar"].astype(str))["mentions"].sum().replace(0, np.nan)).sort_values(ascending=False)
         return agg.index.tolist()
-    return df.groupby("pillar")["opportunity_score"].mean().sort_values(ascending=False).index.tolist()
+    return df.groupby(df["pillar"].astype(str))["opportunity_score"].mean().sort_values(ascending=False).index.tolist()
 
-pillars_ordered = [p for p in pillar_order(summary) if p in selected_pillars]
+pillars_ordered = [p for p in get_pillar_order(summary) if p in selected_pillars]
 
 summary["product_display"] = pd.Categorical(summary["product_display"], categories=product_order, ordered=True)
-summary["pillar"] = pd.Categorical(summary["pillar"], categories=pillars_ordered, ordered=True)
+summary["pillar"] = pd.Categorical(summary["pillar"].astype(str), categories=pillars_ordered, ordered=True)
 
-# Top status
+# Top status row
 st.markdown("---")
 c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1, 1, 1.2])
 c1.metric("Reviews (base)", f"{len(df_base):,}")
-c2.metric("Seeded (base)", f"{seeded_count:,}" if seeded_col_present else "N/A")
+c2.metric("Seeded (base)", f"{seeded_count:,}" if seeded_col else "N/A")
 c3.metric("Reviews (included)", f"{len(df_work):,}")
 c4.metric("Products", f"{prod['product_full'].nunique():,}")
 c5.metric("Pillars", f"{len(selected_pillars):,}")
-if seeded_col_present:
+if seeded_col:
     st.caption(f"Seeded mode: **{seeded_mode}** · Included reviews: **{len(df_work):,}**")
 
-# Product scorecards
+# Scorecards
 st.subheader("🔎 Product scorecards")
 cols_cards = st.columns(min(4, max(1, len(prod))))
 for i, r in enumerate(prod.itertuples()):
@@ -594,14 +647,16 @@ for i, r in enumerate(prod.itertuples()):
         st.caption(f"**Top opportunity:** {r.top_opportunity_pillar or '—'}")
 
 st.markdown("---")
-
 tab_story, tab_stack, tab_faceoff, tab_table, tab_health = st.tabs(
-    ["Story Heatmaps", "Stacked Bars", "Pillar Faceoff", "Table + Export", "Health Check"]
+    ["Story", "Stacked Bars", "Pillar Faceoff", "Table + Export", "Health Check"]
 )
 
+# -----------------------------
+# TAB: Story (heatmaps + bubble-line + differentiators + hotspots)
+# -----------------------------
 with tab_story:
-    st.subheader("Conversation focus")
-    st.caption("Heatmap = share of each product’s total mentions by pillar (each product sums to 100% across pillars).")
+    st.subheader("1) Conversation focus")
+    st.caption("Heatmap = **share of each product’s total mentions** by pillar (each product sums to 100% across pillars).")
 
     fig_focus = px.density_heatmap(
         summary,
@@ -617,7 +672,9 @@ with tab_story:
     fig_focus.update_yaxes(title="")
     st.plotly_chart(fig_focus, use_container_width=True)
 
-    st.subheader("How it feels")
+    st.subheader("2) How it feels")
+    st.caption("Net sentiment = (positive − negative) / mentions, from -1 to +1.")
+
     fig_sent = px.density_heatmap(
         summary,
         x="pillar",
@@ -633,37 +690,280 @@ with tab_story:
     fig_sent.update_yaxes(title="")
     st.plotly_chart(fig_sent, use_container_width=True)
 
-    st.subheader("Hotspots (high‑volume pain)")
-    min_mentions = st.slider("Min mentions to include", 0, int(summary["mentions"].max() if len(summary) else 0), 10)
-    opp = summary[summary["mentions"] >= min_mentions].copy().sort_values("opportunity_score", ascending=False).head(20)
+    # ---- Bubble-line storyline chart ----
+    st.markdown("---")
+    st.subheader("3) Pillar storyline (lines + circles)")
+    st.caption(
+        "One chart: **line height = focus** (what they talk about), "
+        "**circle size = volume**, **circle color = sentiment**."
+    )
 
-    opp_show = opp.copy()
-    opp_show["mention_share_%"] = (opp_show["mention_share_of_product_mentions"] * 100).round(1)
-    opp_show["neg_share_%"] = (pd.to_numeric(opp_show["neg_share_mentions"], errors="coerce") * 100).round(1)
-    opp_show["net_sentiment"] = pd.to_numeric(opp_show["net_sentiment"], errors="coerce").round(2)
-    opp_show["opportunity_(0-100)"] = (pd.to_numeric(opp_show["opportunity_score"], errors="coerce") * 100).round(2)
+    cA, cB, cC = st.columns([1.2, 1.2, 1.2])
+    with cA:
+        y_choice = st.selectbox(
+            "Line (Y)",
+            [
+                "Mention share of product mentions (%)",
+                "Mention rate (% of reviews)",
+                "Net sentiment",
+                "Avg stars (mentions)",
+            ],
+            index=0,
+        )
+    with cB:
+        size_choice = st.radio(
+            "Circle size",
+            ["Mentions (count)", "% of product mentions"],
+            index=0,
+            horizontal=True,
+        )
+    with cC:
+        color_choice = st.selectbox(
+            "Circle color",
+            ["Net sentiment", "Negative share (mentions)"],
+            index=0,
+        )
 
-    if stars_col:
-        opp_show["avg_stars_mentions"] = pd.to_numeric(opp_show["avg_stars_mentions"], errors="coerce").round(2)
+    # map Y
+    if y_choice == "Mention share of product mentions (%)":
+        y_col, y_is_pct, y_label = "mention_share_of_product_mentions", True, "Mention share"
+    elif y_choice == "Mention rate (% of reviews)":
+        y_col, y_is_pct, y_label = "mention_rate", True, "Mention rate"
+    elif y_choice == "Net sentiment":
+        y_col, y_is_pct, y_label = "net_sentiment", False, "Net sentiment"
+    else:
+        y_col, y_is_pct, y_label = "avg_stars_mentions", False, "Avg stars (mentions)"
+
+    # size
+    if size_choice == "Mentions (count)":
+        size_col, size_is_pct = "mentions", False
+    else:
+        size_col, size_is_pct = "mention_share_of_product_mentions", True
+
+    # color
+    if color_choice == "Net sentiment":
+        color_col, cmin, cmax, colorscale, colorbar_title = "net_sentiment", -1, 1, "RdYlGn", "Net sentiment"
+    else:
+        color_col, cmin, cmax, colorscale, colorbar_title = "neg_share_mentions", 0, 1, "RdYlGn_r", "Negative share"
+
+    df_plot = summary.copy()
+    df_plot["pillar_str"] = df_plot["pillar"].astype(str)
+
+    pillar_x = [str(p) for p in pillars_ordered]
+
+    # y values
+    y_vals = pd.to_numeric(df_plot[y_col], errors="coerce")
+    df_plot["_y"] = (y_vals * 100.0) if y_is_pct else y_vals
+
+    # size base
+    s_vals = pd.to_numeric(df_plot[size_col], errors="coerce").fillna(0)
+    df_plot["_size_base"] = (s_vals * 100.0) if size_is_pct else s_vals
+
+    # color values
+    df_plot["_color"] = pd.to_numeric(df_plot[color_col], errors="coerce")
+
+    palette = qualitative.Set2 + qualitative.Safe + qualitative.Dark2 + qualitative.Plotly
+    product_colors = {p: palette[i % len(palette)] for i, p in enumerate(product_order)}
+
+    fig = go.Figure()
+    show_scale = True
+
+    for p_name in product_order:
+        g = df_plot[df_plot["product_display"] == p_name].copy()
+        if g.empty:
+            continue
+
+        g = g.set_index("pillar_str").reindex(pillar_x).reset_index()
+        g["product_display"] = p_name
+
+        # line (keeps clean)
+        fig.add_trace(
+            go.Scatter(
+                x=g["pillar_str"],
+                y=g["_y"],
+                mode="lines",
+                name=p_name,
+                line=dict(color=product_colors.get(p_name, "#333"), width=2),
+                legendgroup=p_name,
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+
+        # markers only where mentions > 0
+        gm = g[g["mentions"].fillna(0) > 0].copy()
+        if gm.empty:
+            continue
+
+        sizes = scale_bubble_sizes(gm["_size_base"], min_size=7, max_size=28)
+
+        # hover with key fields
+        cd = np.stack(
+            [
+                gm["product_display"].astype(str).to_numpy(),
+                gm["mentions"].fillna(0).astype(int).to_numpy(),
+                gm["positive_count"].fillna(0).astype(int).to_numpy(),
+                gm["neutral_count"].fillna(0).astype(int).to_numpy(),
+                gm["negative_count"].fillna(0).astype(int).to_numpy(),
+                pd.to_numeric(gm["mention_rate"], errors="coerce").fillna(0).to_numpy(),
+                pd.to_numeric(gm["net_sentiment"], errors="coerce").to_numpy(),
+                pd.to_numeric(gm["avg_stars_mentions"], errors="coerce").to_numpy(),
+            ],
+            axis=-1,
+        )
+
+        hovertemplate = (
+            "<b>%{customdata[0]}</b><br>"
+            "Pillar: %{x}<br>"
+            f"{y_label}: %{y:.2f}" + ("%" if y_is_pct else "") + "<br>"
+            "Mentions: %{customdata[1]:,}<br>"
+            "Pos/Neu/Neg: %{customdata[2]:,} / %{customdata[3]:,} / %{customdata[4]:,}<br>"
+            "Mention rate: %{customdata[5]:.1%}<br>"
+            "Net sentiment: %{customdata[6]:+.2f}<br>"
+            "Avg stars (mentions): %{customdata[7]:.2f}<br>"
+            "<extra></extra>"
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=gm["pillar_str"],
+                y=gm["_y"],
+                mode="markers",
+                name=p_name,
+                legendgroup=p_name,
+                showlegend=False,
+                customdata=cd,
+                hovertemplate=hovertemplate,
+                marker=dict(
+                    size=sizes,
+                    color=gm["_color"],
+                    colorscale=colorscale,
+                    cmin=cmin,
+                    cmax=cmax,
+                    showscale=show_scale,
+                    colorbar=dict(title=colorbar_title) if show_scale else None,
+                    line=dict(color="rgba(255,255,255,0.95)", width=1),
+                    opacity=0.95,
+                ),
+            )
+        )
+        show_scale = False
+
+    fig.update_layout(
+        template=template,
+        height=580,
+        margin=dict(l=20, r=20, t=60, b=40),
+        legend_title_text="Product",
+        hovermode="closest",
+        title="Pillar storyline: focus (line), volume (circle size), sentiment (circle color)",
+    )
+    fig.update_xaxes(
+        title="",
+        type="category",
+        categoryorder="array",
+        categoryarray=pillar_x,
+        tickangle=-25,
+    )
+
+    if y_col == "net_sentiment":
+        fig.update_yaxes(title=y_label, range=[-1, 1], zeroline=True)
+    elif y_col == "avg_stars_mentions":
+        fig.update_yaxes(title=y_label, range=[1, 5])
+    else:
+        fig.update_yaxes(title=y_label + (" (%)" if y_is_pct else ""), rangemode="tozero")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Differentiators ----
+    st.markdown("---")
+    st.subheader("4) Biggest differentiators (what varies most across products)")
+    st.caption("Ranks pillars by **volume × variation**, so you see meaningful differences (not noise).")
+
+    d = summary.copy()
+    grp = d.groupby(d["pillar"].astype(str)).agg(
+        total_mentions=("mentions", "sum"),
+        share_min=("mention_share_of_product_mentions", "min"),
+        share_max=("mention_share_of_product_mentions", "max"),
+        net_min=("net_sentiment", "min"),
+        net_max=("net_sentiment", "max"),
+    ).reset_index().rename(columns={"pillar": "Pillar"})
+
+    grp["share_range"] = grp["share_max"] - grp["share_min"]
+    grp["net_range"] = (grp["net_max"] - grp["net_min"]).abs()
+    grp["impact_share"] = grp["total_mentions"] * grp["share_range"]
+    grp["impact_sentiment"] = grp["total_mentions"] * grp["net_range"]
+
+    rank_mode = st.radio("Rank by", ["Conversation focus differences", "Sentiment differences"], horizontal=True)
+    topN = st.slider("Show top N", 5, min(30, len(grp)), 12)
+
+    if rank_mode == "Conversation focus differences":
+        show = grp.sort_values("impact_share", ascending=False).head(topN).copy()
+    else:
+        show = grp.sort_values("impact_sentiment", ascending=False).head(topN).copy()
+
+    show["Mention share range (pp)"] = (show["share_range"] * 100).round(1)
+    show["Net sentiment range"] = show["net_range"].round(2)
 
     st.dataframe(
-        opp_show[["product_display", "pillar", "mentions", "mention_share_%", "neg_share_%", "net_sentiment", "avg_stars_mentions", "opportunity_(0-100)"]]
-        .rename(columns={"product_display": "Product", "avg_stars_mentions": "Avg stars (mentions)"}),
+        show[["Pillar", "total_mentions", "Mention share range (pp)", "Net sentiment range"]].rename(columns={"total_mentions": "Total mentions"}),
+        use_container_width=True,
+        height=360,
+    )
+
+    # ---- Hotspots ----
+    st.markdown("---")
+    st.subheader("5) Hotspots (high‑volume pain)")
+    st.caption("Opportunity = mention share × negative share (high‑volume issues rise to the top).")
+
+    min_mentions = st.slider("Min mentions to include", 0, int(summary["mentions"].max() if len(summary) else 0), 10)
+    opp = summary[summary["mentions"] >= min_mentions].copy().sort_values("opportunity_score", ascending=False).head(25)
+
+    opp_show = opp.copy()
+    opp_show["Mention share (%)"] = (opp_show["mention_share_of_product_mentions"] * 100).round(1)
+    opp_show["Negative share (%)"] = (pd.to_numeric(opp_show["neg_share_mentions"], errors="coerce") * 100).round(1)
+    opp_show["Net sentiment"] = pd.to_numeric(opp_show["net_sentiment"], errors="coerce").round(2)
+    opp_show["Opportunity (0-100)"] = (pd.to_numeric(opp_show["opportunity_score"], errors="coerce") * 100).round(2)
+    if stars_col:
+        opp_show["Avg stars (mentions)"] = pd.to_numeric(opp_show["avg_stars_mentions"], errors="coerce").round(2)
+
+    st.dataframe(
+        opp_show[["product_display", "pillar", "mentions", "Mention share (%)", "Negative share (%)", "Net sentiment", "Avg stars (mentions)", "Opportunity (0-100)"]]
+        .rename(columns={"product_display": "Product", "pillar": "Pillar", "mentions": "Mentions"}),
         use_container_width=True,
         height=420,
     )
 
+# -----------------------------
+# TAB: Stacked bars (counts OR % of product mentions)
+# -----------------------------
 with tab_stack:
     st.subheader("Stacked bars by pillar")
+    st.caption("Switch between raw counts and **% of product total mentions**.")
+
     mode = st.radio(
         "X-axis mode",
-        ["Counts (positive/neutral/negative/not mentioned)", "% of product total mentions (pos/neu/neg only)"],
+        ["Counts (pos/neu/neg/not mentioned)", "% of product total mentions (pos/neu/neg only)"],
         index=0,
         horizontal=True,
     )
 
+    cA, cB = st.columns([1, 1])
+    with cA:
+        limit_pillars = st.checkbox("Show only top pillars by mentions (overall)", value=False)
+    with cB:
+        top_k = st.slider("Top K pillars", 3, max(3, len(pillars_ordered)), min(8, len(pillars_ordered)))
+
+    plot_base = summary.copy()
+    if limit_pillars:
+        top_p = plot_base.groupby(plot_base["pillar"].astype(str))["mentions"].sum().sort_values(ascending=False).head(top_k).index.tolist()
+        plot_base = plot_base[plot_base["pillar"].astype(str).isin(top_p)].copy()
+        plot_base["pillar"] = pd.Categorical(plot_base["pillar"].astype(str), categories=top_p, ordered=True)
+        local_pillar_order = top_p
+    else:
+        local_pillar_order = pillars_ordered
+
     if mode.startswith("Counts"):
-        plot_long = summary.melt(
+        plot_long = plot_base.melt(
             id_vars=["product_display", "pillar", "mentions", "mention_rate", "avg_stars_mentions"],
             value_vars=["positive_count", "neutral_count", "negative_count", "not_mentioned_count"],
             var_name="label",
@@ -687,13 +987,14 @@ with tab_stack:
             orientation="h",
             barmode="stack",
             color_discrete_map=SENTIMENT_COLORS,
+            category_orders={"product_display": product_order, "pillar": local_pillar_order, "label": LABEL_ORDER},
             template=template,
-            title="Counts of labels per pillar (faceted by product)",
         )
         fig.update_xaxes(title="Count")
+        fig.update_layout(title="Counts of labels per pillar (faceted by product)")
     else:
-        plot_long = summary.melt(
-            id_vars=["product_display", "pillar", "product_mentions_total"],
+        plot_long = plot_base.melt(
+            id_vars=["product_display", "pillar", "product_mentions_total", "mentions"],
             value_vars=["positive_count", "neutral_count", "negative_count"],
             var_name="label",
             value_name="count",
@@ -715,48 +1016,128 @@ with tab_stack:
             orientation="h",
             barmode="stack",
             color_discrete_map=SENTIMENT_COLORS,
+            category_orders={"product_display": product_order, "pillar": local_pillar_order, "label": ["positive", "neutral", "negative"]},
             template=template,
-            title="% of product total mentions (pos/neu/neg only) — sums to 100% per product",
         )
         fig.update_xaxes(title="% of product total mentions")
+        fig.update_layout(title="% of product total mentions (pos/neu/neg) — sums to 100% per product")
 
-    fig.update_layout(height=min(1800, 260 + 260 * len(product_order)), margin=dict(l=10, r=10, t=60, b=10))
+    fig.update_layout(
+        height=min(1800, 260 + 260 * len(product_order)),
+        margin=dict(l=10, r=10, t=70, b=10),
+        legend_title_text="Label",
+    )
     fig.for_each_annotation(lambda a: a.update(text=a.text.replace("product_display=", "Product: ")))
     fig.update_yaxes(title="")
     st.plotly_chart(fig, use_container_width=True)
 
+# -----------------------------
+# TAB: Pillar faceoff
+# -----------------------------
 with tab_faceoff:
     st.subheader("Pillar faceoff")
     pillar_pick = st.selectbox("Choose pillar", pillars_ordered, index=0)
-    p = summary[summary["pillar"] == pillar_pick].copy().sort_values("product_display")
+    p = summary[summary["pillar"].astype(str) == pillar_pick].copy().sort_values("product_display")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        fig_m = px.bar(p, x="product_display", y="mention_rate", template=template, title="Mention rate")
+        fig_m = px.bar(
+            p,
+            x="product_display",
+            y="mention_rate",
+            text=(p["mention_rate"] * 100).round(1).astype(str) + "%",
+            template=template,
+            title="Mention rate",
+        )
         fig_m.update_layout(height=360)
         fig_m.update_yaxes(tickformat=".0%")
         fig_m.update_xaxes(title="")
         st.plotly_chart(fig_m, use_container_width=True)
 
     with c2:
-        fig_n = px.bar(p, x="product_display", y="net_sentiment", template=template, title="Net sentiment")
+        fig_n = px.bar(
+            p,
+            x="product_display",
+            y="net_sentiment",
+            text=pd.to_numeric(p["net_sentiment"], errors="coerce").round(2),
+            template=template,
+            title="Net sentiment",
+        )
         fig_n.update_layout(height=360, yaxis_range=[-1, 1])
         fig_n.update_xaxes(title="")
         st.plotly_chart(fig_n, use_container_width=True)
 
     with c3:
         if stars_col:
-            fig_s = px.bar(p, x="product_display", y="avg_stars_mentions", template=template, title="Avg stars (mentions)")
+            fig_s = px.bar(
+                p,
+                x="product_display",
+                y="avg_stars_mentions",
+                text=pd.to_numeric(p["avg_stars_mentions"], errors="coerce").round(2),
+                template=template,
+                title="Avg stars (mentions)",
+            )
             fig_s.update_layout(height=360, yaxis_range=[1, 5])
             fig_s.update_xaxes(title="")
             st.plotly_chart(fig_s, use_container_width=True)
         else:
-            st.info("Provide a stars column to enable avg stars comparison.")
+            st.info("Select a stars column to enable avg stars comparison.")
 
+    st.markdown("#### Exact counts")
+    t = p[[
+        "product_display", "positive_count", "neutral_count", "negative_count", "not_mentioned_count",
+        "mentions", "mention_rate", "mention_share_of_product_mentions",
+        "neg_share_mentions", "avg_stars_mentions"
+    ]].copy()
+    t = t.rename(columns={"product_display": "Product"})
+    t["mention_rate"] = (t["mention_rate"] * 100).round(1).astype(str) + "%"
+    t["mention_share_of_product_mentions"] = (t["mention_share_of_product_mentions"] * 100).round(1).astype(str) + "%"
+    t["neg_share_mentions"] = (pd.to_numeric(t["neg_share_mentions"], errors="coerce") * 100).round(1).astype(str) + "%"
+    if stars_col:
+        t["avg_stars_mentions"] = pd.to_numeric(t["avg_stars_mentions"], errors="coerce").round(2)
+    else:
+        t = t.drop(columns=["avg_stars_mentions"])
+    st.dataframe(t, use_container_width=True, height=300)
+
+# -----------------------------
+# TAB: Table + export
+# -----------------------------
 with tab_table:
     st.subheader("Full Product × Pillar table")
-    out = summary.copy()
-    st.dataframe(out.sort_values(["product_display", "pillar"]), use_container_width=True, height=560)
+
+    out = summary[[
+        "product_display", "product_full", "pillar",
+        "positive_count", "neutral_count", "negative_count", "not_mentioned_count",
+        "mentions", "total_reviews",
+        "mention_rate", "mention_share_of_product_mentions",
+        "net_sentiment", "neg_share_mentions",
+        "avg_stars_mentions", "n_star_mentions",
+        "opportunity_score",
+    ]].copy()
+
+    disp = out.copy().rename(columns={
+        "product_display": "Product",
+        "product_full": "Full Product Name",
+        "mention_rate": "Mention rate",
+        "mention_share_of_product_mentions": "Mention share (of product)",
+        "neg_share_mentions": "Neg share (mentions)",
+        "avg_stars_mentions": "Avg stars (mentions)",
+        "opportunity_score": "Opportunity (share×neg)",
+        "pillar": "Pillar",
+    })
+
+    disp["Mention rate"] = (disp["Mention rate"] * 100).round(1).astype(str) + "%"
+    disp["Mention share (of product)"] = (disp["Mention share (of product)"] * 100).round(1).astype(str) + "%"
+    disp["Net sentiment"] = pd.to_numeric(disp["net_sentiment"], errors="coerce").round(2).map(lambda x: f"{x:+.2f}" if pd.notna(x) else "—")
+    disp["Neg share (mentions)"] = (pd.to_numeric(disp["Neg share (mentions)"], errors="coerce") * 100).round(1).astype(str) + "%"
+    disp["Opportunity (share×neg)"] = (pd.to_numeric(disp["Opportunity (share×neg)"], errors="coerce") * 100).round(2)
+
+    disp = disp.drop(columns=["net_sentiment"])
+    if not stars_col:
+        disp = disp.drop(columns=["Avg stars (mentions)", "n_star_mentions"])
+
+    st.dataframe(disp.sort_values(["Product", "Pillar"]), use_container_width=True, height=560)
+
     st.download_button(
         "Download summary CSV",
         data=out.to_csv(index=False).encode("utf-8"),
@@ -764,15 +1145,63 @@ with tab_table:
         mime="text/csv",
         use_container_width=True,
     )
+    st.download_button(
+        "Download product name mapping CSV",
+        data=pack.name_map.to_csv(index=False).encode("utf-8"),
+        file_name="ax_product_name_mapping.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
+# -----------------------------
+# TAB: Health check
+# -----------------------------
 with tab_health:
-    st.subheader("Health Check")
+    st.subheader("✅ Health Check")
+
+    st.markdown("### Label validity")
     if len(pack.invalid_labels):
-        st.warning("Invalid/unknown label values found (treated as 'not mentioned' for metrics).")
+        st.warning("Invalid/unknown label values found. They are treated as 'not mentioned' in metrics.")
         st.dataframe(pack.invalid_labels, use_container_width=True, height=320)
     else:
-        st.success("All pillar labels are valid.")
+        st.success("All pillar labels are valid: positive / neutral / negative / not mentioned.")
+
+    st.markdown("---")
+    st.markdown("### Stars QA")
+    if stars_col:
+        stars_parsed = parse_stars_series(df_work[stars_col])
+        n_total = len(stars_parsed)
+        n_ok = int(stars_parsed.notna().sum())
+        out_of_range = int(((stars_parsed < 1) | (stars_parsed > 5)).sum(skipna=True))
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Stars present", f"{n_ok:,} / {n_total:,}")
+        c2.metric("Avg stars", f"{stars_parsed.mean():.2f}" if n_ok else "—")
+        c3.metric("Out of 1–5 range", f"{out_of_range:,}")
+
+        fig_hist = px.histogram(
+            pd.DataFrame({"stars": stars_parsed.dropna()}),
+            x="stars",
+            nbins=10,
+            template=template,
+            title="Stars distribution",
+        )
+        fig_hist.update_layout(height=320, margin=dict(l=10, r=10, t=60, b=10))
+        st.plotly_chart(fig_hist, use_container_width=True)
+    else:
+        st.info("No stars column selected.")
+
+    st.markdown("---")
+    st.markdown("### Seeded QA")
+    if seeded_col:
+        seeded_rate = seeded_count / len(df_base) if len(df_base) else 0
+        st.write(f"Seeded in base: **{seeded_count:,}** (**{seeded_rate*100:.1f}%**). Current mode: **{seeded_mode}**.")
+    else:
+        st.info("No seeded flag column selected.")
+
+    st.markdown("---")
     st.markdown("### Product name mapping")
     st.dataframe(pack.name_map, use_container_width=True, height=320)
+
 
 
