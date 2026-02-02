@@ -450,6 +450,45 @@ long_valid = computed.long_df_valid.copy()
 wide_df = computed.wide_df.copy()
 product_roll = computed.product_rollup.copy()
 
+# --- Seeded review filter (drop-in) ---
+SEED_COL = "Seeded Flag"
+
+if SEED_COL in df_raw.columns:
+    seeded_mode = st.sidebar.selectbox(
+        "Seeded reviews",
+        ["Include all", "Exclude seeded", "Only seeded"],
+        index=1,  # default: exclude seeded
+        help="Uses the 'Seeded Flag' column to include/exclude seeded/incentivized reviews.",
+    )
+
+    seed = df_raw[SEED_COL]
+
+    # Normalize to boolean: True = seeded
+    if pd.api.types.is_bool_dtype(seed):
+        seeded = seed.fillna(False)
+    else:
+        # numeric path (0/1)
+        num = pd.to_numeric(seed, errors="coerce")
+        seeded = pd.Series(False, index=df_raw.index)
+
+        mask_num = num.notna()
+        seeded.loc[mask_num] = num.loc[mask_num].astype(float).eq(1.0)
+
+        # text path (yes/true/seeded/etc.)
+        s = seed.astype("string").str.strip().str.lower()
+        true_set = {"1", "true", "t", "yes", "y", "seeded", "incentivized", "gifted", "paid"}
+        seeded.loc[~mask_num] = s.loc[~mask_num].isin(true_set)
+
+    # Apply filter
+    if seeded_mode == "Exclude seeded":
+        df_raw = df_raw.loc[~seeded].copy()
+    elif seeded_mode == "Only seeded":
+        df_raw = df_raw.loc[seeded].copy()
+
+    st.sidebar.caption(f"Reviews after seeded filter: {len(df_raw):,}")
+
+
+
 # Filters
 st.sidebar.markdown("---")
 st.sidebar.subheader("Filters")
