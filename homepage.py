@@ -269,7 +269,7 @@ Rules:
 # Header
 # -----------------------------
 st.title("🧭 Starwalk Hub")
-st.caption("A clean workflow hub that connects your existing Streamlit tools.")
+st.caption("Inspect your reviews and calls data here.")
 tool_bar()
 
 tab_reviews, tab_calls, tab_ask, tab_about = st.tabs(["Reviews", "Calls", "Ask Data (Optional LLM)", "About"])
