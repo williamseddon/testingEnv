@@ -1,5 +1,4 @@
 import io
-import ast
 import json
 import re
 from datetime import datetime, date
@@ -15,10 +14,9 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 EXCEL_MAX_CHARS = 32767
 
-
-# -----------------------------
+# =============================
 # Helpers
-# -----------------------------
+# =============================
 def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
     cur: Any = d
     for k in path:
@@ -67,31 +65,29 @@ def title_from_filename(filename: str) -> str:
 
 
 def excel_safe_value(v: Any, list_sep: str = " | ") -> Any:
-    """Convert arbitrary Python objects into openpyxl-safe scalar types."""
+    """
+    Convert arbitrary Python objects into openpyxl-safe scalar types.
+    Fixes: ValueError: Cannot convert ['Leshow CN', ...] to Excel
+    """
     if v is None:
         return None
 
-    # Pandas / numpy missing
     try:
         if pd.isna(v):
             return None
     except Exception:
         pass
 
-    # Pandas timestamp
     if isinstance(v, pd.Timestamp):
         if pd.isna(v):
             return None
         return v.to_pydatetime()
 
-    # Native safe types
     if isinstance(v, (datetime, date, bool, int, float)):
         return v
 
     if isinstance(v, str):
-        if len(v) > EXCEL_MAX_CHARS:
-            return v[: EXCEL_MAX_CHARS - 3] + "..."
-        return v
+        return v[: EXCEL_MAX_CHARS - 3] + "..." if len(v) > EXCEL_MAX_CHARS else v
 
     # numpy scalar
     if hasattr(v, "item") and not isinstance(v, (list, tuple, set, dict)):
@@ -100,12 +96,9 @@ def excel_safe_value(v: Any, list_sep: str = " | ") -> Any:
         except Exception:
             pass
 
-    # containers
     if isinstance(v, dict):
         s = json.dumps(v, ensure_ascii=False)
-        if len(s) > EXCEL_MAX_CHARS:
-            s = s[: EXCEL_MAX_CHARS - 3] + "..."
-        return s
+        return s[: EXCEL_MAX_CHARS - 3] + "..." if len(s) > EXCEL_MAX_CHARS else s
 
     if isinstance(v, (list, tuple, set)):
         parts: List[str] = []
@@ -119,20 +112,15 @@ def excel_safe_value(v: Any, list_sep: str = " | ") -> Any:
         s = list_sep.join([p.strip() for p in parts if p.strip() != ""])
         if not s:
             return None
-        if len(s) > EXCEL_MAX_CHARS:
-            s = s[: EXCEL_MAX_CHARS - 3] + "..."
-        return s
+        return s[: EXCEL_MAX_CHARS - 3] + "..." if len(s) > EXCEL_MAX_CHARS else s
 
-    # fallback
     s = str(v)
-    if len(s) > EXCEL_MAX_CHARS:
-        s = s[: EXCEL_MAX_CHARS - 3] + "..."
-    return s
+    return s[: EXCEL_MAX_CHARS - 3] + "..." if len(s) > EXCEL_MAX_CHARS else s
 
 
-# -----------------------------
+# =============================
 # JSON -> DataFrames
-# -----------------------------
+# =============================
 REVIEWS_BASE_COLS: List[Tuple[str, Any]] = [
     ("Record ID", lambda r: r.get("_id")),
     ("Opened Timestamp", lambda r: parse_iso_date(r.get("openedTimestamp"))),
@@ -166,7 +154,6 @@ REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
     ("Base SKU", lambda r: safe_get(r, ["clientAttributes", "Base SKU"])),
     ("Brand", lambda r: safe_get(r, ["clientAttributes", "Brand"])),
     ("Company", lambda r: safe_get(r, ["clientAttributes", "Company"])),
-    # NOTE: these sometimes come through as lists -> excel_safe_value handles it
     ("Factory Name", lambda r: safe_get(r, ["clientAttributes", "Factory Name"])),
     ("Translation", lambda r: safe_get(r, ["clientAttributes", "Translation"])),
     ("Event ID", lambda r: r.get("eventId")),
@@ -204,17 +191,19 @@ def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_miss
         max_len = max(len(comps), len(conds), len(modes), 0)
 
         if max_len == 0 and include_blank_row_when_missing:
-            out_rows.append({
-                "Record ID": rid,
-                "Opened Timestamp": opened,
-                "Rating": rating,
-                "Retailer": retailer,
-                "Model": model,
-                "Symptom Index": None,
-                "Symptom Component": None,
-                "Symptom Condition": None,
-                "Symptom Mode": None,
-            })
+            out_rows.append(
+                {
+                    "Record ID": rid,
+                    "Opened Timestamp": opened,
+                    "Rating": rating,
+                    "Retailer": retailer,
+                    "Model": model,
+                    "Symptom Index": None,
+                    "Symptom Component": None,
+                    "Symptom Condition": None,
+                    "Symptom Mode": None,
+                }
+            )
             continue
 
         for i in range(max_len):
@@ -232,17 +221,19 @@ def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_miss
                 else:
                     mode = "-"
 
-            out_rows.append({
-                "Record ID": rid,
-                "Opened Timestamp": opened,
-                "Rating": rating,
-                "Retailer": retailer,
-                "Model": model,
-                "Symptom Index": i + 1,
-                "Symptom Component": comp,
-                "Symptom Condition": cond,
-                "Symptom Mode": mode,
-            })
+            out_rows.append(
+                {
+                    "Record ID": rid,
+                    "Opened Timestamp": opened,
+                    "Rating": rating,
+                    "Retailer": retailer,
+                    "Model": model,
+                    "Symptom Index": i + 1,
+                    "Symptom Component": comp,
+                    "Symptom Condition": cond,
+                    "Symptom Mode": mode,
+                }
+            )
 
     df = pd.DataFrame(out_rows)
     if "Rating" in df.columns:
@@ -250,9 +241,9 @@ def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_miss
     return df
 
 
-# -----------------------------
+# =============================
 # Summary Data
-# -----------------------------
+# =============================
 def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, top_n: int = 10):
     total_reviews = int(len(reviews_df))
 
@@ -267,39 +258,36 @@ def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, to
         avg_rating = float(pd.to_numeric(reviews_df["Rating (num)"], errors="coerce").mean())
 
     rating_counts = (
-        reviews_df["Rating (num)"]
-        .dropna()
-        .astype(int)
-        .value_counts()
-        .reindex([5, 4, 3, 2, 1], fill_value=0)
+        reviews_df["Rating (num)"].dropna().astype(int).value_counts().reindex([5, 4, 3, 2, 1], fill_value=0)
     )
-    rating_dist = pd.DataFrame({
-        "Rating": rating_counts.index.astype(int),
-        "Count": rating_counts.values.astype(int),
-        "Share": (rating_counts.values / total_reviews) if total_reviews else 0,
-    })
+    rating_dist = pd.DataFrame(
+        {
+            "Rating": rating_counts.index.astype(int),
+            "Count": rating_counts.values.astype(int),
+            "Share": (rating_counts.values / total_reviews) if total_reviews else 0,
+        }
+    )
 
-    retailer_counts = (
-        reviews_df.get("Retailer", pd.Series(dtype=str))
-        .fillna("(blank)")
-        .value_counts()
-        .head(top_n)
+    retailer_counts = reviews_df.get("Retailer", pd.Series(dtype=str)).fillna("(blank)").value_counts().head(top_n)
+    top_retailers = pd.DataFrame(
+        {
+            "Retailer": retailer_counts.index,
+            "Count": retailer_counts.values.astype(int),
+            "Share": (retailer_counts.values / total_reviews) if total_reviews else 0,
+        }
     )
-    top_retailers = pd.DataFrame({
-        "Retailer": retailer_counts.index,
-        "Count": retailer_counts.values.astype(int),
-        "Share": (retailer_counts.values / total_reviews) if total_reviews else 0,
-    })
 
     cond_series = symptoms_df.get("Symptom Condition", pd.Series(dtype=str)).fillna("")
     cond_series = cond_series[cond_series.astype(str).str.strip() != ""]
     symptom_rows = int(len(cond_series))
     cond_counts = cond_series.value_counts().head(top_n)
-    top_conditions = pd.DataFrame({
-        "Condition": cond_counts.index,
-        "Count": cond_counts.values.astype(int),
-        "Share (of symptom rows)": (cond_counts.values / symptom_rows) if symptom_rows else 0,
-    })
+    top_conditions = pd.DataFrame(
+        {
+            "Condition": cond_counts.index,
+            "Count": cond_counts.values.astype(int),
+            "Share (of symptom rows)": (cond_counts.values / symptom_rows) if symptom_rows else 0,
+        }
+    )
 
     return {
         "total_reviews": total_reviews,
@@ -312,9 +300,9 @@ def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, to
     }
 
 
-# -----------------------------
+# =============================
 # Excel Writer (openpyxl)
-# -----------------------------
+# =============================
 HEADER_FILL = PatternFill("solid", fgColor="1F4E79")  # dark blue
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 TITLE_FONT = Font(color="1F4E79", bold=True, size=14)
@@ -396,9 +384,37 @@ def build_workbook(
     wrap_long_text: bool = False,
 ) -> bytes:
     wb = Workbook()
+    # Remove default sheet
     wb.remove(wb.active)
 
-    # --- Summary ---
+    # --- Reviews sheet (FIRST TAB) ---
+    ws_r = wb.create_sheet("Reviews")
+    write_df_to_sheet(ws_r, reviews_df)
+    add_excel_table(ws_r, reviews_df, table_name="ReviewsTable")
+    apply_hyperlinks(ws_r, reviews_df, url_cols=["Post Link"])
+    set_date_format(ws_r, reviews_df, date_cols=["Opened Timestamp"])
+
+    review_widths = {
+        "Record ID": 34,
+        "Opened Timestamp": 16,
+        "Rating (num)": 11,
+        "Retailer": 14,
+        "Retailer Rating": 14,
+        "Model": 12,
+        "Seeded Reviews": 15,
+        "Syndicated/Seeded Reviews": 22,
+        "Location": 10,
+        "Post Link": 55,
+        "Title": 45,
+        "Review": 85,
+        "Translation": 55,
+        "Factory Name": 22,
+    }
+    set_col_widths(ws_r, reviews_df, review_widths)
+    if wrap_long_text:
+        wrap_cells(ws_r, reviews_df, wrap_cols=["Title", "Review", "Translation"])
+
+    # --- Summary sheet ---
     ws = wb.create_sheet("Summary")
     ws["A1"] = f"{dataset_title} — Summary"
     ws["A1"].font = TITLE_FONT
@@ -489,34 +505,7 @@ def build_workbook(
     ws.column_dimensions["E"].width = 35
     ws.column_dimensions["F"].width = 10
 
-    # --- Reviews ---
-    ws_r = wb.create_sheet("Reviews")
-    write_df_to_sheet(ws_r, reviews_df)
-    add_excel_table(ws_r, reviews_df, table_name="ReviewsTable")
-    apply_hyperlinks(ws_r, reviews_df, url_cols=["Post Link"])
-    set_date_format(ws_r, reviews_df, date_cols=["Opened Timestamp"])
-
-    review_widths = {
-        "Record ID": 34,
-        "Opened Timestamp": 16,
-        "Rating (num)": 11,
-        "Retailer": 14,
-        "Retailer Rating": 14,
-        "Model": 12,
-        "Seeded Reviews": 15,
-        "Syndicated/Seeded Reviews": 22,
-        "Location": 10,
-        "Post Link": 55,
-        "Title": 45,
-        "Review": 85,
-        "Translation": 55,
-        "Factory Name": 22,
-    }
-    set_col_widths(ws_r, reviews_df, review_widths)
-    if wrap_long_text:
-        wrap_cells(ws_r, reviews_df, wrap_cols=["Title", "Review", "Translation"])
-
-    # --- Symptoms ---
+    # --- Symptoms sheet ---
     ws_s = wb.create_sheet("Symptoms")
     write_df_to_sheet(ws_s, symptoms_df)
     add_excel_table(ws_s, symptoms_df, table_name="SymptomsTable")
@@ -535,24 +524,28 @@ def build_workbook(
     }
     set_col_widths(ws_s, symptoms_df, symptom_widths)
 
+    # Make Reviews the active sheet when opening
+    wb.active = wb.sheetnames.index("Reviews")
+
+    # Save to bytes
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
 
 
-# -----------------------------
+# =============================
 # Streamlit UI
-# -----------------------------
+# =============================
 st.set_page_config(page_title="JSON → Clean Excel (Reviews)", layout="wide")
 st.title("JSON → Clean Excel Converter (Reviews format)")
 st.caption(
     "Upload a JSON file **or** paste JSON text. The app will parse it, normalize list fields, "
-    "and export a formatted Excel workbook (Summary / Reviews / Symptoms)."
+    "and export a formatted Excel workbook (Reviews / Summary / Symptoms)."
 )
 
 
 # -----------------------------
-# Input parsing helpers (flexible)
+# Flexible JSON parsing
 # -----------------------------
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -601,6 +594,7 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
     try:
         return json.loads(s), warnings
     except Exception as e1:
+        # Attempt: remove trailing commas
         s2 = re.sub(r",\s*([}\]])", r"\1", s)
         if s2 != s:
             try:
@@ -609,17 +603,13 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
             except Exception:
                 warnings.pop()
 
+        # Attempt: JSON Lines
         jl = _try_parse_json_lines(s)
         if jl is not None:
             warnings.append("Detected JSON Lines and parsed each line as a record.")
             return jl, warnings
 
-        try:
-            obj = ast.literal_eval(s)
-            warnings.append("Parsed via Python literal_eval (input was not strict JSON).")
-            return obj, warnings
-        except Exception as e4:
-            raise ValueError("Could not parse input as JSON. Paste valid JSON (or JSON Lines).") from e1
+        raise ValueError("Could not parse input as JSON. Paste valid JSON (or JSON Lines).") from e1
 
 
 def extract_records(raw: Any) -> List[Dict[str, Any]]:
@@ -630,9 +620,9 @@ def extract_records(raw: Any) -> List[Dict[str, Any]]:
     raise ValueError("Unrecognized JSON shape. Expected a dict with `results: []` or a list of record objects.")
 
 
-# -----------------------------
-# Input area (upload OR paste; app auto-picks)
-# -----------------------------
+# =============================
+# UI Inputs (Upload OR Paste)
+# =============================
 st.subheader("1) Provide input JSON")
 left, right = st.columns(2)
 
@@ -664,14 +654,13 @@ elif prefer_paste:
 auto_convert = st.checkbox("Auto-convert when input looks complete", value=True)
 convert_clicked = st.button("Convert to Excel", type="primary")
 
-# Heuristic: don't spam errors while user is still typing
+
 def looks_complete_json(s: str) -> bool:
     ss = s.strip()
     if not ss:
         return False
     if ss.endswith(("}", "]")):
         return True
-    # code fence end
     if ss.endswith("```"):
         return True
     return False
@@ -682,13 +671,12 @@ if raw_text is not None:
     if convert_clicked:
         should_run = True
     elif auto_convert:
-        # For uploads, always run; for paste, only if it looks complete.
         if prefer_upload or looks_complete_json(raw_text):
             should_run = True
 
-# -----------------------------
+# =============================
 # Options
-# -----------------------------
+# =============================
 st.subheader("2) Options")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -700,9 +688,9 @@ with col3:
 with col4:
     top_n = st.number_input("Top N in Summary", min_value=5, max_value=25, value=10, step=1)
 
-# -----------------------------
+# =============================
 # Convert
-# -----------------------------
+# =============================
 if raw_text is None:
     st.info("Upload a JSON file or paste JSON text to begin.")
 elif not should_run:
@@ -768,4 +756,3 @@ else:
 
     except Exception as e:
         st.exception(e)
-
