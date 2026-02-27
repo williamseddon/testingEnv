@@ -13,11 +13,13 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-APP_VERSION = "2026-02-27-autodetect-headers-v2"
+APP_VERSION = "2026-02-27-extra-cols-after-symptom20-no-hairtype-v1"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
-# Default header (mirrors typical Star Walk workbook; includes two trailing blank header columns)
+# -----------------------------
+# Default columns (Hair Type removed)
+# -----------------------------
 DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Source",
     "Model (SKU)",
@@ -29,29 +31,18 @@ DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Verbatim",
     "Star Rating",
     "Review count per detractor",
-    "Symptom 1",
-    "Symptom 2",
-    "Symptom 3",
-    "Symptom 4",
-    "Symptom 5",
-    "Symptom 6",
-    "Symptom 7",
-    "Symptom 8",
-    "Symptom 9",
-    "Symptom 10",
-    "Symptom 11",
-    "Symptom 12",
-    "Symptom 13",
-    "Symptom 14",
-    "Symptom 15",
-    "Symptom 16",
-    "Symptom 17",
-    "Symptom 18",
-    "Symptom 19",
-    "Symptom 20",
-    "Hair Type",
-    "Unnamed: 31",
-    "Unnamed: 32",
+] + [f"Symptom {i}" for i in range(1, 21)]
+
+# Default optional extra columns to place after Symptom 20
+DEFAULT_EXTRA_AFTER_SYMPTOM20: List[str] = [
+    "Key Review Sentiment_Reviews",
+    "Key Review Sentiment Type_Reviews",
+    "Trigger Point_Product",
+    "Dominant Customer Journey Step",
+    "L2 Delighter Component",
+    "L2 Delighter Mode",
+    "L3 Non Product Detractors",
+    "Product_Symptom Component",
 ]
 
 # Used for splitting multi-tag cells like "A; B | C"
@@ -131,9 +122,6 @@ def parse_tags(value, split_re: re.Pattern) -> List[str]:
       - delimited strings (e.g., "A; B | C")
       - stringified list: "['A','B']"
       - actual python list/tuple/set (rare but possible)
-
-    NOTE: We intentionally do NOT treat the whole string "['Seeded']" as a single token.
-    We return ["Seeded"] so downstream normalization can work.
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
@@ -211,15 +199,7 @@ def clean_seeded_value(v):
     Convert Seeded inputs into:
       - "Yes" for seeded-like values (including ['Seeded'])
       - "no" for anything blank/empty/unseeded/false
-
-    Rules:
-      - Blank/NaN/None -> "no"
-      - ['Seeded'], "Seeded" (case-insensitive) -> "Yes"
-      - True / 1 / "1" / "1.0" -> "Yes"
-      - negatives like "Not Seeded" / "unseeded" / "false" / 0 -> "no"
-      - strings containing 'seeded' like "Seeded Reviews [AX]" -> "Yes"
     """
-    # Treat blanks as "no"
     if v is None:
         return "no"
     try:
@@ -228,18 +208,15 @@ def clean_seeded_value(v):
     except Exception:
         pass
 
-    # Bool
     if isinstance(v, (bool, np.bool_)):
         return "Yes" if bool(v) else "no"
 
-    # Numeric (int/float)
     if isinstance(v, (int, np.integer, float, np.floating)):
         try:
             return "Yes" if float(v) == 1.0 else "no"
         except Exception:
             return "no"
 
-    # Numeric-as-string shortcut (common for exports: "1", "0", "1.0")
     s0 = str(v).strip()
     if s0 and _NUMERIC_RE.match(s0):
         try:
@@ -251,30 +228,24 @@ def clean_seeded_value(v):
         except Exception:
             pass
 
-    # Tokenize (this is what makes "['Seeded']" become ["Seeded"])
     tokens = parse_tags(v, DEFAULT_TAG_SPLIT_RE)
 
     for t in tokens:
         raw = str(t).strip().lower()
         nt = _norm(t)
 
-        # negatives first
         if nt in {"notseeded", "unseeded", "nonseeded"} or raw in {"not seeded", "unseeded", "non seeded"}:
             return "no"
         if nt in {"false", "no", "n", "0"}:
             return "no"
 
-        # exact positives
         if nt in {"seeded", "yes", "true", "y", "1"}:
             return "Yes"
         if raw in {"1.0", "1"}:
             return "Yes"
-
-        # permissive "contains seeded" (covers "Seeded Reviews [AX]" etc.)
         if "seeded" in nt:
             return "Yes"
 
-    # default
     return "no"
 
 
@@ -349,6 +320,27 @@ def collect_from_row_tuple(
             continue
         tags.extend(parse_tags(row_tup[i], split_re))
     return dedupe_preserve(tags)
+
+
+def insert_after_symptom20(out_cols: List[str], extra_cols: List[str]) -> List[str]:
+    """
+    Insert extra columns immediately after Symptom 20.
+    If Symptom 20 not found, append at end.
+    De-dupes while preserving order.
+    """
+    base = list(out_cols)
+    extras = [c for c in extra_cols if c and str(c).strip()]
+    if not extras:
+        return base
+
+    # remove extras if already present so insertion doesn't duplicate
+    base_no_extras = [c for c in base if c not in extras]
+
+    try:
+        idx = base_no_extras.index("Symptom 20")
+        return base_no_extras[: idx + 1] + extras + base_no_extras[idx + 1 :]
+    except ValueError:
+        return base_no_extras + extras
 
 
 # -----------------------------
@@ -498,14 +490,18 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
     """
     Preserve the full template workbook (other sheets, formulas, pivots, etc.) and
     replace the Star Walk scrubbed verbatims sheet data (keeping its header row).
+
+    If df_out contains columns not in the template header, append them to the end
+    of the template header so they are included in the export.
     """
     wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
 
     ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
 
-    # Read template header (row 1) to determine column order we should write
+    # Read template header (row 1)
     header = []
-    for c in range(1, ws.max_column + 1):
+    max_col = ws.max_column
+    for c in range(1, max_col + 1):
         v = ws.cell(1, c).value
         if v is None or str(v).strip() == "":
             header.append(f"Unnamed: {c-1}")
@@ -517,6 +513,14 @@ def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sh
         header = list(df_out.columns)
         for c, name in enumerate(header, start=1):
             ws.cell(1, c).value = name
+
+    # Append missing columns to header (so export always includes them)
+    missing = [c for c in df_out.columns if c not in header]
+    if missing:
+        start = len(header) + 1
+        for i, name in enumerate(missing, start=0):
+            ws.cell(1, start + i).value = name
+        header = header + missing
 
     # Align df to header columns
     aligned = df_out.copy()
@@ -582,7 +586,7 @@ src_df = read_table(src_bytes, src_file.name, sheet=src_sheet)
 st.subheader("Source Preview")
 st.dataframe(src_df.head(50), use_container_width=True)
 
-# Determine output columns
+# Determine output columns from template (if provided)
 out_cols = DEFAULT_STARWALK_COLUMNS
 allowed_det = allowed_del = None
 
@@ -605,15 +609,43 @@ if template_file:
 
     allowed_det, allowed_del = load_allowed_l2_from_template(tbytes)
 
-    # Helpful visibility for the exact "Seeded" header present in the template
     with st.expander("Debug: Template header matches", expanded=False):
         st.write("Template columns normalized as 'seeded':", [c for c in out_cols if _norm(c) == "seeded"])
         st.write("Template columns normalized as 'starrating':", [c for c in out_cols if _norm(c) == "starrating"])
 
+# -----------------------------
+# Extra columns after Symptom 20
+# -----------------------------
+st.subheader("Additional columns after Symptom 20")
+
+extra_count_default = len(DEFAULT_EXTRA_AFTER_SYMPTOM20)
+extra_count = st.number_input(
+    "How many default extra columns to include after Symptom 20?",
+    min_value=0,
+    max_value=50,
+    value=extra_count_default,
+    step=1,
+)
+
+custom_extra_raw = st.text_area(
+    "Optional: add more column names (one per line). These will be added after the defaults.",
+    value="",
+    help="Example:\nMy Custom Col 1\nMy Custom Col 2",
+)
+
+custom_extra_cols = [c.strip() for c in custom_extra_raw.splitlines() if c.strip()]
+default_extras_selected = DEFAULT_EXTRA_AFTER_SYMPTOM20[: int(extra_count)]
+extra_cols_after_symptom20 = default_extras_selected + custom_extra_cols
+
+# Ensure output columns include these extras right after Symptom 20 (ordering for output df)
+out_cols = insert_after_symptom20(out_cols, extra_cols_after_symptom20)
+
+# -----------------------------
+# Field Mapping (optional but recommended)
+# -----------------------------
 st.subheader("Field Mapping (optional but recommended)")
 all_src_cols = list(src_df.columns)
 
-# ✅ UPDATED: auto-detection using the headers you showed (plus common variants)
 PREFERRED_CORE_DEFAULTS: Dict[str, List[str]] = {
     "Source": ["Retailer", "Source"],
     "Model (SKU)": ["Model", "SKU Item", "SKU", "Item SKU"],
@@ -624,17 +656,14 @@ PREFERRED_CORE_DEFAULTS: Dict[str, List[str]] = {
     "Verbatim Id": ["Record ID", "Record Id", "Review ID", "Review Id"],
     "Verbatim": ["Review", "Verbatim", "Review Text"],
     "Star Rating": ["Rating (num)", "Rating", "Star Rating", "Stars"],
-    "Hair Type": ["Hair Type", "HairType", "Hair_Type"],
 }
 
 
 def pick_preferred(field: str) -> Optional[str]:
     prefs = PREFERRED_CORE_DEFAULTS.get(field, [])
-    # exact
     for p in prefs:
         if p in all_src_cols:
             return p
-    # normalized exact
     for p in prefs:
         pn = _norm(p)
         for c in all_src_cols:
@@ -643,7 +672,6 @@ def pick_preferred(field: str) -> Optional[str]:
     return None
 
 
-# ✅ UPDATED: allow auto-detection for Verbatim Id + Hair Type (previously None)
 suggest = {
     "Source": pick_preferred("Source") or best_match("Source", all_src_cols),
     "Model (SKU)": pick_preferred("Model (SKU)")
@@ -667,10 +695,10 @@ suggest = {
     or best_match("Star Rating", all_src_cols)
     or best_match("Rating", all_src_cols)
     or best_match("Stars", all_src_cols),
-    "Hair Type": pick_preferred("Hair Type") or best_match("Hair Type", all_src_cols),
 }
 
 field_map: Dict[str, Optional[str]] = {}
+
 core_fields = [
     "Source",
     "Model (SKU)",
@@ -681,8 +709,8 @@ core_fields = [
     "Verbatim Id",
     "Verbatim",
     "Star Rating",
-    "Hair Type",
 ]
+
 left, right = st.columns(2)
 for i, f in enumerate(core_fields):
     with (left if i < (len(core_fields) + 1) // 2 else right):
@@ -696,7 +724,32 @@ for i, f in enumerate(core_fields):
             key=f"map_{f}",
         )
 
-# Optional debug: show a quick raw->clean preview for seeded
+# Extra columns mapping (auto-pick exact/normalized; otherwise blank)
+with st.expander("Map additional columns (after Symptom 20)", expanded=False):
+    if extra_cols_after_symptom20:
+        for col_name in extra_cols_after_symptom20:
+            # Auto-detect: exact or normalized
+            detected = None
+            if col_name in all_src_cols:
+                detected = col_name
+            else:
+                cn = _norm(col_name)
+                for c in all_src_cols:
+                    if _norm(c) == cn:
+                        detected = c
+                        break
+
+            options = [None] + all_src_cols
+            default_idx = options.index(detected) if detected in all_src_cols else 0
+            field_map[col_name] = st.selectbox(
+                f"Output '{col_name}' comes from source column:",
+                options=options,
+                index=default_idx,
+                key=f"map_extra_{_norm(col_name)}",
+            )
+    else:
+        st.caption("No additional columns selected.")
+
 with st.expander("Debug: Seeded raw → cleaned preview", expanded=False):
     seeded_src = field_map.get("Seeded")
     if seeded_src and seeded_src in src_df.columns:
@@ -708,7 +761,6 @@ with st.expander("Debug: Seeded raw → cleaned preview", expanded=False):
 
 st.subheader("L2 Tag Columns (these populate Symptom 1–20)")
 
-# ✅ UPDATED: explicit preferred L2 defaults based on your export headers
 PREFERRED_L2_DEFAULTS: Dict[str, List[str]] = {
     "detractor": [
         "Product_Symptom Conditions",
@@ -726,13 +778,6 @@ PREFERRED_L2_DEFAULTS: Dict[str, List[str]] = {
 
 
 def pick_default_l2_cols(all_cols: List[str], kind: str) -> List[str]:
-    """
-    Choose ONLY ONE default column for each kind (detractor/delighter), preferring:
-      0) explicit preferred names (e.g., Product_Symptom Conditions, L2 Delighter Condition)
-      1) '...Condition...' columns when multiple L2 options exist
-      2) otherwise the first column that looks like an L2 <kind> column
-    """
-
     # 0) Try explicit preferred names first (exact or normalized exact)
     prefs = PREFERRED_L2_DEFAULTS.get(kind, [])
     for p in prefs:
@@ -763,7 +808,6 @@ def pick_default_l2_cols(all_cols: List[str], kind: str) -> List[str]:
     if not candidates:
         return []
 
-    # Prefer condition if multiple
     condition = [c for c in candidates if "condition" in _norm(c)]
     if condition:
         return [condition[0]]
@@ -772,7 +816,6 @@ def pick_default_l2_cols(all_cols: List[str], kind: str) -> List[str]:
 
 
 with st.expander("Select Level 2 detractor/delighter columns", expanded=True):
-    # Preselect ONE column each, preferring your known headers
     l2_det_default = pick_default_l2_cols(all_src_cols, "detractor")
     l2_del_default = pick_default_l2_cols(all_src_cols, "delighter")
 
