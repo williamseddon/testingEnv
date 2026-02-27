@@ -1,5 +1,5 @@
-# starwalk_ui.py
-# Streamlit 1.38+
+# starwalk_master_app.py
+# Streamlit app: Axion JSON → Star Walk scrubbed verbatims → Dashboard (all-in-one)
 
 import streamlit as st
 import pandas as pd
@@ -98,18 +98,40 @@ st_html(
     """
 <script>
 (function () {
-  function setLight() {
+  // Force light mode even if Streamlit theme is set to Auto/Dark.
+  const LIGHT = {
+    base: "light",
+    primaryColor: "#3b82f6",
+    backgroundColor: "#f6f8fc",
+    secondaryBackgroundColor: "#ffffff",
+    textColor: "#0f172a",
+    font: "sans serif"
+  };
+
+  function applyLight() {
     try {
-      document.documentElement.setAttribute('data-theme','light');
-      document.body && document.body.setAttribute('data-theme','light');
-      window.localStorage.setItem('theme','light');
+      document.documentElement.setAttribute("data-theme", "light");
+      document.body && document.body.setAttribute("data-theme", "light");
+      document.documentElement.style.colorScheme = "light";
+    } catch (e) {}
+
+    try {
+      // Streamlit has used different localStorage keys across versions.
+      window.localStorage.setItem("theme", "light");
+      window.localStorage.setItem("stTheme", JSON.stringify(LIGHT));
+      window.localStorage.setItem("streamlitTheme", JSON.stringify(LIGHT));
+      window.localStorage.setItem("__st_theme", JSON.stringify(LIGHT));
     } catch (e) {}
   }
-  setLight();
-  new MutationObserver(setLight).observe(
-    document.documentElement,
-    { attributes: true, attributeFilter: ['data-theme'] }
-  );
+
+  applyLight();
+  setTimeout(applyLight, 150);
+  setTimeout(applyLight, 650);
+
+  new MutationObserver(applyLight).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["data-theme", "class", "style"]
+  });
 })();
 </script>
 """,
@@ -119,33 +141,66 @@ st_html(
 # ---------- Global CSS ----------
 GLOBAL_CSS = """
 <style>
+  /* ---------- Always-Light Theme (fixes dark-mode contrast issues) ---------- */
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
-  @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
+  @supports (scrollbar-color: transparent transparent){
+    * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+  }
 
-  :root{
+  /* Force the same (light) palette even if Streamlit theme is Auto/Dark */
+  :root,
+  html[data-theme="dark"],
+  body[data-theme="dark"]{
     --text:#0f172a; --muted:#475569; --muted-2:#64748b;
     --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
     --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
     --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
-  }
-  html[data-theme="dark"], body[data-theme="dark"]{
-    --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
-    --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
-    --bg-app:#0b0e14; --bg-card:rgba(255,255,255,.06); --bg-tile:rgba(255,255,255,.04);
-    --ring:#60a5fa; --ok:#34d399; --bad:#f87171;
+
+    /* Streamlit theme CSS variables (best-effort, keeps widgets readable) */
+    --primary-color:#3b82f6;
+    --background-color:#f6f8fc;
+    --secondary-background-color:#ffffff;
+    --text-color:#0f172a;
+
+    color-scheme: light;
   }
 
   html, body, .stApp {
-    background: var(--bg-app);
+    background: var(--bg-app) !important;
     font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
-    color: var(--text);
+    color: var(--text) !important;
   }
+
+  /* Sidebar background */
+  section[data-testid="stSidebar"],
+  section[data-testid="stSidebar"] > div{
+    background: var(--bg-app) !important;
+  }
+
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
   section[data-testid="stSidebar"] .block-container { padding-top:.6rem; }
+
   mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
 
+  /* Ensure Streamlit widget text stays readable in forced-light mode */
+  .stTextInput input, .stTextArea textarea, .stNumberInput input, .stDateInput input,
+  .stSelectbox * , .stMultiSelect *, .stRadio *, .stCheckbox *, .stToggle *{
+    color: var(--text) !important;
+  }
+
+  /* Dataframe/table readability */
+  div[data-testid="stDataFrame"], div[data-testid="stTable"]{
+    background: var(--bg-card) !important;
+    color: var(--text) !important;
+    border-radius: 10px;
+  }
+  div[data-testid="stDataFrame"] *, div[data-testid="stTable"] *{
+    color: var(--text) !important;
+  }
+
+  /* Metric cards */
   .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
   @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
   .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
@@ -155,6 +210,7 @@ GLOBAL_CSS = """
   .metric-label{ color:var(--muted); font-size:.85rem; }
   .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
 
+  /* Review cards */
   .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
   .review-card p{ margin:.25rem 0; line-height:1.5; }
   .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
@@ -164,6 +220,7 @@ GLOBAL_CSS = """
 
   [data-testid="stPlotlyChart"]{ margin-top:18px !important; margin-bottom:30px !important; }
 
+  /* Soft panels */
   .soft-panel{
     background:var(--bg-card);
     border-radius:14px;
@@ -177,6 +234,19 @@ GLOBAL_CSS = """
     border:1.3px solid var(--border);
     background:var(--bg-tile);
     font-weight:650; margin-right:8px;
+  }
+
+  /* Simple callout style (used in Ask your data) */
+  .callout{
+    padding:12px 14px; border-radius:12px;
+    border:1.5px solid var(--border);
+    background: var(--bg-card);
+    box-shadow:0 0 0 1px var(--border-soft);
+    margin: 10px 0 14px;
+  }
+  .callout.warn{
+    border-color: rgba(245,158,11,.45);
+    background: rgba(245,158,11,.08);
   }
 </style>
 """
@@ -453,6 +523,33 @@ def _embed_with_backoff(client, model: str, inputs: List[str], max_attempts: int
                 raise
             sleep_s = delay * (1.5 ** (attempt - 1)) + random.uniform(0, 0.5)
             time.sleep(sleep_s)
+
+
+
+def _chat_with_backoff(client, req: dict, max_attempts: int = 6):
+    """
+    Robust wrapper for OpenAI chat.completions.create with exponential backoff.
+    Helps smooth over transient 429/5xx issues without crashing the app.
+    """
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.chat.completions.create(**req)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            msg = str(e).lower()
+            is_retryable = (
+                status in (429, 500, 502, 503, 504)
+                or "rate" in msg
+                or "quota" in msg
+                or "timeout" in msg
+                or "temporar" in msg
+                or "overloaded" in msg
+            )
+            if (not is_retryable) or attempt == max_attempts:
+                raise
+            sleep_s = delay * (1.6 ** (attempt - 1)) + random.uniform(0.0, 0.6)
+            time.sleep(min(20.0, sleep_s))
 
 
 def _hash_texts(texts: list[str]) -> str:
@@ -734,23 +831,1389 @@ def scroll_to(id_: str):
     )
 
 
-# ---------- File Upload ----------
-st.markdown("### 📁 File Upload")
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx", "csv"])
 
-if uploaded_file and st.session_state.get("last_uploaded_name") != uploaded_file.name:
-    st.session_state["last_uploaded_name"] = uploaded_file.name
-    st.session_state["force_scroll_top_once"] = True
 
-if not uploaded_file:
-    st.info("Please upload an Excel file to get started.")
-    st.stop()
+import io
+import json
+import re
+from datetime import datetime, date
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+EXCEL_MAX_CHARS = 32767
+
+# =============================
+# Helpers
+# =============================
+def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
+    cur: Any = d
+    for k in path:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+
+def as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+
+
+def join_list(x: Any, sep: str = " | ") -> Any:
+    if x is None:
+        return None
+    if isinstance(x, list):
+        vals = [str(v).strip() for v in x if v is not None and str(v).strip() != ""]
+        return sep.join(vals) if vals else None
+    return x
+
+
+def parse_iso_date(x: Any) -> Optional[date]:
+    if not x:
+        return None
+    ts = pd.to_datetime(x, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+
+def title_from_filename(filename: str) -> str:
+    stem = Path(filename).stem
+    stem = re.sub(r"[_\-]+", " ", stem)
+    stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)  # camelCase -> words
+    stem = re.sub(r"\s+", " ", stem).strip()
+    tokens = stem.split(" ")
+    if tokens and any(ch.isdigit() for ch in tokens[0]):
+        tokens[0] = tokens[0].upper()
+    return " ".join(tokens)
+
+
+def excel_safe_value(v: Any, list_sep: str = " | ") -> Any:
+    """
+    Convert arbitrary Python objects into openpyxl-safe scalar types.
+    Fixes: ValueError: Cannot convert ['Leshow CN', ...] to Excel
+    """
+    if v is None:
+        return None
+
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return None
+        return v.to_pydatetime()
+
+    if isinstance(v, (datetime, date, bool, int, float)):
+        return v
+
+    if isinstance(v, str):
+        return v[: EXCEL_MAX_CHARS - 3] + "..." if len(v) > EXCEL_MAX_CHARS else v
+
+    # numpy scalar
+    if hasattr(v, "item") and not isinstance(v, (list, tuple, set, dict)):
+        try:
+            return excel_safe_value(v.item(), list_sep=list_sep)
+        except Exception:
+            pass
+
+    if isinstance(v, dict):
+        s = json.dumps(v, ensure_ascii=False)
+        return s[: EXCEL_MAX_CHARS - 3] + "..." if len(s) > EXCEL_MAX_CHARS else s
+
+    if isinstance(v, (list, tuple, set)):
+        parts: List[str] = []
+        for x in v:
+            if x is None:
+                continue
+            if isinstance(x, (dict, list, tuple, set)):
+                parts.append(json.dumps(x, ensure_ascii=False))
+            else:
+                parts.append(str(x))
+        s = list_sep.join([p.strip() for p in parts if p.strip() != ""])
+        if not s:
+            return None
+        return s[: EXCEL_MAX_CHARS - 3] + "..." if len(s) > EXCEL_MAX_CHARS else s
+
+    s = str(v)
+    return s[: EXCEL_MAX_CHARS - 3] + "..." if len(s) > EXCEL_MAX_CHARS else s
+
+
+# =============================
+# JSON -> DataFrames
+# =============================
+REVIEWS_BASE_COLS: List[Tuple[str, Any]] = [
+    ("Record ID", lambda r: r.get("_id")),
+    ("Opened Timestamp", lambda r: parse_iso_date(r.get("openedTimestamp"))),
+    ("Rating (num)", lambda r: safe_get(r, ["clientAttributes", "Rating (num)"])),
+    ("Retailer", lambda r: safe_get(r, ["clientAttributes", "Retailer"])),
+    ("Retailer Rating", lambda r: safe_get(r, ["clientAttributes", "Retailer Rating"])),
+    ("Model", lambda r: safe_get(r, ["clientAttributes", "Model"])),
+    ("Seeded Reviews", lambda r: safe_get(r, ["clientAttributes", "Seeded Reviews"])),
+    ("Syndicated/Seeded Reviews", lambda r: safe_get(r, ["clientAttributes", "Syndicated/Seeded Reviews"])),
+    ("Location", lambda r: safe_get(r, ["clientAttributes", "Location"])),
+    ("Post Link", lambda r: safe_get(r, ["clientAttributes", "Post Link"])),
+    ("Title", lambda r: safe_get(r, ["freeText", "Title"])),
+    ("Review", lambda r: safe_get(r, ["freeText", "Review"])),
+]
+
+REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
+    ("Satisfaction Score", lambda r: safe_get(r, ["customAttributes", "Satisfaction Score"])),
+    ("Key Review Sentiment_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment_Reviews"]))),
+    ("Key Review Sentiment Type_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment Type_Reviews"]))),
+    ("Dominant Customer Journey Step", lambda r: join_list(safe_get(r, ["customAttributes", "Dominant Customer Journey Step"]))),
+    ("Trigger Point_Product", lambda r: join_list(safe_get(r, ["customAttributes", "Trigger Point_Product"]))),
+    ("L2 Delighter Component", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Component"]))),
+    ("L2 Delighter Condition", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Condition"]))),
+    ("L2 Delighter Mode", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Mode"]))),
+    ("L3 Non Product Detractors", lambda r: join_list(safe_get(r, ["customAttributes", "L3 Non Product Detractors"]))),
+    ("Product_Symptom Component", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Component"]))),
+    ("Product_Symptom Conditions", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Conditions"]))),
+    ("Product_Symptom Mode", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Mode"]))),
+    ("Product Name", lambda r: safe_get(r, ["clientAttributes", "Product Name"])),
+    ("Product Category", lambda r: safe_get(r, ["clientAttributes", "Product Category"])),
+    ("Base SKU", lambda r: safe_get(r, ["clientAttributes", "Base SKU"])),
+    ("Brand", lambda r: safe_get(r, ["clientAttributes", "Brand"])),
+    ("Company", lambda r: safe_get(r, ["clientAttributes", "Company"])),
+    ("Factory Name", lambda r: safe_get(r, ["clientAttributes", "Factory Name"])),
+    ("Translation", lambda r: safe_get(r, ["clientAttributes", "Translation"])),
+    ("Event ID", lambda r: r.get("eventId")),
+    ("Event Type", lambda r: r.get("eventType")),
+    ("Is Linked", lambda r: r.get("isLinked")),
+    ("Workspace ID", lambda r: safe_get(r, ["clientAttributes", "Workspace ID"])),
+]
+
+
+def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
+    cols = REVIEWS_BASE_COLS + (REVIEWS_EXTRA_COLS if include_extra else [])
+    rows = [{name: fn(r) for name, fn in cols} for r in records]
+    df = pd.DataFrame(rows)
+
+    if "Rating (num)" in df.columns:
+        df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
+
+    return df
+
+
+def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_missing: bool = True) -> pd.DataFrame:
+    out_rows: List[Dict[str, Any]] = []
+
+    for r in records:
+        rid = r.get("_id")
+        opened = parse_iso_date(r.get("openedTimestamp"))
+        rating = safe_get(r, ["clientAttributes", "Rating (num)"])
+        retailer = safe_get(r, ["clientAttributes", "Retailer"])
+        model = safe_get(r, ["clientAttributes", "Model"])
+
+        comps = as_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Component"]))
+        conds = as_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Conditions"]))
+        modes = as_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Mode"]))
+
+        max_len = max(len(comps), len(conds), len(modes), 0)
+
+        if max_len == 0 and include_blank_row_when_missing:
+            out_rows.append(
+                {
+                    "Record ID": rid,
+                    "Opened Timestamp": opened,
+                    "Rating": rating,
+                    "Retailer": retailer,
+                    "Model": model,
+                    "Symptom Index": None,
+                    "Symptom Component": None,
+                    "Symptom Condition": None,
+                    "Symptom Mode": None,
+                }
+            )
+            continue
+
+        for i in range(max_len):
+            comp = comps[i] if i < len(comps) else None
+            cond = conds[i] if i < len(conds) else None
+            mode = modes[i] if i < len(modes) else None
+
+            if mode in (None, "", "-", "—"):
+                if comp and cond:
+                    mode = f"{comp} - {cond}"
+                elif cond:
+                    mode = f"- {cond}"
+                elif comp:
+                    mode = f"{comp} -"
+                else:
+                    mode = "-"
+
+            out_rows.append(
+                {
+                    "Record ID": rid,
+                    "Opened Timestamp": opened,
+                    "Rating": rating,
+                    "Retailer": retailer,
+                    "Model": model,
+                    "Symptom Index": i + 1,
+                    "Symptom Component": comp,
+                    "Symptom Condition": cond,
+                    "Symptom Mode": mode,
+                }
+            )
+
+    df = pd.DataFrame(out_rows)
+    if "Rating" in df.columns:
+        df["Rating"] = pd.to_numeric(df["Rating"], errors="coerce")
+    return df
+
+
+# =============================
+# Summary Data
+# =============================
+def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, top_n: int = 10):
+    total_reviews = int(len(reviews_df))
+
+    date_min = reviews_df["Opened Timestamp"].min() if "Opened Timestamp" in reviews_df.columns else None
+    date_max = reviews_df["Opened Timestamp"].max() if "Opened Timestamp" in reviews_df.columns else None
+    date_range_str = ""
+    if pd.notna(date_min) and pd.notna(date_max) and date_min and date_max:
+        date_range_str = f"{date_min} to {date_max}"
+
+    avg_rating = None
+    if "Rating (num)" in reviews_df.columns:
+        avg_rating = float(pd.to_numeric(reviews_df["Rating (num)"], errors="coerce").mean())
+
+    rating_counts = (
+        reviews_df["Rating (num)"].dropna().astype(int).value_counts().reindex([5, 4, 3, 2, 1], fill_value=0)
+    )
+    rating_dist = pd.DataFrame(
+        {
+            "Rating": rating_counts.index.astype(int),
+            "Count": rating_counts.values.astype(int),
+            "Share": (rating_counts.values / total_reviews) if total_reviews else 0,
+        }
+    )
+
+    retailer_counts = reviews_df.get("Retailer", pd.Series(dtype=str)).fillna("(blank)").value_counts().head(top_n)
+    top_retailers = pd.DataFrame(
+        {
+            "Retailer": retailer_counts.index,
+            "Count": retailer_counts.values.astype(int),
+            "Share": (retailer_counts.values / total_reviews) if total_reviews else 0,
+        }
+    )
+
+    cond_series = symptoms_df.get("Symptom Condition", pd.Series(dtype=str)).fillna("")
+    cond_series = cond_series[cond_series.astype(str).str.strip() != ""]
+    symptom_rows = int(len(cond_series))
+    cond_counts = cond_series.value_counts().head(top_n)
+    top_conditions = pd.DataFrame(
+        {
+            "Condition": cond_counts.index,
+            "Count": cond_counts.values.astype(int),
+            "Share (of symptom rows)": (cond_counts.values / symptom_rows) if symptom_rows else 0,
+        }
+    )
+
+    return {
+        "total_reviews": total_reviews,
+        "date_range_str": date_range_str,
+        "avg_rating": avg_rating,
+        "rating_dist": rating_dist,
+        "top_retailers": top_retailers,
+        "top_conditions": top_conditions,
+        "symptom_rows": symptom_rows,
+    }
+
+
+# =============================
+# Excel Writer (openpyxl)
+# =============================
+HEADER_FILL = PatternFill("solid", fgColor="1F4E79")  # dark blue
+HEADER_FONT = Font(color="FFFFFF", bold=True)
+TITLE_FONT = Font(color="1F4E79", bold=True, size=14)
+SECTION_FONT = Font(color="1F4E79", bold=False)
+
+
+def write_df_to_sheet(ws, df: pd.DataFrame):
+    ws.append(list(df.columns))
+    for row in df.itertuples(index=False, name=None):
+        ws.append([excel_safe_value(v) for v in row])
+
+
+def add_excel_table(ws, df: pd.DataFrame, table_name: str, style_name: str = "TableStyleMedium9"):
+    nrows = len(df) + 1
+    ncols = len(df.columns)
+    if nrows <= 1 or ncols == 0:
+        return
+
+    ref = f"A1:{get_column_letter(ncols)}{nrows}"
+    tab = Table(displayName=table_name, ref=ref)
+
+    style = TableStyleInfo(
+        name=style_name,
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    tab.tableStyleInfo = style
+    ws.add_table(tab)
+    ws.freeze_panes = "A2"
+
+
+def set_col_widths(ws, df: pd.DataFrame, widths: Dict[str, float]):
+    for i, col in enumerate(df.columns, start=1):
+        if col in widths:
+            ws.column_dimensions[get_column_letter(i)].width = widths[col]
+
+
+def set_date_format(ws, df: pd.DataFrame, date_cols: List[str]):
+    for col_name in date_cols:
+        if col_name not in df.columns:
+            continue
+        col_idx = list(df.columns).index(col_name) + 1
+        for r in range(2, len(df) + 2):
+            cell = ws.cell(row=r, column=col_idx)
+            if isinstance(cell.value, (datetime, date)):
+                cell.number_format = "yyyy-mm-dd"
+
+
+def apply_hyperlinks(ws, df: pd.DataFrame, url_cols: List[str]):
+    for col_name in url_cols:
+        if col_name not in df.columns:
+            continue
+        col_idx = list(df.columns).index(col_name) + 1
+        for r in range(2, len(df) + 2):
+            cell = ws.cell(row=r, column=col_idx)
+            val = cell.value
+            if isinstance(val, str) and val.startswith("http"):
+                cell.hyperlink = val
+                cell.style = "Hyperlink"
+
+
+def wrap_cells(ws, df: pd.DataFrame, wrap_cols: List[str]):
+    align = Alignment(wrap_text=True, vertical="top")
+    for col_name in wrap_cols:
+        if col_name not in df.columns:
+            continue
+        col_idx = list(df.columns).index(col_name) + 1
+        for r in range(1, len(df) + 2):
+            ws.cell(row=r, column=col_idx).alignment = align
+
+
+def build_workbook(
+    dataset_title: str,
+    reviews_df: pd.DataFrame,
+    symptoms_df: pd.DataFrame,
+    summary: Dict[str, Any],
+    wrap_long_text: bool = False,
+) -> bytes:
+    wb = Workbook()
+    # Remove default sheet
+    wb.remove(wb.active)
+
+    # --- Reviews sheet (FIRST TAB) ---
+    ws_r = wb.create_sheet("Reviews")
+    write_df_to_sheet(ws_r, reviews_df)
+    add_excel_table(ws_r, reviews_df, table_name="ReviewsTable")
+    apply_hyperlinks(ws_r, reviews_df, url_cols=["Post Link"])
+    set_date_format(ws_r, reviews_df, date_cols=["Opened Timestamp"])
+
+    review_widths = {
+        "Record ID": 34,
+        "Opened Timestamp": 16,
+        "Rating (num)": 11,
+        "Retailer": 14,
+        "Retailer Rating": 14,
+        "Model": 12,
+        "Seeded Reviews": 15,
+        "Syndicated/Seeded Reviews": 22,
+        "Location": 10,
+        "Post Link": 55,
+        "Title": 45,
+        "Review": 85,
+        "Translation": 55,
+        "Factory Name": 22,
+    }
+    set_col_widths(ws_r, reviews_df, review_widths)
+    if wrap_long_text:
+        wrap_cells(ws_r, reviews_df, wrap_cols=["Title", "Review", "Translation"])
+
+    # --- Summary sheet ---
+    ws = wb.create_sheet("Summary")
+    ws["A1"] = f"{dataset_title} — Summary"
+    ws["A1"].font = TITLE_FONT
+
+    ws["A3"] = "Dataset"
+    ws["A3"].font = Font(bold=True)
+
+    ws["A4"] = "Total Reviews"
+    ws["B4"] = summary["total_reviews"]
+
+    ws["A5"] = "Date Range (Opened)"
+    ws["B5"] = summary["date_range_str"]
+
+    ws["A6"] = "Average Rating"
+    if summary["avg_rating"] is not None:
+        ws["B6"] = round(summary["avg_rating"], 3)
+
+    ws["A8"] = "Rating Distribution"
+    ws["A8"].font = SECTION_FONT
+    ws["D8"] = "Top Retailers"
+    ws["D8"].font = SECTION_FONT
+
+    rd = summary["rating_dist"].copy()
+    rd_cols = ["Rating", "Count", "Share"]
+    rd = rd[rd_cols]
+    start_row, start_col = 9, 1
+    for j, col in enumerate(rd_cols):
+        cell = ws.cell(row=start_row, column=start_col + j, value=col)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for i, row in enumerate(rd.itertuples(index=False, name=None), start=1):
+        for j, val in enumerate(row):
+            c = ws.cell(row=start_row + i, column=start_col + j, value=excel_safe_value(val))
+            if j == 2:
+                c.number_format = "0.0%"
+
+    tr = summary["top_retailers"].copy()
+    tr_cols = ["Retailer", "Count", "Share"]
+    tr = tr[tr_cols]
+    start_row, start_col = 9, 4
+    for j, col in enumerate(tr_cols):
+        cell = ws.cell(row=start_row, column=start_col + j, value=col)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for i, row in enumerate(tr.itertuples(index=False, name=None), start=1):
+        for j, val in enumerate(row):
+            c = ws.cell(row=start_row + i, column=start_col + j, value=excel_safe_value(val))
+            if j == 2:
+                c.number_format = "0.0%"
+
+    ws["A22"] = "Top Symptom Conditions"
+    ws["A22"].font = SECTION_FONT
+    ws["E22"] = "Notes"
+    ws["E22"].font = SECTION_FONT
+
+    ws["E23"] = (
+        "Symptoms sheet is exploded from\n"
+        "customAttributes.taxonomies lists\n"
+        "(Component / Condition / Mode)."
+    )
+    ws["E23"].alignment = Alignment(wrap_text=True, vertical="top")
+
+    tc = summary["top_conditions"].copy()
+    tc_cols = ["Condition", "Count", "Share (of symptom rows)"]
+    tc = tc[tc_cols]
+    start_row, start_col = 23, 1
+    for j, col in enumerate(tc_cols):
+        cell = ws.cell(row=start_row, column=start_col + j, value=col if j < 2 else "Share")
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        if j == 2:
+            ws.column_dimensions[get_column_letter(start_col + j)].width = 6
+            cell.alignment = Alignment(horizontal="center", vertical="center", textRotation=90)
+        else:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for i, row in enumerate(tc.itertuples(index=False, name=None), start=1):
+        for j, val in enumerate(row):
+            c = ws.cell(row=start_row + i, column=start_col + j, value=excel_safe_value(val))
+            if j == 2:
+                c.number_format = "0.0%"
+
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 28
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 35
+    ws.column_dimensions["F"].width = 10
+
+    # --- Symptoms sheet ---
+    ws_s = wb.create_sheet("Symptoms")
+    write_df_to_sheet(ws_s, symptoms_df)
+    add_excel_table(ws_s, symptoms_df, table_name="SymptomsTable")
+    set_date_format(ws_s, symptoms_df, date_cols=["Opened Timestamp"])
+
+    symptom_widths = {
+        "Record ID": 34,
+        "Opened Timestamp": 16,
+        "Rating": 8,
+        "Retailer": 14,
+        "Model": 12,
+        "Symptom Index": 12,
+        "Symptom Component": 22,
+        "Symptom Condition": 38,
+        "Symptom Mode": 38,
+    }
+    set_col_widths(ws_s, symptoms_df, symptom_widths)
+
+    # Make Reviews the active sheet when opening
+    wb.active = wb.sheetnames.index("Reviews")
+
+    # Save to bytes
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", s, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def _extract_json_substring(s: str) -> str:
+    s = s.strip()
+    if s.startswith("{") or s.startswith("["):
+        return s
+    start_candidates = [i for i in [s.find("{"), s.find("[")] if i != -1]
+    if not start_candidates:
+        return s
+    start = min(start_candidates)
+    end = max(s.rfind("}"), s.rfind("]"))
+    if end != -1 and end > start:
+        return s[start : end + 1].strip()
+    return s
+
+
+def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    objs: List[Dict[str, Any]] = []
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+            if isinstance(obj, dict):
+                objs.append(obj)
+            else:
+                return None
+        except Exception:
+            return None
+    return objs
+
+
+def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
+    warnings: List[str] = []
+    s = _strip_code_fences(text_in)
+    s = _extract_json_substring(s)
+
+    try:
+        return json.loads(s), warnings
+    except Exception as e1:
+        # Attempt: remove trailing commas
+        s2 = re.sub(r",\s*([}\]])", r"\1", s)
+        if s2 != s:
+            try:
+                warnings.append("Removed trailing commas to make JSON valid.")
+                return json.loads(s2), warnings
+            except Exception:
+                warnings.pop()
+
+        # Attempt: JSON Lines
+        jl = _try_parse_json_lines(s)
+        if jl is not None:
+            warnings.append("Detected JSON Lines and parsed each line as a record.")
+            return jl, warnings
+
+        raise ValueError("Could not parse input as JSON. Paste valid JSON (or JSON Lines).") from e1
+
+
+def extract_records(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, dict) and "results" in raw and isinstance(raw["results"], list):
+        return raw["results"]
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, dict)]
+    raise ValueError("Unrecognized JSON shape. Expected a dict with `results: []` or a list of record objects.")
+
+# starwalk_converter_app_FIXED.py
+# Streamlit app to convert raw website review exports into the
+# "Star Walk scrubbed verbatims" format (Symptom 1–10 detractors, 11–20 delighters).
+
+import ast
+import io
+import re
+from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+APP_VERSION = "2026-02-27-extra-cols-after-symptom20-no-hairtype-v1"
+
+STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
+
+# -----------------------------
+# Default columns (Hair Type removed)
+# -----------------------------
+DEFAULT_STARWALK_COLUMNS: List[str] = [
+    "Source",
+    "Model (SKU)",
+    "Seeded",
+    "Country",
+    "New Review",
+    "Review Date",
+    "Verbatim Id",
+    "Verbatim",
+    "Star Rating",
+    "Review count per detractor",
+] + [f"Symptom {i}" for i in range(1, 21)]
+
+# Default optional extra columns to place after Symptom 20
+DEFAULT_EXTRA_AFTER_SYMPTOM20: List[str] = [
+    "Key Review Sentiment_Reviews",
+    "Key Review Sentiment Type_Reviews",
+    "Trigger Point_Product",
+    "Dominant Customer Journey Step",
+    "L2 Delighter Component",
+    "L2 Delighter Mode",
+    "L3 Non Product Detractors",
+    "Product_Symptom Component",
+]
+
+# Used for splitting multi-tag cells like "A; B | C"
+DEFAULT_TAG_SPLIT_RE = re.compile(r"[;\|\n,]+")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+
+def best_match(target: str, candidates: List[str]) -> Optional[str]:
+    """Lightweight matcher: exact normalized match > substring match."""
+    if not candidates:
+        return None
+    t = _norm(target)
+    norm_map = {c: _norm(c) for c in candidates}
+
+    for c, nc in norm_map.items():
+        if nc == t:
+            return c
+    for c, nc in norm_map.items():
+        if t and (t in nc or nc in t):
+            return c
+    return None
+
+
+def resolve_out_col(wanted: str, out_columns: List[str]) -> Optional[str]:
+    """
+    Resolve an output column name by normalized match so templates with headers like:
+      - "Seeded?"
+      - "Star Rating (1-5)"
+    still map correctly when the app UI key is "Seeded" / "Star Rating".
+
+    Priority:
+      1) exact match
+      2) normalized exact match
+    """
+    if wanted in out_columns:
+        return wanted
+    wn = _norm(wanted)
+    for c in out_columns:
+        if _norm(c) == wn:
+            return c
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def read_table(file_bytes: bytes, filename: str, sheet: Optional[str] = None) -> pd.DataFrame:
+    if filename.lower().endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes))
+    if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
+    raise ValueError("Unsupported file type. Please upload a CSV or Excel file.")
+
+
+def dedupe_preserve(items: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in items:
+        s = str(x).strip()
+        if not s:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def parse_tags(value, split_re: re.Pattern) -> List[str]:
+    """
+    Parse a cell that may contain:
+      - NaN/empty
+      - a single string
+      - delimited strings (e.g., "A; B | C")
+      - stringified list: "['A','B']"
+      - actual python list/tuple/set (rare but possible)
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return dedupe_preserve([str(v).strip() for v in value if str(v).strip()])
+
+    s = str(value).strip()
+    if not s:
+        return []
+
+    # Try safe parsing first for list-like strings
+    if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, (list, tuple, set)):
+                return dedupe_preserve([str(v).strip().strip("'\"") for v in parsed if str(v).strip()])
+        except Exception:
+            # Fall back to a simple split if literal_eval fails
+            inner = s[1:-1].strip()
+            if inner:
+                parts = [p.strip().strip("'\"") for p in inner.split(",")]
+                return dedupe_preserve([p for p in parts if p])
+            return []
+
+    parts = [p.strip() for p in split_re.split(s) if p and p.strip()]
+    return dedupe_preserve(parts)
+
+
+# -----------------------------
+# Value normalizers
+# -----------------------------
+def clean_star_rating_value(v):
+    """Coerce star rating into a numeric (int/float) and strip words like 'star(s)'."""
+    if v is None:
+        return pd.NA
+    try:
+        if pd.isna(v):
+            return pd.NA
+    except Exception:
+        pass
+
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        try:
+            if np.isnan(v):
+                return pd.NA
+        except Exception:
+            pass
+        fv = float(v)
+        return int(fv) if fv.is_integer() else fv
+
+    s = str(v).strip()
+    if not s:
+        return pd.NA
+
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return pd.NA
+
+    fv = float(m.group(1))
+    return int(fv) if fv.is_integer() else fv
+
+
+def clean_star_rating_series(series: pd.Series) -> pd.Series:
+    return series.apply(clean_star_rating_value).astype("object")
+
+
+_NUMERIC_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*$")
+
+
+def clean_seeded_value(v):
+    """
+    Convert Seeded inputs into:
+      - "Yes" for seeded-like values (including ['Seeded'])
+      - "no" for anything blank/empty/unseeded/false
+    """
+    if v is None:
+        return "no"
+    try:
+        if pd.isna(v):
+            return "no"
+    except Exception:
+        pass
+
+    if isinstance(v, (bool, np.bool_)):
+        return "Yes" if bool(v) else "no"
+
+    if isinstance(v, (int, np.integer, float, np.floating)):
+        try:
+            return "Yes" if float(v) == 1.0 else "no"
+        except Exception:
+            return "no"
+
+    s0 = str(v).strip()
+    if s0 and _NUMERIC_RE.match(s0):
+        try:
+            fv = float(s0)
+            if fv == 1.0:
+                return "Yes"
+            if fv == 0.0:
+                return "no"
+        except Exception:
+            pass
+
+    tokens = parse_tags(v, DEFAULT_TAG_SPLIT_RE)
+
+    for t in tokens:
+        raw = str(t).strip().lower()
+        nt = _norm(t)
+
+        if nt in {"notseeded", "unseeded", "nonseeded"} or raw in {"not seeded", "unseeded", "non seeded"}:
+            return "no"
+        if nt in {"false", "no", "n", "0"}:
+            return "no"
+
+        if nt in {"seeded", "yes", "true", "y", "1"}:
+            return "Yes"
+        if raw in {"1.0", "1"}:
+            return "Yes"
+        if "seeded" in nt:
+            return "Yes"
+
+    return "no"
+
+
+def clean_seeded_series(series: pd.Series) -> pd.Series:
+    return series.apply(clean_seeded_value).astype("object")
+
+
+# -----------------------------
+# Template helpers
+# -----------------------------
+def extract_template_header(template_bytes: bytes, sheet_name: str, keep_trailing_blank_cols: int = 5) -> List[str]:
+    """
+    Extract header row from an Excel sheet using openpyxl so we don't accidentally
+    drop trailing blank header columns (common in the Star Walk template).
+    """
+    wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
+    if sheet_name not in wb.sheetnames:
+        return DEFAULT_STARWALK_COLUMNS
+
+    ws = wb[sheet_name]
+    raw = []
+    for c in range(1, ws.max_column + 1):
+        raw.append(ws.cell(1, c).value)
+
+    last_named = -1
+    for i, v in enumerate(raw):
+        if v is not None and str(v).strip() != "":
+            last_named = i
+
+    if last_named == -1:
+        return DEFAULT_STARWALK_COLUMNS
+
+    max_keep = min(len(raw), last_named + 1 + keep_trailing_blank_cols)
+    headers: List[str] = []
+    for i in range(max_keep):
+        v = raw[i]
+        if v is None or str(v).strip() == "":
+            headers.append(f"Unnamed: {i}")
+        else:
+            headers.append(str(v).strip())
+    return headers
+
+
+def load_allowed_l2_from_template(template_bytes: bytes) -> Tuple[Optional[Set[str]], Optional[Set[str]]]:
+    """
+    If the template has a 'Symptoms' sheet with columns 'Detractors' and 'Delighters',
+    use it as an allow-list for L2 tags.
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(template_bytes), sheet_name="Symptoms")
+        if "Detractors" not in df.columns or "Delighters" not in df.columns:
+            return None, None
+        det = set(df["Detractors"].dropna().astype(str).str.strip())
+        deli = set(df["Delighters"].dropna().astype(str).str.strip())
+        det = {x for x in det if x}
+        deli = {x for x in deli if x}
+        return det or None, deli or None
+    except Exception:
+        return None, None
+
+
+def collect_from_row_tuple(
+    row_tup,
+    col_idx: Dict[str, int],
+    cols: List[str],
+    split_re: re.Pattern,
+) -> List[str]:
+    tags: List[str] = []
+    for c in cols:
+        i = col_idx.get(c)
+        if i is None:
+            continue
+        tags.extend(parse_tags(row_tup[i], split_re))
+    return dedupe_preserve(tags)
+
+
+def insert_after_symptom20(out_cols: List[str], extra_cols: List[str]) -> List[str]:
+    """
+    Insert extra columns immediately after Symptom 20.
+    If Symptom 20 not found, append at end.
+    De-dupes while preserving order.
+    """
+    base = list(out_cols)
+    extras = [c for c in extra_cols if c and str(c).strip()]
+    if not extras:
+        return base
+
+    # remove extras if already present so insertion doesn't duplicate
+    base_no_extras = [c for c in base if c not in extras]
+
+    try:
+        idx = base_no_extras.index("Symptom 20")
+        return base_no_extras[: idx + 1] + extras + base_no_extras[idx + 1 :]
+    except ValueError:
+        return base_no_extras + extras
+
+
+# -----------------------------
+# Conversion
+# -----------------------------
+def convert_to_starwalk(
+    src_df: pd.DataFrame,
+    out_cols: List[str],
+    field_map: Dict[str, Optional[str]],
+    l2_det_cols: List[str],
+    l2_del_cols: List[str],
+    split_regex: str,
+    weight_mode: str,
+    allowed_det: Optional[Set[str]] = None,
+    allowed_del: Optional[Set[str]] = None,
+    filter_unknown: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Build Star Walk scrubbed verbatims output:
+      - L2 detractors -> Symptom 1-10
+      - L2 delighters -> Symptom 11-20
+    """
+    src_df = src_df.reset_index(drop=True)
+    n = len(src_df)
+
+    needed_symptoms = [f"Symptom {i}" for i in range(1, 21)]
+    base_cols = list(out_cols)
+    for c in needed_symptoms:
+        if c not in base_cols:
+            base_cols.append(c)
+    if "Review count per detractor" not in base_cols:
+        base_cols.append("Review count per detractor")
+
+    out = pd.DataFrame(index=range(n), columns=base_cols, dtype="object")
+
+    # Copy mapped fields (with robust output-column resolving for templates)
+    out_columns_list = list(out.columns)
+    for ui_out_field, in_field in field_map.items():
+        out_col = resolve_out_col(ui_out_field, out_columns_list)
+        if not out_col:
+            continue
+
+        if in_field and in_field in src_df.columns:
+            series = src_df[in_field]
+            if _norm(out_col) == "seeded":
+                out[out_col] = clean_seeded_series(series)
+            elif _norm(out_col) == "starrating":
+                out[out_col] = clean_star_rating_series(series)
+            else:
+                out[out_col] = series.values
+        else:
+            out[out_col] = pd.NA
+
+    # Safety pass (handles template quirks / duplicate header variants)
+    for c in list(out.columns):
+        if _norm(c) == "seeded":
+            out[c] = clean_seeded_series(out[c])
+        if _norm(c) == "starrating":
+            out[c] = clean_star_rating_series(out[c])
+
+    split_re = re.compile(split_regex)
+    src_cols = list(src_df.columns)
+    col_idx = {c: i for i, c in enumerate(src_cols)}
+
+    detr_matrix = [[pd.NA] * 10 for _ in range(n)]
+    deli_matrix = [[pd.NA] * 10 for _ in range(n)]
+    detr_count = np.zeros(n, dtype=int)
+    deli_count = np.zeros(n, dtype=int)
+
+    rows_trunc_det = 0
+    rows_trunc_del = 0
+    unknown_det_total = 0
+    unknown_del_total = 0
+
+    for r_i, row in enumerate(src_df.itertuples(index=False, name=None)):
+        d_tags = collect_from_row_tuple(row, col_idx, l2_det_cols, split_re)
+        l_tags = collect_from_row_tuple(row, col_idx, l2_del_cols, split_re)
+
+        if allowed_det is not None:
+            unknown = [t for t in d_tags if t not in allowed_det]
+            if unknown:
+                unknown_det_total += len(unknown)
+                if filter_unknown:
+                    d_tags = [t for t in d_tags if t in allowed_det]
+
+        if allowed_del is not None:
+            unknown = [t for t in l_tags if t not in allowed_del]
+            if unknown:
+                unknown_del_total += len(unknown)
+                if filter_unknown:
+                    l_tags = [t for t in l_tags if t in allowed_del]
+
+        if len(d_tags) > 10:
+            rows_trunc_det += 1
+        if len(l_tags) > 10:
+            rows_trunc_del += 1
+
+        d_tags = d_tags[:10]
+        l_tags = l_tags[:10]
+
+        detr_count[r_i] = len(d_tags)
+        deli_count[r_i] = len(l_tags)
+
+        for j, t in enumerate(d_tags):
+            detr_matrix[r_i][j] = t
+        for j, t in enumerate(l_tags):
+            deli_matrix[r_i][j] = t
+
+    detr_cols_out = [f"Symptom {i}" for i in range(1, 11)]
+    deli_cols_out = [f"Symptom {i}" for i in range(11, 21)]
+
+    out[detr_cols_out] = pd.DataFrame(detr_matrix, columns=detr_cols_out).values
+    out[deli_cols_out] = pd.DataFrame(deli_matrix, columns=deli_cols_out).values
+
+    # Weight column behavior (configurable)
+    if "Review count per detractor" in out.columns:
+        if weight_mode == "Leave blank":
+            out["Review count per detractor"] = pd.NA
+        elif weight_mode == "Always 1":
+            out["Review count per detractor"] = 1.0
+        elif weight_mode == "1 / # detractor symptoms (if any)":
+            out["Review count per detractor"] = np.where(detr_count > 0, 1.0 / detr_count, pd.NA)
+        elif weight_mode == "1 / # delighter symptoms (if any)":
+            out["Review count per detractor"] = np.where(deli_count > 0, 1.0 / deli_count, pd.NA)
+        else:  # "1 / # total symptoms (detractors + delighters)"
+            total = detr_count + deli_count
+            out["Review count per detractor"] = np.where(total > 0, 1.0 / total, pd.NA)
+
+    stats = {
+        "rows": n,
+        "rows_truncated_detractors_gt10": rows_trunc_det,
+        "rows_truncated_delighters_gt10": rows_trunc_del,
+        "unknown_detractor_tags_total": unknown_det_total,
+        "unknown_delighter_tags_total": unknown_del_total,
+    }
+    return out, stats
+
+
+def to_excel_one_sheet(df_out: pd.DataFrame, sheet_name: str = STARWALK_SHEET_NAME) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buf.getvalue()
+
+
+def write_into_template_workbook(template_bytes: bytes, df_out: pd.DataFrame, sheet_name: str = STARWALK_SHEET_NAME) -> bytes:
+    """
+    Preserve the full template workbook (other sheets, formulas, pivots, etc.) and
+    replace the Star Walk scrubbed verbatims sheet data (keeping its header row).
+
+    If df_out contains columns not in the template header, append them to the end
+    of the template header so they are included in the export.
+    """
+    wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
+
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
+
+    # Read template header (row 1)
+    header = []
+    max_col = ws.max_column
+    for c in range(1, max_col + 1):
+        v = ws.cell(1, c).value
+        if v is None or str(v).strip() == "":
+            header.append(f"Unnamed: {c-1}")
+        else:
+            header.append(str(v).strip())
+
+    # If sheet is empty, write header from df_out
+    if (ws.max_row == 1 and ws.max_column == 1 and ws.cell(1, 1).value is None):
+        header = list(df_out.columns)
+        for c, name in enumerate(header, start=1):
+            ws.cell(1, c).value = name
+
+    # Append missing columns to header (so export always includes them)
+    missing = [c for c in df_out.columns if c not in header]
+    if missing:
+        start = len(header) + 1
+        for i, name in enumerate(missing, start=0):
+            ws.cell(1, start + i).value = name
+        header = header + missing
+
+    # Align df to header columns
+    aligned = df_out.copy()
+    for col in header:
+        if col not in aligned.columns:
+            aligned[col] = pd.NA
+    aligned = aligned[header]
+
+    # Replace pandas missing with None (so Excel is truly blank)
+    aligned = aligned.replace({pd.NA: None})
+    aligned = aligned.where(pd.notna(aligned), None)
+
+    # Clear existing rows below header
+    if ws.max_row >= 2:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    # Append new data rows
+    for r in dataframe_to_rows(aligned, index=False, header=False):
+        ws.append(r)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+
+# =============================
+# Master pipeline helpers (JSON -> Star Walk DF)
+# =============================
+
+class _NameOnlyUpload:
+    """Fallback when user pastes JSON text (no UploadedFile object)."""
+    def __init__(self, name: str):
+        self.name = name
+
+
+def _hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def canonicalize_starwalk_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize common Star Walk column header variants so the dashboard works
+    even if a template uses headers like 'Seeded?' or 'Star Rating (1-5)'.
+    """
+    df = df_in.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Build a normalized -> actual mapping (first occurrence wins)
+    existing = list(df.columns)
+    norm_to_col = {}
+    for c in existing:
+        n = _norm(c)
+        if n and n not in norm_to_col:
+            norm_to_col[n] = c
+
+    desired = {
+        "source": "Source",
+        "country": "Country",
+        "modelsku": "Model (SKU)",
+        "seeded": "Seeded",
+        "newreview": "New Review",
+        "reviewdate": "Review Date",
+        "verbatimid": "Verbatim Id",
+        "verbatim": "Verbatim",
+        "starrating": "Star Rating",
+        "reviewcountperdetractor": "Review count per detractor",
+    }
+
+    rename = {}
+    for n, canon in desired.items():
+        if canon in existing:
+            continue
+        if n in norm_to_col:
+            rename[norm_to_col[n]] = canon
+
+    # Symptoms: Symptom1 / symptom 1 / Symptom_01 -> Symptom 1
+    for c in existing:
+        n = _norm(c)
+        m = re.fullmatch(r"symptom(\d+)", n or "")
+        if not m:
+            continue
+        num = int(m.group(1))
+        canon = f"Symptom {num}"
+        if canon in existing:
+            continue
+        if c not in rename:
+            rename[c] = canon
+
+    if rename:
+        # Avoid collisions: if two columns map to the same canon, keep the first.
+        seen_target = set()
+        safe_rename = {}
+        for src, tgt in rename.items():
+            if tgt in seen_target or tgt in df.columns:
+                continue
+            seen_target.add(tgt)
+            safe_rename[src] = tgt
+        if safe_rename:
+            df = df.rename(columns=safe_rename)
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def axion_json_to_starwalk(
+    raw_text: str,
+    *,
+    include_extra: bool = True,
+    extra_cols_after_symptom20: Optional[List[str]] = None,
+    split_regex: str = r"[;\|\n,]+",
+    weight_mode: str = "Leave blank",
+    template_bytes: Optional[bytes] = None,
+    validate_l2_against_template: bool = False,
+    filter_unknown_tags: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, int], pd.DataFrame, List[str]]:
+    """
+    End-to-end:
+      Axion JSON export (dict-with-results, list-of-records, or JSON lines)
+        -> Reviews DataFrame (aXreviewsConverter logic)
+        -> Star Walk scrubbed verbatims DataFrame (axionReviews logic)
+
+    Returns:
+      starwalk_df_raw, stats, reviews_df, warnings
+    """
+    warnings_list: List[str] = []
+
+    raw_obj, parse_warnings = loads_flexible_json(raw_text)
+    warnings_list.extend(parse_warnings)
+
+    records = extract_records(raw_obj)
+    if not records:
+        raise ValueError("Parsed JSON but found 0 record objects.")
+
+    # Build the intermediate Reviews df (same columns your second script expects)
+    reviews_df = build_reviews_df(records, include_extra=include_extra)
+
+    # Output columns: default or template header (then insert extra columns after Symptom 20)
+    if extra_cols_after_symptom20 is None:
+        extra_cols_after_symptom20 = list(DEFAULT_EXTRA_AFTER_SYMPTOM20)
+
+    if template_bytes:
+        # Prefer the standard sheet name if present
+        try:
+            xls = pd.ExcelFile(io.BytesIO(template_bytes))
+            sheet = STARWALK_SHEET_NAME if STARWALK_SHEET_NAME in xls.sheet_names else xls.sheet_names[0]
+        except Exception:
+            sheet = STARWALK_SHEET_NAME
+
+        base_out_cols = extract_template_header(template_bytes, sheet_name=sheet)
+        out_cols = insert_after_symptom20(base_out_cols, extra_cols_after_symptom20)
+    else:
+        out_cols = insert_after_symptom20(list(DEFAULT_STARWALK_COLUMNS), extra_cols_after_symptom20)
+
+    # Fixed mapping from the JSON→Reviews schema into Star Walk columns
+    field_map: Dict[str, Optional[str]] = {
+        "Source": "Retailer",
+        "Model (SKU)": "Model",
+        "Seeded": "Seeded Reviews",
+        "Country": "Location",
+        "New Review": "Syndicated/Seeded Reviews",
+        "Review Date": "Opened Timestamp",
+        "Verbatim Id": "Record ID",
+        "Verbatim": "Review",
+        "Star Rating": "Rating (num)",
+        # Weight column is computed inside convert_to_starwalk
+    }
+
+    # Copy any optional extra columns (if present)
+    for c in extra_cols_after_symptom20:
+        if c in reviews_df.columns:
+            field_map[c] = c
+
+    # Symptoms mapping:
+    # Detractors -> Symptom 1-10   (default: Product_Symptom Conditions)
+    # Delighters -> Symptom 11-20  (default: L2 Delighter Condition)
+    l2_det_cols = [c for c in ["Product_Symptom Conditions"] if c in reviews_df.columns]
+    l2_del_cols = [c for c in ["L2 Delighter Condition"] if c in reviews_df.columns]
+
+    # If those aren't present, fall back to any reasonable candidates
+    if not l2_det_cols:
+        l2_det_cols = [c for c in ["Product_Symptom Mode", "Product_Symptom Component"] if c in reviews_df.columns]
+    if not l2_del_cols:
+        l2_del_cols = [c for c in ["L2 Delighter Mode", "L2 Delighter Component"] if c in reviews_df.columns]
+
+    allowed_det = allowed_del = None
+    if template_bytes and validate_l2_against_template:
+        allowed_det, allowed_del = load_allowed_l2_from_template(template_bytes)
+
+    starwalk_df_raw, stats = convert_to_starwalk(
+        src_df=reviews_df,
+        out_cols=out_cols,
+        field_map=field_map,
+        l2_det_cols=l2_det_cols,
+        l2_del_cols=l2_del_cols,
+        split_regex=split_regex,
+        weight_mode=weight_mode,
+        allowed_det=allowed_det,
+        allowed_del=allowed_del,
+        filter_unknown=filter_unknown_tags,
+    )
+
+    return starwalk_df_raw, stats, reviews_df, warnings_list
+
+
+@st.cache_data(show_spinner=False)
+def clean_starwalk_df_for_dashboard(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply the same cleaning rules as the dashboard's Excel loader,
+    but starting from an in-memory DataFrame.
+    """
+    df_local = canonicalize_starwalk_columns(df_in)
+
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+        if col in df_local.columns:
+            df_local[col] = df_local[col].astype("string").str.upper()
+
+    if "Star Rating" in df_local.columns:
+        df_local["Star Rating"] = pd.to_numeric(df_local["Star Rating"], errors="coerce")
+
+    all_symptom_cols = [c for c in df_local.columns if str(c).startswith("Symptom")]
+    for c in all_symptom_cols:
+        df_local[c] = df_local[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
+
+    if "Verbatim" in df_local.columns:
+        df_local["Verbatim"] = df_local["Verbatim"].astype("string").map(clean_text)
+
+    if "Review Date" in df_local.columns:
+        df_local["Review Date"] = pd.to_datetime(df_local["Review Date"], errors="coerce")
+
+    return df_local
+
+
+# ---------- Data Source ----------
+st.markdown("### 📁 Data Source")
+
+data_mode = st.radio(
+    "Choose input type",
+    options=[
+        "Axion JSON → Dashboard (recommended)",
+        "Star Walk Excel/CSV (already formatted)",
+    ],
+    horizontal=True,
+    key="data_mode",
+)
 
 # ---------- Load & clean (cached) ----------
 @st.cache_data(show_spinner=False)
 def _load_clean_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
-    # Keep your original behavior first; then improve robustness:
     # 1) Try named sheet
     # 2) Try to find a sheet containing "Verbatim"
     # 3) Fallback to first sheet
@@ -783,6 +2246,8 @@ def _load_clean_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"Could not read file: {e}")
 
+    df_local = canonicalize_starwalk_columns(df_local)
+
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
         if col in df_local.columns:
             df_local[col] = df_local[col].astype("string").str.upper()
@@ -803,11 +2268,239 @@ def _load_clean_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     return df_local
 
 
-try:
-    df = _load_clean_excel(uploaded_file.getvalue(), uploaded_file.name)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
+# --- Resolve dataset into `df` + `uploaded_file` (name used downstream) ---
+df = None
+uploaded_file = None
+
+if data_mode.startswith("Axion JSON"):
+    c1, c2 = st.columns([1.25, 1])
+
+    with c1:
+        uploaded_json = st.file_uploader("Upload Axion JSON export", type=["json"], key="json_upload")
+        with st.expander("…or paste JSON text (optional)", expanded=False):
+            pasted_json = st.text_area(
+                "Paste JSON (or JSON Lines)",
+                height=140,
+                key="json_paste",
+                placeholder="Paste JSON here (supports dict-with-results, list-of-records, or JSON Lines).",
+            )
+
+    with c2:
+        st.markdown("**Conversion options**")
+        include_extra = st.checkbox("Include extra taxonomy/tag columns", value=True, key="json_include_extra")
+
+        weight_mode = st.selectbox(
+            "Weight column behavior (Review count per detractor)",
+            options=[
+                "Leave blank",
+                "Always 1",
+                "1 / # detractor symptoms (if any)",
+                "1 / # delighter symptoms (if any)",
+                "1 / # total symptoms (detractors + delighters)",
+            ],
+            index=0,
+            key="json_weight_mode",
+        )
+
+        include_extra_after20 = st.checkbox(
+            "Include extra columns after Symptom 20 (for additional filters)",
+            value=True,
+            key="json_extra_after20",
+        )
+
+        template_file = st.file_uploader(
+            "Optional: Star Walk template workbook (xlsx)",
+            type=["xlsx", "xlsm", "xls"],
+            key="json_template",
+            help="If provided, the output will mirror the template's header order (useful for downstream pivots).",
+        )
+
+        with st.expander("Advanced parsing / validation", expanded=False):
+            split_regex = st.text_input(
+                "Tag split regex",
+                value=r"[;\|\n,]+",
+                key="json_split_regex",
+                help="Used to split multi-tag cells into individual detractor/delighter tags.",
+            )
+            validate_l2 = st.checkbox(
+                "Validate detractor/delighter tags against template 'Symptoms' sheet",
+                value=False,
+                key="json_validate_l2",
+                help="If the template has a sheet named 'Symptoms' with columns Detractors/Delighters, unknown tags can be counted (or filtered).",
+            )
+            filter_unknown = st.checkbox(
+                "If validating, filter out unknown tags",
+                value=False,
+                key="json_filter_unknown",
+            )
+            auto_build = st.checkbox("Auto-build dashboard on change", value=True, key="json_auto_build")
+            rebuild = st.button("Rebuild now", type="primary", key="json_rebuild")
+
+    raw_text = None
+    raw_bytes = None
+    source_name = None
+
+    if uploaded_json is not None and getattr(uploaded_json, "size", 0) > 0:
+        raw_bytes = uploaded_json.getvalue()
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        source_name = uploaded_json.name
+        uploaded_file = uploaded_json
+    elif st.session_state.get("json_paste", "").strip():
+        raw_text = st.session_state["json_paste"]
+        raw_bytes = raw_text.encode("utf-8", errors="replace")
+        source_name = "pasted_json"
+        uploaded_file = _NameOnlyUpload(source_name)
+
+    if not raw_text:
+        st.info("Upload a JSON file (or paste JSON text) to build the dashboard.")
+        st.stop()
+
+    # Determine which extra columns to insert after Symptom 20
+    extra_cols_after20 = list(DEFAULT_EXTRA_AFTER_SYMPTOM20) if include_extra_after20 else []
+
+    template_bytes = template_file.getvalue() if template_file is not None else None
+
+    ds_key = "|".join(
+        [
+            "json",
+            _hash_bytes(raw_bytes or b""),
+            str(include_extra),
+            str(weight_mode),
+            str(extra_cols_after20),
+            _hash_bytes(template_bytes) if template_bytes else "no_template",
+            str(validate_l2),
+            str(filter_unknown),
+            str(split_regex),
+        ]
+    )
+
+    # Rebuild if new dataset/options, or if user clicked rebuild
+    need_rebuild = st.session_state.get("_master_ds_key") != ds_key
+    should_rebuild = rebuild or (st.session_state.get("json_auto_build", True) and need_rebuild)
+
+    if should_rebuild:
+        with st.spinner("Converting Axion JSON → Star Walk scrubbed verbatims…"):
+            try:
+                sw_raw, stats, reviews_df, warnings_list = axion_json_to_starwalk(
+                    raw_text,
+                    include_extra=include_extra,
+                    extra_cols_after_symptom20=extra_cols_after20,
+                    split_regex=split_regex,
+                    weight_mode=weight_mode,
+                    template_bytes=template_bytes,
+                    validate_l2_against_template=validate_l2,
+                    filter_unknown_tags=filter_unknown,
+                )
+                sw_clean = clean_starwalk_df_for_dashboard(sw_raw)
+
+                st.session_state["_master_ds_key"] = ds_key
+                st.session_state["_master_source_name"] = source_name
+                st.session_state["_master_sw_raw"] = sw_raw
+                st.session_state["_master_sw_clean"] = sw_clean
+                st.session_state["_master_reviews_df"] = reviews_df
+                st.session_state["_master_stats"] = stats
+                st.session_state["_master_warnings"] = warnings_list
+
+                # Scroll to top on new dataset
+                st.session_state["last_uploaded_name"] = source_name
+                st.session_state["force_scroll_top_once"] = True
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+                st.stop()
+
+    # If we still don't have a built dataset, prompt user
+    if st.session_state.get("_master_ds_key") != ds_key:
+        st.info("Ready to convert. Click **Rebuild now** (or enable Auto-build).")
+        st.stop()
+
+    df = st.session_state.get("_master_sw_clean")
+    source_name = st.session_state.get("_master_source_name", source_name)
+
+    # Brief status + downloads
+    with st.expander("✅ Conversion status / downloads", expanded=False):
+        if st.session_state.get("_master_warnings"):
+            for w in st.session_state["_master_warnings"]:
+                st.info(w)
+
+        stats = st.session_state.get("_master_stats") or {}
+        if stats:
+            st.json(stats)
+
+        # Preview
+        try:
+            st.caption("Preview — Star Walk scrubbed verbatims (first 25 rows)")
+            st.dataframe(st.session_state["_master_sw_raw"].head(25), use_container_width=True)
+        except Exception:
+            pass
+
+        # Downloads
+        try:
+            starwalk_bytes = to_excel_one_sheet(st.session_state["_master_sw_raw"], sheet_name=STARWALK_SHEET_NAME)
+            st.download_button(
+                "Download Star Walk Excel (one sheet)",
+                data=starwalk_bytes,
+                file_name=f"{Path(source_name).stem}_starwalk_scrubbed_verbatims.xlsx" if source_name else "starwalk_scrubbed_verbatims.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.warning(f"Could not generate Star Walk Excel download: {e}")
+
+        if template_bytes:
+            try:
+                templ_out = write_into_template_workbook(template_bytes, st.session_state["_master_sw_raw"], sheet_name=STARWALK_SHEET_NAME)
+                st.download_button(
+                    "Download Star Walk Excel (filled template)",
+                    data=templ_out,
+                    file_name=f"{Path(source_name).stem}_starwalk_filled_template.xlsx" if source_name else "starwalk_filled_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception as e:
+                st.warning(f"Could not write into template workbook: {e}")
+
+        # Optional: intermediate "Clean Reviews" workbook (original JSON→Excel app)
+        try:
+            st.markdown("---")
+            st.caption("Optional: download the intermediate workbook (Reviews / Summary / Symptoms).")
+            if st.checkbox("Enable intermediate workbook download", value=False, key="enable_intermediate"):
+                # Re-parse records only when requested (avoids extra work for dashboard-only use)
+                raw_obj, _warn = loads_flexible_json(raw_text)
+                records = extract_records(raw_obj)
+                dataset_title = title_from_filename(source_name) if source_name else "Axion Export"
+                reviews_df = st.session_state.get("_master_reviews_df") or build_reviews_df(records, include_extra=include_extra)
+                symptoms_df = build_symptoms_df(records, include_blank_row_when_missing=True)
+                summary = build_summary_tables(reviews_df, symptoms_df, top_n=10)
+                wb_bytes = build_workbook(
+                    dataset_title=f"{dataset_title} Reviews",
+                    reviews_df=reviews_df,
+                    symptoms_df=symptoms_df,
+                    summary=summary,
+                    wrap_long_text=False,
+                )
+                st.download_button(
+                    "Download Clean Reviews workbook (3 sheets)",
+                    data=wb_bytes,
+                    file_name=f"{Path(source_name).stem}_clean_reviews.xlsx" if source_name else "clean_reviews.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        except Exception as e:
+            st.warning(f"Intermediate workbook download unavailable: {e}")
+
+else:
+    uploaded_file = st.file_uploader("Upload your Star Walk Excel/CSV file", type=["xlsx", "csv"], key="excel_upload")
+
+    if uploaded_file and st.session_state.get("last_uploaded_name") != uploaded_file.name:
+        st.session_state["last_uploaded_name"] = uploaded_file.name
+        st.session_state["force_scroll_top_once"] = True
+
+    if not uploaded_file:
+        st.info("Please upload a Star Walk Excel/CSV file to get started.")
+        st.stop()
+
+    try:
+        df = _load_clean_excel(uploaded_file.getvalue(), uploaded_file.name)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
 
 # ---------- Sidebar filters ----------
@@ -967,20 +2660,50 @@ with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
 
 with st.sidebar.expander("🔒 Privacy & AI", expanded=True):
     ai_enabled = st.toggle(
-        "Enable AI (send filtered text to OpenAI)",
+        "Enable AI (remote LLM via OpenAI)",
         value=True,
         key="ai_enabled",
-        help="When on and you ask a question, short masked snippets and embeddings are sent to OpenAI.",
+        help="When on, the app can call OpenAI for summaries and Q&A. No remote calls happen until you press Send / Generate.",
     )
+
+    ai_strict = st.toggle(
+        "Strict privacy mode (NO verbatims/snippets sent)",
+        value=bool(st.session_state.get("ai_strict", False)),
+        key="ai_strict",
+        disabled=not ai_enabled,
+        help="When enabled, the LLM only receives aggregated stats + tool outputs. No review text is sent.",
+    )
+
+    ai_send_quotes = st.toggle(
+        "Allow sending masked evidence snippets",
+        value=bool(st.session_state.get("ai_send_quotes", True)),
+        key="ai_send_quotes",
+        disabled=(not ai_enabled) or ai_strict,
+        help="If enabled, masked snippets are included so the AI can cite evidence. Disabled automatically in strict mode.",
+    )
+
+    ai_embed_enriched = st.toggle(
+        "Use enriched embeddings (metadata + symptoms + verbatim)",
+        value=bool(st.session_state.get("ai_embed_enriched", True)),
+        key="ai_embed_enriched",
+        disabled=(not ai_enabled) or ai_strict,
+        help="Improves retrieval for queries about regions/sources/symptoms. Uses masked text. Disabled in strict mode.",
+    )
+
     ai_cap = st.number_input(
-        "Max reviews to embed per Q",
+        "Max reviews to embed per question",
         min_value=200,
         max_value=5000,
         value=int(st.session_state.get("ai_cap", 1500)),
         step=100,
         key="ai_cap",
+        disabled=(not ai_enabled) or ai_strict,
     )
-    st.caption("Emails/phone numbers are masked before embedding. No remote calls happen until you press Send / Generate.")
+
+    st.caption(
+        "PII (emails/phone numbers) is masked before embedding. "
+        "In Strict mode, no review text is sent—only aggregates computed locally."
+    )
 
 with st.sidebar.expander("🧠 Local Intelligence", expanded=False):
     st.toggle("Use BM25 blend (local, fast)", value=st.session_state.get("use_bm25", False), key="use_bm25")
@@ -1133,23 +2856,39 @@ with st.expander("🪄 AI Product Summary (narrative, button-triggered)", expand
             top_del = _top_table(delighters_results_full, 6)
             top_det = _top_table(detractors_results_full, 6)
 
-            # Evidence quotes (local pick from top symptoms)
+                        # Evidence quotes (optional; masked before sending to the LLM)
             quotes = []
-            if top_del:
-                sym = top_del[0]["item"].title()
-                q = _pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high")
-                for i, qq in enumerate(q):
-                    quotes.append(f"[Q{len(quotes)+1}] “{qq['text']}” — {qq['meta']}")
-            if top_det:
-                sym = top_det[0]["item"].title()
-                q = _pick_quotes_for_symptom(filtered, sym, existing_detractor_columns, k=2, prefer="low")
-                for i, qq in enumerate(q):
-                    quotes.append(f"[Q{len(quotes)+1}] “{qq['text']}” — {qq['meta']}")
+            if (not ai_strict) and ai_send_quotes:
+                if top_del:
+                    sym = top_del[0]["item"].title()
+                    q = _pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high")
+                    for qq in q:
+                        quotes.append(f"[Q{len(quotes)+1}] “{_mask_pii(qq['text'])}” — {qq['meta']}")
+                if top_det:
+                    sym = top_det[0]["item"].title()
+                    q = _pick_quotes_for_symptom(filtered, sym, existing_detractor_columns, k=2, prefer="low")
+                    for qq in q:
+                        quotes.append(f"[Q{len(quotes)+1}] “{_mask_pii(qq['text'])}” — {qq['meta']}")
 
-            # Add watchouts lines
+# Add watchouts lines
             watch = trend_watchouts[:6] if trend_watchouts else []
 
             ctx = {
+                "privacy_mode": "STRICT" if ai_strict else "HYBRID",
+                "active_filters": {
+                    "timeframe": timeframe,
+                    "start_date": str(start_date) if start_date else None,
+                    "end_date": str(end_date) if end_date else None,
+                    "star_ratings": selected_ratings,
+                    "country_filter": st.session_state.get("f_Country", ["All"]),
+                    "source_filter": st.session_state.get("f_Source", ["All"]),
+                    "sku_filter": st.session_state.get("f_Model (SKU)", ["All"]),
+                    "seeded_filter": st.session_state.get("f_Seeded", ["All"]),
+                    "new_review_filter": st.session_state.get("f_New Review", ["All"]),
+                    "delighter_filter": st.session_state.get("delight", ["All"]),
+                    "detractor_filter": st.session_state.get("detract", ["All"]),
+                    "keyword": st.session_state.get("kw", ""),
+                },
                 "metrics": m,
                 "top_delighters": top_del,
                 "top_detractors": top_det,
@@ -1165,7 +2904,7 @@ with st.expander("🪄 AI Product Summary (narrative, button-triggered)", expand
                 "Rules:\n"
                 "- Use ONLY the data in DATA_JSON for any numbers.\n"
                 "- If you mention a number, it must appear in DATA_JSON.\n"
-                "- Include evidence quotes by referencing quote IDs like [Q1], [Q2].\n"
+                "- If evidence quotes are provided in DATA_JSON, cite them by ID like [Q1], [Q2]. If none are provided, do NOT fabricate quotes.\n"
                 "- Be concise and executive-friendly.\n"
                 "- Provide prioritized recommendations (what to do next) and explain why.\n"
             )
@@ -1192,7 +2931,7 @@ with st.expander("🪄 AI Product Summary (narrative, button-triggered)", expand
                     req["temperature"] = llm_temp
 
                 with st.spinner("Generating summary…"):
-                    resp = client.chat.completions.create(**req)
+                    resp = _chat_with_backoff(client, req)
                 st.session_state["product_summary_text"] = resp.choices[0].message.content
             except Exception as e:
                 st.error(f"Could not generate summary: {e}")
@@ -1218,7 +2957,8 @@ if send and q.strip():
     q = q.strip()
 
     # Build local search index ON DEMAND (no remote calls)
-    verb_series_all = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
+    df_docs = filtered.reset_index(drop=True)
+    verb_series_all = df_docs.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
     local_texts = verb_series_all.tolist()
     content_hash_local = _hash_texts(local_texts)
     local_index = _get_or_build_local_text_index(local_texts, content_hash_local)
@@ -1328,7 +3068,96 @@ if send and q.strip():
         except Exception as e:
             return {"error": str(e)}
 
-    # Default: high-quality local answer + quotes
+    
+    def symptom_lift(which: str, query_a: str, query_b: str, k: int = 10) -> dict:
+        """
+        Compare symptom mention rates between two cohorts A and B (defined by pandas query strings),
+        using UNIQUE review mentions (a symptom counted at most once per review).
+        """
+        try:
+            which_l = (which or "").strip().lower()
+            if which_l not in {"detractors", "delighters"}:
+                return {"error": "which must be 'detractors' or 'delighters'"}
+
+            if not _safe_query(query_a) or not _safe_query(query_b):
+                return {"error": "unsafe query"}
+
+            df_a = filtered.query(query_a)
+            df_b = filtered.query(query_b)
+
+            cols = existing_detractor_columns if which_l == "detractors" else existing_delighter_columns
+            if not cols:
+                return {"rows": [], "n_a": int(len(df_a)), "n_b": int(len(df_b))}
+
+            def _counts(sub: pd.DataFrame) -> pd.Series:
+                m = sub[cols].reset_index().melt(id_vars="index", value_name="symptom")
+                m["symptom"] = m["symptom"].apply(lambda v: clean_text(v, keep_na=True))
+                m = m.dropna(subset=["symptom"])
+                m["symptom"] = m["symptom"].astype("string")
+                m = m[m["symptom"].apply(is_valid_symptom_value)]
+                m = m.drop_duplicates(subset=["index", "symptom"])
+                return m["symptom"].value_counts()
+
+            n_a = int(len(df_a))
+            n_b = int(len(df_b))
+            c_a = _counts(df_a)
+            c_b = _counts(df_b)
+
+            all_syms = sorted(set(c_a.index.tolist()) | set(c_b.index.tolist()))
+            rows = []
+            for s in all_syms:
+                a = int(c_a.get(s, 0))
+                b = int(c_b.get(s, 0))
+                ra = a / max(1, n_a)
+                rb = b / max(1, n_b)
+                rows.append(
+                    {
+                        "symptom": str(s),
+                        "mentions_a": a,
+                        "rate_a": ra,
+                        "mentions_b": b,
+                        "rate_b": rb,
+                        "delta_pp_a_minus_b": (ra - rb) * 100.0,
+                        "lift_a_over_b": (ra / (rb + 1e-9)),
+                    }
+                )
+            rows = sorted(rows, key=lambda r: r["delta_pp_a_minus_b"], reverse=True)[: int(k)]
+            return {"n_a": n_a, "n_b": n_b, "rows": rows}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def opportunity_matrix(which: str, k: int = 12) -> dict:
+        """
+        Return a ranked list of symptoms for prioritization.
+        For detractors: high mentions + low avg ★ bubble up.
+        For delighters: high mentions + high avg ★ bubble up.
+        """
+        try:
+            which_l = (which or "").strip().lower()
+            if which_l not in {"detractors", "delighters"}:
+                return {"error": "which must be 'detractors' or 'delighters'"}
+
+            tbl = detractors_results_full.copy() if which_l == "detractors" else delighters_results_full.copy()
+            if tbl.empty:
+                return {"rows": []}
+
+            tbl = tbl.copy()
+            tbl["Mentions"] = pd.to_numeric(tbl["Mentions"], errors="coerce").fillna(0)
+            tbl["Avg Star"] = pd.to_numeric(tbl["Avg Star"], errors="coerce")
+
+            if which_l == "detractors":
+                # prioritize low avg star
+                tbl["Priority Score"] = tbl["Mentions"] * (3.5 - tbl["Avg Star"]).clip(lower=0)
+            else:
+                # prioritize high avg star
+                tbl["Priority Score"] = tbl["Mentions"] * (tbl["Avg Star"] - 4.2).clip(lower=0)
+
+            out = tbl.sort_values("Priority Score", ascending=False).head(int(k))
+            return {"rows": out.to_dict(orient="records")}
+        except Exception as e:
+            return {"error": str(e)}
+
+# Default: high-quality local answer + quotes
     local_quotes = _get_local_quotes(q)
     local_answer = _route_and_answer_locally(q, filtered, local_quotes)
 
@@ -1339,38 +3168,158 @@ if send and q.strip():
     else:
         # Remote LLM path (tools-first), ONLY after we have retrieval & numbers ready
         try:
-            # Prepare masked texts and cap for embedding (keep your existing approach; add local evidence regardless)
-            raw_texts_all = [_mask_pii(t) for t in local_texts]
+                        # --- Privacy knobs (evaluated at runtime) ---
+            ai_strict_local = bool(st.session_state.get("ai_strict", False))
+            ai_send_quotes_local = bool(st.session_state.get("ai_send_quotes", True))
+            ai_embed_enriched_local = bool(st.session_state.get("ai_embed_enriched", True))
 
-            # Cap deterministically: sort by MD5 and take first ai_cap
-            def _stable_top_k(texts: list[str], k: int) -> list[str]:
-                if k >= len(texts):
-                    return texts
-                keyed = [(hashlib.md5((t or "").encode()).hexdigest(), t) for t in texts]
-                keyed.sort(key=lambda x: x[0])
-                return [t for _, t in keyed[:k]]
-
-            cap_n = int(ai_cap)
-            raw_texts = _stable_top_k(raw_texts_all, cap_n)
-            emb_model = "text-embedding-3-small"
-            content_hash = _hash_texts(raw_texts)
-
-            _ = _ensure_cache_slot(emb_model, content_hash, api_key)  # dummy cached marker
-            index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
-
-            retrieved = vector_search(q, index, api_key, top_k=10) if index else []
             retrieved_quotes = []
-            for txt, sim in retrieved[:6]:
-                s = (txt or "").strip()
-                if len(s) > 320:
-                    s = s[:317] + "…"
-                if s:
-                    retrieved_quotes.append(s)
+            retrieved_meta = []
 
-            # Build strong context pack (local, accurate)
+            index = None
+
+            if not ai_strict_local:
+                # Prepare masked texts (these will be sent to the embeddings endpoint)
+                raw_texts_all = [_mask_pii(t) for t in local_texts]
+
+                # Cap deterministically: sort by MD5 and take first ai_cap
+                def _stable_top_k_indices(texts: list[str], k: int) -> list[int]:
+                    if k >= len(texts):
+                        return list(range(len(texts)))
+                    keyed = [(hashlib.md5((t or "").encode()).hexdigest(), i) for i, t in enumerate(texts)]
+                    keyed.sort(key=lambda x: x[0])
+                    return [i for _, i in keyed[:k]]
+
+                cap_n = int(ai_cap)
+                idxs = _stable_top_k_indices(raw_texts_all, cap_n)
+
+                # Build embedding inputs (optionally enrich with metadata + symptom tags)
+                if ai_embed_enriched_local:
+                    df_docs = filtered.reset_index(drop=True)
+
+                    def _uniq_keep(seq):
+                        out, seen = [], set()
+                        for x in seq:
+                            if x in seen:
+                                continue
+                            seen.add(x)
+                            out.append(x)
+                        return out
+
+                    def _enriched_doc(i: int) -> str:
+                        row = df_docs.iloc[int(i)]
+
+                        # Meta
+                        star_val = row.get("Star Rating", "")
+                        try:
+                            star_num = float(star_val) if not pd.isna(star_val) else None
+                        except Exception:
+                            star_num = None
+                        star_s = f"{star_num:.0f}" if star_num is not None else (str(star_val) if not pd.isna(star_val) else "")
+
+                        country = str(row.get("Country", "") or "").strip()
+                        source = str(row.get("Source", "") or "").strip()
+                        sku = str(row.get("Model (SKU)", "") or "").strip()
+                        seeded = str(row.get("Seeded", "") or "").strip()
+
+                        rdate = row.get("Review Date", "")
+                        rdate_s = ""
+                        try:
+                            ts = pd.to_datetime(rdate, errors="coerce")
+                            rdate_s = "" if pd.isna(ts) else ts.strftime("%Y-%m-%d")
+                        except Exception:
+                            rdate_s = str(rdate) if not pd.isna(rdate) else ""
+
+                        # Symptoms (unique)
+                        dets = []
+                        for c in existing_detractor_columns:
+                            v = clean_text(row.get(c), keep_na=True)
+                            if is_valid_symptom_value(v):
+                                dets.append(str(v))
+                        dets = _uniq_keep(dets)
+
+                        dels = []
+                        for c in existing_delighter_columns:
+                            v = clean_text(row.get(c), keep_na=True)
+                            if is_valid_symptom_value(v):
+                                dels.append(str(v))
+                        dels = _uniq_keep(dels)
+
+                        review = _mask_pii(clean_text(row.get("Verbatim", "")))
+
+                        return (
+                            f"[{star_s}★] Country={country} | Source={source} | SKU={sku} | Seeded={seeded} | Date={rdate_s} | "
+                            f"Detractors: {', '.join(dets) if dets else '(none)'} | "
+                            f"Delighters: {', '.join(dels) if dels else '(none)'} | "
+                            f"Review: {review}"
+                        )
+
+                    raw_texts = [_enriched_doc(i) for i in idxs]
+                else:
+                    raw_texts = [raw_texts_all[i] for i in idxs]
+
+                emb_model = "text-embedding-3-small"
+                content_hash = _hash_texts(raw_texts)
+
+                _ = _ensure_cache_slot(emb_model, content_hash, api_key)  # dummy cached marker
+                index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
+
+                retrieved = vector_search(q, index, api_key, top_k=10) if index else []
+
+                def _parse_doc(doc: str) -> tuple[str, str]:
+                    s = (doc or "").strip()
+                    if "Review:" in s:
+                        pre, rev = s.split("Review:", 1)
+                        quote = (rev or "").strip()
+                        meta = (pre or "").strip().strip("|").replace("|", "•")
+                        return quote, meta
+                    return s, ""
+
+                for txt, sim in retrieved[:6]:
+                    quote, meta = _parse_doc(txt)
+                    quote = (quote or "").strip()
+                    if len(quote) > 320:
+                        quote = quote[:317] + "…"
+                    if quote:
+                        retrieved_quotes.append(quote)
+                        retrieved_meta.append(meta)
+# Build strong context pack (local, accurate)
             snap = get_metrics_snapshot()
             top_det = detractors_results_full.head(8).to_dict(orient="records")
             top_del = delighters_results_full.head(8).to_dict(orient="records")
+
+            # Active filter state (helps the model stay aligned with what the dashboard is showing)
+            active_filters = {
+                "timeframe": timeframe,
+                "start_date": str(start_date) if start_date else None,
+                "end_date": str(end_date) if end_date else None,
+                "star_ratings": selected_ratings,
+                "country_filter": st.session_state.get("f_Country", ["All"]),
+                "source_filter": st.session_state.get("f_Source", ["All"]),
+                "sku_filter": st.session_state.get("f_Model (SKU)", ["All"]),
+                "seeded_filter": st.session_state.get("f_Seeded", ["All"]),
+                "new_review_filter": st.session_state.get("f_New Review", ["All"]),
+                "delighter_filter": st.session_state.get("delight", ["All"]),
+                "detractor_filter": st.session_state.get("detract", ["All"]),
+                "keyword": st.session_state.get("kw", ""),
+            }
+
+            # Seeded vs Organic split (aggregated; safe to share even in strict mode)
+            seeded_vs_organic = {}
+            if "Seeded" in filtered.columns and "Star Rating" in filtered.columns:
+                seed_m = filtered["Seeded"].astype("string").fillna("").str.upper().eq("YES")
+                for nm, mask in [("seeded", seed_m), ("organic", ~seed_m)]:
+                    sub = filtered[mask]
+                    ss = pd.to_numeric(sub.get("Star Rating"), errors="coerce")
+                    seeded_vs_organic[nm] = {
+                        "count": int(len(sub)),
+                        "avg_star": float(ss.mean()) if len(sub) else None,
+                        "pct_1_2": float((ss <= 2).mean() * 100) if len(sub) else None,
+                    }
+
+            # Prioritization shortlist (aggregated)
+            opp_det = opportunity_matrix("detractors", 10).get("rows", [])
+            opp_del = opportunity_matrix("delighters", 10).get("rows", [])
 
             # Add a couple of symptom-specific representative quotes (better evidence)
             symptom_quotes = []
@@ -1381,20 +3330,35 @@ if send and q.strip():
                 sym = str(top_del[0].get("Item", "")).title()
                 symptom_quotes.extend(_pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high"))
 
-            # Build evidence list with IDs
+                        # Build evidence list with IDs (optional; respects privacy toggles)
             evidence_lines = []
-            # Local search quotes (full corpus coverage)
-            for i, s in enumerate(local_quotes[:5], start=1):
-                evidence_lines.append(f"[L{i}] “{_mask_pii(s)}”")
-            # Vector retrieved quotes (semantic)
-            for i, s in enumerate(retrieved_quotes[:5], start=1):
-                evidence_lines.append(f"[R{i}] “{_mask_pii(s)}”")
-            # Symptom-based picked quotes with attribution
-            for i, qq in enumerate(symptom_quotes[:4], start=1):
-                evidence_lines.append(f"[S{i}] “{qq.get('text','')}” — {qq.get('meta','')}")
+            sent_local_quotes = []
+            sent_retrieved_quotes = []
 
-            evidence_pack = {"local_quotes": local_quotes[:6], "retrieved_quotes": retrieved_quotes[:6]}
+            if (not ai_strict_local) and ai_send_quotes_local:
+                # Local search quotes (full corpus coverage)
+                for i, s in enumerate(local_quotes[:5], start=1):
+                    ss = _mask_pii(s)
+                    sent_local_quotes.append(ss)
+                    evidence_lines.append(f"[L{i}] “{ss}”")
 
+                # Vector retrieved quotes (semantic; may include meta if enriched)
+                for i, s in enumerate(retrieved_quotes[:5], start=1):
+                    ss = _mask_pii(s)
+                    meta = retrieved_meta[i - 1] if (i - 1) < len(retrieved_meta) else ""
+                    sent_retrieved_quotes.append(ss)
+                    evidence_lines.append(f"[R{i}] “{ss}”" + (f" — {meta}" if meta else ""))
+
+                # Symptom-based picked quotes with attribution
+                for i, qq in enumerate(symptom_quotes[:4], start=1):
+                    evidence_lines.append(f"[S{i}] “{qq.get('text','')}” — {qq.get('meta','')}")
+
+            # Evidence packs: what was sent vs what stayed local
+            evidence_pack = {
+                "sent_local_quotes": sent_local_quotes[:6],
+                "sent_retrieved_quotes": sent_retrieved_quotes[:6],
+                "local_only_quotes": local_quotes[:6] if (not sent_local_quotes) else [],
+            }
             selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
             llm_temp = float(st.session_state.get("llm_temp", 0.2))
 
@@ -1460,6 +3424,39 @@ if send and q.strip():
                         "parameters": {"type": "object", "properties": {}},
                     },
                 },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "symptom_lift",
+                        "description": "Compare symptom mention rates between two cohorts A and B (pandas queries) on the CURRENT filtered dataset.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "which": {"type": "string", "description": "detractors or delighters"},
+                                "query_a": {"type": "string", "description": "pandas query defining cohort A"},
+                                "query_b": {"type": "string", "description": "pandas query defining cohort B"},
+                                "k": {"type": "integer", "description": "max rows to return"}
+                            },
+                            "required": ["which", "query_a", "query_b"]
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "opportunity_matrix",
+                        "description": "Return ranked symptoms for prioritization (mentions × rating impact).",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "which": {"type": "string", "description": "detractors or delighters"},
+                                "k": {"type": "integer", "description": "max rows to return"}
+                            },
+                            "required": ["which"]
+                        },
+                    },
+                },
+
             ]
 
             # Strong system context (quant + evidence oriented)
@@ -1468,10 +3465,15 @@ if send and q.strip():
                 "Hard rules:\n"
                 "- Use ONLY numbers from METRICS_JSON or tool outputs. Do NOT invent numbers.\n"
                 "- If you mention a number, it must be present in METRICS_JSON or a tool result.\n"
-                "- Support claims using evidence quotes. Cite quotes by ID (e.g., [L1], [R2], [S1]).\n"
+                "- If EVIDENCE_QUOTES are provided, cite them by ID (e.g., [L1], [R2], [S1]). If none are provided, do NOT fabricate quotes; rely on aggregated stats + tool outputs.\n"
                 "- If evidence is weak, say so.\n\n"
                 f"PRODUCT_GUESS={product_label}\n"
-                f"ROW_COUNT={len(filtered)}\n\n"
+                f"ROW_COUNT={len(filtered)}\n"
+                f"PRIVACY_MODE={'STRICT' if ai_strict_local else 'HYBRID'}\n\n"
+                f"FILTERS_JSON:\n{json.dumps(active_filters, ensure_ascii=False)}\n\n"
+                f"SEEDED_VS_ORGANIC_JSON:\n{json.dumps(seeded_vs_organic, ensure_ascii=False)}\n\n"
+                f"OPPORTUNITY_DETRACTORS_JSON:\n{json.dumps(opp_det, ensure_ascii=False)}\n\n"
+                f"OPPORTUNITY_DELIGHTERS_JSON:\n{json.dumps(opp_del, ensure_ascii=False)}\n\n"
                 f"METRICS_JSON:\n{json.dumps(snap, ensure_ascii=False)}\n\n"
                 f"TOP_DETRACTORS_JSON:\n{json.dumps(top_det, ensure_ascii=False)}\n\n"
                 f"TOP_DELIGHTERS_JSON:\n{json.dumps(top_del, ensure_ascii=False)}\n\n"
@@ -1485,7 +3487,7 @@ if send and q.strip():
                 req["temperature"] = llm_temp
 
             with st.spinner("Thinking..."):
-                first = client.chat.completions.create(**req)
+                first = _chat_with_backoff(client, req)
 
             msg = first.choices[0].message
             tool_calls = getattr(msg, "tool_calls", []) or []
@@ -1514,6 +3516,10 @@ if send and q.strip():
                         out = top_symptoms(args.get("which", ""), int(args.get("k", 10) or 10))
                     if name == "monthly_volume_and_mean":
                         out = monthly_volume_and_mean()
+                    if name == "symptom_lift":
+                        out = symptom_lift(args.get("which", ""), args.get("query_a", ""), args.get("query_b", ""), int(args.get("k", 10) or 10))
+                    if name == "opportunity_matrix":
+                        out = opportunity_matrix(args.get("which", ""), int(args.get("k", 12) or 12))
 
                     tool_msgs.append({"tool_call_id": call.id, "role": "tool", "name": name, "content": json.dumps(out)})
 
@@ -1528,7 +3534,7 @@ if send and q.strip():
                 }
                 if model_supports_temperature(selected_model):
                     follow["temperature"] = llm_temp
-                res2 = client.chat.completions.create(**follow)
+                res2 = _chat_with_backoff(client, follow)
                 final_text = res2.choices[0].message.content
             else:
                 final_text = msg.content
@@ -1544,15 +3550,28 @@ if send and q.strip():
     st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
 
     with st.expander("🔎 Evidence used (snippets)", expanded=False):
-        st.caption("These are the snippets provided to the model. IDs like [L1], [R2], [S1] should appear in the AI answer if evidence is cited correctly.")
-        if evidence_pack.get("local_quotes"):
-            st.markdown("**Local retrieval (covers full dataset):**")
-            for i, s in enumerate(evidence_pack["local_quotes"], start=1):
-                st.write(f"[L{i}] “{_mask_pii(s)}”")
-        if evidence_pack.get("retrieved_quotes"):
-            st.markdown("**Vector retrieval (semantic):**")
-            for i, s in enumerate(evidence_pack["retrieved_quotes"], start=1):
-                st.write(f"[R{i}] “{_mask_pii(s)}”")
+        if evidence_pack.get("sent_local_quotes") or evidence_pack.get("sent_retrieved_quotes"):
+            st.caption(
+                "These are the snippets actually sent to the AI model. "
+                "IDs like [L1], [R2] may appear in the answer if evidence is cited."
+            )
+
+            if evidence_pack.get("sent_local_quotes"):
+                st.markdown("**Sent: Local retrieval (lexical)**")
+                for i, s in enumerate(evidence_pack["sent_local_quotes"], start=1):
+                    st.write(f"[L{i}] “{_mask_pii(s)}”")
+
+            if evidence_pack.get("sent_retrieved_quotes"):
+                st.markdown("**Sent: Vector retrieval (semantic)**")
+                for i, s in enumerate(evidence_pack["sent_retrieved_quotes"], start=1):
+                    st.write(f"[R{i}] “{_mask_pii(s)}”")
+        else:
+            st.info("Strict/privacy mode: no verbatim snippets were sent to the AI for this question.")
+            if evidence_pack.get("local_only_quotes"):
+                st.markdown("**Local-only supporting snippets (not sent):**")
+                for i, s in enumerate(evidence_pack["local_only_quotes"], start=1):
+                    st.write(f"[L{i}] “{_mask_pii(s)}”")
+
 
 st.markdown("---")
 
@@ -1616,86 +3635,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- NEW: Monthly Volume + Avg ★ chart (integrated) ----------
-st.markdown("### 📊 Monthly Review Volume + Avg ★")
-if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
-    st.info("Need 'Review Date' and 'Star Rating' columns to compute this chart.")
-else:
-    cA, cB, cC = st.columns([1, 1, 1])
-    with cA:
-        show_seeded_split = st.toggle("Split Seeded vs Organic", value=False, key="month_split_seeded")
-    with cB:
-        show_volume_month = st.toggle("Show Volume Bars", value=True, key="month_show_volume")
-    with cC:
-        month_freq = st.selectbox("Bucket", ["Month", "Week"], index=0, key="month_bucket")
-
-    d = filtered.copy()
-    d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
-    d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-    d = d.dropna(subset=["Review Date", "Star Rating"])
-    if d.empty:
-        st.warning("No data after cleaning dates/ratings.")
-    else:
-        if month_freq == "Week":
-            d["bucket"] = d["Review Date"].dt.to_period("W-MON").dt.start_time
-        else:
-            d["bucket"] = d["Review Date"].dt.to_period("M").dt.to_timestamp()
-
-        overall = d.groupby("bucket")["Star Rating"].agg(count="count", mean="mean").reset_index().sort_values("bucket")
-
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        if show_volume_month:
-            fig.add_trace(
-                go.Bar(
-                    x=overall["bucket"],
-                    y=overall["count"],
-                    name="Review volume",
-                    opacity=0.30,
-                    marker=dict(color="rgba(15, 23, 42, 0.35)"),
-                ),
-                secondary_y=False,
-            )
-        fig.add_trace(
-            go.Scatter(
-                x=overall["bucket"],
-                y=overall["mean"],
-                name="Avg ★",
-                mode="lines+markers",
-                line=dict(width=3),
-                marker=dict(size=6),
-                hovertemplate="Bucket: %{x|%Y-%m-%d}<br>Avg ★: %{y:.2f}<extra></extra>",
-            ),
-            secondary_y=True,
-        )
-
-        if show_seeded_split and "Seeded" in d.columns:
-            d2 = d.copy()
-            d2["Seeded"] = d2["Seeded"].astype("string").str.upper().fillna("NO")
-            for label, mask in [("Organic", d2["Seeded"].ne("YES")), ("Seeded", d2["Seeded"].eq("YES"))]:
-                sub = d2[mask].groupby("bucket")["Star Rating"].agg(mean="mean").reset_index().sort_values("bucket")
-                if not sub.empty:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=sub["bucket"],
-                            y=sub["mean"],
-                            name=f"{label} Avg ★",
-                            mode="lines",
-                            line=dict(width=2, dash="dot"),
-                            hovertemplate=f"{label}<br>Bucket: %{{x|%Y-%m-%d}}<br>Avg ★: %{{y:.2f}}<extra></extra>",
-                        ),
-                        secondary_y=True,
-                    )
-
-        fig.update_yaxes(title_text="Review volume", secondary_y=False, rangemode="tozero")
-        fig.update_yaxes(title_text="Avg ★", secondary_y=True, range=[1.0, 5.2])
-        fig.update_layout(
-            template="plotly_white",
-            hovermode="x unified",
-            margin=dict(l=50, r=50, t=40, b=40),
-            legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
 # ---------- NEW: Top Delighters/Detractors bar charts (integrated) ----------
 st.markdown("### 🧩 Top Delighters & Detractors (Bars)")
 c1, c2 = st.columns(2)
@@ -1733,6 +3672,334 @@ with c2:
         )
         fig_del.update_layout(template="plotly_white", margin=dict(l=140, r=20, t=20, b=20), height=420)
         st.plotly_chart(fig_del, use_container_width=True)
+
+
+# ---------- NEW: Opportunity Matrix ----------
+st.markdown("### 🎯 Opportunity Matrix: Mentions vs Avg ★")
+st.caption("**Detractors:** prioritize high mentions + low Avg ★. **Delighters:** double-down on high mentions + high Avg ★.")
+
+tab_opp_det, tab_opp_del = st.tabs(["Detractors (fix first)", "Delighters (amplify)"])
+
+with tab_opp_det:
+    if detractors_results_full.empty:
+        st.info("No detractor symptoms available.")
+    else:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            n_show = st.slider("Symptoms to show", 8, 60, value=25, step=1, key="opp_det_n")
+        with c2:
+            show_labels = st.toggle("Label top items", value=True, key="opp_det_labels")
+
+        det_tbl = detractors_results_full.copy().head(int(n_show))
+        # Median lines (within what we're showing) to create an intuitive quadrant
+        x_med = float(det_tbl["Mentions"].median()) if "Mentions" in det_tbl.columns else 0.0
+        y_med = float(det_tbl["Avg Star"].median()) if "Avg Star" in det_tbl.columns else 0.0
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=det_tbl["Mentions"],
+                y=det_tbl["Avg Star"],
+                mode="markers+text" if show_labels else "markers",
+                text=det_tbl["Item"] if show_labels else None,
+                textposition="top center",
+                hovertemplate="%{text}<br>Mentions: %{x}<br>Avg ★: %{y:.2f}<extra></extra>",
+                marker=dict(size=12, opacity=0.8),
+            )
+        )
+        # Quadrant lines
+        fig.add_shape(type="line", x0=x_med, x1=x_med, y0=1, y1=5.2, line=dict(dash="dot"))
+        fig.add_shape(type="line", x0=0, x1=max(det_tbl["Mentions"].max(), 1), y0=y_med, y1=y_med, line=dict(dash="dot"))
+
+        fig.update_layout(
+            template="plotly_white",
+            xaxis_title="Mentions (higher = more common)",
+            yaxis_title="Avg ★ among reviews mentioning it (lower = worse)",
+            margin=dict(l=60, r=20, t=20, b=50),
+            height=520,
+        )
+        fig.update_yaxes(range=[1.0, 5.2])
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption("Top-left quadrant (high mentions / low Avg ★) usually represents the biggest pain-point opportunities.")
+
+with tab_opp_del:
+    if delighters_results_full.empty:
+        st.info("No delighter symptoms available.")
+    else:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            n_show = st.slider("Symptoms to show", 8, 60, value=25, step=1, key="opp_del_n")
+        with c2:
+            show_labels = st.toggle("Label top items", value=True, key="opp_del_labels")
+
+        del_tbl = delighters_results_full.copy().head(int(n_show))
+        x_med = float(del_tbl["Mentions"].median()) if "Mentions" in del_tbl.columns else 0.0
+        y_med = float(del_tbl["Avg Star"].median()) if "Avg Star" in del_tbl.columns else 0.0
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=del_tbl["Mentions"],
+                y=del_tbl["Avg Star"],
+                mode="markers+text" if show_labels else "markers",
+                text=del_tbl["Item"] if show_labels else None,
+                textposition="top center",
+                hovertemplate="%{text}<br>Mentions: %{x}<br>Avg ★: %{y:.2f}<extra></extra>",
+                marker=dict(size=12, opacity=0.8),
+            )
+        )
+        fig.add_shape(type="line", x0=x_med, x1=x_med, y0=1, y1=5.2, line=dict(dash="dot"))
+        fig.add_shape(type="line", x0=0, x1=max(del_tbl["Mentions"].max(), 1), y0=y_med, y1=y_med, line=dict(dash="dot"))
+
+        fig.update_layout(
+            template="plotly_white",
+            xaxis_title="Mentions (higher = more common)",
+            yaxis_title="Avg ★ among reviews mentioning it (higher = better)",
+            margin=dict(l=60, r=20, t=20, b=50),
+            height=520,
+        )
+        fig.update_yaxes(range=[1.0, 5.2])
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption("Top-right quadrant (high mentions / high Avg ★) usually represents your biggest strengths to amplify.")
+
+# ---------- NEW: Cohort Comparison ----------
+st.markdown("### 🔀 Cohort Comparison: What’s different between two groups?")
+st.caption("This compares **unique review mentions** of each symptom (not raw cell counts). Use it to pinpoint what over-indexes in one cohort vs another.")
+
+if "Star Rating" not in filtered.columns:
+    st.info("Need 'Star Rating' to run cohort comparison.")
+else:
+    # Cohort builder
+    mode = st.selectbox(
+        "Comparison mode",
+        options=[
+            "Low (1–2★) vs High (4–5★)",
+            "Seeded (YES) vs Organic (NO/blank)",
+            "Pick two groups by a field",
+        ],
+        index=0,
+        key="cohort_mode",
+    )
+
+    def _coerce_upper(series: pd.Series) -> pd.Series:
+        return series.astype("string").fillna("").str.upper()
+
+    dfA, dfB = None, None
+    labelA, labelB = "Cohort A", "Cohort B"
+
+    dbase = filtered.copy()
+    dbase["Star Rating"] = pd.to_numeric(dbase["Star Rating"], errors="coerce")
+
+    if mode.startswith("Low"):
+        dfA = dbase[dbase["Star Rating"].between(1, 2, inclusive="both")]
+        dfB = dbase[dbase["Star Rating"].between(4, 5, inclusive="both")]
+        labelA, labelB = "Low (1–2★)", "High (4–5★)"
+    elif mode.startswith("Seeded"):
+        if "Seeded" not in dbase.columns:
+            st.info("No 'Seeded' column available in this dataset.")
+        else:
+            seeded = _coerce_upper(dbase["Seeded"]).eq("YES")
+            dfA = dbase[seeded]
+            dfB = dbase[~seeded]
+            labelA, labelB = "Seeded (YES)", "Organic (NO/blank)"
+    else:
+        # Field-based compare
+        candidates = [c for c in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] if c in dbase.columns]
+        if not candidates:
+            st.info("No suitable fields found for group comparison (need Country/Source/Model/Seeded/New Review).")
+        else:
+            field = st.selectbox("Field", options=candidates, key="cohort_field")
+            vals = sorted([v for v in dbase[field].astype("string").dropna().unique().tolist() if str(v).strip() != ""])
+            if len(vals) < 2:
+                st.info("Not enough distinct values in that field to compare.")
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    valA = st.selectbox("Cohort A value", options=vals, index=0, key="cohort_valA")
+                with c2:
+                    valB = st.selectbox("Cohort B value", options=vals, index=min(1, len(vals) - 1), key="cohort_valB")
+                dfA = dbase[dbase[field].astype("string") == valA]
+                dfB = dbase[dbase[field].astype("string") == valB]
+                labelA, labelB = f"{field} = {valA}", f"{field} = {valB}"
+
+    def _symptom_lift_table(df_a: pd.DataFrame, df_b: pd.DataFrame, cols: list[str], top_k: int = 15) -> pd.DataFrame:
+        if df_a is None or df_b is None or df_a.empty or df_b.empty or not cols:
+            return pd.DataFrame()
+
+        def _counts(sub: pd.DataFrame) -> pd.Series:
+            m = sub[cols].reset_index().melt(id_vars="index", value_name="symptom")
+            m["symptom"] = m["symptom"].apply(lambda v: clean_text(v, keep_na=True))
+            m = m.dropna(subset=["symptom"])
+            m["symptom"] = m["symptom"].astype("string")
+            m = m[m["symptom"].apply(is_valid_symptom_value)]
+            # unique review mentions
+            m = m.drop_duplicates(subset=["index", "symptom"])
+            return m["symptom"].value_counts()
+
+        nA = len(df_a)
+        nB = len(df_b)
+        cA = _counts(df_a)
+        cB = _counts(df_b)
+
+        all_syms = sorted(set(cA.index.tolist()) | set(cB.index.tolist()))
+        rows = []
+        for s in all_syms:
+            a = int(cA.get(s, 0))
+            b = int(cB.get(s, 0))
+            ra = a / max(1, nA)
+            rb = b / max(1, nB)
+            rows.append(
+                {
+                    "Symptom": s,
+                    "Mentions A": a,
+                    "Rate A": ra,
+                    "Mentions B": b,
+                    "Rate B": rb,
+                    "Δ (pp) A−B": (ra - rb) * 100.0,
+                    "Lift (A/B)": (ra / (rb + 1e-9)),
+                }
+            )
+        out = pd.DataFrame(rows)
+        out = out.sort_values("Δ (pp) A−B", ascending=False).head(int(top_k))
+        return out
+
+    if dfA is not None and dfB is not None and (not dfA.empty) and (not dfB.empty):
+        # Cohort KPI row
+        def _avg_star(sub: pd.DataFrame) -> float:
+            s = pd.to_numeric(sub["Star Rating"], errors="coerce").dropna()
+            return float(s.mean()) if not s.empty else 0.0
+
+        k1, k2, k3, k4 = st.columns([1, 1, 1, 1])
+        with k1:
+            st.metric(labelA + " (n)", f"{len(dfA):,}")
+        with k2:
+            st.metric(labelA + " Avg ★", f"{_avg_star(dfA):.2f}")
+        with k3:
+            st.metric(labelB + " (n)", f"{len(dfB):,}")
+        with k4:
+            st.metric(labelB + " Avg ★", f"{_avg_star(dfB):.2f}")
+
+        tab_cmp_det, tab_cmp_del = st.tabs(["Detractors lift", "Delighters lift"])
+
+        with tab_cmp_det:
+            if not existing_detractor_columns:
+                st.info("No detractor symptom columns found.")
+            else:
+                lift = _symptom_lift_table(dfA, dfB, existing_detractor_columns, top_k=20)
+                if lift.empty:
+                    st.info("Not enough data to compute detractor lift for these cohorts.")
+                else:
+                    # Bar: Δ percentage points
+                    fig = go.Figure(
+                        go.Bar(
+                            x=lift["Δ (pp) A−B"][::-1],
+                            y=[str(s).title() for s in lift["Symptom"][::-1]],
+                            orientation="h",
+                            hovertemplate="%{y}<br>Δpp: %{x:.1f}<extra></extra>",
+                        )
+                    )
+                    fig.update_layout(
+                        template="plotly_white",
+                        xaxis_title="Δ mention rate (percentage points) • positive = more common in Cohort A",
+                        margin=dict(l=180, r=20, t=20, b=40),
+                        height=560,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    with st.expander("📋 Table (rates + counts)", expanded=False):
+                        t = lift.copy()
+                        t["Symptom"] = t["Symptom"].astype(str).str.title()
+                        t["Rate A"] = (t["Rate A"] * 100).round(1)
+                        t["Rate B"] = (t["Rate B"] * 100).round(1)
+                        t["Δ (pp) A−B"] = t["Δ (pp) A−B"].round(1)
+                        t["Lift (A/B)"] = t["Lift (A/B)"].round(2)
+                        st.dataframe(t, use_container_width=True, hide_index=True)
+
+                    # Quote explorer
+                    if "Verbatim" in filtered.columns:
+                        sym_choice = st.selectbox(
+                            "Explore evidence quotes for a detractor",
+                            options=lift["Symptom"].tolist(),
+                            format_func=lambda s: str(s).title(),
+                            key="cmp_det_sym",
+                        )
+                        qa = _pick_quotes_for_symptom(dfA, sym_choice, existing_detractor_columns, k=3, prefer="low")
+                        qb = _pick_quotes_for_symptom(dfB, sym_choice, existing_detractor_columns, k=3, prefer="low")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown(f"**{labelA} quotes**")
+                            if not qa:
+                                st.caption("No matching quotes found.")
+                            for qx in qa:
+                                st.write(f"• {qx.get('text','')}")
+                        with c2:
+                            st.markdown(f"**{labelB} quotes**")
+                            if not qb:
+                                st.caption("No matching quotes found.")
+                            for qx in qb:
+                                st.write(f"• {qx.get('text','')}")
+
+        with tab_cmp_del:
+            if not existing_delighter_columns:
+                st.info("No delighter symptom columns found.")
+            else:
+                lift = _symptom_lift_table(dfA, dfB, existing_delighter_columns, top_k=20)
+                if lift.empty:
+                    st.info("Not enough data to compute delighter lift for these cohorts.")
+                else:
+                    fig = go.Figure(
+                        go.Bar(
+                            x=lift["Δ (pp) A−B"][::-1],
+                            y=[str(s).title() for s in lift["Symptom"][::-1]],
+                            orientation="h",
+                            hovertemplate="%{y}<br>Δpp: %{x:.1f}<extra></extra>",
+                        )
+                    )
+                    fig.update_layout(
+                        template="plotly_white",
+                        xaxis_title="Δ mention rate (percentage points) • positive = more common in Cohort A",
+                        margin=dict(l=180, r=20, t=20, b=40),
+                        height=560,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    with st.expander("📋 Table (rates + counts)", expanded=False):
+                        t = lift.copy()
+                        t["Symptom"] = t["Symptom"].astype(str).str.title()
+                        t["Rate A"] = (t["Rate A"] * 100).round(1)
+                        t["Rate B"] = (t["Rate B"] * 100).round(1)
+                        t["Δ (pp) A−B"] = t["Δ (pp) A−B"].round(1)
+                        t["Lift (A/B)"] = t["Lift (A/B)"].round(2)
+                        st.dataframe(t, use_container_width=True, hide_index=True)
+
+                    # Quote explorer
+                    if "Verbatim" in filtered.columns:
+                        sym_choice = st.selectbox(
+                            "Explore evidence quotes for a delighter",
+                            options=lift["Symptom"].tolist(),
+                            format_func=lambda s: str(s).title(),
+                            key="cmp_del_sym",
+                        )
+                        qa = _pick_quotes_for_symptom(dfA, sym_choice, existing_delighter_columns, k=3, prefer="high")
+                        qb = _pick_quotes_for_symptom(dfB, sym_choice, existing_delighter_columns, k=3, prefer="high")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown(f"**{labelA} quotes**")
+                            if not qa:
+                                st.caption("No matching quotes found.")
+                            for qx in qa:
+                                st.write(f"• {qx.get('text','')}")
+                        with c2:
+                            st.markdown(f"**{labelB} quotes**")
+                            if not qb:
+                                st.caption("No matching quotes found.")
+                            for qx in qb:
+                                st.write(f"• {qx.get('text','')}")
+    elif dfA is not None and dfB is not None and (dfA.empty or dfB.empty):
+        st.info("One of the cohorts is empty with the current filters. Try widening filters or changing cohorts.")
+
 
 # ---------- Avg ★ Over Time by Region — Cumulative (Weighted Over Time) ----------
 st.markdown("### 📈 Cumulative Avg ★ Over Time by Region (Weighted)")
@@ -1940,57 +4207,109 @@ else:
                 fig.update_traces(cliponaxis=False, selector=dict(type="scatter"))
                 st.plotly_chart(fig, use_container_width=True)
 
-# ---------- NEW: Country × Source breakdown (integrated) ----------
+# ---------- NEW: Country × Source breakdown (connected Avg ★ + Count) ----------
 st.markdown("### 🧭 Country × Source Breakdown")
+st.caption("**Color = Avg ★** • **Label = Review count** (0 = no reviews). Great for spotting weak pockets and low-sample noise.")
+
 if "Country" in filtered.columns and "Source" in filtered.columns and "Star Rating" in filtered.columns:
     cA, cB, cC = st.columns([1, 1, 1])
     with cA:
-        top_countries = st.number_input("Top Countries", 3, 30, value=10, step=1, key="cx_top_countries")
+        top_countries = st.number_input("Top Countries (by volume)", 3, 40, value=12, step=1, key="cx_top_countries")
     with cB:
-        top_sources = st.number_input("Top Sources", 3, 30, value=10, step=1, key="cx_top_sources")
+        top_sources = st.number_input("Top Sources (by volume)", 3, 40, value=12, step=1, key="cx_top_sources")
     with cC:
-        show_heatmap = st.toggle("Show Avg ★ Heatmap", value=False, key="cx_show_heatmap")
+        show_table = st.toggle("Show underlying table", value=False, key="cx_show_table")
 
     d = filtered.copy()
     d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
     d = d.dropna(subset=["Star Rating"])
-    if not d.empty:
+    if d.empty:
+        st.info("No rating data available after filtering.")
+    else:
         # Limit to top-N for readability
         topC = d["Country"].astype("string").value_counts().head(int(top_countries)).index.tolist()
         topS = d["Source"].astype("string").value_counts().head(int(top_sources)).index.tolist()
         d = d[d["Country"].astype("string").isin(topC) & d["Source"].astype("string").isin(topS)]
 
-        pivot = d.groupby(["Country", "Source"])["Star Rating"].agg(count="count", mean="mean").reset_index()
-        pivot["mean"] = pivot["mean"].round(2)
+        agg = (
+            d.groupby(["Country", "Source"])["Star Rating"]
+            .agg(count="count", mean="mean")
+            .reset_index()
+        )
+        if agg.empty:
+            st.info("No Country × Source intersections after filtering.")
+        else:
+            # Order axes by volume
+            countries = agg.groupby("Country")["count"].sum().sort_values(ascending=False).index.astype(str).tolist()
+            sources = agg.groupby("Source")["count"].sum().sort_values(ascending=False).index.astype(str).tolist()
 
-        # Create a wide table: show count and mean side-by-side (stacked columns)
-        wide_count = pivot.pivot(index="Country", columns="Source", values="count").fillna(0).astype(int)
-        wide_mean = pivot.pivot(index="Country", columns="Source", values="mean").round(2)
+            mean_mat = np.full((len(countries), len(sources)), np.nan)
+            cnt_mat = np.zeros((len(countries), len(sources)), dtype=int)
 
-        # Display combined table in a readable way
-        with st.expander("📋 Table (Count + Avg ★)", expanded=True):
-            st.caption("Count table shown first, Avg ★ table shown second.")
-            st.markdown("**Counts**")
-            st.dataframe(wide_count, use_container_width=True)
-            st.markdown("**Avg ★**")
-            st.dataframe(wide_mean, use_container_width=True)
+            c_idx = {c: i for i, c in enumerate(countries)}
+            s_idx = {s: j for j, s in enumerate(sources)}
 
-        if show_heatmap:
-            hm = wide_mean.copy()
-            fig_hm = go.Figure(
-                data=go.Heatmap(
-                    z=hm.values,
-                    x=list(hm.columns),
-                    y=list(hm.index),
-                    hovertemplate="Country=%{y}<br>Source=%{x}<br>Avg ★=%{z}<extra></extra>",
+            for _, r in agg.iterrows():
+                c = str(r["Country"])
+                s = str(r["Source"])
+                i = c_idx.get(c)
+                j = s_idx.get(s)
+                if i is None or j is None:
+                    continue
+                mean_mat[i, j] = float(r["mean"])
+                cnt_mat[i, j] = int(r["count"])
+
+            # Heatmap: Avg ★ as color; Count as text overlay
+            fig = go.Figure()
+
+            fig.add_trace(
+                go.Heatmap(
+                    z=mean_mat,
+                    x=sources,
+                    y=countries,
+                    zmin=1.0,
+                    zmax=5.0,
+                    colorbar=dict(title="Avg ★"),
+                    customdata=cnt_mat,
+                    hovertemplate="Country=%{y}<br>Source=%{x}<br>Avg ★=%{z:.2f}<br>Count=%{customdata}<extra></extra>",
                 )
             )
-            fig_hm.update_layout(template="plotly_white", margin=dict(l=80, r=20, t=30, b=40), height=520)
-            st.plotly_chart(fig_hm, use_container_width=True)
-    else:
-        st.info("No rating data available after filtering.")
+
+            xs, ys, txt = [], [], []
+            for i, c in enumerate(countries):
+                for j, s in enumerate(sources):
+                    xs.append(s)
+                    ys.append(c)
+                    txt.append("" if cnt_mat[i, j] == 0 else str(cnt_mat[i, j]))
+
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="text",
+                    text=txt,
+                    textfont=dict(size=12, color="rgba(15,23,42,0.85)"),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+            fig.update_layout(
+                template="plotly_white",
+                margin=dict(l=90, r=20, t=20, b=50),
+                height=max(520, 34 * len(countries)),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            if show_table:
+                tbl = agg.copy()
+                tbl["Avg ★"] = tbl["mean"].round(2)
+                tbl["Count"] = tbl["count"].astype(int)
+                tbl = tbl.drop(columns=["mean", "count"]).sort_values(["Count", "Avg ★"], ascending=[False, False])
+                st.dataframe(tbl, use_container_width=True, hide_index=True)
 else:
     st.info("Need Country, Source, and Star Rating columns to compute this breakdown.")
+
 
 # ---------- Symptom Tables ----------
 st.markdown("### 🩺 Symptom Tables")
@@ -2188,3 +4507,4 @@ if submitted:
 if st.session_state.get("force_scroll_top_once"):
     st.session_state["force_scroll_top_once"] = False
     st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+
