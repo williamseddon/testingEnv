@@ -11,4 +11,4 @@ pyserial
 openai
 scikit-learn
 streamlit
-
+ApifyClient
