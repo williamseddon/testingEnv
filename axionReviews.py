@@ -13,19 +13,45 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-APP_VERSION = "2026-01-08-seeded-Yes-no-l2-default-condition-v1"
+APP_VERSION = "2026-02-27-autodetect-headers-v2"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
 # Default header (mirrors typical Star Walk workbook; includes two trailing blank header columns)
 DEFAULT_STARWALK_COLUMNS: List[str] = [
-    "Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date",
-    "Verbatim Id", "Verbatim", "Star Rating", "Review count per detractor",
-    "Symptom 1", "Symptom 2", "Symptom 3", "Symptom 4", "Symptom 5",
-    "Symptom 6", "Symptom 7", "Symptom 8", "Symptom 9", "Symptom 10",
-    "Symptom 11", "Symptom 12", "Symptom 13", "Symptom 14", "Symptom 15",
-    "Symptom 16", "Symptom 17", "Symptom 18", "Symptom 19", "Symptom 20",
-    "Hair Type", "Unnamed: 31", "Unnamed: 32",
+    "Source",
+    "Model (SKU)",
+    "Seeded",
+    "Country",
+    "New Review",
+    "Review Date",
+    "Verbatim Id",
+    "Verbatim",
+    "Star Rating",
+    "Review count per detractor",
+    "Symptom 1",
+    "Symptom 2",
+    "Symptom 3",
+    "Symptom 4",
+    "Symptom 5",
+    "Symptom 6",
+    "Symptom 7",
+    "Symptom 8",
+    "Symptom 9",
+    "Symptom 10",
+    "Symptom 11",
+    "Symptom 12",
+    "Symptom 13",
+    "Symptom 14",
+    "Symptom 15",
+    "Symptom 16",
+    "Symptom 17",
+    "Symptom 18",
+    "Symptom 19",
+    "Symptom 20",
+    "Hair Type",
+    "Unnamed: 31",
+    "Unnamed: 32",
 ]
 
 # Used for splitting multi-tag cells like "A; B | C"
@@ -587,23 +613,28 @@ if template_file:
 st.subheader("Field Mapping (optional but recommended)")
 all_src_cols = list(src_df.columns)
 
-# Preferred defaults for the most common "raw website reviews" export schema
+# ✅ UPDATED: auto-detection using the headers you showed (plus common variants)
 PREFERRED_CORE_DEFAULTS: Dict[str, List[str]] = {
-    "Source": ["Retailer"],
-    "Model (SKU)": ["SKU Item"],
-    "Seeded": ["Seeded Reviews [AX]"],
-    "Country": ["Location"],
-    "New Review": ["Syndicated Reviews [AX]"],
-    "Review Date": ["Opened date", "Opened Date"],
-    "Verbatim": ["Review"],
-    "Star Rating": ["Rating"],
+    "Source": ["Retailer", "Source"],
+    "Model (SKU)": ["Model", "SKU Item", "SKU", "Item SKU"],
+    "Seeded": ["Seeded Reviews", "Seeded Reviews [AX]", "Seeded"],
+    "Country": ["Location", "Country"],
+    "New Review": ["Syndicated/Seeded Reviews", "Syndicated Reviews [AX]", "Syndicated Reviews"],
+    "Review Date": ["Opened Timestamp", "Opened date", "Opened Date", "Review Date"],
+    "Verbatim Id": ["Record ID", "Record Id", "Review ID", "Review Id"],
+    "Verbatim": ["Review", "Verbatim", "Review Text"],
+    "Star Rating": ["Rating (num)", "Rating", "Star Rating", "Stars"],
+    "Hair Type": ["Hair Type", "HairType", "Hair_Type"],
 }
+
 
 def pick_preferred(field: str) -> Optional[str]:
     prefs = PREFERRED_CORE_DEFAULTS.get(field, [])
+    # exact
     for p in prefs:
         if p in all_src_cols:
             return p
+    # normalized exact
     for p in prefs:
         pn = _norm(p)
         for c in all_src_cols:
@@ -611,21 +642,47 @@ def pick_preferred(field: str) -> Optional[str]:
                 return c
     return None
 
+
+# ✅ UPDATED: allow auto-detection for Verbatim Id + Hair Type (previously None)
 suggest = {
     "Source": pick_preferred("Source") or best_match("Source", all_src_cols),
-    "Model (SKU)": pick_preferred("Model (SKU)") or best_match("Model (SKU)", all_src_cols) or best_match("SKU", all_src_cols) or best_match("Model", all_src_cols),
+    "Model (SKU)": pick_preferred("Model (SKU)")
+    or best_match("Model (SKU)", all_src_cols)
+    or best_match("SKU", all_src_cols)
+    or best_match("Model", all_src_cols),
     "Seeded": pick_preferred("Seeded") or best_match("Seeded", all_src_cols),
     "Country": pick_preferred("Country") or best_match("Country", all_src_cols),
     "New Review": pick_preferred("New Review") or best_match("New Review", all_src_cols),
-    "Review Date": pick_preferred("Review Date") or best_match("Review Date", all_src_cols) or best_match("Date", all_src_cols),
-    "Verbatim Id": None,
-    "Verbatim": pick_preferred("Verbatim") or best_match("Verbatim", all_src_cols) or best_match("Review", all_src_cols) or best_match("Review Text", all_src_cols),
-    "Star Rating": pick_preferred("Star Rating") or best_match("Star Rating", all_src_cols) or best_match("Rating", all_src_cols) or best_match("Stars", all_src_cols),
-    "Hair Type": None,
+    "Review Date": pick_preferred("Review Date")
+    or best_match("Review Date", all_src_cols)
+    or best_match("Date", all_src_cols),
+    "Verbatim Id": pick_preferred("Verbatim Id")
+    or best_match("Verbatim Id", all_src_cols)
+    or best_match("Record ID", all_src_cols),
+    "Verbatim": pick_preferred("Verbatim")
+    or best_match("Verbatim", all_src_cols)
+    or best_match("Review", all_src_cols)
+    or best_match("Review Text", all_src_cols),
+    "Star Rating": pick_preferred("Star Rating")
+    or best_match("Star Rating", all_src_cols)
+    or best_match("Rating", all_src_cols)
+    or best_match("Stars", all_src_cols),
+    "Hair Type": pick_preferred("Hair Type") or best_match("Hair Type", all_src_cols),
 }
 
 field_map: Dict[str, Optional[str]] = {}
-core_fields = ["Source", "Model (SKU)", "Seeded", "Country", "New Review", "Review Date", "Verbatim Id", "Verbatim", "Star Rating", "Hair Type"]
+core_fields = [
+    "Source",
+    "Model (SKU)",
+    "Seeded",
+    "Country",
+    "New Review",
+    "Review Date",
+    "Verbatim Id",
+    "Verbatim",
+    "Star Rating",
+    "Hair Type",
+]
 left, right = st.columns(2)
 for i, f in enumerate(core_fields):
     with (left if i < (len(core_fields) + 1) // 2 else right):
@@ -651,26 +708,71 @@ with st.expander("Debug: Seeded raw → cleaned preview", expanded=False):
 
 st.subheader("L2 Tag Columns (these populate Symptom 1–20)")
 
+# ✅ UPDATED: explicit preferred L2 defaults based on your export headers
+PREFERRED_L2_DEFAULTS: Dict[str, List[str]] = {
+    "detractor": [
+        "Product_Symptom Conditions",
+        "Product Symptom Conditions",
+        "Product_Symptom Condition",
+        "Product Symptom Condition",
+        "L2 Detractor Condition",
+        "L2 Detractor Conditions",
+    ],
+    "delighter": [
+        "L2 Delighter Condition",
+        "L2 Delighter Conditions",
+    ],
+}
+
+
 def pick_default_l2_cols(all_cols: List[str], kind: str) -> List[str]:
     """
     Choose ONLY ONE default column for each kind (detractor/delighter), preferring:
-      1) 'L2 <kind> Condition [AX]' (contains 'condition')
+      0) explicit preferred names (e.g., Product_Symptom Conditions, L2 Delighter Condition)
+      1) '...Condition...' columns when multiple L2 options exist
       2) otherwise the first column that looks like an L2 <kind> column
-    This avoids preselecting multiple columns like Mode/Component/etc.
     """
+
+    # 0) Try explicit preferred names first (exact or normalized exact)
+    prefs = PREFERRED_L2_DEFAULTS.get(kind, [])
+    for p in prefs:
+        if p in all_cols:
+            return [p]
+    for p in prefs:
+        pn = _norm(p)
+        for c in all_cols:
+            if _norm(c) == pn:
+                return [c]
+
+    # 1) General heuristic: columns containing L2 + detr/delight
     kind_n = "detr" if kind == "detractor" else "delight"
     candidates = [c for c in all_cols if "l2" in _norm(c) and kind_n in _norm(c)]
+
+    # 2) Extra fallback for your export: Product_Symptom Conditions (detractors)
+    if not candidates and kind == "detractor":
+        candidates = [
+            c
+            for c in all_cols
+            if ("productsymptom" in _norm(c)) or ("symptom" in _norm(c) and "condition" in _norm(c))
+        ]
+
+    # 3) Extra fallback for delighters if "l2" isn't present but delighter is
+    if not candidates and kind == "delighter":
+        candidates = [c for c in all_cols if "delighter" in _norm(c) and "condition" in _norm(c)]
+
     if not candidates:
         return []
-    # Prefer condition
+
+    # Prefer condition if multiple
     condition = [c for c in candidates if "condition" in _norm(c)]
     if condition:
         return [condition[0]]
-    # Else: just the first match
+
     return [candidates[0]]
 
+
 with st.expander("Select Level 2 detractor/delighter columns", expanded=True):
-    # NEW: only preselect ONE column each, preferring Condition [AX]
+    # Preselect ONE column each, preferring your known headers
     l2_det_default = pick_default_l2_cols(all_src_cols, "detractor")
     l2_del_default = pick_default_l2_cols(all_src_cols, "delighter")
 
@@ -782,11 +884,3 @@ if build:
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
-
-
-
-
-
-
