@@ -1,4 +1,5 @@
 import io
+import ast
 import json
 import re
 from datetime import datetime, date
@@ -11,6 +12,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+EXCEL_MAX_CHARS = 32767
 
 
 # -----------------------------
@@ -38,7 +41,6 @@ def join_list(x: Any, sep: str = " | ") -> Any:
     if x is None:
         return None
     if isinstance(x, list):
-        # remove Nones/empties
         vals = [str(v).strip() for v in x if v is not None and str(v).strip() != ""]
         return sep.join(vals) if vals else None
     return x
@@ -47,14 +49,10 @@ def join_list(x: Any, sep: str = " | ") -> Any:
 def parse_iso_date(x: Any) -> Optional[date]:
     if not x:
         return None
-    try:
-        # Handles "...Z" as UTC.
-        ts = pd.to_datetime(x, utc=True, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts.date()
-    except Exception:
+    ts = pd.to_datetime(x, utc=True, errors="coerce")
+    if pd.isna(ts):
         return None
+    return ts.date()
 
 
 def title_from_filename(filename: str) -> str:
@@ -62,13 +60,74 @@ def title_from_filename(filename: str) -> str:
     stem = re.sub(r"[_\-]+", " ", stem)
     stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)  # camelCase -> words
     stem = re.sub(r"\s+", " ", stem).strip()
-
-    # Make first token uppercase if it contains digits (e.g., hd6000 -> HD6000)
     tokens = stem.split(" ")
-    if tokens:
-        if any(ch.isdigit() for ch in tokens[0]):
-            tokens[0] = tokens[0].upper()
+    if tokens and any(ch.isdigit() for ch in tokens[0]):
+        tokens[0] = tokens[0].upper()
     return " ".join(tokens)
+
+
+def excel_safe_value(v: Any, list_sep: str = " | ") -> Any:
+    """Convert arbitrary Python objects into openpyxl-safe scalar types."""
+    if v is None:
+        return None
+
+    # Pandas / numpy missing
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+
+    # Pandas timestamp
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return None
+        return v.to_pydatetime()
+
+    # Native safe types
+    if isinstance(v, (datetime, date, bool, int, float)):
+        return v
+
+    if isinstance(v, str):
+        if len(v) > EXCEL_MAX_CHARS:
+            return v[: EXCEL_MAX_CHARS - 3] + "..."
+        return v
+
+    # numpy scalar
+    if hasattr(v, "item") and not isinstance(v, (list, tuple, set, dict)):
+        try:
+            return excel_safe_value(v.item(), list_sep=list_sep)
+        except Exception:
+            pass
+
+    # containers
+    if isinstance(v, dict):
+        s = json.dumps(v, ensure_ascii=False)
+        if len(s) > EXCEL_MAX_CHARS:
+            s = s[: EXCEL_MAX_CHARS - 3] + "..."
+        return s
+
+    if isinstance(v, (list, tuple, set)):
+        parts: List[str] = []
+        for x in v:
+            if x is None:
+                continue
+            if isinstance(x, (dict, list, tuple, set)):
+                parts.append(json.dumps(x, ensure_ascii=False))
+            else:
+                parts.append(str(x))
+        s = list_sep.join([p.strip() for p in parts if p.strip() != ""])
+        if not s:
+            return None
+        if len(s) > EXCEL_MAX_CHARS:
+            s = s[: EXCEL_MAX_CHARS - 3] + "..."
+        return s
+
+    # fallback
+    s = str(v)
+    if len(s) > EXCEL_MAX_CHARS:
+        s = s[: EXCEL_MAX_CHARS - 3] + "..."
+    return s
 
 
 # -----------------------------
@@ -107,6 +166,7 @@ REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
     ("Base SKU", lambda r: safe_get(r, ["clientAttributes", "Base SKU"])),
     ("Brand", lambda r: safe_get(r, ["clientAttributes", "Brand"])),
     ("Company", lambda r: safe_get(r, ["clientAttributes", "Company"])),
+    # NOTE: these sometimes come through as lists -> excel_safe_value handles it
     ("Factory Name", lambda r: safe_get(r, ["clientAttributes", "Factory Name"])),
     ("Translation", lambda r: safe_get(r, ["clientAttributes", "Translation"])),
     ("Event ID", lambda r: r.get("eventId")),
@@ -118,13 +178,9 @@ REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
 
 def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
     cols = REVIEWS_BASE_COLS + (REVIEWS_EXTRA_COLS if include_extra else [])
-    rows = []
-    for r in records:
-        row = {name: fn(r) for name, fn in cols}
-        rows.append(row)
+    rows = [{name: fn(r) for name, fn in cols} for r in records]
     df = pd.DataFrame(rows)
 
-    # Normalize numeric rating
     if "Rating (num)" in df.columns:
         df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
 
@@ -166,7 +222,6 @@ def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_miss
             cond = conds[i] if i < len(conds) else None
             mode = modes[i] if i < len(modes) else None
 
-            # Fill mode if missing
             if mode in (None, "", "-", "—"):
                 if comp and cond:
                     mode = f"{comp} - {cond}"
@@ -190,7 +245,8 @@ def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_miss
             })
 
     df = pd.DataFrame(out_rows)
-    df["Rating"] = pd.to_numeric(df["Rating"], errors="coerce")
+    if "Rating" in df.columns:
+        df["Rating"] = pd.to_numeric(df["Rating"], errors="coerce")
     return df
 
 
@@ -200,19 +256,16 @@ def build_symptoms_df(records: List[Dict[str, Any]], include_blank_row_when_miss
 def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, top_n: int = 10):
     total_reviews = int(len(reviews_df))
 
-    # Date range
     date_min = reviews_df["Opened Timestamp"].min() if "Opened Timestamp" in reviews_df.columns else None
     date_max = reviews_df["Opened Timestamp"].max() if "Opened Timestamp" in reviews_df.columns else None
     date_range_str = ""
     if pd.notna(date_min) and pd.notna(date_max) and date_min and date_max:
         date_range_str = f"{date_min} to {date_max}"
 
-    # Avg rating
     avg_rating = None
     if "Rating (num)" in reviews_df.columns:
         avg_rating = float(pd.to_numeric(reviews_df["Rating (num)"], errors="coerce").mean())
 
-    # Rating distribution (1-5)
     rating_counts = (
         reviews_df["Rating (num)"]
         .dropna()
@@ -226,7 +279,6 @@ def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, to
         "Share": (rating_counts.values / total_reviews) if total_reviews else 0,
     })
 
-    # Top retailers
     retailer_counts = (
         reviews_df.get("Retailer", pd.Series(dtype=str))
         .fillna("(blank)")
@@ -239,7 +291,6 @@ def build_summary_tables(reviews_df: pd.DataFrame, symptoms_df: pd.DataFrame, to
         "Share": (retailer_counts.values / total_reviews) if total_reviews else 0,
     })
 
-    # Top symptom conditions (exclude blanks)
     cond_series = symptoms_df.get("Symptom Condition", pd.Series(dtype=str)).fillna("")
     cond_series = cond_series[cond_series.astype(str).str.strip() != ""]
     symptom_rows = int(len(cond_series))
@@ -269,10 +320,11 @@ HEADER_FONT = Font(color="FFFFFF", bold=True)
 TITLE_FONT = Font(color="1F4E79", bold=True, size=14)
 SECTION_FONT = Font(color="1F4E79", bold=False)
 
+
 def write_df_to_sheet(ws, df: pd.DataFrame):
     ws.append(list(df.columns))
     for row in df.itertuples(index=False, name=None):
-        ws.append(list(row))
+        ws.append([excel_safe_value(v) for v in row])
 
 
 def add_excel_table(ws, df: pd.DataFrame, table_name: str, style_name: str = "TableStyleMedium9"):
@@ -293,7 +345,6 @@ def add_excel_table(ws, df: pd.DataFrame, table_name: str, style_name: str = "Ta
     )
     tab.tableStyleInfo = style
     ws.add_table(tab)
-
     ws.freeze_panes = "A2"
 
 
@@ -345,12 +396,10 @@ def build_workbook(
     wrap_long_text: bool = False,
 ) -> bytes:
     wb = Workbook()
-    # Remove default sheet
     wb.remove(wb.active)
 
-    # --- Summary sheet ---
+    # --- Summary ---
     ws = wb.create_sheet("Summary")
-
     ws["A1"] = f"{dataset_title} — Summary"
     ws["A1"].font = TITLE_FONT
 
@@ -367,38 +416,30 @@ def build_workbook(
     if summary["avg_rating"] is not None:
         ws["B6"] = round(summary["avg_rating"], 3)
 
-    # Section headers
     ws["A8"] = "Rating Distribution"
     ws["A8"].font = SECTION_FONT
     ws["D8"] = "Top Retailers"
     ws["D8"].font = SECTION_FONT
 
-    # Rating dist table A9:C?
     rd = summary["rating_dist"].copy()
-    # Ensure 3 columns
     rd_cols = ["Rating", "Count", "Share"]
     rd = rd[rd_cols]
-    start_row = 9
-    start_col = 1  # A
-    # header
+    start_row, start_col = 9, 1
     for j, col in enumerate(rd_cols):
         cell = ws.cell(row=start_row, column=start_col + j, value=col)
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    # body
     for i, row in enumerate(rd.itertuples(index=False, name=None), start=1):
         for j, val in enumerate(row):
-            c = ws.cell(row=start_row + i, column=start_col + j, value=val)
-            if j == 2:  # Share
+            c = ws.cell(row=start_row + i, column=start_col + j, value=excel_safe_value(val))
+            if j == 2:
                 c.number_format = "0.0%"
 
-    # Top retailers table D9:F?
     tr = summary["top_retailers"].copy()
     tr_cols = ["Retailer", "Count", "Share"]
     tr = tr[tr_cols]
-    start_row = 9
-    start_col = 4  # D
+    start_row, start_col = 9, 4
     for j, col in enumerate(tr_cols):
         cell = ws.cell(row=start_row, column=start_col + j, value=col)
         cell.fill = HEADER_FILL
@@ -406,11 +447,10 @@ def build_workbook(
         cell.alignment = Alignment(horizontal="center", vertical="center")
     for i, row in enumerate(tr.itertuples(index=False, name=None), start=1):
         for j, val in enumerate(row):
-            c = ws.cell(row=start_row + i, column=start_col + j, value=val)
+            c = ws.cell(row=start_row + i, column=start_col + j, value=excel_safe_value(val))
             if j == 2:
                 c.number_format = "0.0%"
 
-    # Top conditions section
     ws["A22"] = "Top Symptom Conditions"
     ws["A22"].font = SECTION_FONT
     ws["E22"] = "Notes"
@@ -426,34 +466,32 @@ def build_workbook(
     tc = summary["top_conditions"].copy()
     tc_cols = ["Condition", "Count", "Share (of symptom rows)"]
     tc = tc[tc_cols]
-    start_row = 23
-    start_col = 1  # A
+    start_row, start_col = 23, 1
     for j, col in enumerate(tc_cols):
         cell = ws.cell(row=start_row, column=start_col + j, value=col if j < 2 else "Share")
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center")
         if j == 2:
-            # Make share column narrow like the screenshot
             ws.column_dimensions[get_column_letter(start_col + j)].width = 6
             cell.alignment = Alignment(horizontal="center", vertical="center", textRotation=90)
+        else:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
     for i, row in enumerate(tc.itertuples(index=False, name=None), start=1):
         for j, val in enumerate(row):
-            c = ws.cell(row=start_row + i, column=start_col + j, value=val)
+            c = ws.cell(row=start_row + i, column=start_col + j, value=excel_safe_value(val))
             if j == 2:
                 c.number_format = "0.0%"
 
-    # Column widths (Summary)
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 28
     ws.column_dimensions["D"].width = 18
     ws.column_dimensions["E"].width = 35
     ws.column_dimensions["F"].width = 10
 
-    # --- Reviews sheet ---
+    # --- Reviews ---
     ws_r = wb.create_sheet("Reviews")
     write_df_to_sheet(ws_r, reviews_df)
-
     add_excel_table(ws_r, reviews_df, table_name="ReviewsTable")
     apply_hyperlinks(ws_r, reviews_df, url_cols=["Post Link"])
     set_date_format(ws_r, reviews_df, date_cols=["Opened Timestamp"])
@@ -471,16 +509,16 @@ def build_workbook(
         "Post Link": 55,
         "Title": 45,
         "Review": 85,
+        "Translation": 55,
+        "Factory Name": 22,
     }
     set_col_widths(ws_r, reviews_df, review_widths)
-
     if wrap_long_text:
         wrap_cells(ws_r, reviews_df, wrap_cols=["Title", "Review", "Translation"])
 
-    # --- Symptoms sheet ---
+    # --- Symptoms ---
     ws_s = wb.create_sheet("Symptoms")
     write_df_to_sheet(ws_s, symptoms_df)
-
     add_excel_table(ws_s, symptoms_df, table_name="SymptomsTable")
     set_date_format(ws_s, symptoms_df, date_cols=["Opened Timestamp"])
 
@@ -497,7 +535,6 @@ def build_workbook(
     }
     set_col_widths(ws_s, symptoms_df, symptom_widths)
 
-    # Save to bytes
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -507,51 +544,202 @@ def build_workbook(
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="JSON → Clean Excel (Reviews)", layout="wide")
-
 st.title("JSON → Clean Excel Converter (Reviews format)")
-st.caption("Upload a JSON that contains a top-level `results` list of review records, then download a formatted Excel workbook (Summary / Reviews / Symptoms).")
+st.caption(
+    "Upload a JSON file **or** paste JSON text. The app will parse it, normalize list fields, "
+    "and export a formatted Excel workbook (Summary / Reviews / Symptoms)."
+)
 
-uploaded = st.file_uploader("Upload JSON", type=["json"])
 
-col1, col2, col3 = st.columns(3)
+# -----------------------------
+# Input parsing helpers (flexible)
+# -----------------------------
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", s, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def _extract_json_substring(s: str) -> str:
+    s = s.strip()
+    if s.startswith("{") or s.startswith("["):
+        return s
+    start_candidates = [i for i in [s.find("{"), s.find("[")] if i != -1]
+    if not start_candidates:
+        return s
+    start = min(start_candidates)
+    end = max(s.rfind("}"), s.rfind("]"))
+    if end != -1 and end > start:
+        return s[start : end + 1].strip()
+    return s
+
+
+def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    objs: List[Dict[str, Any]] = []
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+            if isinstance(obj, dict):
+                objs.append(obj)
+            else:
+                return None
+        except Exception:
+            return None
+    return objs
+
+
+def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
+    warnings: List[str] = []
+    s = _strip_code_fences(text_in)
+    s = _extract_json_substring(s)
+
+    try:
+        return json.loads(s), warnings
+    except Exception as e1:
+        s2 = re.sub(r",\s*([}\]])", r"\1", s)
+        if s2 != s:
+            try:
+                warnings.append("Removed trailing commas to make JSON valid.")
+                return json.loads(s2), warnings
+            except Exception:
+                warnings.pop()
+
+        jl = _try_parse_json_lines(s)
+        if jl is not None:
+            warnings.append("Detected JSON Lines and parsed each line as a record.")
+            return jl, warnings
+
+        try:
+            obj = ast.literal_eval(s)
+            warnings.append("Parsed via Python literal_eval (input was not strict JSON).")
+            return obj, warnings
+        except Exception as e4:
+            raise ValueError("Could not parse input as JSON. Paste valid JSON (or JSON Lines).") from e1
+
+
+def extract_records(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, dict) and "results" in raw and isinstance(raw["results"], list):
+        return raw["results"]
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, dict)]
+    raise ValueError("Unrecognized JSON shape. Expected a dict with `results: []` or a list of record objects.")
+
+
+# -----------------------------
+# Input area (upload OR paste; app auto-picks)
+# -----------------------------
+st.subheader("1) Provide input JSON")
+left, right = st.columns(2)
+
+uploaded = None
+pasted = ""
+
+with left:
+    uploaded = st.file_uploader("Upload JSON file", type=["json"])
+with right:
+    pasted = st.text_area(
+        "…or paste JSON text",
+        height=210,
+        placeholder="Paste JSON (or ```json ... ```). Supports dict-with-results, list of records, or JSON Lines.",
+    )
+
+prefer_upload = uploaded is not None and getattr(uploaded, "size", 0) > 0
+prefer_paste = (not prefer_upload) and pasted.strip() != ""
+
+raw_text: Optional[str] = None
+source_name: str = "pasted_json"
+
+if prefer_upload:
+    source_name = uploaded.name
+    raw_text = uploaded.getvalue().decode("utf-8", errors="replace")
+elif prefer_paste:
+    source_name = "pasted_json"
+    raw_text = pasted
+
+auto_convert = st.checkbox("Auto-convert when input looks complete", value=True)
+convert_clicked = st.button("Convert to Excel", type="primary")
+
+# Heuristic: don't spam errors while user is still typing
+def looks_complete_json(s: str) -> bool:
+    ss = s.strip()
+    if not ss:
+        return False
+    if ss.endswith(("}", "]")):
+        return True
+    # code fence end
+    if ss.endswith("```"):
+        return True
+    return False
+
+
+should_run = False
+if raw_text is not None:
+    if convert_clicked:
+        should_run = True
+    elif auto_convert:
+        # For uploads, always run; for paste, only if it looks complete.
+        if prefer_upload or looks_complete_json(raw_text):
+            should_run = True
+
+# -----------------------------
+# Options
+# -----------------------------
+st.subheader("2) Options")
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     include_extra = st.checkbox("Include extra tag/taxonomy columns", value=True)
 with col2:
     wrap_long_text = st.checkbox("Wrap Title/Review text", value=False)
 with col3:
     include_blank_symptom_rows = st.checkbox("Keep 1 blank symptom row when no symptoms exist", value=True)
+with col4:
+    top_n = st.number_input("Top N in Summary", min_value=5, max_value=25, value=10, step=1)
 
-top_n = st.slider("Top N (Retailers & Symptom Conditions) in Summary", min_value=5, max_value=25, value=10, step=1)
-
-if uploaded is not None:
+# -----------------------------
+# Convert
+# -----------------------------
+if raw_text is None:
+    st.info("Upload a JSON file or paste JSON text to begin.")
+elif not should_run:
+    if prefer_paste and auto_convert:
+        st.info("Paste looks incomplete — finish the JSON (ending in } or ]) or click **Convert to Excel**.")
+else:
     try:
-        raw = json.loads(uploaded.getvalue().decode("utf-8"))
-        if isinstance(raw, dict) and "results" in raw and isinstance(raw["results"], list):
-            records = raw["results"]
-        elif isinstance(raw, list):
-            records = raw
-        else:
-            st.error("Unrecognized JSON shape. Expected a dict with `results: []` or a list of records.")
+        raw_obj, warnings = loads_flexible_json(raw_text)
+        for w in warnings:
+            st.info(w)
+
+        records = extract_records(raw_obj)
+        if not records:
+            st.error("Parsed input, but found 0 record objects to convert.")
             st.stop()
 
-        dataset_title = title_from_filename(uploaded.name)
-        dataset_title = st.text_input("Dataset title (used in Summary sheet title)", value=dataset_title)
+        default_title = title_from_filename(source_name) if source_name else "Pasted JSON"
+        dataset_title = st.text_input("Dataset title (used in Summary sheet title)", value=default_title)
 
         reviews_df = build_reviews_df(records, include_extra=include_extra)
         symptoms_df = build_symptoms_df(records, include_blank_row_when_missing=include_blank_symptom_rows)
-        summary = build_summary_tables(reviews_df, symptoms_df, top_n=top_n)
+        summary = build_summary_tables(reviews_df, symptoms_df, top_n=int(top_n))
 
         st.success(f"Loaded {len(records):,} records.")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Reviews", summary["total_reviews"])
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Reviews", summary["total_reviews"])
         if summary["avg_rating"] is not None:
-            c2.metric("Average Rating", f"{summary['avg_rating']:.3f}")
-        c3.metric("Symptom rows (non-blank conditions)", summary["symptom_rows"])
+            m2.metric("Average Rating", f"{summary['avg_rating']:.3f}")
+        m3.metric("Symptom rows (non-blank conditions)", summary["symptom_rows"])
 
-        st.subheader("Preview — Reviews")
+        with st.expander("Show parsed JSON structure (first record)", expanded=False):
+            st.json(records[0])
+
+        st.subheader("Preview — Reviews (first 50 rows)")
         st.dataframe(reviews_df.head(50), use_container_width=True)
 
-        st.subheader("Preview — Symptoms")
+        st.subheader("Preview — Symptoms (first 50 rows)")
         st.dataframe(symptoms_df.head(50), use_container_width=True)
 
         excel_bytes = build_workbook(
@@ -562,7 +750,9 @@ if uploaded is not None:
             wrap_long_text=wrap_long_text,
         )
 
-        out_name = f"{Path(uploaded.name).stem}_clean.xlsx"
+        out_name_default = f"{Path(source_name).stem}_clean.xlsx" if source_name else "converted_clean.xlsx"
+        out_name = st.text_input("Output filename", value=out_name_default)
+
         st.download_button(
             "Download Excel",
             data=excel_bytes,
@@ -570,5 +760,12 @@ if uploaded is not None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
+        st.caption(
+            "Note: List/dict fields are automatically converted to Excel-safe strings "
+            "(joined with ' | ' or JSON). This prevents openpyxl errors like "
+            "`ValueError: Cannot convert ['Leshow CN', ...] to Excel`."
+        )
+
     except Exception as e:
         st.exception(e)
+
