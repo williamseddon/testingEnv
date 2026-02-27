@@ -12,3 +12,4 @@ openai
 scikit-learn
 streamlit
 ApifyClient
+apify_client
