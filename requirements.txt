@@ -11,5 +11,7 @@ pyserial
 openai
 scikit-learn
 streamlit
-ApifyClient
-apify_client
+streamlit>=1.30
+apify-client>=1.6
+pandas>=2.0
+openpyxl>=3.1
