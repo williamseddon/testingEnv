@@ -1,29 +1,36 @@
-# app.py
-# Streamlit: Amazon Reviews Scraper (Apify) — improved UX + secrets support
+# amazonReviewScraper.py
+# Streamlit: Amazon Reviews Scraper (Apify) — improved UX + Streamlit secrets support
 #
-# Key features:
-# - Token: checks Streamlit secrets (st.secrets) first; manual override optional
-# - Manage ASINs UI:
-#   - Add single ASIN form
-#   - Bulk add (ASIN list or CSV-like lines)
-#   - Editable table with Enabled + Delete checkboxes
-# - Parallel runs (max concurrency), live status, ETA
-# - Run usage/cost: usageTotalUsd + stats.computeUnits (best-effort)
-# - ReviewContent cleaning: removes Amazon VSE video player JSON blob and extracts video metadata
-# - Export: Excel workbook (tab per row + MASTER) + Master CSV
+# ✅ Token UX:
+#   - Auto-uses st.secrets if present (APIFY_TOKEN or [apify].token)
+#   - Manual override optional
+#   - Shows exact secrets.toml format
 #
-# Requirements:
+# ✅ ASIN UX:
+#   - “Manage ASINs” tab with:
+#       - Add single row form
+#       - Bulk add (one ASIN per line)
+#       - Bulk add CSV-like lines (ASIN, Country, Reviews, Rating, Sort)
+#       - Import/export config CSV
+#       - Editable grid with Enabled + Delete checkboxes
+#       - Buttons: Remove checked / Disable checked / Clear table
+#
+# ✅ Run UX:
+#   - Parallel runs (max concurrency)
+#   - Live progress + ETA (based on observed throughput)
+#   - Cost/CU (best-effort from run details: usageTotalUsd, stats.computeUnits)
+#
+# ✅ Output:
+#   - Excel: one tab per row + MASTER
+#   - CSV: MASTER
+#   - Cleans ReviewContent for video reviews (removes huge VSE player JSON blob)
+#     + optional columns: VideoUrl, VideoPosterImageUrl, VideoCaptionsUrl
+#
+# Install:
 #   pip install streamlit apify-client pandas openpyxl
 #
 # Run:
-#   streamlit run app.py
-#
-# Streamlit secrets (local):
-#   Create .streamlit/secrets.toml with either:
-#     APIFY_TOKEN = "apify_api_your_token_here"
-#   OR
-#     [apify]
-#     token = "apify_api_your_token_here"
+#   streamlit run amazonReviewScraper.py
 
 
 from __future__ import annotations
@@ -56,40 +63,22 @@ ASIN_RE = re.compile(r"^[A-Z0-9]{10}$", re.IGNORECASE)
 SORT_LABEL_TO_KEY = {"Recent": "recent", "Helpful": "helpful"}
 SORT_OVERRIDE_OPTIONS = ["Default", "Recent", "Helpful"]
 
-# IMPORTANT: These should match your actor's accepted values.
-# Apify's input schema for the actor shows these country names with parentheses, etc.
-# If you get validation errors, update this list to match the actor schema exactly.
+# Keep these aligned to what your actor expects.
+# You previously ran successfully with "France" and "United States".
 COUNTRY_VALUES = [
-    "United States",
-    "Canada",
-    "United Kingdom",
-    "Germany (Deutschland)",
     "France",
-    "Italy (Italia)",
-    "Japan (日本)",
-    "Mexico (México)",
-    "Spain (España)",
-    "India",
-    "Brazil (Brasil)",
-    "Belgium (Belgique)",
-    "Netherlands (Nederland)",
-    "Sweden (Sverige)",
-    "Poland (Polska)",
-    "Singapore",
-    "Australia",
+    "United States",
+    "United Kingdom",
+    "Germany",
+    "Italy",
+    "Spain",
+    "Canada",
+    "Japan",
 ]
 
-# Ratings: the actor definitely supports one_star..five_star.
-# It ALSO references “All stars” in its UI/description; many actors use "all_stars".
-# We attempt "all_stars" for All; if actor rejects it, we fallback to selecting all five star buckets.
-RATING_UI_OPTIONS = [
-    "All stars",
-    "1-star",
-    "2-star",
-    "3-star",
-    "4-star",
-    "5-star",
-]
+# Rating UI -> actor values
+# Preferred: All stars => ["all_stars"]. If the actor rejects it, we fallback to 1..5 buckets.
+RATING_UI_OPTIONS = ["All stars", "1-star", "2-star", "3-star", "4-star", "5-star"]
 RATING_UI_TO_ACTOR = {
     "All stars": ["all_stars"],
     "1-star": ["one_star"],
@@ -100,29 +89,8 @@ RATING_UI_TO_ACTOR = {
 }
 RATING_FALLBACK_ALL = ["one_star", "two_star", "three_star", "four_star", "five_star"]
 
-# ReviewContent “video widget junk” signature
+# Video-widget “junk” signature captured in ReviewContent
 VIDEO_MARKER = "This is a modal window."
-
-
-# ----------------------------
-# Secrets / token helpers
-# ----------------------------
-def get_apify_token_from_secrets() -> str:
-    """
-    Supports either:
-      APIFY_TOKEN="..."
-    or:
-      [apify]
-      token="..."
-    """
-    try:
-        if "APIFY_TOKEN" in st.secrets:
-            return str(st.secrets["APIFY_TOKEN"]).strip()
-        if "apify" in st.secrets and "token" in st.secrets["apify"]:
-            return str(st.secrets["apify"]["token"]).strip()
-    except Exception:
-        pass
-    return ""
 
 
 # ----------------------------
@@ -134,8 +102,8 @@ class JobSpec:
     asin: str
     country: str
     max_reviews: int
-    rating_ui: str           # "All stars" / "1-star"... etc
-    sort_override: str       # Default/Recent/Helpful
+    rating_ui: str
+    sort_override: str
 
 
 @dataclass
@@ -191,7 +159,6 @@ def is_valid_asin(asin: str) -> bool:
 
 
 def safe_sheet_name(name: str) -> str:
-    # Excel: <=31 chars, no : \ / ? * [ ]
     name = re.sub(r"[:\\/?*\[\]]", "_", name)
     return name[:31] if len(name) > 31 else name
 
@@ -215,6 +182,27 @@ def extract_filter_by_star_from_pageurl(url: Any) -> Optional[str]:
     q = parse_qs(urlparse(url).query)
     v = q.get("filterByStar")
     return v[0] if v else None
+
+
+# ----------------------------
+# Streamlit secrets / token helper
+# ----------------------------
+def get_apify_token_from_secrets() -> str:
+    """
+    Supports either:
+      APIFY_TOKEN="..."
+    or:
+      [apify]
+      token="..."
+    """
+    try:
+        if "APIFY_TOKEN" in st.secrets:
+            return str(st.secrets["APIFY_TOKEN"]).strip()
+        if "apify" in st.secrets and "token" in st.secrets["apify"]:
+            return str(st.secrets["apify"]["token"]).strip()
+    except Exception:
+        pass
+    return ""
 
 
 # ----------------------------
@@ -278,7 +266,7 @@ def clean_review_content(raw: Any) -> Tuple[str, Dict[str, Any], bool]:
     """
     s = "" if raw is None else str(raw)
 
-    # Typical signature: starts with JSON and contains videoUrl plus the modal text marker
+    # Signature: JSON starts the field + contains videoUrl + modal marker text
     if s.startswith("{") and '"videoUrl"' in s and VIDEO_MARKER in s:
         json_str, rem = split_leading_json(s)
         vmeta = parse_video_meta(json_str)
@@ -307,7 +295,6 @@ def export_csv_bytes(master: pd.DataFrame) -> bytes:
 
 
 def export_config_csv_bytes(df: pd.DataFrame) -> bytes:
-    # Save only the user-config columns (not internal)
     cols = ["Enabled", "Country", "ASIN or URL", "Reviews to pull", "Rating", "Sort"]
     out = df.copy()
     for c in cols:
@@ -318,12 +305,9 @@ def export_config_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ----------------------------
-# ASIN table parsing/validation
+# Table helpers
 # ----------------------------
 def ensure_table_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Guarantees the table has all expected columns, with defaults.
-    """
     df = df.copy()
     if "Enabled" not in df.columns:
         df["Enabled"] = True
@@ -356,9 +340,7 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
         sort = str(r.get("Sort", "Default")).strip() or "Default"
         n = r.get("Reviews to pull", 0)
 
-        if not enabled:
-            continue
-        if not raw:
+        if not enabled or not raw:
             continue
 
         asin = normalize_asin(raw)
@@ -368,16 +350,16 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
             n_int = 0
 
         if country not in COUNTRY_VALUES:
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid country (must match actor options)."})
+            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid country."})
             continue
         if rating not in RATING_UI_OPTIONS:
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid rating selection."})
+            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid rating."})
             continue
         if sort not in SORT_OVERRIDE_OPTIONS:
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid sort selection."})
+            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid sort."})
             continue
         if not is_valid_asin(asin):
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": f"Could not parse valid ASIN (got '{asin}')."})
+            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": f"Invalid ASIN parsed: '{asin}'"})
             continue
         if not (1 <= n_int <= MAX_PER_ASIN_HARD_CAP):
             issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": f"Reviews must be 1..{MAX_PER_ASIN_HARD_CAP}."})
@@ -398,9 +380,6 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
 
 
 def parse_bulk_asin_lines(text: str) -> List[str]:
-    """
-    Parse newline-separated ASINs/URLs.
-    """
     out: List[str] = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -415,15 +394,13 @@ def parse_bulk_csv_lines(text: str) -> List[dict]:
     Lines like:
       ASIN
       ASIN, Country, Reviews, Rating, Sort
-    Rating examples: "All stars", "5-star", "1-star"
-    Sort examples: Default / Recent / Helpful
-    Delimiters: comma or tab
     """
     rows: List[dict] = []
     for line in (text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+
         parts = [p.strip() for p in re.split(r"[,\t]", line) if p.strip()]
         if not parts:
             continue
@@ -474,13 +451,11 @@ def build_actor_input(
     rating_filters: List[str],
 ) -> dict:
     sort_key = resolve_sort_key(global_sort_key, spec.sort_override)
-
     return {
         "ASIN_or_URL": [spec.asin],
         "country": spec.country,
         "max_reviews": int(spec.max_reviews),
-        # actor expects arrays for these fields
-        "sort_reviews_by": [sort_key],
+        "sort_reviews_by": [sort_key],  # actor expects array
         "filter_by_verified_purchase_only": [verified_filter],
         "filter_by_mediaType": [media_filter],
         "filter_by_ratings": rating_filters,
@@ -517,11 +492,10 @@ def run_one_job(
     compute_units = None
     pricing_model = None
 
-    # Rating filters
     rating_filters_primary = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
     rating_filters_fallback = RATING_FALLBACK_ALL if spec.rating_ui == "All stars" else rating_filters_primary
 
-    def _call_with_filters(filters: List[str]) -> Tuple[dict, List[dict]]:
+    def _call(filters: List[str]) -> Tuple[dict, List[dict]]:
         run_input = build_actor_input(
             spec=spec,
             global_sort_key=global_sort_key,
@@ -537,24 +511,21 @@ def run_one_job(
         return run_obj, items_local
 
     try:
-        # Primary attempt
-        run_obj, items = _call_with_filters(rating_filters_primary)
-
+        run_obj, items = _call(rating_filters_primary)
         run_id = run_obj.get("id")
         dataset_id = run_obj.get("defaultDatasetId")
-
     except ApifyApiError as e:
-        # Fallback if "all_stars" is not accepted by this actor
         msg = str(e)
-        if spec.rating_ui == "All stars" and ("filter_by_ratings" in msg or "ratings" in msg):
-            run_obj, items = _call_with_filters(rating_filters_fallback)
+        # If the actor doesn't accept "all_stars", fallback to selecting all five buckets.
+        if spec.rating_ui == "All stars" and ("all_stars" in msg or "filter_by_ratings" in msg or "ratings" in msg):
+            run_obj, items = _call(rating_filters_fallback)
             run_id = run_obj.get("id")
             dataset_id = run_obj.get("defaultDatasetId")
         else:
             raise
 
+    # Best-effort run usage
     try:
-        # Run details for cost/CU
         if run_id:
             details = client.run(run_id).get() or {}
             usage_total_usd = details.get("usageTotalUsd")
@@ -563,11 +534,10 @@ def run_one_job(
             pricing_info = details.get("pricingInfo") or {}
             pricing_model = pricing_info.get("pricingModel")
     except Exception:
-        # best-effort only
         pass
 
-    # Post-process items
     sort_effective = resolve_sort_key(global_sort_key, spec.sort_override)
+
     for it in items:
         it["_meta_asin"] = spec.asin
         it["_meta_country"] = spec.country
@@ -579,7 +549,6 @@ def run_one_job(
 
         if add_score_value:
             it["ReviewScoreValue"] = parse_score_value(it.get("ReviewScore"))
-
         if add_effective_filter:
             it["EffectiveFilterByStar"] = extract_filter_by_star_from_pageurl(it.get("PageUrl"))
 
@@ -638,7 +607,7 @@ def compute_cost_projection(done: List[JobResult], pending: List[JobSpec]) -> Tu
 
 
 # ----------------------------
-# Streamlit app
+# Streamlit layout
 # ----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -663,13 +632,9 @@ if "last_master_df" not in st.session_state:
     st.session_state.last_master_df = None
 if "last_per_sheet" not in st.session_state:
     st.session_state.last_per_sheet = None
-if "last_run_meta" not in st.session_state:
-    st.session_state.last_run_meta = {}
 
 
-# ----------------------------
 # Sidebar
-# ----------------------------
 with st.sidebar:
     st.subheader("Token")
     secret_token = get_apify_token_from_secrets()
@@ -683,13 +648,11 @@ with st.sidebar:
     token_manual = st.text_input("Apify API Token (manual override)", type="password", value="")
     token = (token_manual.strip() or (secret_token.strip() if use_secrets else "")).strip()
 
-    with st.expander("Streamlit secrets format (copy/paste)", expanded=False):
-        st.write("Create `.streamlit/secrets.toml` locally, or paste TOML into Streamlit Cloud → App → Settings → Secrets.")
+    with st.expander("Streamlit secrets format", expanded=False):
+        st.markdown("Create `.streamlit/secrets.toml` with either:")
         st.code('APIFY_TOKEN = "apify_api_your_token_here"', language="toml")
+        st.markdown("Or namespaced:")
         st.code('[apify]\ntoken = "apify_api_your_token_here"', language="toml")
-        if token_manual.strip():
-            st.caption("Populated snippet (from your manual token):")
-            st.code(f'APIFY_TOKEN = "{token_manual.strip()}"', language="toml")
 
     st.divider()
     st.subheader("Actor / Run settings")
@@ -709,8 +672,8 @@ with st.sidebar:
 
     with st.expander("Output cleaning", expanded=True):
         clean_content = st.checkbox("Clean ReviewContent (remove video widget blob)", value=True)
-        keep_raw_content = st.checkbox("Keep ReviewContent_raw column", value=False)
-        extract_video_meta = st.checkbox("Extract video metadata (VideoUrl, etc.)", value=True)
+        keep_raw_content = st.checkbox("Keep ReviewContent_raw", value=False)
+        extract_video_meta = st.checkbox("Extract video metadata columns", value=True)
         add_score_value = st.checkbox("Add numeric ReviewScoreValue", value=True)
         add_effective_filter = st.checkbox("Add EffectiveFilterByStar (debug)", value=True)
 
@@ -719,32 +682,33 @@ tabs = st.tabs(["Manage ASINs", "Run", "Results", "Help"])
 
 
 # ----------------------------
-# Tab: Manage ASINs
+# Manage ASINs tab
 # ----------------------------
 with tabs[0]:
     st.subheader("Manage ASINs")
 
-    # Quick actions row
-    a1, a2, a3, a4 = st.columns([1.2, 1.2, 1.2, 2.4])
-    with a1:
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 2.4])
+    with c1:
         if st.button("Remove checked rows", use_container_width=True):
             df = ensure_table_columns(st.session_state.asin_table)
             df = df[df["Delete"] != True].copy()
             df["Delete"] = False
             st.session_state.asin_table = df
             st.success("Removed checked rows.")
-    with a2:
+    with c2:
         if st.button("Disable checked rows", use_container_width=True):
             df = ensure_table_columns(st.session_state.asin_table)
             df.loc[df["Delete"] == True, "Enabled"] = False
             df["Delete"] = False
             st.session_state.asin_table = df
             st.success("Disabled checked rows.")
-    with a3:
+    with c3:
         if st.button("Clear table", use_container_width=True):
-            st.session_state.asin_table = ensure_table_columns(pd.DataFrame(columns=["Enabled","Country","ASIN or URL","Reviews to pull","Rating","Sort","Delete"]))
+            st.session_state.asin_table = ensure_table_columns(
+                pd.DataFrame(columns=["Enabled", "Country", "ASIN or URL", "Reviews to pull", "Rating", "Sort", "Delete"])
+            )
             st.success("Cleared.")
-    with a4:
+    with c4:
         cfg_bytes = export_config_csv_bytes(ensure_table_columns(st.session_state.asin_table))
         st.download_button(
             "Download current config CSV",
@@ -755,52 +719,48 @@ with tabs[0]:
         )
 
     st.divider()
-
-    # Add single ASIN form (more intuitive than editing the grid first)
     st.markdown("### Add a single ASIN")
     with st.form("add_single_asin", clear_on_submit=True):
-        c1, c2, c3, c4, c5 = st.columns([1.4, 2.0, 1.2, 1.2, 1.2])
-        country = c1.selectbox("Country", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0)
-        asin_or_url = c2.text_input("ASIN or Amazon URL", value="")
-        reviews = c3.number_input("Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25)
-        rating = c4.selectbox("Rating", options=RATING_UI_OPTIONS, index=0)
-        sort = c5.selectbox("Sort", options=SORT_OVERRIDE_OPTIONS, index=0)
+        a, b, c, d, e = st.columns([1.4, 2.0, 1.2, 1.2, 1.2])
+        add_country = a.selectbox("Country", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0)
+        add_asin = b.text_input("ASIN or Amazon URL", value="")
+        add_reviews = c.number_input("Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25)
+        add_rating = d.selectbox("Rating", options=RATING_UI_OPTIONS, index=0)
+        add_sort = e.selectbox("Sort", options=SORT_OVERRIDE_OPTIONS, index=0)
         submitted = st.form_submit_button("Add row")
 
         if submitted:
-            asin = normalize_asin(asin_or_url)
+            asin = normalize_asin(add_asin)
             if not is_valid_asin(asin):
-                st.error(f"Could not parse a valid ASIN from: {asin_or_url}")
+                st.error(f"Could not parse a valid ASIN from: {add_asin}")
             else:
                 df = ensure_table_columns(st.session_state.asin_table)
                 new_row = {
                     "Enabled": True,
-                    "Country": country,
+                    "Country": add_country,
                     "ASIN or URL": asin,
-                    "Reviews to pull": int(reviews),
-                    "Rating": rating,
-                    "Sort": sort,
+                    "Reviews to pull": int(add_reviews),
+                    "Rating": add_rating,
+                    "Sort": add_sort,
                     "Delete": False,
                 }
                 st.session_state.asin_table = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                 st.success(f"Added {asin}.")
 
     st.divider()
-
-    # Bulk add
     st.markdown("### Bulk add")
-    b1, b2 = st.columns(2)
+    left, right = st.columns(2)
 
-    with b1:
+    with left:
         st.write("Paste ASINs/URLs (one per line). They will use the defaults below.")
-        default_country = st.selectbox("Default Country (bulk)", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0, key="bulk_country")
-        default_reviews = st.number_input("Default Reviews (bulk)", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25, key="bulk_reviews")
-        default_rating = st.selectbox("Default Rating (bulk)", options=RATING_UI_OPTIONS, index=0, key="bulk_rating")
-        default_sort = st.selectbox("Default Sort (bulk)", options=SORT_OVERRIDE_OPTIONS, index=0, key="bulk_sort")
+        bulk_country = st.selectbox("Default Country (bulk)", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0, key="bulk_country")
+        bulk_reviews = st.number_input("Default Reviews (bulk)", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25, key="bulk_reviews")
+        bulk_rating = st.selectbox("Default Rating (bulk)", options=RATING_UI_OPTIONS, index=0, key="bulk_rating")
+        bulk_sort = st.selectbox("Default Sort (bulk)", options=SORT_OVERRIDE_OPTIONS, index=0, key="bulk_sort")
+        bulk_text = st.text_area("ASINs/URLs", height=140, key="bulk_text")
 
-        bulk_asins_text = st.text_area("ASINs/URLs", height=140, key="bulk_asins_text")
         if st.button("Add ASIN list", use_container_width=True):
-            lines = parse_bulk_asin_lines(bulk_asins_text)
+            lines = parse_bulk_asin_lines(bulk_text)
             rows = []
             for raw in lines:
                 asin = normalize_asin(raw)
@@ -808,11 +768,11 @@ with tabs[0]:
                     rows.append(
                         {
                             "Enabled": True,
-                            "Country": default_country,
+                            "Country": bulk_country,
                             "ASIN or URL": asin,
-                            "Reviews to pull": int(default_reviews),
-                            "Rating": default_rating,
-                            "Sort": default_sort,
+                            "Reviews to pull": int(bulk_reviews),
+                            "Rating": bulk_rating,
+                            "Sort": bulk_sort,
                             "Delete": False,
                         }
                     )
@@ -823,12 +783,12 @@ with tabs[0]:
             else:
                 st.warning("No valid ASINs found.")
 
-    with b2:
+    with right:
         st.write("CSV-like lines: `ASIN, Country, Reviews, Rating, Sort` (Country/Reviews/Rating/Sort optional)")
-        st.code("B0XXXXXXX1\nB0XXXXXXX2, France, 200, All stars, Default\nB0XXXXXXX3, Germany (Deutschland), 100, 5-star, Helpful")
-        bulk_csv_text = st.text_area("CSV-like bulk input", height=140, key="bulk_csv_text")
+        st.code("B0XXXXXXX1\nB0XXXXXXX2, France, 200, All stars, Default\nB0XXXXXXX3, Germany, 100, 5-star, Helpful")
+        bulk_csv = st.text_area("CSV-like bulk input", height=140, key="bulk_csv")
         if st.button("Add CSV-like lines", use_container_width=True):
-            rows = parse_bulk_csv_lines(bulk_csv_text)
+            rows = parse_bulk_csv_lines(bulk_csv)
             if rows:
                 df = ensure_table_columns(st.session_state.asin_table)
                 st.session_state.asin_table = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
@@ -837,15 +797,12 @@ with tabs[0]:
                 st.warning("No valid rows found.")
 
     st.divider()
-
-    # Import config
     st.markdown("### Import config CSV")
-    up = st.file_uploader("Upload a config CSV exported from this app", type=["csv"])
+    up = st.file_uploader("Upload config CSV exported from this app", type=["csv"])
     if up is not None:
         try:
             imported = pd.read_csv(up)
             imported = ensure_table_columns(imported)
-            # Normalize ASINs
             imported["ASIN or URL"] = imported["ASIN or URL"].astype(str).map(normalize_asin)
             st.session_state.asin_table = imported
             st.success("Config loaded.")
@@ -853,10 +810,8 @@ with tabs[0]:
             st.error(f"Failed to load CSV: {e}")
 
     st.divider()
-
-    # Editable table
     st.markdown("### Edit list")
-    st.write("Tip: Use **Enabled** to temporarily skip rows. Use **Delete** checkbox + **Remove checked rows** to remove quickly.")
+    st.write("Tip: Use **Enabled** to skip a row. Use **Delete** checkbox + **Remove checked rows** to remove quickly.")
 
     st.session_state.asin_table = ensure_table_columns(st.session_state.asin_table)
 
@@ -864,6 +819,7 @@ with tabs[0]:
         st.session_state.asin_table,
         num_rows="dynamic",
         use_container_width=True,
+        hide_index=True,
         column_config={
             "Enabled": st.column_config.CheckboxColumn("Enabled", width="small"),
             "Country": st.column_config.SelectboxColumn("Country", options=COUNTRY_VALUES, width="medium"),
@@ -873,7 +829,6 @@ with tabs[0]:
             "Sort": st.column_config.SelectboxColumn("Sort", options=SORT_OVERRIDE_OPTIONS, width="small"),
             "Delete": st.column_config.CheckboxColumn("Delete", width="small"),
         },
-        hide_index=True,
     )
     st.session_state.asin_table = ensure_table_columns(edited)
 
@@ -881,12 +836,11 @@ with tabs[0]:
     if not issues_df.empty:
         st.warning("Fix these rows before running:")
         st.dataframe(issues_df, use_container_width=True, hide_index=True)
-
     st.caption(f"Enabled rows ready: {len(jobs)}")
 
 
 # ----------------------------
-# Tab: Run
+# Run tab
 # ----------------------------
 with tabs[1]:
     st.subheader("Run")
@@ -904,22 +858,21 @@ with tabs[1]:
     with r3:
         st.caption(f"Rows: **{len(jobs)}** · Concurrency: **{max_workers}** · Default sort: **{global_sort_label}**")
 
+    if not token:
+        st.info("Add your Apify token (sidebar). You can store it in Streamlit secrets.")
     if not issues_df.empty:
-        st.warning("Fix table issues first (see Manage ASINs tab).")
+        st.warning("Fix table issues first (Manage ASINs tab).")
 
     if clear_clicked:
         st.session_state.last_results = []
         st.session_state.last_master_df = None
         st.session_state.last_per_sheet = None
-        st.session_state.last_run_meta = {}
         st.success("Cleared.")
 
     if run_clicked:
-        # Reset last run
         st.session_state.last_results = []
         st.session_state.last_master_df = None
         st.session_state.last_per_sheet = None
-        st.session_state.last_run_meta = {}
 
         total = len(jobs)
         status_ph = st.empty()
@@ -957,7 +910,6 @@ with tabs[1]:
         render_metrics()
         status_ph.markdown(f"**[{now_ts()}]** Starting {total} runs… (parallelism={max_workers})")
 
-        # Parallel runs
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
                 ex.submit(
@@ -1001,7 +953,6 @@ with tabs[1]:
 
                 results.append(res)
                 pending = [p for p in pending if p != spec]
-
                 done_so_far += 1
                 progress.progress(int(done_so_far / total * 100))
 
@@ -1015,7 +966,6 @@ with tabs[1]:
                     with log_box:
                         st.error(f"[{now_ts()}] Row {spec.row_id} ERROR · {spec.asin} · {res.error}")
 
-                # Live summary table
                 rows = []
                 for r in sorted(results, key=lambda x: x.spec.row_id):
                     rows.append(
@@ -1043,12 +993,10 @@ with tabs[1]:
         total_runtime = time.time() - start_all
         status_ph.markdown(f"**[{now_ts()}]** Finished in {format_seconds(total_runtime)}. Building exports…")
 
-        # Build exports
         per_sheet: Dict[str, pd.DataFrame] = {}
         all_items: List[dict] = []
 
         for r in results:
-            # Short sheet key to avoid Excel 31-char limit
             sheet_key = f"{r.spec.asin}-{r.spec.country[:2].upper()}-{r.spec.rating_ui.split()[0]}-{r.spec.sort_override[0]}"
             if r.ok and r.items:
                 df_sheet = pd.json_normalize(r.items)
@@ -1070,17 +1018,12 @@ with tabs[1]:
         st.session_state.last_results = results
         st.session_state.last_per_sheet = per_sheet
         st.session_state.last_master_df = master_df
-        st.session_state.last_run_meta = {
-            "finished_at": now_ts(),
-            "total_runtime_s": total_runtime,
-            "actor_id": actor_id,
-        }
 
         status_ph.markdown(f"**[{now_ts()}]** Done ✅  (Go to Results tab to download.)")
 
 
 # ----------------------------
-# Tab: Results
+# Results tab
 # ----------------------------
 with tabs[2]:
     st.subheader("Results")
@@ -1099,21 +1042,24 @@ with tabs[2]:
         with_cost = [r for r in results if r.ok and r.usage_total_usd is not None]
         cost_total = sum(float(r.usage_total_usd) for r in with_cost) if with_cost else None
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Succeeded", ok_count)
-        c2.metric("Failed", fail_count)
-        c3.metric("Collected rows", collected_total)
-        c4.metric("Cost total (USD)", f"{cost_total:.4f}" if cost_total is not None else "—")
+        a, b, c, d = st.columns(4)
+        a.metric("Succeeded", ok_count)
+        b.metric("Failed", fail_count)
+        c.metric("Collected rows", collected_total)
+        d.metric("Cost total (USD)", f"{cost_total:.4f}" if cost_total is not None else "—")
 
         if master_df is not None and not master_df.empty:
             with st.expander("Preview MASTER (first 100 rows)", expanded=False):
                 st.dataframe(master_df.head(100), use_container_width=True)
 
-            # Quick star distribution check (helps validate “All stars”)
             if "ReviewScoreValue" in master_df.columns:
                 with st.expander("Star distribution (MASTER)", expanded=False):
                     dist = master_df["ReviewScoreValue"].value_counts(dropna=True).sort_index()
-                    st.dataframe(dist.rename("count").reset_index().rename(columns={"index": "ReviewScoreValue"}), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        dist.rename("count").reset_index().rename(columns={"index": "ReviewScoreValue"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
         ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         excel_name = f"amazon_reviews_{ts_tag}.xlsx"
@@ -1143,26 +1089,26 @@ with tabs[2]:
 
 
 # ----------------------------
-# Tab: Help
+# Help tab (no triple-quoted strings)
 # ----------------------------
 with tabs[3]:
     st.subheader("Help")
 
+    st.markdown("### Streamlit secrets")
+    st.markdown("Create `.streamlit/secrets.toml` locally, or paste the same TOML in Streamlit Cloud → App → Settings → Secrets.")
+    st.code('APIFY_TOKEN = "apify_api_your_token_here"', language="toml")
+    st.markdown("Or namespaced:")
+    st.code('[apify]\ntoken = "apify_api_your_token_here"', language="toml")
+
+    st.markdown("### Why ReviewContent sometimes contains a huge JSON blob")
     st.markdown(
-        """
-### Why “All stars” sometimes looks like only 5-star
-Some actors collect reviews by iterating filters and stop when `max_reviews` is reached.  
-If the actor starts with 5★ and a product has plenty of 5★ reviews, you can end up with mostly 5★ unless the actor supports a true “All stars” mode.
+        "Some reviews include inline video. Amazon embeds a VSE player config JSON and UI text in the same container as "
+        "the review body. Enable **Clean ReviewContent** to strip it and optionally extract `VideoUrl` and poster image URL."
+    )
 
-This app tries `filter_by_ratings=["all_stars"]` for **All stars**, and if the actor rejects it, falls back to selecting all five star buckets.
-
-### ReviewContent contains huge JSON blobs
-That happens for **video reviews** (Amazon VSE player config).  
-If you enabled “Clean ReviewContent”, the app will strip the blob and keep only the written text, and optionally extract `VideoUrl` and poster image URL.
-
-### Secrets setup
-Local:
-- Create `.streamlit/secrets.toml` in your project:
-
-```toml
-APIFY_TOKEN = "apify_api_your_token_here"
+    st.markdown("### “All stars” sometimes looks like only 5★")
+    st.markdown(
+        "This app tries `filter_by_ratings=['all_stars']` for **All stars**. If your actor rejects `all_stars`, it falls "
+        "back to requesting all five star buckets. If you still see only 5★, turn on the debug column "
+        "`EffectiveFilterByStar` and check the generated filter."
+    )
