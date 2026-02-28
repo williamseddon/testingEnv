@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-02-28-master-v7"
+APP_VERSION = "2026-02-28-master-v8"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -200,7 +200,8 @@ GLOBAL_CSS = """
 
   .metric-row{
     display:grid;
-    grid-template-columns:repeat(3, minmax(0, 1fr));
+    /* auto-fit prevents small-screen clipping even when sidebar reduces content width */
+    grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
     gap:12px;
     align-items:stretch;
   }
@@ -227,19 +228,60 @@ GLOBAL_CSS = """
 
   .metric-kpi{
     font-weight:800;
-    font-size:clamp(1.35rem, 2.5vw, 1.80rem);
+    /* Slightly smaller minimum so numbers never clip on smaller laptop widths */
+    font-size:clamp(1.10rem, 2.35vw, 1.75rem);
     letter-spacing:-0.01em;
     margin-top:2px;
     color:var(--text);
     line-height:1.05;
     white-space:nowrap;
-    overflow:hidden;
-    text-overflow:ellipsis;
+    /* Never truncate numbers; instead rely on responsive sizing + grid wrapping */
+    overflow:visible;
     font-variant-numeric: tabular-nums;
   }
 
+  /* Backstop for very tight layouts */
   @media (max-width: 520px){
     .metric-row{ grid-template-columns:1fr; }
+  }
+
+  /* Sticky top navigation (ONLY the main View radio) */
+  .sticky-topnav-host{
+    position: sticky;
+    top: 0;
+    z-index: 999;
+    margin: 6px 0 12px;
+    padding: 6px 0;
+    background: linear-gradient(to bottom, var(--bg-app) 60%, rgba(0,0,0,0) 100%);
+    backdrop-filter: blur(6px);
+  }
+  .sticky-topnav-host [data-testid="stRadio"]{ display:flex; justify-content:center; }
+  .sticky-topnav-host [role="radiogroup"]{
+    display:flex;
+    flex-direction: row;
+    gap:10px;
+    padding:10px;
+    border-radius:999px;
+    background:var(--bg-card);
+    box-shadow:0 0 0 1.2px var(--border-strong), 0 8px 16px rgba(15,23,42,0.08);
+    align-items:center;
+  }
+  .sticky-topnav-host label[data-baseweb="radio"]{
+    margin:0 !important;
+    border-radius:999px !important;
+    border:1.2px solid var(--border) !important;
+    background:var(--bg-tile) !important;
+    padding:8px 14px !important;
+    font-weight:850 !important;
+  }
+  .sticky-topnav-host label[data-baseweb="radio"]:hover{ border-color: var(--border-strong) !important; }
+  .sticky-topnav-host label[data-baseweb="radio"]:has(input:checked){
+    background: rgba(59,130,246,0.12) !important;
+    border-color: rgba(59,130,246,0.55) !important;
+    box-shadow: 0 0 0 3px rgba(59,130,246,0.10);
+  }
+
+  @media (max-width: 520px){
     .metric-box{
       text-align:left;
       display:flex;
@@ -391,6 +433,45 @@ def _infer_product_label(df_in: pd.DataFrame, fallback_filename: str) -> str:
                 return str(top[0])
             return " / ".join([str(x) for x in top])
     return base
+
+
+_BASIC_STOP = {
+    "the","and","for","with","this","that","have","has","had","was","were","are","but","not","you","your","i","me","my",
+    "we","our","they","them","their","it","its","a","an","to","of","in","on","at","as","is","be","been","so","if",
+    "very","really","just","from","or","by","about","after","before","when","while","can","could","would","should","will",
+    "did","does","do","than","then","there","here","also","too","more","most","less","much","many","one","two","three",
+}
+
+
+def infer_product_profile(df_in: pd.DataFrame, fallback_filename: str) -> dict:
+    """Best-effort product identity from the dataset itself (no web calls)."""
+    prof: dict = {"product_guess": _infer_product_label(df_in, fallback_filename)}
+
+    def _top_vals(col: str, k: int = 5):
+        if col not in df_in.columns:
+            return []
+        s = df_in[col].astype("string").str.strip().replace({"": pd.NA}).dropna()
+        if s.empty:
+            return []
+        return [str(x) for x in s.value_counts().head(k).index.tolist()]
+
+    for c in ["Product Name", "Product Category", "Brand", "Company", "Model (SKU)"]:
+        top = _top_vals(c, 5)
+        if top:
+            prof[f"top_{c.lower().replace(' ', '_')}"] = top
+
+    # Keywords from verbatims
+    if "Verbatim" in df_in.columns:
+        txt = df_in["Verbatim"].astype("string").fillna("")
+        tokens = []
+        for t in txt.head(6000).tolist():
+            t = clean_text(t)
+            words = re.findall(r"[a-zA-Z]{3,}", t.lower())
+            tokens.extend([w for w in words if w not in _BASIC_STOP])
+        if tokens:
+            most = Counter(tokens).most_common(18)
+            prof["top_keywords"] = [w for w, _ in most]
+    return prof
 
 
 def _extract_sentence(text: str, keyword: str | None = None, prefer_tail: bool = False) -> str:
@@ -1919,24 +2000,11 @@ st.markdown(
 
 
 # ============================================================
-# Navigation / Views
+# Navigation / Views (sticky top bar, NO page refresh)
 # ============================================================
-st.markdown(
-    '''
-<div class="soft-panel" style="margin-top: 6px; margin-bottom: 10px;">
-  <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:14px; flex-wrap:wrap;">
-    <div>
-      <div style="font-weight:900; font-size:1.15rem; line-height:1.15;">🧭 View</div>
-      <div class="small-muted" style="margin-top:4px;">Pick what you want to look at right now.</div>
-    </div>
-    <div class="small-muted" style="max-width:520px;">
-      Tip: <b>📝 All Reviews</b> contains the individual review cards (with green/red symptom tiles).
-    </div>
-  </div>
-</div>
-''',
-    unsafe_allow_html=True,
-)
+
+# Marker lets us find-and-sticky this exact widget via a tiny DOM hook (no session reset).
+st.markdown("<div id='view-nav-marker'></div>", unsafe_allow_html=True)
 
 view = st.radio(
     "View",
@@ -1944,7 +2012,38 @@ view = st.radio(
     horizontal=True,
     index=0,
     key="main_view",
+    label_visibility="collapsed",
 )
+
+# Make ONLY the view switcher sticky + centered after the file loads
+st_html(
+    """
+<script>
+(function(){
+  try {
+    const doc = window.parent.document;
+    const marker = doc.getElementById('view-nav-marker');
+    if (!marker) return;
+    // Streamlit wraps each element in an element-container; the widget is usually the next sibling
+    const host = marker.closest('div.element-container') || marker.parentElement;
+    if (!host) return;
+    // Find the first stRadio after the marker
+    let node = host.nextElementSibling;
+    let radio = null;
+    for (let i=0; i<6 && node; i++){
+      if (node.querySelector && node.querySelector('[data-testid="stRadio"]')) { radio = node; break; }
+      node = node.nextElementSibling;
+    }
+    if (!radio) return;
+    radio.classList.add('sticky-topnav-host');
+  } catch (e) {}
+})();
+</script>
+""",
+    height=0,
+)
+
+st.caption("Tip: **📝 All Reviews** contains the individual review cards (with green/red symptom tiles).")
 
 # ============================================================
 # Precompute analysis tables (fast) — only when needed
@@ -2032,10 +2131,14 @@ if view.startswith("📊"):
 
     # ---------- Symptom Tables ----------
     st.markdown("## 🩺 Symptom Tables")
-    detractors_results = detractors_results_full.head(50)
-    delighters_results = delighters_results_full.head(50)
+    # Default display limit; show a "View full" affordance if truncated.
+    table_limit = int(st.session_state.get("symptom_table_limit", 50))
+    table_limit = st.selectbox("Rows to preview", options=[25, 50, 100], index=[25, 50, 100].index(50), key="symptom_table_limit")
 
-    view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
+    detractors_results = detractors_results_full.head(table_limit)
+    delighters_results = delighters_results_full.head(table_limit)
+
+    view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0, key="symptom_table_view_mode")
 
     def _styled_table(df_in: pd.DataFrame):
         if df_in.empty:
@@ -2054,20 +2157,58 @@ if view.startswith("📊"):
             return ""
         return df_in.style.applymap(colstyle, subset=["Avg Star"]).format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})
 
+    def _table_downloads(df_full: pd.DataFrame, label: str, key_prefix: str):
+        if df_full is None or df_full.empty:
+            return
+        csv = df_full.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            f"⬇️ Download full {label} (CSV)",
+            data=csv,
+            file_name=f"{key_prefix}_full.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"dl_{key_prefix}",
+        )
+
+    def _render_symptom_table(df_preview: pd.DataFrame, df_full: pd.DataFrame, title: str, key_prefix: str):
+        left, right = st.columns([1.25, 0.9])
+        with left:
+            st.subheader(title)
+        with right:
+            _table_downloads(df_full, title, key_prefix)
+
+        # Main preview
+        st.dataframe(
+            _styled_table(df_preview) if not df_preview.empty else df_preview,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # If truncated, show "View full" affordance
+        if len(df_full) > len(df_preview) and len(df_preview) > 0:
+            if st.button(f"View full table ({len(df_full):,} rows)", key=f"view_full_{key_prefix}"):
+                st.session_state[f"show_full_{key_prefix}"] = True
+            if st.session_state.get(f"show_full_{key_prefix}"):
+                with st.expander(f"Full {title} table", expanded=True):
+                    st.dataframe(
+                        _styled_table(df_full) if not df_full.empty else df_full,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=680,
+                    )
+
     if view_mode == "Split":
         c1, c2 = st.columns([1, 1])
         with c1:
-            st.subheader("All Detractors")
-            st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results, use_container_width=True, hide_index=True)
+            _render_symptom_table(detractors_results, detractors_results_full, "All Detractors", "detractors")
         with c2:
-            st.subheader("All Delighters")
-            st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results, use_container_width=True, hide_index=True)
+            _render_symptom_table(delighters_results, delighters_results_full, "All Delighters", "delighters")
     else:
         tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
         with tab1:
-            st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results, use_container_width=True, hide_index=True)
+            _render_symptom_table(detractors_results, detractors_results_full, "All Detractors", "detractors")
         with tab2:
-            st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results, use_container_width=True, hide_index=True)
+            _render_symptom_table(delighters_results, delighters_results_full, "All Delighters", "delighters")
 
 
 
@@ -2750,15 +2891,19 @@ if view.startswith("🤖"):
             for f in ["Country", "Source", "Model (SKU)", "Seeded"]:
                 hotspots[f] = _segment_hotspots(filtered, f, k=10, min_n=15)
 
+            product_profile = infer_product_profile(filtered, source_label)
+
             _ai_cache[_filters_hash] = {
                 "driver_det": driver_det,
                 "driver_del": driver_del,
                 "hotspots": hotspots,
+                "product_profile": product_profile,
             }
 
     driver_det = _ai_cache[_filters_hash]["driver_det"]
     driver_del = _ai_cache[_filters_hash]["driver_del"]
     hotspots = _ai_cache[_filters_hash]["hotspots"]
+    product_profile = _ai_cache[_filters_hash]["product_profile"]
 
     # ----------------------------
     # CSAT snapshot panel
@@ -2860,6 +3005,27 @@ if view.startswith("🤖"):
 
     with st.sidebar.expander("🔑 OpenAI Key (optional override)", expanded=False):
         st.text_input("OPENAI_API_KEY override", value="", type="password", key="api_key_override")
+        if _HAS_OPENAI:
+            if st.button("🔌 Test API key", use_container_width=True, key="test_openai_key"):
+                k = (st.session_state.get("api_key_override") or "").strip() or st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+                if not k:
+                    st.warning("No API key found (override, secrets, or env).")
+                else:
+                    try:
+                        _client = OpenAI(api_key=k, timeout=20, max_retries=0)
+                        # Lightweight call
+                        models = _client.models.list()
+                        mnames = []
+                        try:
+                            mnames = [getattr(m, "id", "") for m in getattr(models, "data", [])][:6]
+                        except Exception:
+                            mnames = []
+                        st.success("API key looks valid. ✅")
+                        if mnames:
+                            st.caption("Sample models: " + ", ".join([x for x in mnames if x]))
+                    except Exception as e:
+                        st.session_state["ai_last_error"] = repr(e)
+                        st.error(f"API key test failed: {e}")
 
     api_key_override = (st.session_state.get("api_key_override") or "").strip()
     api_key = api_key_override or st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
@@ -2868,6 +3034,25 @@ if view.startswith("🤖"):
         st.info("To enable remote LLM, add `openai` to requirements and set `OPENAI_API_KEY`. Local CSAT Copilot still works.")
     elif not api_key:
         st.info("Set `OPENAI_API_KEY` (env or .streamlit/secrets.toml) for remote LLM. Local CSAT Copilot still works.")
+
+    # Main-page AI status (so model selection + connectivity is obvious)
+    sel_model = st.session_state.get("llm_model", "gpt-4o-mini")
+    remote_ready = bool(ai_enabled and _HAS_OPENAI and api_key)
+    status_txt = "🟢 Remote AI ready" if remote_ready else "🟡 Local-only mode"
+    st.markdown(
+        f"""
+<div class="soft-panel" style="margin-top: 8px;">
+  <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+    <div style="font-weight:850;">{_html.escape(status_txt)}</div>
+    <div class="small-muted">Model: <b>{_html.escape(str(sel_model))}</b></div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("ai_last_error"):
+        with st.expander("⚠️ Last AI error (debug)", expanded=False):
+            st.code(st.session_state.get("ai_last_error"))
 
     # ----------------------------
     # Preset questions tuned for CSAT / quality engineering
@@ -3002,6 +3187,24 @@ if view.startswith("🤖"):
         # --------------------------------------
         # Local structured answer (always available)
         # --------------------------------------
+        def _local_product_identity_answer() -> str:
+            prof = product_profile or {}
+            lines = []
+            lines.append(f"**Product guess:** {prof.get('product_guess','(unknown)')}")
+            # Prefer explicit metadata if present
+            for k in ["top_product_name", "top_brand", "top_product_category", "top_company", "top_model_(sku)"]:
+                if k in prof:
+                    pretty = k.replace("top_", "").replace("_", " ").title()
+                    vals = prof.get(k) or []
+                    if vals:
+                        lines.append(f"- **{pretty}:** " + ", ".join(vals[:5]))
+            kws = prof.get("top_keywords") or []
+            if kws:
+                lines.append("- **Common review keywords:** " + ", ".join(kws[:12]))
+            lines.append("")
+            lines.append("If you want a cleaner label, add a column like **Product Name** or **Product Category** to the file (or map SKU → product internally).")
+            return "\n".join(lines)
+
         def _local_csat_answer() -> str:
             lines = []
             lines.append(f"**CSAT snapshot (filtered):** {total_reviews:,} reviews • Avg ★ **{baseline_avg:.2f}** • % 1–2★ **{baseline_pct_low:.1f}%** • % 4–5★ **{baseline_pct_high:.1f}%**.")
@@ -3028,7 +3231,11 @@ if view.startswith("🤖"):
                     lines.append(f"- [L{i}] “{_mask_pii(s)}”")
             return "\n".join(lines)
 
-        local_answer = _local_csat_answer()
+        ql = q.lower()
+        if "what is this product" in ql or "what product is this" in ql or re.search(r"\bwhat\s+product\b", ql):
+            local_answer = _local_product_identity_answer()
+        else:
+            local_answer = _local_csat_answer()
         final_text = None
 
         # --------------------------------------
@@ -3051,9 +3258,19 @@ if view.startswith("🤖"):
                 raw_texts = _stable_top_k(raw_texts_all, cap_n)
                 emb_model = "text-embedding-3-small"
                 content_hash = _hash_texts(raw_texts)
-                index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
+                index = None
+                try:
+                    index = _get_or_build_index(content_hash, raw_texts, api_key, emb_model)
+                except Exception as e_emb:
+                    # Embeddings can fail (quota/rate/network). Don't block the main LLM call.
+                    st.session_state["ai_last_error"] = st.session_state.get("ai_last_error") or repr(e_emb)
+                    index = None
 
-                retrieved = vector_search(q, index, api_key, top_k=10) if index else []
+                retrieved = []
+                try:
+                    retrieved = vector_search(q, index, api_key, top_k=10) if index else []
+                except Exception:
+                    retrieved = []
                 retrieved_quotes = []
                 for txt, _sim in retrieved[:6]:
                     s = (txt or "").split("||", 1)[-1].strip()
@@ -3067,6 +3284,7 @@ if view.startswith("🤖"):
                 # Context pack (compact, CSAT-focused)
                 style = st.session_state.get("ai_style", "Engineering deep dive")
                 ctx = {
+                    "product_profile": product_profile,
                     "filters": active_filters,
                     "counts": {"total_reviews": total_reviews},
                     "csat": {
@@ -3358,67 +3576,97 @@ if view.startswith("🤖"):
                 selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
                 llm_temp = float(st.session_state.get("llm_temp", 0.2))
 
-                client = OpenAI(api_key=api_key)
+                client = OpenAI(api_key=api_key, timeout=60, max_retries=0)
 
-                req = {
-                    "model": selected_model,
-                    "messages": [{"role": "system", "content": sys_ctx}, {"role": "user", "content": q}],
-                    "tools": tools,
-                }
-                if model_supports_temperature(selected_model):
-                    req["temperature"] = llm_temp
-
-                with st.spinner("Thinking…"):
-                    first = client.chat.completions.create(**req)
-
-                msg = first.choices[0].message
-                tool_calls = getattr(msg, "tool_calls", []) or []
-                tool_msgs = []
-                if tool_calls:
-                    for call in tool_calls:
+                # NOTE: GPT‑5 family works best with the Responses API (and can be finicky with tool-calling on Chat Completions).
+                # We keep the tool-driven loop for non‑GPT‑5 models, and use Responses for GPT‑5 for maximum reliability.
+                if str(selected_model).startswith("gpt-5"):
+                    with st.spinner("Thinking…"):
+                        resp = client.responses.create(
+                            model=selected_model,
+                            input=[
+                                {"role": "system", "content": sys_ctx},
+                                {"role": "user", "content": q},
+                            ],
+                            store=False,
+                        )
+                    final_text = getattr(resp, "output_text", None) or ""
+                    if not final_text:
+                        # Fallback for SDK variants
                         try:
-                            args = json.loads(call.function.arguments or "{}")
-                            if not isinstance(args, dict):
-                                args = {}
+                            final_text = "".join([
+                                it.get("text", "") for it in getattr(resp, "output", []) if isinstance(it, dict)
+                            ])
                         except Exception:
-                            args = {}
-                        name = call.function.name
-                        out = {"error": "unknown tool"}
-                        if name == "get_csat_snapshot":
-                            out = get_csat_snapshot()
-                        if name == "top_drivers":
-                            out = top_drivers(args.get("which", "detractors"), int(args.get("k", 10) or 10))
-                        if name == "segment_hotspots":
-                            out = segment_hotspots(args.get("field", "Country"), int(args.get("k", 10) or 10), int(args.get("min_n", 15) or 15))
-                        if name == "symptom_deep_dive":
-                            out = symptom_deep_dive(args.get("symptom", ""), int(args.get("k_quotes", 4) or 4))
-                        if name == "monthly_csat":
-                            out = monthly_csat(int(args.get("last_n", 6) or 6))
-                        if name == "pandas_count":
-                            out = pandas_count(args.get("query", ""))
-                        if name == "pandas_mean":
-                            out = pandas_mean(args.get("column", ""), args.get("query"))
-
-                        tool_msgs.append({"tool_call_id": call.id, "role": "tool", "name": name, "content": json.dumps(out)})
-
-                if tool_msgs:
-                    follow = {
+                            final_text = ""
+                else:
+                    req = {
                         "model": selected_model,
-                        "messages": [
-                            {"role": "system", "content": sys_ctx},
-                            {"role": "assistant", "tool_calls": tool_calls, "content": None},
-                            *tool_msgs,
-                        ],
+                        "messages": [{"role": "system", "content": sys_ctx}, {"role": "user", "content": q}],
+                        "tools": tools,
                     }
                     if model_supports_temperature(selected_model):
-                        follow["temperature"] = llm_temp
-                    res2 = client.chat.completions.create(**follow)
-                    final_text = res2.choices[0].message.content
-                else:
-                    final_text = msg.content
+                        req["temperature"] = llm_temp
 
-            except Exception:
+                    with st.spinner("Thinking…"):
+                        first = client.chat.completions.create(**req)
+
+                    msg = first.choices[0].message
+                    tool_calls = getattr(msg, "tool_calls", []) or []
+                    tool_msgs = []
+                    if tool_calls:
+                        for call in tool_calls:
+                            try:
+                                args = json.loads(call.function.arguments or "{}")
+                                if not isinstance(args, dict):
+                                    args = {}
+                            except Exception:
+                                args = {}
+                            name = call.function.name
+                            out = {"error": "unknown tool"}
+                            if name == "get_csat_snapshot":
+                                out = get_csat_snapshot()
+                            if name == "top_drivers":
+                                out = top_drivers(args.get("which", "detractors"), int(args.get("k", 10) or 10))
+                            if name == "segment_hotspots":
+                                out = segment_hotspots(args.get("field", "Country"), int(args.get("k", 10) or 10), int(args.get("min_n", 15) or 15))
+                            if name == "symptom_deep_dive":
+                                out = symptom_deep_dive(args.get("symptom", ""), int(args.get("k_quotes", 4) or 4))
+                            if name == "monthly_csat":
+                                out = monthly_csat(int(args.get("last_n", 6) or 6))
+                            if name == "pandas_count":
+                                out = pandas_count(args.get("query", ""))
+                            if name == "pandas_mean":
+                                out = pandas_mean(args.get("column", ""), args.get("query"))
+
+                            tool_msgs.append({"tool_call_id": call.id, "role": "tool", "name": name, "content": json.dumps(out)})
+
+                    if tool_msgs:
+                        follow = {
+                            "model": selected_model,
+                            "messages": [
+                                {"role": "system", "content": sys_ctx},
+                                {"role": "assistant", "tool_calls": tool_calls, "content": None},
+                                *tool_msgs,
+                            ],
+                        }
+                        if model_supports_temperature(selected_model):
+                            follow["temperature"] = llm_temp
+                        res2 = client.chat.completions.create(**follow)
+                        final_text = res2.choices[0].message.content
+                    else:
+                        final_text = msg.content
+
+            except Exception as e:
+                st.session_state["ai_last_error"] = repr(e)
                 st.info("AI temporarily unavailable. Showing local CSAT brief instead.")
+                with st.expander("⚠️ AI error details (why it fell back)", expanded=False):
+                    st.write("This is the exact exception raised by the OpenAI client:")
+                    st.code(repr(e))
+                    st.caption(
+                        "Common fixes: confirm the API key is valid, verify the selected model is available on your account, "
+                        "and try a non‑GPT‑5 model if your network blocks /responses."
+                    )
                 final_text = local_answer
 
         # Render answer
