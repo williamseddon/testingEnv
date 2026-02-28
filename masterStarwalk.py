@@ -1835,24 +1835,55 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ============================================================
-# Precompute analysis tables (fast)
-# ============================================================
-t_agg0 = time.perf_counter()
-detractors_results_full = analyze_symptoms_fast(filtered, existing_detractor_columns)
-delighters_results_full = analyze_symptoms_fast(filtered, existing_delighter_columns)
-trend_watchouts = _detect_trends(filtered, symptom_cols=all_sym_cols_present, min_mentions=3)
-agg_s = time.perf_counter() - t_agg0
-
-if show_perf:
-    st.sidebar.caption(f"Filter time: {filter_s:.3f}s • Agg time: {agg_s:.3f}s")
 
 # ============================================================
 # Navigation / Views
 # ============================================================
-view = st.radio("View", options=["📊 Dashboard", "📝 All Reviews", "🤖 AI"], horizontal=True, index=0, key="main_view")
+st.markdown(
+    '''
+<div class="soft-panel" style="margin-top: 6px; margin-bottom: 10px;">
+  <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:14px; flex-wrap:wrap;">
+    <div>
+      <div style="font-weight:900; font-size:1.15rem; line-height:1.15;">🧭 View</div>
+      <div class="small-muted" style="margin-top:4px;">Pick what you want to look at right now.</div>
+    </div>
+    <div class="small-muted" style="max-width:520px;">
+      Tip: <b>📝 All Reviews</b> contains the individual review cards (with green/red symptom tiles).
+    </div>
+  </div>
+</div>
+''',
+    unsafe_allow_html=True,
+)
 
-st.caption("Tip: 📝 All Reviews contains the individual review cards (with green/red symptom tiles).")
+view = st.radio(
+    "View",
+    options=["📊 Dashboard", "📝 All Reviews", "🤖 AI"],
+    horizontal=True,
+    index=0,
+    key="main_view",
+)
+
+# ============================================================
+# Precompute analysis tables (fast) — only when needed
+# ============================================================
+need_agg = view.startswith("📊") or view.startswith("🤖")
+
+if need_agg:
+    t_agg0 = time.perf_counter()
+    with st.spinner("Analyzing symptoms…"):
+        detractors_results_full = analyze_symptoms_fast(filtered, existing_detractor_columns)
+        delighters_results_full = analyze_symptoms_fast(filtered, existing_delighter_columns)
+        trend_watchouts = _detect_trends(filtered, symptom_cols=all_sym_cols_present, min_mentions=3)
+    agg_s = time.perf_counter() - t_agg0
+else:
+    detractors_results_full = pd.DataFrame(columns=["Item", "Mentions", "Avg Star", "% Total"])
+    delighters_results_full = pd.DataFrame(columns=["Item", "Mentions", "Avg Star", "% Total"])
+    trend_watchouts = []
+    agg_s = 0.0
+
+if show_perf:
+    st.sidebar.caption(f"Filter time: {filter_s:.3f}s • Agg time: {agg_s:.3f}s")
 
 # ============================================================
 # Dashboard view
@@ -2003,140 +2034,149 @@ if view.startswith("📊"):
             fig_del.update_layout(template="plotly_white", margin=dict(l=160, r=20, t=20, b=20), height=460)
             st.plotly_chart(fig_del, use_container_width=True)
 
-# ---------- Opportunity Matrix (high impact) ----------
-st.markdown("## 🎯 Opportunity Matrix")
-st.caption("Mentions vs Avg ★. Fix high-mention low-star detractors first; amplify high-mention high-star delighters.")
 
-tab_det, tab_del = st.tabs(["Detractors", "Delighters"])
+    # ---------- Opportunity Matrix (high impact) ----------
+    st.markdown("## 🎯 Opportunity Matrix")
+    st.caption("Mentions vs Avg ★. Fix high-mention low-star detractors first; amplify high-mention high-star delighters.")
 
-def _opportunity_scatter(tbl: pd.DataFrame, title: str, kind: str, baseline: float):
-    if tbl is None or tbl.empty:
-        st.info("No data available.")
-        return
+    # Baseline = overall average star rating (CURRENT filtered dataset)
+    try:
+        baseline_overall = float(all_avg)
+    except Exception:
+        baseline_overall = float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean())
+    if not np.isfinite(baseline_overall):
+        baseline_overall = 0.0
 
-    d = tbl.copy()
-    d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0)
-    d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
-    d = d.dropna(subset=["Avg Star"])
+    tab_det, tab_del = st.tabs(["Detractors", "Delighters"])
 
-    if d.empty:
-        st.info("No data available.")
-        return
+    def _opportunity_scatter(tbl: pd.DataFrame, title: str, kind: str, baseline: float):
+        if tbl is None or tbl.empty:
+            st.info("No data available.")
+            return
 
-    x = d["Mentions"].astype(float).to_numpy()
-    y = d["Avg Star"].astype(float).to_numpy()
+        d = tbl.copy()
+        d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0)
+        d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
+        d = d.dropna(subset=["Avg Star"])
 
-    # Priority score (used for labels + table)
-    if kind == "detractors":
-        score = x * np.clip(baseline - y, 0, None)
-        table_label = "Fix first (high mentions × below-baseline ★)"
-    else:
-        score = x * np.clip(y - baseline, 0, None)
-        table_label = "Amplify (high mentions × above-baseline ★)"
+        if d.empty:
+            st.info("No data available.")
+            return
 
-    # Controls (labels are OFF by default to prevent overlap)
-    c1, c2, c3 = st.columns([1.1, 1.5, 1.6])
-    show_labels = c1.toggle("Show labels", value=False, key=f"opp_show_labels_{kind}")
-    max_labels = int(min(25, len(d)))
-    label_default = int(min(10, max_labels))
-    label_n = c2.slider("Label top N", 0, max_labels, value=label_default, key=f"opp_label_n_{kind}", disabled=not show_labels)
-    size_by_mentions = c3.toggle("Bubble size = Mentions", value=True, key=f"opp_size_mentions_{kind}")
+        x = d["Mentions"].astype(float).to_numpy()
+        y = d["Avg Star"].astype(float).to_numpy()
 
-    labels = np.array([""] * len(d), dtype=object)
-    if show_labels and label_n > 0:
-        top_idx = np.argsort(-score)[:label_n]
-        labels[top_idx] = d["Item"].astype(str).to_numpy()[top_idx]
+        # Priority score (used for labels + table)
+        if kind == "detractors":
+            score = x * np.clip(baseline - y, 0, None)
+            table_label = "Fix first (high mentions × below-baseline ★)"
+        else:
+            score = x * np.clip(y - baseline, 0, None)
+            table_label = "Amplify (high mentions × above-baseline ★)"
 
-    # Marker sizing (sqrt scale for stability)
-    if size_by_mentions and np.nanmax(x) > 0:
-        size = (np.sqrt(x) / (np.sqrt(np.nanmax(x)) + 1e-9)) * 28 + 10
-    else:
-        size = np.full_like(x, 14.0, dtype=float)
+        # Controls (labels are OFF by default to prevent overlap)
+        c1, c2, c3 = st.columns([1.1, 1.5, 1.6])
+        show_labels = c1.toggle("Show labels", value=False, key=f"opp_show_labels_{kind}")
+        max_labels = int(min(25, len(d)))
+        label_default = int(min(10, max_labels))
+        label_n = c2.slider("Label top N", 0, max_labels, value=label_default, key=f"opp_label_n_{kind}", disabled=not show_labels)
+        size_by_mentions = c3.toggle("Bubble size = Mentions", value=True, key=f"opp_size_mentions_{kind}")
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=y,
-            mode=("markers+text" if show_labels else "markers"),
-            text=(labels if show_labels else None),
-            textposition="top center",
-            textfont=dict(size=10),
-            customdata=np.stack([d["Item"].astype(str).to_numpy(), score], axis=-1),
-            marker=dict(
-                size=size,
-                color=y,
-                colorscale="RdYlGn",
-                cmin=1.0,
-                cmax=5.0,
-                showscale=True,
-                colorbar=dict(title="Avg ★"),
-                opacity=0.86,
-                line=dict(width=1, color="rgba(0,0,0,0.25)"),
-            ),
-            hovertemplate="%{customdata[0]}<br>Mentions=%{x}<br>Avg ★=%{y:.2f}<br>Priority=%{customdata[1]:.2f}<extra></extra>",
+        labels = np.array([""] * len(d), dtype=object)
+        if show_labels and label_n > 0:
+            top_idx = np.argsort(-score)[:label_n]
+            labels[top_idx] = d["Item"].astype(str).to_numpy()[top_idx]
+
+        # Marker sizing (sqrt scale for stability)
+        if size_by_mentions and np.nanmax(x) > 0:
+            size = (np.sqrt(x) / (np.sqrt(np.nanmax(x)) + 1e-9)) * 28 + 10
+        else:
+            size = np.full_like(x, 14.0, dtype=float)
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode=("markers+text" if show_labels else "markers"),
+                text=(labels if show_labels else None),
+                textposition="top center",
+                textfont=dict(size=10),
+                customdata=np.stack([d["Item"].astype(str).to_numpy(), score], axis=-1),
+                marker=dict(
+                    size=size,
+                    color=y,
+                    colorscale="RdYlGn",
+                    cmin=1.0,
+                    cmax=5.0,
+                    showscale=True,
+                    colorbar=dict(title="Avg ★"),
+                    opacity=0.86,
+                    line=dict(width=1, color="rgba(0,0,0,0.25)"),
+                ),
+                hovertemplate="%{customdata[0]}<br>Mentions=%{x}<br>Avg ★=%{y:.2f}<br>Priority=%{customdata[1]:.2f}<extra></extra>",
+            )
         )
-    )
 
-    # Reference lines (median mentions + overall avg ★)
-    try:
-        fig.add_vline(x=float(np.nanmedian(x)), line_dash="dot", opacity=0.35)
-    except Exception:
-        pass
-    try:
-        fig.add_hline(y=float(baseline), line_dash="dot", opacity=0.35)
-    except Exception:
-        pass
+        # Reference lines (median mentions + overall avg ★)
+        try:
+            fig.add_vline(x=float(np.nanmedian(x)), line_dash="dot", opacity=0.35)
+        except Exception:
+            pass
+        try:
+            fig.add_hline(y=float(baseline), line_dash="dot", opacity=0.35)
+        except Exception:
+            pass
 
-    fig.update_layout(
-        template="plotly_white",
-        xaxis_title="Mentions",
-        yaxis_title="Avg ★",
-        title=title,
-        margin=dict(l=55, r=20, t=65, b=55),
-        height=560,
-    )
-    fig.update_yaxes(range=[1.0, 5.2])
-    st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(
+            template="plotly_white",
+            xaxis_title="Mentions",
+            yaxis_title="Avg ★",
+            title=title,
+            margin=dict(l=55, r=20, t=65, b=55),
+            height=560,
+        )
+        fig.update_yaxes(range=[1.0, 5.2])
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Best-in-class usability: show a ranked table (click-to-scan)
-    d_tbl = d.copy()
-    d_tbl["Priority"] = score
-    d_tbl = d_tbl.sort_values("Priority", ascending=False).head(15)
+        # Best-in-class usability: show a ranked table (click-to-scan)
+        d_tbl = d.copy()
+        d_tbl["Priority"] = score
+        d_tbl = d_tbl.sort_values("Priority", ascending=False).head(15)
 
-    cols = ["Item", "Mentions", "Avg Star"]
-    if "% Total" in d_tbl.columns:
-        cols.append("% Total")
-    cols.append("Priority")
+        cols = ["Item", "Mentions", "Avg Star"]
+        if "% Total" in d_tbl.columns:
+            cols.append("% Total")
+        cols.append("Priority")
 
-    with st.expander(f"📋 {table_label} — top 15", expanded=False):
-        out = d_tbl[cols].copy()
-        for c in ["Mentions", "Avg Star", "% Total", "Priority"]:
-            if c in out.columns:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-        if "% Total" in out.columns:
-            out["% Total"] = out["% Total"].round(2)
-        out["Avg Star"] = out["Avg Star"].round(2)
-        out["Priority"] = out["Priority"].round(2)
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        with st.expander(f"📋 {table_label} — top 15", expanded=False):
+            out = d_tbl[cols].copy()
+            for c in ["Mentions", "Avg Star", "% Total", "Priority"]:
+                if c in out.columns:
+                    out[c] = pd.to_numeric(out[c], errors="coerce")
+            if "% Total" in out.columns:
+                out["% Total"] = out["% Total"].round(2)
+            out["Avg Star"] = out["Avg Star"].round(2)
+            out["Priority"] = out["Priority"].round(2)
+            st.dataframe(out, use_container_width=True, hide_index=True)
 
-with tab_det:
-    st.caption("Hover points for symptom names. Turn on labels only if needed (top N only).")
-    _opportunity_scatter(
-        detractors_results_full.head(60),
-        "Detractors — prioritize high mentions + low Avg ★",
-        kind="detractors",
-        baseline=float(globals().get("all_avg", 0.0)) if isinstance(globals().get("all_avg", 0.0), (int, float)) else 0.0,
-    )
+    with tab_det:
+        st.caption("Hover points for symptom names. Turn on labels only if needed (top N only).")
+        _opportunity_scatter(
+            detractors_results_full.head(60),
+            "Detractors — prioritize high mentions + low Avg ★",
+            kind="detractors",
+            baseline=float(baseline_overall),
+        )
 
-with tab_del:
-    st.caption("Hover points for symptom names. Turn on labels only if needed (top N only).")
-    _opportunity_scatter(
-        delighters_results_full.head(60),
-        "Delighters — amplify high mentions + high Avg ★",
-        kind="delighters",
-        baseline=float(globals().get("all_avg", 0.0)) if isinstance(globals().get("all_avg", 0.0), (int, float)) else 0.0,
-    )
+    with tab_del:
+        st.caption("Hover points for symptom names. Turn on labels only if needed (top N only).")
+        _opportunity_scatter(
+            delighters_results_full.head(60),
+            "Delighters — amplify high mentions + high Avg ★",
+            kind="delighters",
+            baseline=float(baseline_overall),
+        )
 
     # ---------- Cumulative Avg ★ Over Time by Region (Weighted) ----------
     st.markdown("## 📈 Cumulative Avg ★ Over Time by Region (Weighted)")
@@ -2288,7 +2328,7 @@ with tab_del:
 
     # ---------- Country × Source breakdown (connected Avg + Count) ----------
     st.markdown("## 🧭 Country × Source Breakdown")
-    st.caption("Color = Avg ★, label = Count. This ties average and volume together in one view.")
+    st.caption("Color = Avg ★ (red→green), label = Count. This ties average and volume together in one view.")
 
     if "Country" in filtered.columns and "Source" in filtered.columns and "Star Rating" in filtered.columns:
         cA, cB, cC, cD = st.columns([1, 1, 1, 1])
@@ -2319,10 +2359,8 @@ with tab_del:
             if int(min_cell_n) > 0:
                 mean_m = mean_m.where(count_m >= int(min_cell_n))
 
-            # Heatmap
             hm = mean_m.copy()
             hm = hm.reindex(index=sorted(hm.index), columns=sorted(hm.columns))
-
             count_m = count_m.reindex(index=hm.index, columns=hm.columns).fillna(0).astype(int)
 
             z = hm.values
@@ -2331,7 +2369,6 @@ with tab_del:
             counts = count_m.values
 
             fig = go.Figure()
-
             fig.add_trace(
                 go.Heatmap(
                     z=z,
@@ -2358,7 +2395,6 @@ with tab_del:
                     v = z[yi][xi]
                     is_dark = False
                     try:
-                        # extremes in RdYlGn tend to be darker (red/green) → use white text
                         if v is not None and not (isinstance(v, float) and np.isnan(v)):
                             vv = float(v)
                             if vv <= 2.3 or vv >= 4.5:
