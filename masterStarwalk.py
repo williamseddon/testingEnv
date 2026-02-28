@@ -1,4 +1,4 @@
-# starwalk_master_app_v4.py
+# starwalk_master_app_v7.py
 # Streamlit master app:
 # - Accepts either:
 #   1) Star Walk scrubbed verbatims Excel/CSV (same behavior as starwalk_ui_test.py), OR
@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-02-28-master-v4"
+APP_VERSION = "2026-02-28-master-v7"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -182,14 +182,74 @@ GLOBAL_CSS = """
 
   .small-muted{ color:var(--muted); font-size:.9rem; }
 
-  .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
-  @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
-  .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
+  /* --- Metrics cards (responsive; prevents small-screen overflow) --- */
+  .metrics-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
+    gap:17px;
+  }
+  .metric-card{
+    background:var(--bg-card);
+    border-radius:14px;
+    padding:16px;
+    box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06);
+    color:var(--text);
+    min-width:0;
+  }
   .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
-  .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-  .metric-box{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:12px; padding:12px; text-align:center; color:var(--text); }
-  .metric-label{ color:var(--muted); font-size:.85rem; }
-  .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
+
+  .metric-row{
+    display:grid;
+    grid-template-columns:repeat(3, minmax(0, 1fr));
+    gap:12px;
+    align-items:stretch;
+  }
+
+  .metric-box{
+    background:var(--bg-tile);
+    border:1.6px solid var(--border);
+    border-radius:12px;
+    padding:12px 10px;
+    text-align:center;
+    color:var(--text);
+    min-width:0;           /* critical: allow CSS-grid children to shrink */
+    overflow:hidden;       /* prevent text bleed from pushing rounded corners out */
+  }
+
+  .metric-label{
+    color:var(--muted);
+    font-size:clamp(0.78rem, 1.0vw, 0.85rem);
+    line-height:1.15;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+
+  .metric-kpi{
+    font-weight:800;
+    font-size:clamp(1.35rem, 2.5vw, 1.80rem);
+    letter-spacing:-0.01em;
+    margin-top:2px;
+    color:var(--text);
+    line-height:1.05;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
+
+  @media (max-width: 520px){
+    .metric-row{ grid-template-columns:1fr; }
+    .metric-box{
+      text-align:left;
+      display:flex;
+      align-items:baseline;
+      justify-content:space-between;
+      gap:10px;
+    }
+    .metric-kpi{ margin-top:0; }
+    .metric-label{ white-space:normal; }
+  }
 
   .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
   .review-card p{ margin:.25rem 0; line-height:1.5; }
@@ -349,11 +409,30 @@ def _extract_sentence(text: str, keyword: str | None = None, prefer_tail: bool =
 
 
 def _pick_quotes_for_symptom(df_in: pd.DataFrame, symptom: str, cols: list[str], k: int = 2, prefer: str = "low"):
+    """Pick up to k short evidence snippets for a symptom.
+
+    Robustness improvements:
+    - case-insensitive symptom matching (prevents missed matches due to casing)
+    - tolerates blank/NA cells
+    """
     if not cols or not symptom:
         return []
     if "Star Rating" not in df_in.columns:
         return []
-    mask = df_in[cols].isin([symptom]).any(axis=1)
+
+    sym = str(symptom).strip()
+    if not sym:
+        return []
+    sym_l = sym.lower()
+
+    # Case-insensitive match across symptom columns
+    mask = pd.Series(False, index=df_in.index)
+    for c in cols:
+        if c not in df_in.columns:
+            continue
+        s = df_in[c].astype("string").fillna("").str.strip().str.lower()
+        mask |= s.eq(sym_l)
+
     sub = df_in.loc[mask].copy()
     if sub.empty:
         return []
@@ -361,12 +440,13 @@ def _pick_quotes_for_symptom(df_in: pd.DataFrame, symptom: str, cols: list[str],
     sub = sub.dropna(subset=["Star Rating"])
     if sub.empty:
         return []
+
     sub = sub.sort_values("Star Rating", ascending=(prefer == "low"))
     out = []
     for _, row in sub.head(k).iterrows():
         txt = clean_text(row.get("Verbatim", ""))
         txt = _mask_pii(txt)
-        sent = _extract_sentence(txt, keyword=symptom, prefer_tail=(prefer == "low"))
+        sent = _extract_sentence(txt, keyword=sym, prefer_tail=(prefer == "low"))
         if len(sent) > 280:
             sent = sent[:277] + "…"
         meta = []
@@ -388,6 +468,7 @@ def _pick_quotes_for_symptom(df_in: pd.DataFrame, symptom: str, cols: list[str],
                     pass
         out.append({"text": sent, "meta": " • ".join(meta) if meta else ""})
     return out
+
 
 
 def _detect_trends(df_in: pd.DataFrame, symptom_cols: list[str], min_mentions: int = 3):
@@ -1150,10 +1231,11 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
     long = block.stack(dropna=False).reset_index()
     # columns: level_0 (index), level_1 (col), 0 (value)
     long.columns = ["__idx", "__col", "symptom"]
-    # Clean / filter
+    # Clean / filter (normalize casing so the same symptom doesn't appear twice)
     s = long["symptom"].astype("string").str.strip()
     mask = s.map(is_valid_symptom_value)
-    long = long.loc[mask, ["__idx", "symptom"]]
+    long = long.loc[mask, ["__idx"]].copy()
+    long["symptom"] = s[mask].astype("string").str.strip().str.title()
     if long.empty:
         return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
 
@@ -2556,14 +2638,170 @@ if view.startswith("📝"):
             st.rerun()
 
 # ============================================================
-# AI view
+# AI view (CSAT Copilot)
 # ============================================================
 if view.startswith("🤖"):
-    st.markdown("## 🤖 Ask your data")
-    st.caption("No remote calls happen until you press Send or Generate.")
+    st.markdown("## 🤖 CSAT Copilot")
+    st.caption("Built for **Quality Engineering + CSAT**. No remote calls happen until you press **Send**.")
 
-    # Sidebar AI / privacy toggles
-    with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
+    # ----------------------------
+    # Compute baseline CSAT metrics (local)
+    # ----------------------------
+    stars_all = pd.to_numeric(filtered.get("Star Rating"), errors="coerce") if "Star Rating" in filtered.columns else pd.Series(dtype=float)
+    stars_all = stars_all.dropna()
+    total_reviews = int(len(filtered))
+    baseline_avg = float(stars_all.mean()) if not stars_all.empty else 0.0
+    baseline_median = float(stars_all.median()) if not stars_all.empty else 0.0
+    baseline_pct_low = float((stars_all <= 2).mean() * 100) if not stars_all.empty else 0.0
+    baseline_pct_high = float((stars_all >= 4).mean() * 100) if not stars_all.empty else 0.0
+    star_counts = (
+        stars_all.value_counts().reindex([1, 2, 3, 4, 5]).fillna(0).astype(int).to_dict()
+        if not stars_all.empty
+        else {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    )
+
+    # Cache heavyweight CSAT/driver tables per applied filter state
+    try:
+        _filters_hash = hashlib.sha1(json.dumps(active_filters, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    except Exception:
+        _filters_hash = str(len(filtered))
+
+    _ai_cache = st.session_state.setdefault("_ai_csat_cache", {})
+    if _filters_hash not in _ai_cache:
+        def _symptom_driver_stats(df_in: pd.DataFrame, symptom_cols: list[str]) -> pd.DataFrame:
+            cols = [c for c in symptom_cols if c in df_in.columns]
+            if not cols or df_in.empty or "Star Rating" not in df_in.columns:
+                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
+
+            stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
+            # long stack
+            long = df_in[cols].stack(dropna=False).reset_index()
+            long.columns = ["__idx", "__col", "symptom"]
+            s = long["symptom"].astype("string").str.strip()
+            long = long.loc[s.map(is_valid_symptom_value), ["__idx", "symptom"]]
+            if long.empty:
+                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
+
+            tmp = long.drop_duplicates(subset=["__idx", "symptom"]).copy()
+            star_map = stars.to_dict()
+            tmp["star"] = tmp["__idx"].map(star_map)
+            tmp = tmp.dropna(subset=["star"])
+            tmp["low"] = tmp["star"] <= 2
+
+            g = tmp.groupby("symptom").agg(Reviews=("__idx", "nunique"), AvgStar=("star", "mean"), PctLow=("low", "mean"))
+            g = g.sort_values("Reviews", ascending=False)
+            g.reset_index(inplace=True)
+            g.rename(columns={"symptom": "Symptom"}, inplace=True)
+
+            total = max(1, len(df_in))
+            g["Mention %"] = (g["Reviews"] / total * 100).round(1)
+            g["Avg ★"] = g["AvgStar"].astype(float).round(2)
+            g["% 1–2★"] = (g["PctLow"].astype(float) * 100).round(1)
+            out = g[["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"]].copy()
+            out["Symptom"] = out["Symptom"].astype(str).str.title()
+            return out
+
+        def _driver_table(stats_df: pd.DataFrame, kind: str) -> pd.DataFrame:
+            if stats_df.empty:
+                return stats_df
+            df = stats_df.copy()
+            # Deltas vs baseline
+            df["Δ Avg ★"] = (df["Avg ★"] - baseline_avg).round(2)
+            df["Δ % 1–2★"] = (df["% 1–2★"] - baseline_pct_low).round(1)
+
+            # Impact score: "rating points recovered" if symptom removed (heuristic)
+            if kind == "detractors":
+                df["Impact"] = (df["Reviews"] * (baseline_avg - df["Avg ★"])).round(2)
+                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
+            else:
+                df["Impact"] = (df["Reviews"] * (df["Avg ★"] - baseline_avg)).round(2)
+                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
+
+            # Keep readable columns
+            return df[["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★", "Δ Avg ★", "Δ % 1–2★", "Impact"]].reset_index(drop=True)
+
+        # Hotspot tables (Country/Source/SKU) for DSAT (%1–2★)
+        def _segment_hotspots(df_in: pd.DataFrame, field: str, k: int = 10, min_n: int = 15) -> pd.DataFrame:
+            if field not in df_in.columns or df_in.empty or "Star Rating" not in df_in.columns:
+                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
+            d = df_in[[field, "Star Rating"]].copy()
+            d[field] = d[field].astype("string").fillna("(blank)").str.strip().replace("", "(blank)")
+            d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+            d = d.dropna(subset=["star"])
+            if d.empty:
+                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
+            d["low"] = d["star"] <= 2
+            d["high"] = d["star"] >= 4
+            g = d.groupby(field).agg(Reviews=("star", "size"), Avg=("star", "mean"), PctLow=("low", "mean"), PctHigh=("high", "mean")).reset_index()
+            g["Avg ★"] = g["Avg"].round(2)
+            g["% 1–2★"] = (g["PctLow"] * 100).round(1)
+            g["% 4–5★"] = (g["PctHigh"] * 100).round(1)
+            g = g[g["Reviews"] >= int(min_n)]
+            g = g.sort_values(["% 1–2★", "Reviews"], ascending=[False, False]).head(int(k))
+            return g[[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"]]
+
+        with st.spinner("Building CSAT driver tables…"):
+            det_stats = _symptom_driver_stats(filtered, existing_detractor_columns)
+            del_stats = _symptom_driver_stats(filtered, existing_delighter_columns)
+            driver_det = _driver_table(det_stats, "detractors")
+            driver_del = _driver_table(del_stats, "delighters")
+
+            hotspots = {}
+            for f in ["Country", "Source", "Model (SKU)", "Seeded"]:
+                hotspots[f] = _segment_hotspots(filtered, f, k=10, min_n=15)
+
+            _ai_cache[_filters_hash] = {
+                "driver_det": driver_det,
+                "driver_del": driver_del,
+                "hotspots": hotspots,
+            }
+
+    driver_det = _ai_cache[_filters_hash]["driver_det"]
+    driver_del = _ai_cache[_filters_hash]["driver_del"]
+    hotspots = _ai_cache[_filters_hash]["hotspots"]
+
+    # ----------------------------
+    # CSAT snapshot panel
+    # ----------------------------
+    cA, cB, cC, cD = st.columns([1, 1, 1, 1])
+    cA.metric("Reviews (filtered)", f"{total_reviews:,}")
+    cB.metric("Avg ★", f"{baseline_avg:.2f}")
+    cC.metric("% 1–2★ (DSAT proxy)", f"{baseline_pct_low:.1f}%")
+    cD.metric("% 4–5★ (CSAT proxy)", f"{baseline_pct_high:.1f}%")
+
+    with st.expander("📌 Quick CSAT context (drivers + hotspots)", expanded=True):
+        left, right = st.columns([1, 1])
+        with left:
+            st.markdown("### 🚨 Top CSAT risks (Detractors)")
+            st.caption("Sorted by **Impact** (heuristic: reviews × rating deficit vs baseline).")
+            if driver_det.empty:
+                st.info("No detractor symptoms found in this filtered dataset.")
+            else:
+                st.dataframe(driver_det.head(12), use_container_width=True, hide_index=True)
+
+        with right:
+            st.markdown("### ✅ Top CSAT strengths (Delighters)")
+            st.caption("Protect these. Also useful for 'what to highlight in marketing / onboarding'.")
+            if driver_del.empty:
+                st.info("No delighter symptoms found in this filtered dataset.")
+            else:
+                st.dataframe(driver_del.head(12), use_container_width=True, hide_index=True)
+
+        st.markdown("### 🗺️ DSAT hotspots (where the pain concentrates)")
+        h1, h2 = st.columns([1, 1])
+        with h1:
+            st.markdown("**By Country**")
+            st.dataframe(hotspots.get("Country", pd.DataFrame()).head(10), use_container_width=True, hide_index=True)
+        with h2:
+            st.markdown("**By Source**")
+            st.dataframe(hotspots.get("Source", pd.DataFrame()).head(10), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ----------------------------
+    # Sidebar: AI settings (kept local until Send)
+    # ----------------------------
+    with st.sidebar.expander("🤖 AI Assistant", expanded=False):
         _model_choices = [
             ("Fast & economical – 4o-mini", "gpt-4o-mini"),
             ("Balanced – 4o", "gpt-4o"),
@@ -2588,15 +2826,27 @@ if view.startswith("🤖"):
         if not temp_supported:
             st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
 
-    with st.sidebar.expander("🔒 Privacy & AI", expanded=True):
+        st.session_state["ai_style"] = st.radio(
+            "Answer style",
+            options=["Engineering deep dive", "Executive brief"],
+            index=0 if st.session_state.get("ai_style", "Engineering deep dive") == "Engineering deep dive" else 1,
+            help="Engineering = root cause hypotheses + next tests. Executive = crisp summary + priorities.",
+        )
+
+    with st.sidebar.expander("🔒 Privacy & Retrieval", expanded=True):
         ai_enabled = st.toggle(
-            "Enable AI (send filtered text to OpenAI)",
+            "Enable remote AI (send masked snippets to OpenAI)",
             value=bool(st.session_state.get("ai_enabled", True)),
             key="ai_enabled",
-            help="When on and you ask a question, short masked snippets and embeddings are sent to OpenAI.",
+        )
+        send_quotes = st.toggle(
+            "Include evidence quotes in AI context",
+            value=bool(st.session_state.get("ai_send_quotes", True)),
+            key="ai_send_quotes",
+            help="Turn off if you want *only* aggregated stats sent to the model.",
         )
         ai_cap = st.number_input(
-            "Max reviews to embed per Q",
+            "Max reviews to embed per Q (semantic search)",
             min_value=200,
             max_value=5000,
             value=int(st.session_state.get("ai_cap", 1500)),
@@ -2605,7 +2855,6 @@ if view.startswith("🤖"):
         )
         st.caption("Emails/phone numbers are masked before embedding.")
 
-    with st.sidebar.expander("🧠 Local Intelligence", expanded=False):
         st.toggle("Use BM25 blend (local, fast)", value=st.session_state.get("use_bm25", False), key="use_bm25")
         st.toggle("Use cross-encoder reranker (local, slower)", value=st.session_state.get("use_reranker", False), key="use_reranker")
 
@@ -2616,20 +2865,22 @@ if view.startswith("🤖"):
     api_key = api_key_override or st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
     if not _HAS_OPENAI:
-        st.info("To enable remote LLM, add `openai` to requirements and set `OPENAI_API_KEY`. Local Q&A still works.")
+        st.info("To enable remote LLM, add `openai` to requirements and set `OPENAI_API_KEY`. Local CSAT Copilot still works.")
     elif not api_key:
-        st.info("Set `OPENAI_API_KEY` (env or .streamlit/secrets.toml) for remote LLM. Local Q&A still works.")
+        st.info("Set `OPENAI_API_KEY` (env or .streamlit/secrets.toml) for remote LLM. Local CSAT Copilot still works.")
 
-    # Preset questions
+    # ----------------------------
+    # Preset questions tuned for CSAT / quality engineering
+    # ----------------------------
     if "ask_q" not in st.session_state:
         st.session_state["ask_q"] = ""
 
     st.markdown(
         """
 <div class="soft-panel">
-  <div style="font-weight:800; font-size:1.05rem;">⚡ Preset Insight Questions</div>
+  <div style="font-weight:850; font-size:1.05rem;">🪄 CSAT Playbooks</div>
   <div class="small-muted" style="margin-top:4px;">
-    Click one to prefill the question box (then click <b>Send</b>).
+    Click to prefill the question box, then press <b>Send</b>.
   </div>
 </div>
 """,
@@ -2637,75 +2888,162 @@ if view.startswith("🤖"):
     )
 
     b1, b2, b3, b4, b5, b6 = st.columns([1, 1, 1, 1, 1, 1])
-    if b1.button("Executive Summary", use_container_width=True):
+    if b1.button("CSAT Brief", use_container_width=True):
         st.session_state["ask_q"] = (
-            "Provide an executive summary of this product based on the CURRENT filtered reviews. "
-            "Quantify key points (counts/percentages), list top delighters and detractors, and include 4–6 evidence quotes."
+            "Write a CSAT brief for a quality engineer using ONLY the current filtered reviews: "
+            "1) CSAT headline, 2) top 5 DSAT drivers with metrics + likely root causes, "
+            "3) hotspots (Country/Source/SKU), 4) next 7-day actions + validation plan, "
+            "5) top 3 delighters to protect. Cite evidence quotes by ID."
         )
-    if b2.button("Top Delighters", use_container_width=True):
-        st.session_state["ask_q"] = "What are the top delighters? Quantify mentions and include evidence quotes."
-    if b3.button("Top Detractors", use_container_width=True):
-        st.session_state["ask_q"] = "What are the top detractors? Quantify mentions and include evidence quotes."
-    if b4.button("Biggest Improvements", use_container_width=True):
-        st.session_state["ask_q"] = (
-            "What are the biggest improvement opportunities for this product? "
-            "Quantify how common each issue is, and recommend 3–6 actions prioritized by impact."
-        )
-    if b5.button("Trends / Watchouts", use_container_width=True):
-        st.session_state["ask_q"] = "Are there any emerging trends or watchouts? Quantify changes and include evidence."
-    if b6.button("Seeded vs Organic", use_container_width=True):
-        st.session_state["ask_q"] = "Compare Seeded vs Organic. Quantify the avg rating gap, volumes, and key theme differences."
+    if b2.button("Top DSAT Drivers", use_container_width=True):
+        st.session_state["ask_q"] = "What are the top drivers of 1–2★ reviews? Quantify (mention %, avg ★, DSAT lift) and propose fixes + validation."
+    if b3.button("Hotspot RCA", use_container_width=True):
+        st.session_state["ask_q"] = "Pick the biggest DSAT hotspot (Country/Source/SKU) and do an RCA: what themes drive low stars there, and what should we test next?"
+    if b4.button("Seeded vs Organic", use_container_width=True):
+        st.session_state["ask_q"] = "Compare Seeded vs Organic: rating gap, DSAT gap, and the top theme differences. Provide actions."
+    if b5.button("Trend Watchouts", use_container_width=True):
+        st.session_state["ask_q"] = "Are there emerging watchouts recently? Quantify movement and list the most likely drivers and what to monitor."
+    if b6.button("Defect Backlog", use_container_width=True):
+        st.session_state["ask_q"] = "Create a prioritized defect backlog from detractor symptoms: severity × frequency × trend. Recommend owners/next tests."
 
+    # ----------------------------
     # Ask form
-    with st.form("ask_ai_form", clear_on_submit=True):
-        q = st.text_area("Ask a question", key="ask_q", height=90)
+    # ----------------------------
+    with st.form("ask_ai_form", clear_on_submit=False):
+        q = st.text_area("Ask a question", key="ask_q", height=110, placeholder="Example: What should we fix first to reduce % 1–2★?")
         send = st.form_submit_button("Send")
 
     if send and q.strip():
         q = q.strip()
 
-        # Local retrieval first (no remote calls)
-        verb_series_all = filtered.get("Verbatim", pd.Series(dtype=str)).fillna("").astype(str).map(clean_text)
-        local_texts = verb_series_all.tolist()
+        # --------------------------------------
+        # Local retrieval corpus (enriched)
+        # --------------------------------------
+        def _row_symptoms_list(row: pd.Series, cols: list[str]) -> list[str]:
+            out = []
+            for c in cols:
+                if c not in row.index:
+                    continue
+                v = row.get(c, pd.NA)
+                if pd.isna(v):
+                    continue
+                s = str(v).strip()
+                if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}:
+                    continue
+                out.append(s)
+            # de-dup preserving order
+            seen = set()
+            out2 = []
+            for x in out:
+                xl = x.lower()
+                if xl in seen:
+                    continue
+                seen.add(xl)
+                out2.append(x)
+            return out2
 
-        # Build local index on demand
+        # Build enriched text lines ONCE per filter hash
+        _enriched_cache = st.session_state.setdefault("_ai_enriched_texts", {})
+        if _filters_hash not in _enriched_cache:
+            rows = []
+            # Keep this fast: avoid expensive apply() with python objects too much; iterrows is OK up to a few thousand.
+            for _, r in filtered.iterrows():
+                verb = clean_text(r.get("Verbatim", ""))
+                verb = _mask_pii(str(verb))
+                meta = []
+                for f in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+                    if f in filtered.columns:
+                        vv = r.get(f, pd.NA)
+                        if pd.notna(vv) and str(vv).strip():
+                            meta.append(f"{f}={str(vv).strip()}")
+                sr = r.get("Star Rating", pd.NA)
+                if pd.notna(sr):
+                    meta.append(f"Star={sr}")
+                dets = _row_symptoms_list(r, existing_detractor_columns)
+                dels = _row_symptoms_list(r, existing_delighter_columns)
+                if dets:
+                    meta.append("Detractors=" + ", ".join(dets[:6]) + ("…" if len(dets) > 6 else ""))
+                if dels:
+                    meta.append("Delighters=" + ", ".join(dels[:6]) + ("…" if len(dels) > 6 else ""))
+                prefix = " | ".join(meta)
+                txt = (prefix + " || " if prefix else "") + verb
+                rows.append(txt[:2500])
+            _enriched_cache[_filters_hash] = rows
+
+        local_texts = _enriched_cache[_filters_hash]
         content_hash_local = _hash_texts(local_texts)
         local_index = _get_or_build_local_text_index(local_texts, content_hash_local)
 
         hits = _local_search(q, local_index, top_k=10)
         local_quotes = []
         for txt, _score in hits[:6]:
-            s = (txt or "").strip()
+            # Extract only the verbatim portion for display
+            s = (txt or "").split("||", 1)[-1].strip()
             s = _mask_pii(s)
             if len(s) > 320:
                 s = s[:317] + "…"
             if s:
                 local_quotes.append(s)
 
-        # Basic local answer (quick fallback)
-        snapshot = {
-            "total_reviews": int(len(filtered)),
-            "avg_star": float(pd.to_numeric(filtered.get("Star Rating"), errors="coerce").mean()) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
-            "pct_1_2": float((pd.to_numeric(filtered.get("Star Rating"), errors="coerce") <= 2).mean() * 100) if len(filtered) and "Star Rating" in filtered.columns else 0.0,
-        }
-        local_answer = f"Snapshot — {snapshot['total_reviews']} reviews; avg ★ {snapshot['avg_star']:.2f}; % 1–2★ {snapshot['pct_1_2']:.1f}%."
+        # --------------------------------------
+        # Evidence pack: add symptom-focused quotes for top drivers
+        # --------------------------------------
+        evidence_pack = {"local_quotes": local_quotes[:6], "retrieved_quotes": [], "symptom_quotes": []}
 
-        if local_quotes:
-            local_answer += "\n\nRepresentative quotes:\n" + "\n".join([f"• “{_mask_pii(x)}”" for x in local_quotes[:5]])
+        # pick top 2 detractor + top 2 delighter symptoms as extra evidence anchors
+        top_det_syms = driver_det["Symptom"].head(2).tolist() if not driver_det.empty else []
+        top_del_syms = driver_del["Symptom"].head(2).tolist() if not driver_del.empty else []
 
+        for sym in top_det_syms:
+            evidence_pack["symptom_quotes"].extend(_pick_quotes_for_symptom(filtered, sym, existing_detractor_columns, k=2, prefer="low"))
+        for sym in top_del_syms:
+            evidence_pack["symptom_quotes"].extend(_pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high"))
+
+        # --------------------------------------
+        # Local structured answer (always available)
+        # --------------------------------------
+        def _local_csat_answer() -> str:
+            lines = []
+            lines.append(f"**CSAT snapshot (filtered):** {total_reviews:,} reviews • Avg ★ **{baseline_avg:.2f}** • % 1–2★ **{baseline_pct_low:.1f}%** • % 4–5★ **{baseline_pct_high:.1f}%**.")
+            if not driver_det.empty:
+                lines.append("")
+                lines.append("**Top CSAT risks (detractors) — by Impact:**")
+                for _, r in driver_det.head(5).iterrows():
+                    lines.append(
+                        f"- **{r['Symptom']}** — reviews {int(r['Reviews']):,} ({float(r['Mention %']):.1f}%), "
+                        f"Avg ★ {float(r['Avg ★']):.2f}, %1–2★ {float(r['% 1–2★']):.1f}% "
+                        f"(Δ Avg {float(r['Δ Avg ★']):+.2f}, Δ DSAT {float(r['Δ % 1–2★']):+.1f}pp)"
+                    )
+            if not driver_del.empty:
+                lines.append("")
+                lines.append("**Top strengths (delighters) — protect these:**")
+                for _, r in driver_del.head(3).iterrows():
+                    lines.append(
+                        f"- **{r['Symptom']}** — reviews {int(r['Reviews']):,} ({float(r['Mention %']):.1f}%), Avg ★ {float(r['Avg ★']):.2f}"
+                    )
+            if evidence_pack["local_quotes"]:
+                lines.append("")
+                lines.append("**Representative quotes (local retrieval):**")
+                for i, s in enumerate(evidence_pack["local_quotes"][:4], start=1):
+                    lines.append(f"- [L{i}] “{_mask_pii(s)}”")
+            return "\n".join(lines)
+
+        local_answer = _local_csat_answer()
         final_text = None
-        evidence_pack = {"local_quotes": local_quotes[:6], "retrieved_quotes": []}
 
-        if not ai_enabled or (not _HAS_OPENAI) or (not api_key):
+        # --------------------------------------
+        # Remote LLM (optional)
+        # --------------------------------------
+        if (not ai_enabled) or (not _HAS_OPENAI) or (not api_key):
             final_text = local_answer
         else:
             try:
-                raw_texts_all = [_mask_pii(t) for t in local_texts]
-
+                # Vector retrieval (semantic) over a stable subset (optional but helpful for nuanced Qs)
+                raw_texts_all = local_texts  # already masked, enriched, truncated
                 def _stable_top_k(texts: list[str], k: int) -> list[str]:
                     if k >= len(texts):
                         return texts
-                    keyed = [(hashlib.md5((t or "").encode()).hexdigest(), t) for t in texts]
+                    keyed = [(hashlib.md5((t or "").encode("utf-8")).hexdigest(), t) for t in texts]
                     keyed.sort(key=lambda x: x[0])
                     return [t for _, t in keyed[:k]]
 
@@ -2718,64 +3056,373 @@ if view.startswith("🤖"):
                 retrieved = vector_search(q, index, api_key, top_k=10) if index else []
                 retrieved_quotes = []
                 for txt, _sim in retrieved[:6]:
-                    s = (txt or "").strip()
+                    s = (txt or "").split("||", 1)[-1].strip()
+                    s = _mask_pii(s)
                     if len(s) > 320:
                         s = s[:317] + "…"
                     if s:
                         retrieved_quotes.append(s)
                 evidence_pack["retrieved_quotes"] = retrieved_quotes[:6]
 
-                # Context pack
-                top_det = detractors_results_full.head(8).to_dict(orient="records")
-                top_del = delighters_results_full.head(8).to_dict(orient="records")
-
-                symptom_quotes = []
-                if top_det:
-                    sym = str(top_det[0].get("Item", "")).title()
-                    symptom_quotes.extend(_pick_quotes_for_symptom(filtered, sym, existing_detractor_columns, k=2, prefer="low"))
-                if top_del:
-                    sym = str(top_del[0].get("Item", "")).title()
-                    symptom_quotes.extend(_pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high"))
+                # Context pack (compact, CSAT-focused)
+                style = st.session_state.get("ai_style", "Engineering deep dive")
+                ctx = {
+                    "filters": active_filters,
+                    "counts": {"total_reviews": total_reviews},
+                    "csat": {
+                        "avg_star": round(baseline_avg, 3),
+                        "median_star": round(baseline_median, 3),
+                        "pct_1_2": round(baseline_pct_low, 2),
+                        "pct_4_5": round(baseline_pct_high, 2),
+                        "star_counts": star_counts,
+                    },
+                    "top_detractor_drivers": driver_det.head(15).to_dict(orient="records") if not driver_det.empty else [],
+                    "top_delighter_drivers": driver_del.head(15).to_dict(orient="records") if not driver_del.empty else [],
+                    "hotspots_country": hotspots.get("Country", pd.DataFrame()).head(10).to_dict(orient="records"),
+                    "hotspots_source": hotspots.get("Source", pd.DataFrame()).head(10).to_dict(orient="records"),
+                    "watchouts": trend_watchouts[:8],
+                    "answer_style": style,
+                }
 
                 evidence_lines = []
-                for i, s in enumerate(local_quotes[:5], start=1):
-                    evidence_lines.append(f"[L{i}] “{_mask_pii(s)}”")
-                for i, s in enumerate(retrieved_quotes[:5], start=1):
-                    evidence_lines.append(f"[R{i}] “{_mask_pii(s)}”")
-                for i, qq in enumerate(symptom_quotes[:4], start=1):
-                    evidence_lines.append(f"[S{i}] “{qq.get('text','')}” — {qq.get('meta','')}")
+                if send_quotes:
+                    for i, s in enumerate(local_quotes[:5], start=1):
+                        evidence_lines.append(f"[L{i}] “{_mask_pii(s)}”")
+                    for i, s in enumerate(retrieved_quotes[:5], start=1):
+                        evidence_lines.append(f"[R{i}] “{_mask_pii(s)}”")
+                    for i, qq in enumerate(evidence_pack["symptom_quotes"][:6], start=1):
+                        evidence_lines.append(f"[S{i}] “{qq.get('text','')}” — {qq.get('meta','')}")
+
+                # ---------------- Tooling (LLM can ask for exact stats) ----------------
+                def _safe_query(qs: str) -> bool:
+                    if not qs or len(qs) > 220:
+                        return False
+                    bad = ["__", "@", "import", "exec", "eval", "os.", "pd.", "open(", "read", "write", "globals", "locals", "`", ";", "\n"]
+                    if any(t in qs.lower() for t in bad):
+                        return False
+                    return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
+
+                def pandas_count(query: str) -> dict:
+                    try:
+                        if not _safe_query(query):
+                            return {"error": "unsafe query"}
+                        res = filtered.query(query)
+                        return {"count": int(len(res))}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                def pandas_mean(column: str, query: str | None = None) -> dict:
+                    try:
+                        if column not in filtered.columns:
+                            return {"error": f"Unknown column {column}"}
+                        d = filtered if not query else (filtered.query(query) if _safe_query(query) else None)
+                        if d is None:
+                            return {"error": "unsafe query"}
+                        return {"mean": float(pd.to_numeric(d[column], errors="coerce").mean())}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                def get_csat_snapshot() -> dict:
+                    return ctx["csat"] | {"total_reviews": total_reviews}
+
+                def top_drivers(which: str, k: int = 10) -> dict:
+                    try:
+                        kk = max(1, min(int(k or 10), 50))
+                        if (which or "").lower().startswith("del"):
+                            d = driver_del.head(kk)
+                        else:
+                            d = driver_det.head(kk)
+                        return {"rows": d.to_dict(orient="records")}
+                    except Exception as e:
+                        return {"error": str(e)}
+                def segment_hotspots(field: str, k: int = 10, min_n: int = 15) -> dict:
+                    """DSAT hotspots by segment (uses the current filtered dataframe)."""
+                    try:
+                        allowed = {"Country", "Source", "Model (SKU)", "Seeded", "New Review"}
+                        if field not in allowed:
+                            return {"error": f"field must be one of {sorted(list(allowed))}"}
+
+                        kk = max(1, min(int(k or 10), 25))
+                        mn = max(1, min(int(min_n or 15), 200))
+
+                        if field not in filtered.columns or "Star Rating" not in filtered.columns or filtered.empty:
+                            return {"rows": []}
+
+                        d = filtered[[field, "Star Rating"]].copy()
+                        d[field] = d[field].astype("string").fillna("(blank)").str.strip().replace("", "(blank)")
+                        d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+                        d = d.dropna(subset=["star"])
+                        if d.empty:
+                            return {"rows": []}
+                        d["low"] = d["star"] <= 2
+                        d["high"] = d["star"] >= 4
+                        g = (
+                            d.groupby(field)
+                            .agg(Reviews=("star", "size"), Avg=("star", "mean"), PctLow=("low", "mean"), PctHigh=("high", "mean"))
+                            .reset_index()
+                        )
+                        g["Avg ★"] = g["Avg"].round(2)
+                        g["% 1–2★"] = (g["PctLow"] * 100).round(1)
+                        g["% 4–5★"] = (g["PctHigh"] * 100).round(1)
+                        g = g[g["Reviews"] >= mn].sort_values(["% 1–2★", "Reviews"], ascending=[False, False]).head(kk)
+                        return {"rows": g[[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"]].to_dict(orient="records"), "min_n": mn}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                def symptom_deep_dive(symptom: str, k_quotes: int = 4) -> dict:
+                    try:
+                        sym = (symptom or "").strip()
+                        if not sym:
+                            return {"error": "missing symptom"}
+                        # Try to normalize to known symptom names
+                        import difflib
+                        all_syms = []
+                        if not driver_det.empty:
+                            all_syms.extend(driver_det["Symptom"].tolist())
+                        if not driver_del.empty:
+                            all_syms.extend(driver_del["Symptom"].tolist())
+                        all_syms = sorted(set(all_syms))
+                        sym_norm = sym.title()
+                        if all_syms and sym_norm not in all_syms:
+                            m = difflib.get_close_matches(sym_norm, all_syms, n=1, cutoff=0.6)
+                            if m:
+                                sym_norm = m[0]
+
+                        # Compute stats quickly
+                        cols = [c for c in all_sym_cols_present if c in filtered.columns]
+                        if not cols:
+                            return {"error": "no symptom columns in dataset"}
+                        sym_l = sym_norm.lower()
+                        mask = pd.Series(False, index=filtered.index)
+                        for c in cols:
+                            s = filtered[c].astype("string").fillna("").str.strip().str.lower()
+                            mask |= s.eq(sym_l)
+                        d = filtered[mask]
+                        s = pd.to_numeric(d.get("Star Rating"), errors="coerce")
+                        snap = {
+                            "symptom": sym_norm,
+                            "reviews": int(len(d)),
+                            "mention_pct": round((len(d) / max(1, total_reviews)) * 100, 2),
+                            "avg_star": float(s.mean()) if not s.empty else None,
+                            "pct_1_2": float((s <= 2).mean() * 100) if not s.empty else None,
+                        }
+
+                        # Top segments
+                        seg = {}
+                        for f in ["Country", "Source", "Model (SKU)"]:
+                            if f in d.columns and len(d):
+                                seg[f] = d[f].astype("string").fillna("(blank)").value_counts().head(8).to_dict()
+
+                        # Evidence quotes
+                        qq = []
+                        qq.extend(_pick_quotes_for_symptom(filtered, sym_norm, existing_detractor_columns, k=int(k_quotes or 4), prefer="low"))
+                        if not qq:
+                            qq.extend(_pick_quotes_for_symptom(filtered, sym_norm, existing_delighter_columns, k=int(k_quotes or 4), prefer="high"))
+                        return {"snapshot": snap, "top_segments": seg, "quotes": qq[: int(k_quotes or 4)]}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                def monthly_csat(last_n: int = 6) -> dict:
+                    try:
+                        if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
+                            return {"rows": []}
+                        n = max(3, min(int(last_n or 6), 24))
+                        d = filtered[["Review Date", "Star Rating"]].copy()
+                        d["dt"] = pd.to_datetime(d["Review Date"], errors="coerce")
+                        d = d.dropna(subset=["dt"])
+                        d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+                        d = d.dropna(subset=["star"])
+                        if d.empty:
+                            return {"rows": []}
+                        d["month"] = d["dt"].dt.to_period("M").astype(str)
+                        d["low"] = d["star"] <= 2
+                        d["high"] = d["star"] >= 4
+                        g = d.groupby("month").agg(
+                            Reviews=("star", "size"),
+                            Avg=("star", "mean"),
+                            PctLow=("low", "mean"),
+                            PctHigh=("high", "mean"),
+                        ).reset_index()
+                        g["Avg ★"] = g["Avg"].round(2)
+                        g["% 1–2★"] = (g["PctLow"] * 100).round(1)
+                        g["% 4–5★"] = (g["PctHigh"] * 100).round(1)
+                        g = g.sort_values("month").tail(n)
+                        return {"rows": g[["month", "Reviews", "Avg ★", "% 1–2★", "% 4–5★"]].to_dict(orient="records")}
+                    except Exception as e:
+                        return {"error": str(e)}
+
+                tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_csat_snapshot",
+                            "description": "Return CSAT/DSAT metrics for the currently filtered dataset.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "top_drivers",
+                            "description": "Return top driver symptoms for CSAT. which='detractors' or 'delighters'.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "which": {"type": "string"},
+                                    "k": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "segment_hotspots",
+                            "description": "Return DSAT hotspots for a segment field (Country/Source/Model (SKU)/Seeded/New Review).",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "field": {"type": "string"},
+                                    "k": {"type": "integer"},
+                                    "min_n": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "symptom_deep_dive",
+                            "description": "Deep dive a symptom: volume, DSAT share, affected segments, and evidence quotes.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "symptom": {"type": "string"},
+                                    "k_quotes": {"type": "integer"},
+                                },
+                                "required": ["symptom"],
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "monthly_csat",
+                            "description": "Monthly CSAT metrics (reviews, avg star, DSAT/CSAT proxy) for the last N months.",
+                            "parameters": {"type": "object", "properties": {"last_n": {"type": "integer"}}},
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pandas_count",
+                            "description": "Count rows in the filtered dataset matching a safe pandas.query expression.",
+                            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pandas_mean",
+                            "description": "Mean of a numeric column for all rows (or those matching a safe pandas.query).",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"column": {"type": "string"}, "query": {"type": "string"}},
+                                "required": ["column"],
+                            },
+                        },
+                    },
+                ]
+
+                # System prompt — Quality Engineer / CSAT framing
+                style_note = (
+                    "Engineering deep dive: include root-cause hypotheses (design vs manufacturing vs packaging/shipping vs usability), and a validation plan."
+                    if style == "Engineering deep dive"
+                    else "Executive brief: short, crisp summary + 3–6 priorities + risks + next actions."
+                )
 
                 sys_ctx = (
-                    "You are a consumer insights expert analyzing ONLY the provided dataset.\n"
-                    "Rules:\n"
-                    "- Use ONLY numbers from METRICS_JSON or tool outputs. Do NOT invent numbers.\n"
-                    "- Cite evidence quotes by ID like [L1], [R2], [S1].\n"
-                    "- If evidence is weak, say so.\n\n"
+                    "You are **CSAT Copilot**, an assistant for a **Quality Engineer**.\n"
+                    "Primary goal: improve CSAT by reducing DSAT (1–2★ share) and removing the highest-impact detractors.\n\n"
+                    "Hard rules:\n"
+                    "- Use ONLY numbers that appear in CONTEXT_JSON or tool outputs. If you need a number, call a tool.\n"
+                    "- Do NOT fabricate quotes. Only cite from EVIDENCE_QUOTES by ID (e.g., [L1], [R2], [S1]).\n"
+                    "- When you propose actions, include how to validate (what metric moves, what test, what data).\n\n"
+                    f"STYLE_GUIDE: {style_note}\n"
                     f"PRODUCT_GUESS={product_label}\n"
-                    f"METRICS_JSON:\n{json.dumps(snapshot, ensure_ascii=False)}\n\n"
-                    f"TOP_DETRACTORS_JSON:\n{json.dumps(top_det, ensure_ascii=False)}\n\n"
-                    f"TOP_DELIGHTERS_JSON:\n{json.dumps(top_del, ensure_ascii=False)}\n\n"
-                    "EVIDENCE_QUOTES:\n" + ("\n".join(evidence_lines) if evidence_lines else "(none)")
+                    f"ROW_COUNT={total_reviews}\n\n"
+                    f"CONTEXT_JSON:\n{json.dumps(ctx, ensure_ascii=False)}\n\n"
+                    "EVIDENCE_QUOTES:\n" + ("\n".join(evidence_lines) if evidence_lines else "(quotes not provided)")
                 )
 
                 selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
                 llm_temp = float(st.session_state.get("llm_temp", 0.2))
 
                 client = OpenAI(api_key=api_key)
-                req = {"model": selected_model, "messages": [{"role": "system", "content": sys_ctx}, {"role": "user", "content": q}]}
+
+                req = {
+                    "model": selected_model,
+                    "messages": [{"role": "system", "content": sys_ctx}, {"role": "user", "content": q}],
+                    "tools": tools,
+                }
                 if model_supports_temperature(selected_model):
                     req["temperature"] = llm_temp
 
                 with st.spinner("Thinking…"):
-                    resp = client.chat.completions.create(**req)
+                    first = client.chat.completions.create(**req)
 
-                final_text = resp.choices[0].message.content
+                msg = first.choices[0].message
+                tool_calls = getattr(msg, "tool_calls", []) or []
+                tool_msgs = []
+                if tool_calls:
+                    for call in tool_calls:
+                        try:
+                            args = json.loads(call.function.arguments or "{}")
+                            if not isinstance(args, dict):
+                                args = {}
+                        except Exception:
+                            args = {}
+                        name = call.function.name
+                        out = {"error": "unknown tool"}
+                        if name == "get_csat_snapshot":
+                            out = get_csat_snapshot()
+                        if name == "top_drivers":
+                            out = top_drivers(args.get("which", "detractors"), int(args.get("k", 10) or 10))
+                        if name == "segment_hotspots":
+                            out = segment_hotspots(args.get("field", "Country"), int(args.get("k", 10) or 10), int(args.get("min_n", 15) or 15))
+                        if name == "symptom_deep_dive":
+                            out = symptom_deep_dive(args.get("symptom", ""), int(args.get("k_quotes", 4) or 4))
+                        if name == "monthly_csat":
+                            out = monthly_csat(int(args.get("last_n", 6) or 6))
+                        if name == "pandas_count":
+                            out = pandas_count(args.get("query", ""))
+                        if name == "pandas_mean":
+                            out = pandas_mean(args.get("column", ""), args.get("query"))
+
+                        tool_msgs.append({"tool_call_id": call.id, "role": "tool", "name": name, "content": json.dumps(out)})
+
+                if tool_msgs:
+                    follow = {
+                        "model": selected_model,
+                        "messages": [
+                            {"role": "system", "content": sys_ctx},
+                            {"role": "assistant", "tool_calls": tool_calls, "content": None},
+                            *tool_msgs,
+                        ],
+                    }
+                    if model_supports_temperature(selected_model):
+                        follow["temperature"] = llm_temp
+                    res2 = client.chat.completions.create(**follow)
+                    final_text = res2.choices[0].message.content
+                else:
+                    final_text = msg.content
+
             except Exception:
-                st.info("AI temporarily unavailable. Showing local analysis with evidence instead.")
+                st.info("AI temporarily unavailable. Showing local CSAT brief instead.")
                 final_text = local_answer
 
-        ans_html = _html.escape(final_text or "").replace("\n", "<br>")
-        st.markdown(f"<div class='soft-panel'><b>User:</b> {esc(q)}<br><br><b>Assistant:</b><br>{ans_html}</div>", unsafe_allow_html=True)
+        # Render answer
+        st.markdown(f"<div class='soft-panel'><b>User:</b> {esc(q)}<br><br><b>Assistant:</b><br>{_html.escape(final_text or '').replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
 
         with st.expander("🔎 Evidence used (snippets)", expanded=False):
             if evidence_pack.get("local_quotes"):
@@ -2786,3 +3433,7 @@ if view.startswith("🤖"):
                 st.markdown("**Vector retrieval (semantic):**")
                 for i, s in enumerate(evidence_pack["retrieved_quotes"], start=1):
                     st.write(f"[R{i}] “{_mask_pii(s)}”")
+            if evidence_pack.get("symptom_quotes"):
+                st.markdown("**Symptom-anchored quotes (top drivers):**")
+                for i, qq in enumerate(evidence_pack["symptom_quotes"][:8], start=1):
+                    st.write(f"[S{i}] “{qq.get('text','')}” — {qq.get('meta','')}")
