@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-02-28-master-v10"
+APP_VERSION = "2026-02-28-master-v11"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -2205,28 +2205,60 @@ st_html(
     """
 <script>
 (function(){
-  try {
-    const doc = window.parent.document;
-    const marker = doc.getElementById('view-nav-marker');
-    if (!marker) return;
-    // Streamlit wraps each element in an element-container; the widget is usually the next sibling
-    const host = marker.closest('div.element-container') || marker.parentElement;
-    if (!host) return;
-    // Find the first stRadio after the marker
-    let node = host.nextElementSibling;
-    let radio = null;
-    for (let i=0; i<6 && node; i++){
-      if (node.querySelector && node.querySelector('[data-testid="stRadio"]')) { radio = node; break; }
-      node = node.nextElementSibling;
+  try{
+    const W = window.parent;
+    const doc = W.document;
+
+    function applySticky(){
+      const marker = doc.getElementById('view-nav-marker');
+      if (!marker) return false;
+
+      // Streamlit wraps each element in an element-container; the widget is usually the next sibling
+      const host = marker.closest('div.element-container') || marker.parentElement;
+      if (!host) return false;
+
+      // Find the first stRadio after the marker
+      let node = host.nextElementSibling;
+      let radio = null;
+      for (let i=0; i<12 && node; i++){
+        if (node.querySelector && node.querySelector('[data-testid="stRadio"]')) { radio = node; break; }
+        node = node.nextElementSibling;
+      }
+      if (!radio) return false;
+
+      if (!radio.classList.contains('sticky-topnav-host')){
+        radio.classList.add('sticky-topnav-host');
+      }
+      return true;
     }
-    if (!radio) return;
-    radio.classList.add('sticky-topnav-host');
-  } catch (e) {}
+
+    function schedule(){
+      applySticky();
+      setTimeout(applySticky, 40);
+      setTimeout(applySticky, 120);
+      setTimeout(applySticky, 260);
+      setTimeout(applySticky, 650);
+    }
+
+    schedule();
+
+    // Re-apply after Streamlit reruns replace the widget DOM (prevents the nav from "going away" after clicks)
+    if (!W.__swStickyNavObserver){
+      let t = null;
+      const obs = new W.MutationObserver(() => {
+        if (t) return;
+        t = setTimeout(() => { t=null; applySticky(); }, 80);
+      });
+      obs.observe(doc.body, {childList:true, subtree:true});
+      W.__swStickyNavObserver = obs;
+    }
+  }catch(e){}
 })();
 </script>
 """,
     height=0,
 )
+
 
 st_html(
     """
@@ -3884,7 +3916,7 @@ if view.startswith("🤖"):
 
                 # NOTE: GPT‑5 family works best with the Responses API (and can be finicky with tool-calling on Chat Completions).
                 # We keep the tool-driven loop for non‑GPT‑5 models, and use Responses for GPT‑5 for maximum reliability.
-                if str(selected_model).startswith("gpt-5"):
+                if str(selected_model).startswith("gpt-5") and hasattr(client, "responses"):
                     with st.spinner("Thinking…"):
                         resp = client.responses.create(
                             model=selected_model,
@@ -3904,6 +3936,9 @@ if view.startswith("🤖"):
                         except Exception:
                             final_text = ""
                 else:
+                    if str(selected_model).startswith("gpt-5") and not hasattr(client, "responses"):
+                        # Older OpenAI SDKs may not expose the Responses API; use a widely-supported model instead.
+                        selected_model = "gpt-4o-mini"
                     req = {
                         "model": selected_model,
                         "messages": [{"role": "system", "content": sys_ctx}, {"role": "user", "content": q}],
@@ -3948,13 +3983,35 @@ if view.startswith("🤖"):
                             tool_msgs.append({"tool_call_id": call.id, "role": "tool", "name": name, "content": json.dumps(out)})
 
                     if tool_msgs:
+                                                # Convert tool calls to plain dicts (OpenAI SDK expects JSON-serializable payloads)
+                        tool_calls_payload = []
+                        for _tc in tool_calls:
+                            if isinstance(_tc, dict):
+                                tool_calls_payload.append(_tc)
+                                continue
+                            try:
+                                tool_calls_payload.append(
+                                    {
+                                        "id": getattr(_tc, "id", ""),
+                                        "type": getattr(_tc, "type", "function"),
+                                        "function": {
+                                            "name": getattr(getattr(_tc, "function", None), "name", ""),
+                                            "arguments": getattr(getattr(_tc, "function", None), "arguments", "{}"),
+                                        },
+                                    }
+                                )
+                            except Exception:
+                                pass
+
                         follow = {
                             "model": selected_model,
                             "messages": [
                                 {"role": "system", "content": sys_ctx},
-                                {"role": "assistant", "tool_calls": tool_calls, "content": None},
+                                {"role": "user", "content": q},
+                                {"role": "assistant", "tool_calls": tool_calls_payload, "content": ""},
                                 *tool_msgs,
                             ],
+                            "tools": tools,
                         }
                         if model_supports_temperature(selected_model):
                             follow["temperature"] = llm_temp
