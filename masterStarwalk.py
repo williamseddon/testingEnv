@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-02-28-master-v8"
+APP_VERSION = "2026-02-28-master-v9"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -444,10 +444,13 @@ _BASIC_STOP = {
 
 
 def infer_product_profile(df_in: pd.DataFrame, fallback_filename: str) -> dict:
-    """Best-effort product identity from the dataset itself (no web calls)."""
+    """Best-effort product identity from the dataset itself (no web calls).
+
+    This powers the AI's "product knowledge" without relying on external lookups.
+    """
     prof: dict = {"product_guess": _infer_product_label(df_in, fallback_filename)}
 
-    def _top_vals(col: str, k: int = 5):
+    def _top_vals(col: str, k: int = 5) -> list[str]:
         if col not in df_in.columns:
             return []
         s = df_in[col].astype("string").str.strip().replace({"": pd.NA}).dropna()
@@ -460,18 +463,181 @@ def infer_product_profile(df_in: pd.DataFrame, fallback_filename: str) -> dict:
         if top:
             prof[f"top_{c.lower().replace(' ', '_')}"] = top
 
-    # Keywords from verbatims
+    # Keywords + bigrams from verbatims (presence per review, so long reviews don't dominate)
     if "Verbatim" in df_in.columns:
         txt = df_in["Verbatim"].astype("string").fillna("")
-        tokens = []
-        for t in txt.head(6000).tolist():
+        uni = Counter()
+        bi = Counter()
+        max_n = min(len(txt), 7000)
+
+        for t in txt.head(max_n).tolist():
             t = clean_text(t)
             words = re.findall(r"[a-zA-Z]{3,}", t.lower())
-            tokens.extend([w for w in words if w not in _BASIC_STOP])
-        if tokens:
-            most = Counter(tokens).most_common(18)
-            prof["top_keywords"] = [w for w, _ in most]
+            words = [w for w in words if w not in _BASIC_STOP]
+            if not words:
+                continue
+            uni.update(set(words))
+            if len(words) >= 2:
+                bi.update(set(" ".join(p) for p in zip(words, words[1:])))
+
+        if uni:
+            prof["top_keywords"] = [w for w, _ in uni.most_common(18)]
+        if bi:
+            prof["top_bigrams"] = [w for w, _ in bi.most_common(18)]
+
+    # Heuristic SharkNinja-friendly "product family" guess (best-effort)
+    fam_rules = {
+        "Floorcare / Vacuum": [
+            "vacuum", "suction", "cordless", "carpet", "floor", "dust", "brush", "roller", "mop", "shark", "robot",
+        ],
+        "Kitchen / Air Fryer / Oven": [
+            "air fryer", "airfryer", "crisp", "basket", "oven", "roast", "bake", "preheat",
+        ],
+        "Kitchen / Blender": [
+            "blender", "smoothie", "pitcher", "blend", "ice", "nutri", "nutribullet",
+        ],
+        "Kitchen / Coffee": [
+            "coffee", "espresso", "brew", "frother", "pod", "carafe",
+        ],
+        "Kitchen / Ice Cream (Creami)": [
+            "creami", "gelato", "sorbet", "ice cream",
+        ],
+        "Beauty / Hair": [
+            "hair", "dryer", "blow dry", "styler", "curl", "frizz", "brush",
+        ],
+    }
+
+    blob = " ".join(
+        [str(prof.get("product_guess", ""))]
+        + (prof.get("top_keywords") or [])
+        + (prof.get("top_bigrams") or [])
+        + (prof.get("top_model_(sku)") or [])
+    ).lower()
+
+    best_fam = None
+    best_score = 0
+    best_hits: list[str] = []
+    for fam, terms in fam_rules.items():
+        hits = [t for t in terms if t in blob]
+        score = len(hits)
+        if score > best_score:
+            best_score = score
+            best_fam = fam
+            best_hits = hits
+
+    if best_fam and best_score > 0:
+        # Rough confidence: increases with number of matched signals, capped
+        prof["product_family_guess"] = best_fam
+        prof["product_family_confidence"] = round(min(0.95, 0.30 + 0.15 * best_score), 2)
+        prof["product_family_signals"] = best_hits[:10]
+
     return prof
+
+
+def compute_text_theme_diffs(df_in: pd.DataFrame, max_reviews: int = 5000, top_n: int = 18) -> dict:
+    """Text themes that differentiate low-star (<=2★) vs high-star (>=4★) reviews.
+
+    Uses "presence per review" (not raw word counts) so long reviews don't dominate.
+    Returns small, JSON-serializable dict for the AI context pack.
+    """
+    out: dict = {
+        "n_low_reviews": 0,
+        "n_high_reviews": 0,
+        "low_terms": [],
+        "high_terms": [],
+        "low_vs_high": [],
+        "high_vs_low": [],
+    }
+    if df_in is None or df_in.empty:
+        return out
+    if "Verbatim" not in df_in.columns or "Star Rating" not in df_in.columns:
+        return out
+
+    d = df_in[["Verbatim", "Star Rating"]].copy()
+    d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+    d = d.dropna(subset=["star"])
+    if d.empty:
+        return out
+
+    low = d.loc[d["star"] <= 2].head(int(max_reviews))
+    high = d.loc[d["star"] >= 4].head(int(max_reviews))
+
+    def _presence_counts(df_part: pd.DataFrame) -> tuple[Counter, int]:
+        c = Counter()
+        texts = df_part["Verbatim"].astype("string").fillna("").tolist()
+        for t in texts:
+            t = clean_text(t)
+            words = re.findall(r"[a-zA-Z]{3,}", t.lower())
+            words = [w for w in words if w not in _BASIC_STOP]
+            if not words:
+                continue
+
+            # Unigrams
+            c.update(set(words))
+
+            # Bigrams (only keep if there is enough signal)
+            if len(words) >= 2:
+                bigs = set(" ".join(p) for p in zip(words, words[1:]))
+                # Avoid noisy bigrams like "very good" by filtering stopwords already; keep the rest.
+                c.update(bigs)
+
+        return c, len(texts)
+
+    low_c, low_n = _presence_counts(low)
+    high_c, high_n = _presence_counts(high)
+    out["n_low_reviews"] = int(low_n)
+    out["n_high_reviews"] = int(high_n)
+
+    def _top_list(counter: Counter, n_reviews: int) -> list[dict]:
+        if not counter or n_reviews <= 0:
+            return []
+        rows = []
+        for term, cnt in counter.most_common(int(top_n)):
+            rows.append(
+                {
+                    "term": term,
+                    "reviews": int(cnt),
+                    "rate_pct": round((cnt / max(1, n_reviews)) * 100, 1),
+                }
+            )
+        return rows
+
+    out["low_terms"] = _top_list(low_c, low_n)
+    out["high_terms"] = _top_list(high_c, high_n)
+
+    # Differential (delta in review-mention rate)
+    terms = set(list(low_c.keys())[:2500]) | set(list(high_c.keys())[:2500])
+    diffs = []
+    for term in terms:
+        lr = low_c.get(term, 0) / max(1, low_n)
+        hr = high_c.get(term, 0) / max(1, high_n)
+        diffs.append((term, lr - hr, lr, hr))
+
+    diffs.sort(key=lambda x: x[1], reverse=True)
+    out["low_vs_high"] = [
+        {
+            "term": t,
+            "delta_pp": round(delta * 100, 1),
+            "low_rate_pct": round(lr * 100, 1),
+            "high_rate_pct": round(hr * 100, 1),
+        }
+        for t, delta, lr, hr in diffs[: int(top_n)]
+        if abs(delta) > 0
+    ]
+
+    diffs.sort(key=lambda x: x[1])  # most negative => high > low
+    out["high_vs_low"] = [
+        {
+            "term": t,
+            "delta_pp": round((-delta) * 100, 1),
+            "high_rate_pct": round(hr * 100, 1),
+            "low_rate_pct": round(lr * 100, 1),
+        }
+        for t, delta, lr, hr in diffs[: int(top_n)]
+        if abs(delta) > 0
+    ]
+    return out
+
 
 
 def _extract_sentence(text: str, keyword: str | None = None, prefer_tail: bool = False) -> str:
@@ -1553,6 +1719,21 @@ else:
 # ----------------------------
 assert df_base is not None
 product_label = _infer_product_label(df_base, source_label)
+
+# Reset heavyweight caches when a new dataset is loaded (prevents stale AI insights across uploads)
+try:
+    _dataset_sig = hashlib.sha1(
+        (str(source_label) + "|" + str(df_base.shape) + "|" + "|".join([str(c) for c in df_base.columns.tolist()[:40]])).encode("utf-8")
+    ).hexdigest()
+except Exception:
+    _dataset_sig = str(getattr(df_base, "shape", ""))
+
+if st.session_state.get("_dataset_sig") != _dataset_sig:
+    for _k in ["_ai_csat_cache", "_ai_enriched_texts", "_ai_last_search_results", "_vec_idx", "_local_text_idx"]:
+        st.session_state.pop(_k, None)
+    st.session_state["_dataset_sig"] = _dataset_sig
+    # Also clear last error so users don't see stale failures
+    st.session_state.pop("ai_last_error", None)
 
 st.markdown(
     f"""
@@ -2808,7 +2989,10 @@ if view.startswith("🤖"):
         _filters_hash = str(len(filtered))
 
     _ai_cache = st.session_state.setdefault("_ai_csat_cache", {})
-    if _filters_hash not in _ai_cache:
+    _REQUIRED_CSAT_KEYS = {"driver_det", "driver_del", "hotspots", "product_profile", "text_themes"}
+    _cached = _ai_cache.get(_filters_hash)
+    _needs_build = (not isinstance(_cached, dict)) or (not _REQUIRED_CSAT_KEYS.issubset(set(_cached.keys())))
+    if _needs_build:
         def _symptom_driver_stats(df_in: pd.DataFrame, symptom_cols: list[str]) -> pd.DataFrame:
             cols = [c for c in symptom_cols if c in df_in.columns]
             if not cols or df_in.empty or "Star Rating" not in df_in.columns:
@@ -2892,18 +3076,26 @@ if view.startswith("🤖"):
                 hotspots[f] = _segment_hotspots(filtered, f, k=10, min_n=15)
 
             product_profile = infer_product_profile(filtered, source_label)
+            text_themes = compute_text_theme_diffs(filtered, max_reviews=5000, top_n=18)
 
             _ai_cache[_filters_hash] = {
                 "driver_det": driver_det,
                 "driver_del": driver_del,
                 "hotspots": hotspots,
                 "product_profile": product_profile,
+                "text_themes": text_themes,
             }
 
-    driver_det = _ai_cache[_filters_hash]["driver_det"]
-    driver_del = _ai_cache[_filters_hash]["driver_del"]
-    hotspots = _ai_cache[_filters_hash]["hotspots"]
-    product_profile = _ai_cache[_filters_hash]["product_profile"]
+    _cached = _ai_cache.get(_filters_hash, {}) if isinstance(_ai_cache, dict) else {}
+    driver_det = _cached.get("driver_det", pd.DataFrame())
+    driver_del = _cached.get("driver_del", pd.DataFrame())
+    hotspots = _cached.get("hotspots", {})
+    product_profile = _cached.get("product_profile") or infer_product_profile(filtered, source_label)
+    text_themes = _cached.get("text_themes") or compute_text_theme_diffs(filtered, max_reviews=5000, top_n=18)
+    # Backfill cache for backward compatibility (prevents KeyError after upgrades)
+    _cached["product_profile"] = product_profile
+    _cached["text_themes"] = text_themes
+    _ai_cache[_filters_hash] = _cached
 
     # ----------------------------
     # CSAT snapshot panel
@@ -3100,6 +3292,8 @@ if view.startswith("🤖"):
 
     if send and q.strip():
         q = q.strip()
+        # Reset any previous on-demand search evidence (keeps the Evidence panel relevant to this question)
+        st.session_state["_ai_last_search_results"] = []
 
         # --------------------------------------
         # Local retrieval corpus (enriched)
@@ -3191,6 +3385,13 @@ if view.startswith("🤖"):
             prof = product_profile or {}
             lines = []
             lines.append(f"**Product guess:** {prof.get('product_guess','(unknown)')}")
+            if prof.get("product_family_guess"):
+                conf = prof.get("product_family_confidence")
+                sig = prof.get("product_family_signals") or []
+                conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else ""
+                sig_s = (", ".join(sig[:6])) if sig else ""
+                extra = f" (confidence {conf_s})" if conf_s else ""
+                lines.append(f"**Likely family:** {prof.get('product_family_guess')}{extra}" + (f" — signals: {sig_s}" if sig_s else ""))
             # Prefer explicit metadata if present
             for k in ["top_product_name", "top_brand", "top_product_category", "top_company", "top_model_(sku)"]:
                 if k in prof:
@@ -3201,6 +3402,9 @@ if view.startswith("🤖"):
             kws = prof.get("top_keywords") or []
             if kws:
                 lines.append("- **Common review keywords:** " + ", ".join(kws[:12]))
+            bigs = prof.get("top_bigrams") or []
+            if bigs:
+                lines.append("- **Common phrases:** " + ", ".join(bigs[:10]))
             lines.append("")
             lines.append("If you want a cleaner label, add a column like **Product Name** or **Product Category** to the file (or map SKU → product internally).")
             return "\n".join(lines)
@@ -3285,6 +3489,7 @@ if view.startswith("🤖"):
                 style = st.session_state.get("ai_style", "Engineering deep dive")
                 ctx = {
                     "product_profile": product_profile,
+                     "text_themes": text_themes,
                     "filters": active_filters,
                     "counts": {"total_reviews": total_reviews},
                     "csat": {
@@ -3320,6 +3525,51 @@ if view.startswith("🤖"):
                         return False
                     return bool(re.fullmatch(r"[A-Za-z0-9_ .<>=!&|()'\"-]+", qs))
 
+
+                def search_reviews(query: str, k: int = 8) -> dict:
+                    """Search the *current filtered* consumer-insight corpus (local index).
+                    Returns short masked quotes + lightweight metadata for evidence-based answers.
+                    """
+                    try:
+                        qq = (query or "").strip()
+                        if not qq:
+                            return {"results": []}
+                        if len(qq) > 160:
+                            qq = qq[:160]
+
+                        kk = max(1, min(int(k or 8), 15))
+                        hits2 = _local_search(qq, local_index, top_k=kk)
+
+                        qid = hashlib.md5(qq.encode("utf-8")).hexdigest()[:4]
+                        rows = []
+                        for i, (txt2, score2) in enumerate(hits2[:kk], start=1):
+                            raw = txt2 or ""
+                            meta = ""
+                            verb = raw
+                            if "||" in raw:
+                                prefix, verb = raw.split("||", 1)
+                                meta = prefix.strip().replace("|", " • ").strip()
+
+                            verb = _mask_pii(str(verb).strip())
+                            if len(verb) > 320:
+                                verb = verb[:317] + "…"
+
+                            rows.append(
+                                {
+                                    "id": f"SR{qid}-{i}",
+                                    "quote": verb,
+                                    "meta": meta,
+                                    "score": float(round(float(score2 or 0.0), 4)),
+                                }
+                            )
+
+                        # Store for the Evidence panel (optional)
+                        st.session_state.setdefault("_ai_last_search_results", [])
+                        st.session_state["_ai_last_search_results"] = (st.session_state["_ai_last_search_results"] + rows)[-40:]
+
+                        return {"results": rows}
+                    except Exception as e:
+                        return {"error": str(e)}
                 def pandas_count(query: str) -> dict:
                     try:
                         if not _safe_query(query):
@@ -3533,6 +3783,21 @@ if view.startswith("🤖"):
                     {
                         "type": "function",
                         "function": {
+                            "name": "search_reviews",
+                            "description": "Search the filtered review corpus and return evidence quotes + metadata. Use this when you need more evidence on a topic (e.g., a specific issue, region, SKU).",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                    "k": {"type": "integer"},
+                                },
+                                "required": ["query"],
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
                             "name": "pandas_count",
                             "description": "Count rows in the filtered dataset matching a safe pandas.query expression.",
                             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
@@ -3564,9 +3829,16 @@ if view.startswith("🤖"):
                     "Primary goal: improve CSAT by reducing DSAT (1–2★ share) and removing the highest-impact detractors.\n\n"
                     "Hard rules:\n"
                     "- Use ONLY numbers that appear in CONTEXT_JSON or tool outputs. If you need a number, call a tool.\n"
-                    "- Do NOT fabricate quotes. Only cite from EVIDENCE_QUOTES by ID (e.g., [L1], [R2], [S1]).\n"
+                    "- Do NOT fabricate quotes. Cite only from EVIDENCE_QUOTES by ID (e.g., [L1], [R2], [S1]) **or** from tool outputs (e.g., search_reviews returns ids like [SRabcd-1]).\n- If you need more evidence on a specific issue/segment, call search_reviews(query=..., k=...).\n"
                     "- When you propose actions, include how to validate (what metric moves, what test, what data).\n\n"
                     f"STYLE_GUIDE: {style_note}\n"
+                    "RESPONSE_TEMPLATE (use headings, be concise, but insight-dense):\n"
+                    "- TL;DR (1–3 bullets)\n"
+                    "- What to fix first (top detractors by Impact; quantify volume + DSAT lift)\n"
+                    "- Where it happens (Country/Source/SKU hotspots)\n"
+                    "- Why it happens (root-cause hypotheses: design vs manufacturing vs packaging/shipping vs usability)\n"
+                    "- What to do next (actions + validation plan + what metric should move)\n"
+                    "- Evidence (cite quote IDs)\n\n"
                     f"PRODUCT_GUESS={product_label}\n"
                     f"ROW_COUNT={total_reviews}\n\n"
                     f"CONTEXT_JSON:\n{json.dumps(ctx, ensure_ascii=False)}\n\n"
@@ -3634,6 +3906,8 @@ if view.startswith("🤖"):
                                 out = symptom_deep_dive(args.get("symptom", ""), int(args.get("k_quotes", 4) or 4))
                             if name == "monthly_csat":
                                 out = monthly_csat(int(args.get("last_n", 6) or 6))
+                            if name == "search_reviews":
+                                out = search_reviews(args.get("query", ""), int(args.get("k", 8) or 8))
                             if name == "pandas_count":
                                 out = pandas_count(args.get("query", ""))
                             if name == "pandas_mean":
@@ -3685,3 +3959,10 @@ if view.startswith("🤖"):
                 st.markdown("**Symptom-anchored quotes (top drivers):**")
                 for i, qq in enumerate(evidence_pack["symptom_quotes"][:8], start=1):
                     st.write(f"[S{i}] “{qq.get('text','')}” — {qq.get('meta','')}")
+
+            # On-demand evidence retrieved via tool-calling (if the model asked for it)
+            sr = st.session_state.get("_ai_last_search_results") or []
+            if sr:
+                st.markdown("**On-demand search evidence (tool):**")
+                for r in sr[:12]:
+                    st.write(f"[{r.get('id','SR')}] “{r.get('quote','')}” — {r.get('meta','')}")
