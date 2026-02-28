@@ -1729,7 +1729,7 @@ except Exception:
     _dataset_sig = str(getattr(df_base, "shape", ""))
 
 if st.session_state.get("_dataset_sig") != _dataset_sig:
-    for _k in ["_ai_csat_cache", "_ai_enriched_texts", "_ai_last_search_results", "_vec_idx", "_local_text_idx"]:
+    for _k in ["_ai_csat_cache", "_ai_enriched_texts", "_ai_last_search_results", "_vec_idx", "_local_text_idx", "_review_sort_cache", "ai_chat_messages"]:
         st.session_state.pop(_k, None)
     st.session_state["_dataset_sig"] = _dataset_sig
     # Also clear last error so users don't see stale failures
@@ -2291,7 +2291,7 @@ st.caption("Tip: **📝 All Reviews** contains the individual review cards (with
 # ============================================================
 # Precompute analysis tables (fast) — only when needed
 # ============================================================
-need_agg = view.startswith("📊") or view.startswith("🤖")
+need_agg = view.startswith("📊")
 
 if need_agg:
     t_agg0 = time.perf_counter()
@@ -2386,41 +2386,27 @@ if view.startswith("📊"):
     def _styled_table(df_in: pd.DataFrame):
         if df_in.empty:
             return df_in
+
         def colstyle(v):
             if pd.isna(v):
                 return ""
             try:
                 vv = float(v)
+                # greener for higher Avg Star, redder for lower
                 if vv >= 4.5:
-                    return "color:#065F46;font-weight:600;"
+                    return "color:#065F46;font-weight:700;"
                 if vv < 4.5:
-                    return "color:#7F1D1D;font-weight:600;"
+                    return "color:#7F1D1D;font-weight:700;"
             except Exception:
                 pass
             return ""
+
         return df_in.style.applymap(colstyle, subset=["Avg Star"]).format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})
 
-    def _table_downloads(df_full: pd.DataFrame, label: str, key_prefix: str):
-        if df_full is None or df_full.empty:
-            return
-        csv = df_full.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            f"⬇️ Download full {label} (CSV)",
-            data=csv,
-            file_name=f"{key_prefix}_full.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key=f"dl_{key_prefix}",
-        )
-
     def _render_symptom_table(df_preview: pd.DataFrame, df_full: pd.DataFrame, title: str, key_prefix: str):
-        left, right = st.columns([1.25, 0.9])
-        with left:
-            st.subheader(title)
-        with right:
-            _table_downloads(df_full, title, key_prefix)
+        st.subheader(title)
 
-        # Main preview
+        # Preview
         st.dataframe(
             _styled_table(df_preview) if not df_preview.empty else df_preview,
             use_container_width=True,
@@ -2428,7 +2414,7 @@ if view.startswith("📊"):
         )
 
         # If truncated, show "View full" affordance
-        if len(df_full) > len(df_preview) and len(df_preview) > 0:
+        if df_full is not None and len(df_full) > len(df_preview) and len(df_preview) > 0:
             if st.button(f"View full table ({len(df_full):,} rows)", key=f"view_full_{key_prefix}"):
                 st.session_state[f"show_full_{key_prefix}"] = True
             if st.session_state.get(f"show_full_{key_prefix}"):
@@ -2453,8 +2439,20 @@ if view.startswith("📊"):
         with tab2:
             _render_symptom_table(delighters_results, delighters_results_full, "All Delighters", "delighters")
 
+    # Combined download (both full tables in a single 2-tab Excel file)
+    if (detractors_results_full is not None and not detractors_results_full.empty) or (delighters_results_full is not None and not delighters_results_full.empty):
+        xbuf = BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+            (detractors_results_full if detractors_results_full is not None else pd.DataFrame()).to_excel(writer, sheet_name="Detractors", index=False)
+            (delighters_results_full if delighters_results_full is not None else pd.DataFrame()).to_excel(writer, sheet_name="Delighters", index=False)
 
-
+        st.download_button(
+            "⬇️ Full Delighter and Detractor Tables (Excel)",
+            data=xbuf.getvalue(),
+            file_name="full_delighter_and_detractor_tables.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
@@ -2926,24 +2924,101 @@ if view.startswith("📊"):
 # ============================================================
 if view.startswith("📝"):
     st.markdown("## 📝 Reviews (in filter criteria)")
-    st.caption("Only reviews that match the CURRENT filter criteria are shown below. Update filters in the sidebar to refresh this list.")
+    st.caption(
+        "Only reviews that match the **CURRENT** filter criteria are shown below. "
+        "Change filters in the sidebar and this list updates automatically."
+    )
 
+    # ---- Sort (fast, e-commerce style) ----
+    sort_options = []
+    has_date = "Review Date" in filtered.columns
+    has_star = "Star Rating" in filtered.columns
 
-    if not filtered.empty:
-        csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Download ALL filtered reviews (CSV)", csv_bytes, file_name="filtered_reviews.csv", mime="text/csv")
+    if has_date:
+        sort_options += ["Newest → Oldest", "Oldest → Newest"]
+    if has_star:
+        sort_options += ["Rating: High → Low", "Rating: Low → High"]
+    if not sort_options:
+        sort_options = ["Default order"]
 
+    topL, topR = st.columns([1.2, 1])
+    with topL:
+        sort_choice = st.selectbox("Sort", options=sort_options, index=0, key="review_sort_choice")
+    with topR:
+        # Download of currently filtered reviews (ordering matches the current sort)
+        pass
+
+    # Reset paging when sort changes
     if "review_page" not in st.session_state:
         st.session_state["review_page"] = 0
+    if st.session_state.get("_review_sort_prev") != sort_choice:
+        st.session_state["_review_sort_prev"] = sort_choice
+        st.session_state["review_page"] = 0
+
+    # Cache sort order per (dataset, filters, sort) to keep paging snappy
+    sort_cache = st.session_state.setdefault("_review_sort_cache", {})
+    try:
+        _filters_hash_r = hashlib.sha1(json.dumps(active_filters, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    except Exception:
+        _filters_hash_r = str(len(filtered))
+
+    cache_key = f"{st.session_state.get('_dataset_sig','')}|{_filters_hash_r}|{sort_choice}|n={len(filtered)}"
+    sorted_idx = sort_cache.get(cache_key)
+
+    if sorted_idx is None:
+        df_sorted = filtered
+        try:
+            if sort_choice == "Newest → Oldest" and has_date:
+                df_sorted = filtered.sort_values("Review Date", ascending=False, na_position="last", kind="mergesort")
+            elif sort_choice == "Oldest → Newest" and has_date:
+                df_sorted = filtered.sort_values("Review Date", ascending=True, na_position="last", kind="mergesort")
+            elif sort_choice == "Rating: High → Low" and has_star:
+                if has_date:
+                    df_sorted = filtered.sort_values(["Star Rating", "Review Date"], ascending=[False, False], na_position="last", kind="mergesort")
+                else:
+                    df_sorted = filtered.sort_values(["Star Rating"], ascending=[False], na_position="last", kind="mergesort")
+            elif sort_choice == "Rating: Low → High" and has_star:
+                if has_date:
+                    df_sorted = filtered.sort_values(["Star Rating", "Review Date"], ascending=[True, False], na_position="last", kind="mergesort")
+                else:
+                    df_sorted = filtered.sort_values(["Star Rating"], ascending=[True], na_position="last", kind="mergesort")
+        except Exception:
+            df_sorted = filtered
+
+        try:
+            sorted_idx = df_sorted.index.to_numpy()
+        except Exception:
+            sorted_idx = None
+
+        sort_cache[cache_key] = sorted_idx
+
+    try:
+        reviews_df = filtered.loc[sorted_idx] if sorted_idx is not None else filtered
+    except Exception:
+        reviews_df = filtered
+
+    # Now place download button using the sorted dataset (nice UX; same rows)
+    with topR:
+        if not reviews_df.empty:
+            csv_bytes = reviews_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Download reviews (filtered)",
+                csv_bytes,
+                file_name="filtered_reviews.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    # ---- Pagination ----
     reviews_per_page = int(st.session_state.get("rpp", 10))
-    total_reviews_count = len(filtered)
+    total_reviews_count = len(reviews_df)
     total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
 
     st.session_state["review_page"] = min(st.session_state.get("review_page", 0), max(total_pages - 1, 0))
     current_page = st.session_state["review_page"]
     start_index = current_page * reviews_per_page
     end_index = start_index + reviews_per_page
-    paginated = filtered.iloc[start_index:end_index]
+    paginated = reviews_df.iloc[start_index:end_index]
 
     if paginated.empty:
         st.warning("No reviews match the selected criteria.")
@@ -2997,7 +3072,7 @@ if view.startswith("📝"):
                 unsafe_allow_html=True,
             )
 
-    # Pager
+    # ---- Pager ----
     p1, p2, p3, p4, p5 = st.columns([1, 1, 2, 1, 1])
     with p1:
         if st.button("⏮ First", disabled=current_page == 0):
@@ -3025,213 +3100,44 @@ if view.startswith("📝"):
 
 
 # ============================================================
-# AI view (CSAT Copilot) — reliable RAG (no tool-calling required)
+# AI view — Product + Consumer Insights Chat (reliable RAG)
 # ============================================================
 if view.startswith("🤖"):
-    st.markdown("## 🤖 CSAT Copilot")
+    st.markdown("## 🤖 AI")
     st.caption(
-        "A reliable **Consumer Insights + CSAT** assistant. Answers are grounded in the **currently filtered** dataset. "
-        "Remote AI uses the OpenAI HTTP API directly (no SDK dependency)."
+        "Ask anything about the **product** and what **consumers** are saying. "
+        "Answers are grounded in the **currently filtered** dataset (RAG over your uploaded reviews)."
     )
 
     # ----------------------------
-    # Baseline CSAT metrics (local)
+    # Sidebar: minimal AI controls (kept out of the way)
     # ----------------------------
-    stars_all = pd.to_numeric(filtered.get("Star Rating"), errors="coerce") if "Star Rating" in filtered.columns else pd.Series(dtype=float)
-    stars_all = stars_all.dropna()
-    total_reviews = int(len(filtered))
-    baseline_avg = float(stars_all.mean()) if not stars_all.empty else 0.0
-    baseline_median = float(stars_all.median()) if not stars_all.empty else 0.0
-    baseline_pct_low = float((stars_all <= 2).mean() * 100) if not stars_all.empty else 0.0
-    baseline_pct_high = float((stars_all >= 4).mean() * 100) if not stars_all.empty else 0.0
-    star_counts = (
-        stars_all.value_counts().reindex([1, 2, 3, 4, 5]).fillna(0).astype(int).to_dict()
-        if not stars_all.empty
-        else {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-    )
-
-    # ----------------------------
-    # Cache CSAT driver tables per applied filter state
-    # ----------------------------
-    try:
-        _filters_hash = hashlib.sha1(json.dumps(active_filters, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-    except Exception:
-        _filters_hash = str(len(filtered))
-
-    _ai_cache = st.session_state.setdefault("_ai_csat_cache", {})
-    _REQUIRED_CSAT_KEYS = {"driver_det", "driver_del", "hotspots", "product_profile", "text_themes"}
-    _cached = _ai_cache.get(_filters_hash)
-    _needs_build = (not isinstance(_cached, dict)) or (not _REQUIRED_CSAT_KEYS.issubset(set(_cached.keys())))
-
-    if _needs_build:
-
-        def _symptom_driver_stats(df_in: pd.DataFrame, symptom_cols: list[str]) -> pd.DataFrame:
-            cols = [c for c in symptom_cols if c in df_in.columns]
-            if not cols or df_in.empty or "Star Rating" not in df_in.columns:
-                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
-
-            stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
-            # Melt symptoms -> one row per (review, symptom)
-            long = df_in[cols].copy()
-            long["__rid__"] = np.arange(len(df_in))
-            long = long.melt(id_vars="__rid__", value_vars=cols, value_name="symptom").dropna(subset=["symptom"])
-            long["symptom"] = long["symptom"].astype("string").str.strip()
-            long = long[long["symptom"].ne("")]
-            if long.empty:
-                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
-
-            # unique review counts per symptom
-            g = long.groupby("symptom")["__rid__"].nunique().rename("Reviews").reset_index()
-            g["Mention %"] = (g["Reviews"] / max(1, len(df_in)) * 100).round(2)
-
-            # Avg star and %1–2★ for the subset of reviews containing symptom
-            sym_to_rids = long.groupby("symptom")["__rid__"].apply(lambda x: set(x.tolist())).to_dict()
-            avgs = {}
-            lows = {}
-            for sym, rids in sym_to_rids.items():
-                s = stars.iloc[list(rids)].dropna()
-                avgs[sym] = float(s.mean()) if not s.empty else np.nan
-                lows[sym] = float((s <= 2).mean() * 100) if not s.empty else np.nan
-
-            g["Avg ★"] = g["symptom"].map(avgs).round(2)
-            g["% 1–2★"] = g["symptom"].map(lows).round(1)
-
-            g = g.rename(columns={"symptom": "Symptom"}).sort_values(["Reviews", "Mention %"], ascending=[False, False])
-            return g.reset_index(drop=True)
-
-        def _driver_table(stats: pd.DataFrame, kind: str) -> pd.DataFrame:
-            if stats.empty:
-                return stats
-
-            df = stats.copy()
-            df["Δ Avg ★"] = (df["Avg ★"] - baseline_avg).round(2)
-            df["Δ % 1–2★"] = (df["% 1–2★"] - baseline_pct_low).round(1)
-
-            # Impact score: "rating points recovered" if symptom removed (heuristic)
-            if kind == "detractors":
-                df["Impact"] = (df["Reviews"] * (baseline_avg - df["Avg ★"])).round(2)
-                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
-            else:
-                df["Impact"] = (df["Reviews"] * (df["Avg ★"] - baseline_avg)).round(2)
-                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
-
-            return df[["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★", "Δ Avg ★", "Δ % 1–2★", "Impact"]].reset_index(drop=True)
-
-        def _segment_hotspots(df_in: pd.DataFrame, field: str, k: int = 10, min_n: int = 15) -> pd.DataFrame:
-            if field not in df_in.columns or df_in.empty or "Star Rating" not in df_in.columns:
-                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
-            d = df_in[[field, "Star Rating"]].copy()
-            d[field] = d[field].astype("string").fillna("(blank)").str.strip().replace("", "(blank)")
-            d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-            d = d.dropna(subset=["star"])
-            if d.empty:
-                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
-            d["low"] = d["star"] <= 2
-            d["high"] = d["star"] >= 4
-            g = d.groupby(field).agg(Reviews=("star", "size"), Avg=("star", "mean"), PctLow=("low", "mean"), PctHigh=("high", "mean")).reset_index()
-            g["Avg ★"] = g["Avg"].round(2)
-            g["% 1–2★"] = (g["PctLow"] * 100).round(1)
-            g["% 4–5★"] = (g["PctHigh"] * 100).round(1)
-            g = g[g["Reviews"] >= int(min_n)]
-            g = g.sort_values(["% 1–2★", "Reviews"], ascending=[False, False]).head(int(k))
-            return g[[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"]]
-
-        with st.spinner("Building CSAT insight tables…"):
-            det_stats = _symptom_driver_stats(filtered, existing_detractor_columns)
-            del_stats = _symptom_driver_stats(filtered, existing_delighter_columns)
-            driver_det = _driver_table(det_stats, "detractors")
-            driver_del = _driver_table(del_stats, "delighters")
-
-            hotspots = {}
-            for f in ["Country", "Source", "Model (SKU)", "Seeded"]:
-                hotspots[f] = _segment_hotspots(filtered, f, k=10, min_n=15)
-
-            product_profile = infer_product_profile(filtered, source_label)
-            text_themes = compute_text_theme_diffs(filtered, max_reviews=5000, top_n=18)
-
-            _ai_cache[_filters_hash] = {
-                "driver_det": driver_det,
-                "driver_del": driver_del,
-                "hotspots": hotspots,
-                "product_profile": product_profile,
-                "text_themes": text_themes,
-            }
-
-    _cached = _ai_cache.get(_filters_hash, {}) if isinstance(_ai_cache, dict) else {}
-    driver_det = _cached.get("driver_det", pd.DataFrame())
-    driver_del = _cached.get("driver_del", pd.DataFrame())
-    hotspots = _cached.get("hotspots", {})
-    product_profile = _cached.get("product_profile") or infer_product_profile(filtered, source_label)
-    text_themes = _cached.get("text_themes") or compute_text_theme_diffs(filtered, max_reviews=5000, top_n=18)
-    _cached["product_profile"] = product_profile
-    _cached["text_themes"] = text_themes
-    _ai_cache[_filters_hash] = _cached
-
-    # ----------------------------
-    # Snapshot cards (always visible)
-    # ----------------------------
-    cA, cB, cC, cD = st.columns([1, 1, 1, 1])
-    cA.metric("Reviews (filtered)", f"{total_reviews:,}")
-    cB.metric("Avg ★", f"{baseline_avg:.2f}")
-    cC.metric("% 1–2★ (DSAT proxy)", f"{baseline_pct_low:.1f}%")
-    cD.metric("% 4–5★ (CSAT proxy)", f"{baseline_pct_high:.1f}%")
-
-    with st.expander("📌 Quick CSAT context (drivers + hotspots)", expanded=True):
-        left, right = st.columns([1, 1])
-        with left:
-            st.markdown("### 🚨 Top CSAT risks (Detractors)")
-            st.caption("Sorted by **Impact** (heuristic: reviews × rating deficit vs baseline).")
-            st.dataframe(driver_det.head(12), use_container_width=True, hide_index=True) if not driver_det.empty else st.info("No detractor symptoms found in this filtered dataset.")
-        with right:
-            st.markdown("### ✅ Top CSAT strengths (Delighters)")
-            st.caption("Protect these; they drive 4–5★.")
-            st.dataframe(driver_del.head(12), use_container_width=True, hide_index=True) if not driver_del.empty else st.info("No delighter symptoms found in this filtered dataset.")
-
-        st.markdown("### 🗺️ DSAT hotspots (where low stars concentrate)")
-        h1, h2 = st.columns([1, 1])
-        with h1:
-            st.markdown("**By Country**")
-            st.dataframe(hotspots.get("Country", pd.DataFrame()).head(10), use_container_width=True, hide_index=True)
-        with h2:
-            st.markdown("**By Source**")
-            st.dataframe(hotspots.get("Source", pd.DataFrame()).head(10), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ----------------------------
-    # Sidebar: AI settings
-    # ----------------------------
-    with st.sidebar.expander("🤖 AI Assistant", expanded=False):
+    with st.sidebar.expander("🤖 AI Settings", expanded=False):
         st.session_state.setdefault("llm_model", "gpt-4o-mini")
         st.session_state.setdefault("llm_temp", 0.2)
-        st.session_state.setdefault("ai_style", "Engineering deep dive")
 
         _model_choices = [
             ("Fast (recommended) – 4o-mini", "gpt-4o-mini"),
             ("Balanced – 4o", "gpt-4o"),
             ("Advanced – 4.1", "gpt-4.1"),
         ]
-        # Keep selection stable even if label changes
-        model_id = st.selectbox("Model", options=[m for _, m in _model_choices], index=0 if st.session_state["llm_model"] not in [m for _, m in _model_choices] else [m for _, m in _model_choices].index(st.session_state["llm_model"]))
-        st.session_state["llm_model"] = model_id
-
+        model_ids = [m for _, m in _model_choices]
+        default_idx = model_ids.index(st.session_state["llm_model"]) if st.session_state["llm_model"] in model_ids else 0
+        st.session_state["llm_model"] = st.selectbox("Model", options=model_ids, index=default_idx)
         st.session_state["llm_temp"] = st.slider("Creativity (temperature)", 0.0, 1.0, float(st.session_state.get("llm_temp", 0.2)), 0.1)
-        st.session_state["ai_style"] = st.radio(
-            "Answer style",
-            options=["Engineering deep dive", "Executive brief"],
-            index=0 if st.session_state.get("ai_style", "Engineering deep dive") == "Engineering deep dive" else 1,
-        )
 
-    with st.sidebar.expander("🔒 Evidence & Privacy", expanded=True):
+    with st.sidebar.expander("🔒 Evidence & Privacy", expanded=False):
         st.session_state.setdefault("ai_enabled", True)
         st.session_state.setdefault("ai_send_quotes", True)
         st.session_state.setdefault("ai_cap", 1500)
+        st.session_state.setdefault("ai_quote_k", 10)
+
         ai_enabled = st.toggle("Enable remote AI", value=bool(st.session_state.get("ai_enabled", True)), key="ai_enabled")
         send_quotes = st.toggle(
             "Send evidence quotes (masked) to AI",
             value=bool(st.session_state.get("ai_send_quotes", True)),
             key="ai_send_quotes",
-            help="If disabled, only aggregated stats + themes are sent. (No verbatim text.)",
+            help="If disabled, only aggregated stats + themes are sent (no verbatim text).",
         )
         ai_cap = st.number_input(
             "Max reviews in retrieval corpus",
@@ -3240,9 +3146,8 @@ if view.startswith("🤖"):
             value=int(st.session_state.get("ai_cap", 1500)),
             step=100,
             key="ai_cap",
-            help="Higher = better recall but slower indexing. Retrieval is local; only the top quotes are sent (if enabled).",
+            help="Higher = better recall but slower. Retrieval is local; only top quotes are sent (if enabled).",
         )
-        st.session_state.setdefault("ai_quote_k", 10)
         quote_k = st.slider("Quotes to send (top-k)", 4, 18, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
 
     with st.sidebar.expander("🔑 OpenAI API Key", expanded=False):
@@ -3257,9 +3162,8 @@ if view.startswith("🤖"):
         except Exception:
             api_key = os.getenv("OPENAI_API_KEY")
 
-    # Status panel
-    sel_model = st.session_state.get("llm_model", "gpt-4o-mini")
     remote_ready = bool(ai_enabled and api_key)
+    sel_model = st.session_state.get("llm_model", "gpt-4o-mini")
     status_txt = "🟢 Remote AI ready" if remote_ready else "🟡 Remote AI disabled (local insights only)"
     st.markdown(
         f"""
@@ -3272,9 +3176,6 @@ if view.startswith("🤖"):
 """,
         unsafe_allow_html=True,
     )
-    if st.session_state.get("ai_last_error"):
-        with st.expander("⚠️ Last AI error (debug)", expanded=False):
-            st.code(st.session_state.get("ai_last_error"))
 
     # ----------------------------
     # Remote call helper (HTTP, retries, no SDK dependency)
@@ -3287,7 +3188,6 @@ if view.startswith("🤖"):
 
         base_payload = {"model": model, "messages": messages}
         variants = []
-        # Try full payload first, then fallbacks (some models reject temp/max_tokens)
         variants.append({**base_payload, **({"temperature": float(temperature)} if temperature is not None else {}), "max_tokens": int(max_tokens)})
         variants.append({**base_payload, "max_tokens": int(max_tokens)})
         variants.append({**base_payload})
@@ -3301,38 +3201,28 @@ if view.startswith("🤖"):
                         time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
                         continue
                     if r.status_code >= 400:
-                        # If model not found / access issue, no point retrying attempts for this payload
                         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:600]}")
                     data = r.json()
                     return str(data["choices"][0]["message"]["content"])
                 except Exception as e:
                     last_err = e
-                    # break retry loop on hard errors; continue to next payload variant
+                    # On model-not-found/access, stop retrying this variant
                     if isinstance(e, RuntimeError) and ("model" in str(e).lower() or "not found" in str(e).lower() or "does not exist" in str(e).lower()):
                         break
                     time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
-            # try next payload variant
         raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI error")
 
     def _call_openai_with_fallback(api_key: str, model: str, messages: list[dict], temperature: float | None) -> str:
-        """Call selected model; if model access fails, fall back to gpt-4o-mini."""
         try:
             return _openai_chat_http(api_key, model, messages, temperature=temperature)
         except Exception as e:
             msg = str(e).lower()
             if "does not exist" in msg or "not found" in msg or ("model" in msg and "access" in msg):
-                # auto fallback to a safe model
-                try:
-                    st.warning(f"Selected model `{model}` is unavailable for this key. Falling back to `gpt-4o-mini`.")
-                    return _openai_chat_http(api_key, "gpt-4o-mini", messages, temperature=temperature)
-                except Exception:
-                    raise
+                # fallback to safe model
+                st.warning(f"Selected model `{model}` is unavailable for this key. Falling back to `gpt-4o-mini`.")
+                return _openai_chat_http(api_key, "gpt-4o-mini", messages, temperature=temperature)
             raise
 
-    
-    # ----------------------------
-    # Sidebar: quick connectivity test (optional)
-    # ----------------------------
     with st.sidebar.expander("🔌 Test Remote AI", expanded=False):
         if st.button("Run test prompt", use_container_width=True, key="ai_test_prompt_btn"):
             if not api_key:
@@ -3355,144 +3245,246 @@ if view.startswith("🤖"):
                     st.error("Remote AI test failed.")
                     st.code(repr(e))
 
-# ----------------------------
-    # Preset questions tuned for CSAT / QE
-    # ----------------------------
-    if "ask_q" not in st.session_state:
-        st.session_state["ask_q"] = ""
+    if st.session_state.get("ai_last_error"):
+        with st.expander("⚠️ Last AI error (debug)", expanded=False):
+            st.code(st.session_state.get("ai_last_error"))
 
-    st.markdown(
-        """
-<div class="soft-panel">
-  <div style="font-weight:850; font-size:1.05rem;">🪄 CSAT Playbooks</div>
-  <div class="small-muted" style="margin-top:4px;">
-    Click to prefill the question box, then press <b>Send</b>.
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
+    # ----------------------------
+    # Chat UI (no presets; one executive summary button)
+    # ----------------------------
+    st.session_state.setdefault("ai_chat_messages", [])  # list of {role, content}
+    st.session_state.setdefault("_ai_last_search_results", [])
+
+    EXEC_SUMMARY_PROMPT = (
+        "Create an executive summary of the product using ONLY the current filtered consumer reviews. "
+        "Include: (1) what the product is (based on the dataset), (2) what consumers LOVE (top delighters + evidence), "
+        "(3) biggest improvement opportunities (top detractors ranked by impact + evidence), "
+        "(4) where DSAT concentrates (hotspots by country/source/SKU), and "
+        "(5) the top 5 actions a SharkNinja quality engineer should take next with a validation plan. "
+        "Cite evidence quote IDs like [Q3]."
     )
 
-    b1, b2, b3, b4, b5, b6 = st.columns([1, 1, 1, 1, 1, 1])
-    if b1.button("CSAT Brief", use_container_width=True):
-        st.session_state["ask_q"] = (
-            "Write a CSAT brief for a quality engineer using ONLY the current filtered reviews: "
-            "1) CSAT headline, 2) top 5 DSAT drivers with metrics + likely root causes, "
-            "3) hotspots (Country/Source/SKU), 4) next 7-day actions + validation plan, "
-            "5) top 3 delighters to protect. Cite evidence quotes by ID."
+    exec_clicked = st.button("🪄 Executive Summary", use_container_width=True)
+
+    # Render conversation
+    for msg in st.session_state["ai_chat_messages"]:
+        with st.chat_message("user" if msg.get("role") == "user" else "assistant"):
+            st.markdown(msg.get("content", ""))
+
+    typed_q = st.chat_input("Ask anything (e.g., biggest improvement opportunities, what consumers love, defect hypotheses, hotspots)…")
+    q = EXEC_SUMMARY_PROMPT if exec_clicked else typed_q
+
+    # ----------------------------
+    # Build CSAT + consumer insight context (cached per filter state)
+    # ----------------------------
+    def _ensure_ai_context() -> dict:
+        # hash current applied filters (stable across reruns)
+        try:
+            _filters_hash = hashlib.sha1(json.dumps(active_filters, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        except Exception:
+            _filters_hash = str(len(filtered))
+
+        cache = st.session_state.setdefault("_ai_csat_cache", {})
+        required = {"driver_det", "driver_del", "hotspots", "product_profile", "text_themes", "csat"}
+        cached = cache.get(_filters_hash)
+        if isinstance(cached, dict) and required.issubset(set(cached.keys())):
+            return {**cached, "_filters_hash": _filters_hash}
+
+        # baseline CSAT metrics
+        stars_all = pd.to_numeric(filtered.get("Star Rating"), errors="coerce") if "Star Rating" in filtered.columns else pd.Series(dtype=float)
+        stars_all = stars_all.dropna()
+        baseline_avg = float(stars_all.mean()) if not stars_all.empty else 0.0
+        baseline_median = float(stars_all.median()) if not stars_all.empty else 0.0
+        baseline_pct_low = float((stars_all <= 2).mean() * 100) if not stars_all.empty else 0.0
+        baseline_pct_high = float((stars_all >= 4).mean() * 100) if not stars_all.empty else 0.0
+        star_counts = (
+            stars_all.value_counts().reindex([1, 2, 3, 4, 5]).fillna(0).astype(int).to_dict()
+            if not stars_all.empty
+            else {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
         )
-    if b2.button("Top DSAT Drivers", use_container_width=True):
-        st.session_state["ask_q"] = "What are the top drivers of 1–2★ reviews? Quantify (mention %, avg ★, DSAT lift) and propose fixes + validation."
-    if b3.button("Hotspot RCA", use_container_width=True):
-        st.session_state["ask_q"] = "Pick the biggest DSAT hotspot (Country/Source/SKU) and do an RCA: what themes drive low stars there, and what should we test next?"
-    if b4.button("Seeded vs Organic", use_container_width=True):
-        st.session_state["ask_q"] = "Compare Seeded vs Organic: rating gap, DSAT gap, and the top theme differences. Provide actions."
-    if b5.button("Trend Watchouts", use_container_width=True):
-        st.session_state["ask_q"] = "Are there emerging watchouts recently? Quantify movement and list the most likely drivers and what to monitor."
-    if b6.button("Defect Backlog", use_container_width=True):
-        st.session_state["ask_q"] = "Create a prioritized defect backlog from detractor symptoms: severity × frequency × trend. Recommend owners/next tests."
+
+        def _symptom_driver_stats(df_in: pd.DataFrame, symptom_cols: list[str]) -> pd.DataFrame:
+            cols = [c for c in symptom_cols if c in df_in.columns]
+            if not cols or df_in.empty or "Star Rating" not in df_in.columns:
+                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
+
+            stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
+            long = df_in[cols].copy()
+            long["__rid__"] = np.arange(len(df_in))
+            long = long.melt(id_vars="__rid__", value_vars=cols, value_name="symptom").dropna(subset=["symptom"])
+            long["symptom"] = long["symptom"].astype("string").str.strip()
+            long = long[long["symptom"].ne("")]
+            if long.empty:
+                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
+
+            g = long.groupby("symptom")["__rid__"].nunique().rename("Reviews").reset_index()
+            g["Mention %"] = (g["Reviews"] / max(1, len(df_in)) * 100).round(2)
+
+            sym_to_rids = long.groupby("symptom")["__rid__"].apply(lambda x: set(x.tolist())).to_dict()
+            avgs = {}
+            lows = {}
+            for sym, rids in sym_to_rids.items():
+                s = stars.iloc[list(rids)].dropna()
+                avgs[sym] = float(s.mean()) if not s.empty else np.nan
+                lows[sym] = float((s <= 2).mean() * 100) if not s.empty else np.nan
+
+            g["Avg ★"] = g["symptom"].map(avgs).round(2)
+            g["% 1–2★"] = g["symptom"].map(lows).round(1)
+            g = g.rename(columns={"symptom": "Symptom"}).sort_values(["Reviews", "Mention %"], ascending=[False, False])
+            return g.reset_index(drop=True)
+
+        def _driver_table(stats: pd.DataFrame, kind: str) -> pd.DataFrame:
+            if stats.empty:
+                return stats
+            df = stats.copy()
+            df["Δ Avg ★"] = (df["Avg ★"] - baseline_avg).round(2)
+            df["Δ % 1–2★"] = (df["% 1–2★"] - baseline_pct_low).round(1)
+            if kind == "detractors":
+                df["Impact"] = (df["Reviews"] * (baseline_avg - df["Avg ★"])).round(2)
+                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
+            else:
+                df["Impact"] = (df["Reviews"] * (df["Avg ★"] - baseline_avg)).round(2)
+                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
+            return df[["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★", "Δ Avg ★", "Δ % 1–2★", "Impact"]].reset_index(drop=True)
+
+        def _segment_hotspots(df_in: pd.DataFrame, field: str, k: int = 10, min_n: int = 15) -> pd.DataFrame:
+            if field not in df_in.columns or df_in.empty or "Star Rating" not in df_in.columns:
+                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
+            d = df_in[[field, "Star Rating"]].copy()
+            d[field] = d[field].astype("string").fillna("(blank)").str.strip().replace("", "(blank)")
+            d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+            d = d.dropna(subset=["star"])
+            if d.empty:
+                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
+            d["low"] = d["star"] <= 2
+            d["high"] = d["star"] >= 4
+            g = d.groupby(field).agg(Reviews=("star", "size"), Avg=("star", "mean"), PctLow=("low", "mean"), PctHigh=("high", "mean")).reset_index()
+            g["Avg ★"] = g["Avg"].round(2)
+            g["% 1–2★"] = (g["PctLow"] * 100).round(1)
+            g["% 4–5★"] = (g["PctHigh"] * 100).round(1)
+            g = g[g["Reviews"] >= int(min_n)]
+            g = g.sort_values(["% 1–2★", "Reviews"], ascending=[False, False]).head(int(k))
+            return g[[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"]]
+
+        with st.spinner("Building insight context…"):
+            det_stats = _symptom_driver_stats(filtered, existing_detractor_columns)
+            del_stats = _symptom_driver_stats(filtered, existing_delighter_columns)
+            driver_det = _driver_table(det_stats, "detractors")
+            driver_del = _driver_table(del_stats, "delighters")
+
+            hotspots = {}
+            for f in ["Country", "Source", "Model (SKU)", "Seeded"]:
+                hotspots[f] = _segment_hotspots(filtered, f, k=10, min_n=15)
+
+            product_profile = infer_product_profile(filtered, source_label)
+            text_themes = compute_text_theme_diffs(filtered, max_reviews=5000, top_n=18)
+
+        csat = {
+            "reviews": int(len(filtered)),
+            "avg_star": round(baseline_avg, 3),
+            "median_star": round(baseline_median, 3),
+            "pct_1_2": round(baseline_pct_low, 2),
+            "pct_4_5": round(baseline_pct_high, 2),
+            "star_counts": star_counts,
+        }
+
+        cache[_filters_hash] = {
+            "driver_det": driver_det,
+            "driver_del": driver_del,
+            "hotspots": hotspots,
+            "product_profile": product_profile,
+            "text_themes": text_themes,
+            "csat": csat,
+        }
+        return {**cache[_filters_hash], "_filters_hash": _filters_hash}
 
     # ----------------------------
-    # Chat-style history (kept lightweight)
+    # Local helpers for fallback + evidence display
     # ----------------------------
-    st.session_state.setdefault("ai_chat_history", [])  # list of {role, content}
+    def _row_symptoms_list(row: pd.Series, cols: list[str]) -> list[str]:
+        out = []
+        for c in cols:
+            if c not in row.index:
+                continue
+            v = row.get(c, pd.NA)
+            if pd.isna(v):
+                continue
+            s = str(v).strip()
+            if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}:
+                continue
+            out.append(s)
+        seen = set()
+        out2 = []
+        for x in out:
+            xl = x.lower()
+            if xl in seen:
+                continue
+            seen.add(xl)
+            out2.append(x)
+        return out2
 
-    if st.session_state["ai_chat_history"]:
-        with st.expander("💬 Conversation", expanded=False):
-            for msg in st.session_state["ai_chat_history"][-10:]:
-                role = msg.get("role", "assistant")
-                prefix = "You" if role == "user" else "AI"
-                st.markdown(f"**{prefix}:** {msg.get('content','')}")
+    def _local_fallback_answer(knowledge: dict, evidence_quotes: list[dict], question: str) -> str:
+        prof = knowledge.get("product_profile") or {}
+        csat = knowledge.get("csat") or {}
+        det = knowledge.get("top_detractors") or []
+        deli = knowledge.get("top_delighters") or []
 
-    # ----------------------------
-    # Ask form
-    # ----------------------------
-    with st.form("ask_ai_form", clear_on_submit=False):
-        q = st.text_area("Ask a question", key="ask_q", height=110, placeholder="Example: What should we fix first to reduce % 1–2★?")
-        send = st.form_submit_button("Send")
-
-    def _local_product_identity_answer() -> str:
-        prof = product_profile or {}
         lines = []
-        lines.append(f"**Product guess:** {prof.get('product_guess','(unknown)')}")
-        if prof.get("product_family_guess"):
-            conf = prof.get("product_family_confidence")
-            sig = prof.get("product_family_signals") or []
-            conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else ""
-            sig_s = (", ".join(sig[:6])) if sig else ""
-            extra = f" (confidence {conf_s})" if conf_s else ""
-            lines.append(f"**Likely family:** {prof.get('product_family_guess')}{extra}" + (f" — signals: {sig_s}" if sig_s else ""))
-        for k in ["top_product_name", "top_brand", "top_product_category", "top_company", "top_model_(sku)"]:
-            if k in prof:
-                pretty = k.replace("top_", "").replace("_", " ").title()
-                vals = prof.get(k) or []
-                if vals:
-                    lines.append(f"- **{pretty}:** " + ", ".join(vals[:5]))
-        kws = prof.get("top_keywords") or []
-        if kws:
-            lines.append("- **Common review keywords:** " + ", ".join(kws[:12]))
-        bigs = prof.get("top_bigrams") or []
-        if bigs:
-            lines.append("- **Common phrases:** " + ", ".join(bigs[:10]))
+        lines.append(f"**Product (dataset-based):** {prof.get('product_guess','(unknown)')}")
+        fam = prof.get("product_family_guess")
+        if fam:
+            lines.append(f"**Likely family:** {fam}")
+
         lines.append("")
-        lines.append("If you want a definitive label, include a **Product Name** or **Product Category** column (or map SKU → product internally).")
-        return "\n".join(lines)
+        lines.append(
+            f"**CSAT snapshot (filtered):** {csat.get('reviews',0):,} reviews • Avg ★ **{csat.get('avg_star',0):.2f}** • "
+            f"% 1–2★ **{csat.get('pct_1_2',0):.1f}%** • % 4–5★ **{csat.get('pct_4_5',0):.1f}%**"
+        )
 
-    def _local_csat_brief(evidence_quotes: list[dict]) -> str:
-        lines = []
-        lines.append(f"**CSAT snapshot (filtered):** {total_reviews:,} reviews • Avg ★ **{baseline_avg:.2f}** • % 1–2★ **{baseline_pct_low:.1f}%** • % 4–5★ **{baseline_pct_high:.1f}%**.")
-        if not driver_det.empty:
+        if det:
             lines.append("")
-            lines.append("**Top CSAT risks (detractors) — by Impact:**")
-            for _, r in driver_det.head(5).iterrows():
+            lines.append("### Biggest improvement opportunities (top detractors)")
+            for r in det[:6]:
                 lines.append(
-                    f"- **{r['Symptom']}** — reviews {int(r['Reviews']):,} ({float(r['Mention %']):.1f}%), "
-                    f"Avg ★ {float(r['Avg ★']):.2f}, %1–2★ {float(r['% 1–2★']):.1f}% "
-                    f"(Δ Avg {float(r['Δ Avg ★']):+.2f}, Δ DSAT {float(r['Δ % 1–2★']):+.1f}pp)"
+                    f"- **{r.get('Symptom')}** — {int(r.get('Reviews',0)):,} reviews ({float(r.get('Mention %',0)):.1f}%), "
+                    f"Avg ★ {float(r.get('Avg ★',0)):.2f}, %1–2★ {float(r.get('% 1–2★',0)):.1f}% (Impact {float(r.get('Impact',0)):.2f})"
                 )
-        if not driver_del.empty:
+
+        if deli:
             lines.append("")
-            lines.append("**Top strengths (delighters) — protect these:**")
-            for _, r in driver_del.head(3).iterrows():
-                lines.append(f"- **{r['Symptom']}** — reviews {int(r['Reviews']):,} ({float(r['Mention %']):.1f}%), Avg ★ {float(r['Avg ★']):.2f}")
+            lines.append("### What consumers love (top delighters)")
+            for r in deli[:6]:
+                lines.append(
+                    f"- **{r.get('Symptom')}** — {int(r.get('Reviews',0)):,} reviews ({float(r.get('Mention %',0)):.1f}%), Avg ★ {float(r.get('Avg ★',0)):.2f}"
+                )
+
         if evidence_quotes:
             lines.append("")
-            lines.append("**Evidence (top retrieved):**")
-            for r in evidence_quotes[:4]:
+            lines.append("### Evidence (retrieved from filtered reviews)")
+            for r in evidence_quotes[:6]:
                 lines.append(f"- [{r.get('id','Q')}] “{r.get('quote','')}” — {r.get('meta','')}")
+
+        lines.append("")
+        lines.append("*Note: Remote AI was unavailable; this answer was generated locally from aggregates + retrieved evidence.*")
         return "\n".join(lines)
 
     # ----------------------------
-    # Run (Send)
+    # Handle a question
     # ----------------------------
-    if send and q.strip():
-        q = q.strip()
-        st.session_state["_ai_last_search_results"] = []
+    if q and str(q).strip():
+        q = str(q).strip()
 
-        # -------- local retrieval corpus (enriched) --------
-        def _row_symptoms_list(row: pd.Series, cols: list[str]) -> list[str]:
-            out = []
-            for c in cols:
-                if c not in row.index:
-                    continue
-                v = row.get(c, pd.NA)
-                if pd.isna(v):
-                    continue
-                s = str(v).strip()
-                if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}:
-                    continue
-                out.append(s)
-            seen = set()
-            out2 = []
-            for x in out:
-                xl = x.lower()
-                if xl in seen:
-                    continue
-                seen.add(xl)
-                out2.append(x)
-            return out2
+        # Show the user's message immediately
+        with st.chat_message("user"):
+            st.markdown(q)
+        st.session_state["ai_chat_messages"].append({"role": "user", "content": q})
 
-        # Deterministic sampling for very large datasets (keeps AI fast + stable)
+        ctx = _ensure_ai_context()
+        _filters_hash = ctx.get("_filters_hash", str(len(filtered)))
+        driver_det = ctx.get("driver_det", pd.DataFrame())
+        driver_del = ctx.get("driver_del", pd.DataFrame())
+
+        # Build enriched retrieval corpus (deterministic sampling)
         df_for_retrieval = filtered
         if len(df_for_retrieval) > int(ai_cap):
             try:
@@ -3534,7 +3526,7 @@ if view.startswith("🤖"):
         content_hash_local = _hash_texts(local_texts)
         local_index = _get_or_build_local_text_index(local_texts, content_hash_local)
 
-        hits = _local_search(q, local_index, top_k=max(12, int(quote_k) + 2))
+        hits = _local_search(q, local_index, top_k=max(14, int(quote_k) + 4))
 
         evidence = []
         for i, (raw, score) in enumerate(hits[: int(quote_k)], start=1):
@@ -3548,13 +3540,12 @@ if view.startswith("🤖"):
             verb = _mask_pii(str(verb))
             if len(verb) > 360:
                 verb = verb[:357] + "…"
-
             evidence.append({"id": f"Q{i}", "quote": verb, "meta": meta, "score": float(score)})
 
-        # Add symptom-anchored quotes for the top drivers (helps root cause)
+        # Add a few symptom-anchored quotes for top drivers (helps product understanding)
         symptom_evidence = []
-        top_det_syms = driver_det["Symptom"].head(2).tolist() if not driver_det.empty else []
-        top_del_syms = driver_del["Symptom"].head(2).tolist() if not driver_del.empty else []
+        top_det_syms = driver_det["Symptom"].head(2).tolist() if isinstance(driver_det, pd.DataFrame) and not driver_det.empty else []
+        top_del_syms = driver_del["Symptom"].head(2).tolist() if isinstance(driver_del, pd.DataFrame) and not driver_del.empty else []
         for sym in top_det_syms:
             for s in _pick_quotes_for_symptom(filtered, sym, existing_detractor_columns, k=2, prefer="low"):
                 symptom_evidence.append({"id": f"S-{sym}", "quote": _mask_pii(s), "meta": f"Symptom={sym} (detractor)", "score": 0.0})
@@ -3562,83 +3553,59 @@ if view.startswith("🤖"):
             for s in _pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high"):
                 symptom_evidence.append({"id": f"S+{sym}", "quote": _mask_pii(s), "meta": f"Symptom={sym} (delighter)", "score": 0.0})
 
-        # Store for Evidence panel
         st.session_state["_ai_last_search_results"] = (evidence + symptom_evidence)[:40]
 
-        # -------- build a compact "knowledge pack" --------
-        filters_summary = {}
+        # Compact filter summary
         try:
             filters_summary = _summarize_active_filters(filtered)
         except Exception:
             filters_summary = []
 
         knowledge = {
-            "product_profile": product_profile,
+            "product_profile": ctx.get("product_profile"),
             "filters": [{"name": k, "value": v} for (k, v) in (filters_summary or [])],
-            "csat": {
-                "reviews": total_reviews,
-                "avg_star": round(baseline_avg, 3),
-                "median_star": round(baseline_median, 3),
-                "pct_1_2": round(baseline_pct_low, 2),
-                "pct_4_5": round(baseline_pct_high, 2),
-                "star_counts": star_counts,
-            },
-            "top_detractors": driver_det.head(10).to_dict(orient="records") if not driver_det.empty else [],
-            "top_delighters": driver_del.head(10).to_dict(orient="records") if not driver_del.empty else [],
-            "hotspots_country": hotspots.get("Country", pd.DataFrame()).head(8).to_dict(orient="records"),
-            "hotspots_source": hotspots.get("Source", pd.DataFrame()).head(8).to_dict(orient="records"),
-            "themes": text_themes,
+            "csat": ctx.get("csat"),
+            "top_detractors": ctx.get("driver_det", pd.DataFrame()).head(12).to_dict(orient="records") if isinstance(ctx.get("driver_det"), pd.DataFrame) else [],
+            "top_delighters": ctx.get("driver_del", pd.DataFrame()).head(12).to_dict(orient="records") if isinstance(ctx.get("driver_del"), pd.DataFrame) else [],
+            "hotspots": {k: (v.head(10).to_dict(orient="records") if isinstance(v, pd.DataFrame) else []) for k, v in (ctx.get("hotspots") or {}).items()},
+            "themes": ctx.get("text_themes") or {},
         }
 
-        # -------- local fallback answer (always available) --------
-        ql = q.lower()
-        if "what is this product" in ql or "what product is this" in ql or re.search(r"\bwhat\s+product\b", ql):
-            local_answer = _local_product_identity_answer()
-        else:
-            local_answer = _local_csat_brief(evidence_quotes=evidence)
+        # Local fallback always available
+        local_answer = _local_fallback_answer(knowledge, evidence_quotes=evidence, question=q)
 
-        # -------- remote AI answer --------
         final_answer = local_answer
         used_remote = False
 
         if remote_ready:
             try:
-                # If privacy toggle is OFF, remove evidence quotes entirely
                 evidence_to_send = (evidence + symptom_evidence) if send_quotes else []
                 evidence_to_send = evidence_to_send[: int(quote_k)]
 
-                style = st.session_state.get("ai_style", "Engineering deep dive")
                 system_prompt = (
-                    "You are a SharkNinja Consumer Insights + Quality Engineering copilot focused on improving CSAT. "
-                    "You MUST ground claims in the provided dataset context. "
-                    "If you use general product knowledge, label it as a hypothesis (not a fact from the dataset). "
-                    "Always quantify (mention %, avg star, DSAT proxy %1–2★) when possible. "
-                    "When citing evidence, reference quote IDs like [Q3] or [S-...]. "
-                    "Do not invent quotes or numbers."
+                    "You are a SharkNinja Consumer Insights + Product Quality copilot. "
+                    "Your job is to help a quality engineer improve CSAT using the uploaded consumer review dataset. "
+                    "You MUST ground all metrics and claims in the provided DATA_JSON. "
+                    "If you use general product knowledge, label it clearly as a hypothesis. "
+                    "Be concise but insightful; use headings and bullets. "
+                    "When using evidence, cite quote IDs like [Q3] or [S-...]. "
+                    "Never invent quotes or numbers."
                 )
 
-                if style == "Executive brief":
-                    system_prompt += " Write concise, executive-ready bullets with priorities and clear next actions."
-
-                user_payload = {
-                    "question": q,
-                    "knowledge": knowledge,
-                    "evidence_quotes": evidence_to_send,
-                }
-
+                user_payload = {"question": q, "knowledge": knowledge, "evidence_quotes": evidence_to_send}
                 user_prompt = (
-                    "Use the JSON below as the ONLY source of truth for metrics, drivers, hotspots, and evidence.\n"
-                    "Answer the question and provide: TL;DR, top issues, root-cause hypotheses, actions + validation plan.\n\n"
-                    "DATA_JSON:\n"
-                    + json.dumps(user_payload, ensure_ascii=False)
+                    "Answer the question using the dataset context below.\n"
+                    "Provide: TL;DR, Insights (what consumers love + improvement opportunities), Hotspots, and Next actions + validation plan.\n\n"
+                    "DATA_JSON:\n" + json.dumps(user_payload, ensure_ascii=False)
                 )
 
                 messages = [{"role": "system", "content": system_prompt}]
-                # Keep a small amount of conversation memory
-                hist = st.session_state.get("ai_chat_history", [])
+
+                # Provide a small amount of chat memory (keeps it ChatGPT-like but bounded)
+                hist = st.session_state.get("ai_chat_messages", [])
                 for msg in hist[-6:]:
                     if msg.get("role") in ("user", "assistant"):
-                        messages.append({"role": msg["role"], "content": str(msg.get("content", ""))[:4000]})
+                        messages.append({"role": msg["role"], "content": str(msg.get("content", ""))[:2500]})
                 messages.append({"role": "user", "content": user_prompt})
 
                 ans = _call_openai_with_fallback(
@@ -3650,33 +3617,25 @@ if view.startswith("🤖"):
                 if ans and isinstance(ans, str):
                     final_answer = ans
                     used_remote = True
+                    st.session_state.pop("ai_last_error", None)
             except Exception as e:
                 st.session_state["ai_last_error"] = repr(e)
-                st.error("Remote AI failed. Showing local insight instead.")
-                with st.expander("⚠️ Remote AI error details", expanded=False):
-                    st.code(repr(e))
+                # silent fallback to local (still show debug if user opens it)
 
-        # Save conversation memory
-        st.session_state["ai_chat_history"] = (st.session_state.get("ai_chat_history", []) + [{"role": "user", "content": q}, {"role": "assistant", "content": final_answer}])[-20:]
-        st.session_state["ai_last_answer"] = final_answer
+        # Show assistant answer
+        with st.chat_message("assistant"):
+            st.markdown(final_answer)
+
+        st.session_state["ai_chat_messages"].append({"role": "assistant", "content": final_answer})
         st.session_state["ai_last_used_remote"] = used_remote
 
     # ----------------------------
-    # Render latest answer
+    # Evidence panel (optional)
     # ----------------------------
-    if st.session_state.get("ai_last_answer"):
-        used_remote = bool(st.session_state.get("ai_last_used_remote", False))
-        tag = "🟢 Remote AI" if used_remote else "🟡 Local insights"
-        st.markdown(f"### {tag} Response")
-        st.markdown(st.session_state.get("ai_last_answer", ""))
-
-    # ----------------------------
-    # Evidence panel
-    # ----------------------------
-    with st.expander("🔎 Evidence used", expanded=False):
+    with st.expander("🔎 Evidence (retrieved from your filtered reviews)", expanded=False):
         rows = st.session_state.get("_ai_last_search_results", []) or []
         if not rows:
-            st.caption("No evidence quotes retrieved yet. Ask a question and press Send.")
+            st.caption("Ask a question to retrieve evidence quotes.")
         else:
             for r in rows[:24]:
                 st.write(f"[{r.get('id','Q')}] “{r.get('quote','')}” — {r.get('meta','')}")
