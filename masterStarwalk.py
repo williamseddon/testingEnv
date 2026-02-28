@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-02-28-master-v9"
+APP_VERSION = "2026-02-28-master-v10"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -248,7 +248,7 @@ GLOBAL_CSS = """
   /* Sticky top navigation (ONLY the main View radio) */
   .sticky-topnav-host{
     position: sticky;
-    top: 0;
+    top: calc(var(--stHeaderH, 0px) + 6px);
     z-index: 999;
     margin: 6px 0 12px;
     padding: 6px 0;
@@ -1785,7 +1785,11 @@ st.session_state.setdefault("saved_views", {})  # name -> preset object
 st.session_state.setdefault("live_filters", False)
 st.session_state.setdefault("show_perf", False)
 
-live_update = bool(st.session_state.get("live_filters", False))
+live_update_setting = bool(st.session_state.get("live_filters", False))
+# Force live filters in non-dashboard views so review lists + AI stay in sync
+_current_view = str(st.session_state.get("main_view", "📊 Dashboard"))
+force_live_for_view = not _current_view.startswith("📊")
+live_update = live_update_setting or force_live_for_view
 show_perf = bool(st.session_state.get("show_perf", False))
 
 # ----------------------------
@@ -2072,7 +2076,7 @@ with st.sidebar.expander("⚡ Performance", expanded=False):
         "Live-update filters (slower on big files)",
         value=bool(st.session_state.get("live_filters", False)),
         key="live_filters",
-        help="Off = change multiple filters, then click Apply once (recommended for speed).",
+        help="Off = change multiple filters, then click Apply once (recommended for speed). Note: 📝 All Reviews and 🤖 AI always apply filters live so the review list/csat copilot stays in sync.",
     )
     st.toggle("Show perf timings (debug)", value=bool(st.session_state.get("show_perf", False)), key="show_perf")
 
@@ -2218,6 +2222,32 @@ st_html(
     if (!radio) return;
     radio.classList.add('sticky-topnav-host');
   } catch (e) {}
+})();
+</script>
+""",
+    height=0,
+)
+
+st_html(
+    """
+<script>
+(function(){
+  try{
+    const doc = window.parent.document;
+    const root = doc.documentElement;
+    function update(){
+      const header = doc.querySelector('header[data-testid="stHeader"]');
+      const h = header ? header.getBoundingClientRect().height : 0;
+      root.style.setProperty('--stHeaderH', (h || 0) + 'px');
+    }
+    update();
+    const header = doc.querySelector('header[data-testid="stHeader"]');
+    if (header && window.ResizeObserver){
+      new ResizeObserver(update).observe(header);
+    }
+    window.addEventListener('resize', update);
+    setTimeout(update, 250);
+  }catch(e){}
 })();
 </script>
 """,
@@ -2863,7 +2893,9 @@ if view.startswith("📊"):
 # Reviews view
 # ============================================================
 if view.startswith("📝"):
-    st.markdown("## 📝 All Reviews")
+    st.markdown("## 📝 Reviews (in filter criteria)")
+    st.caption("Only reviews that match the CURRENT filter criteria are shown below. Update filters in the sidebar to refresh this list.")
+
 
     if not filtered.empty:
         csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
