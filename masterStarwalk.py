@@ -2126,7 +2126,7 @@ with tab_det:
         detractors_results_full.head(60),
         "Detractors — prioritize high mentions + low Avg ★",
         kind="detractors",
-        baseline=float(all_avg) if isinstance(all_avg, (int, float)) else 0.0,
+        baseline=float(globals().get("all_avg", 0.0)) if isinstance(globals().get("all_avg", 0.0), (int, float)) else 0.0,
     )
 
 with tab_del:
@@ -2135,7 +2135,7 @@ with tab_del:
         delighters_results_full.head(60),
         "Delighters — amplify high mentions + high Avg ★",
         kind="delighters",
-        baseline=float(all_avg) if isinstance(all_avg, (int, float)) else 0.0,
+        baseline=float(globals().get("all_avg", 0.0)) if isinstance(globals().get("all_avg", 0.0), (int, float)) else 0.0,
     )
 
     # ---------- Cumulative Avg ★ Over Time by Region (Weighted) ----------
