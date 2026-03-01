@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v17"
+APP_VERSION = "2026-03-01-master-v18"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -1867,6 +1867,7 @@ except Exception:
 if st.session_state.get("_dataset_sig") != _dataset_sig:
     for _k in [
         "_review_sort_cache",
+        "_col_opts_cache",
         "_ai_local_index",
         "_ai_last_answer",
         "_ai_last_q",
@@ -1958,16 +1959,34 @@ if st.session_state.get("_symptom_opts_key") != _sym_key:
 detractor_symptoms_all = st.session_state.get("_symptom_opts_det", []) or []
 delighter_symptoms_all = st.session_state.get("_symptom_opts_del", []) or []
 
-def _col_options(df_in: pd.DataFrame, col: str, max_vals: int = 250) -> list:
+def _col_options(df_in: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -> list:
+    """Return filter options for a column.
+
+    - Uses frequency order (e-commerce style: most common values first).
+    - If max_vals is None, returns **all** values found.
+    - Cached per dataset+column so it stays fast even with many reruns.
+    """
     if col not in df_in.columns:
         return ["ALL"]
+
+    cache = st.session_state.setdefault("_col_opts_cache", {})
+    cache_key = (st.session_state.get("_dataset_sig"), str(col), int(max_vals) if isinstance(max_vals, int) else None)
+    if cache_key in cache:
+        return cache[cache_key]
+
     s = df_in[col].astype("string").replace({"": pd.NA}).dropna()
     if s.empty:
+        cache[cache_key] = ["ALL"]
         return ["ALL"]
-    # For very high-cardinality columns, use top-N by frequency
-    vc = s.value_counts().head(max_vals)
+
+    vc = s.value_counts()
+    if isinstance(max_vals, int) and max_vals > 0:
+        vc = vc.head(max_vals)
+
     vals = vc.index.astype(str).tolist()
-    return ["ALL"] + vals
+    out = ["ALL"] + vals
+    cache[cache_key] = out
+    return out
 
 def _sanitize_multiselect(key: str, options: list, default: list):
     cur = st.session_state.get(key, default)
@@ -2015,6 +2034,12 @@ def _reset_all_filters():
     st.session_state["extra_filter_cols"] = []
     # Paging
     st.session_state["review_page"] = 0
+
+
+# Home (requested): quick way back to main dashboard from anywhere
+if st.sidebar.button("🏠 Home", use_container_width=True):
+    st.session_state["main_view"] = "📊 Dashboard"
+    st.rerun()
 
 st.sidebar.header("🔍 Filters")
 
@@ -2117,7 +2142,8 @@ if extra_cols:
                 st.session_state[key] = (float(default[0]), float(default[1]))
                 st.slider(col, min_value=lo, max_value=hi, value=st.session_state[key], key=key)
             else:
-                opts = _col_options(df_base, col, max_vals=250)
+                # Power-user extra filters: show **all** values found (Streamlit multiselect is searchable).
+                opts = _col_options(df_base, col, max_vals=None)
                 _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
                 st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
 
@@ -2368,32 +2394,30 @@ st_html(
     const W = window.parent;
     const doc = W.document;
 
-    function parseColor(s){
-      s = (s || "").trim();
-      if (!s) return null;
-      // rgb/rgba
-      let m = s.match(/^rgba?\(([^)]+)\)/i);
-      if (m){
-        let parts = m[1].split(",").map(x => parseFloat(x));
-        if (parts.length >= 3){
-          return {r: parts[0], g: parts[1], b: parts[2]};
-        }
+    // Robustly normalize any CSS color value into an rgb triplet.
+    // This avoids bugs when Streamlit theme vars are in modern syntax like:
+    //   rgb(255 255 255 / 1)
+    //   rgb(255 255 255)
+    // which don't parse with naive comma-splitting.
+    function toRgbTriplet(cssColor, prop){
+      try{
+        cssColor = (cssColor || "").trim();
+        if (!cssColor) return null;
+        if (!doc.body) return null;
+        const el = doc.createElement('div');
+        el.style.position = 'fixed';
+        el.style.left = '-9999px';
+        el.style.top = '-9999px';
+        el.style[prop] = cssColor;
+        doc.body.appendChild(el);
+        const cs = W.getComputedStyle(el)[prop] || "";
+        doc.body.removeChild(el);
+        const m = cs.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+        if (!m) return null;
+        return {r: parseInt(m[1],10), g: parseInt(m[2],10), b: parseInt(m[3],10)};
+      }catch(e){
+        return null;
       }
-      // hex
-      if (s[0] === "#"){
-        let hex = s.slice(1).trim();
-        if (hex.length === 3){
-          hex = hex.split("").map(c => c + c).join("");
-        }
-        if (hex.length === 6){
-          return {
-            r: parseInt(hex.slice(0,2), 16),
-            g: parseInt(hex.slice(2,4), 16),
-            b: parseInt(hex.slice(4,6), 16)
-          };
-        }
-      }
-      return null;
     }
 
     function luminance(c){
@@ -2409,12 +2433,15 @@ st_html(
 
     function setScheme(){
       try{
+        // Wait until Streamlit has attached the body so our color normalization works.
+        if (!doc.body) return;
         const rootStyle = W.getComputedStyle(doc.documentElement);
         const bgVar = (rootStyle.getPropertyValue('--background-color') || "").trim();
         const txVar = (rootStyle.getPropertyValue('--text-color') || "").trim();
 
-        const bg = parseColor(bgVar);
-        const tx = parseColor(txVar);
+        // Convert whatever Streamlit gives us into computed rgb() with commas.
+        const bg = toRgbTriplet(bgVar, 'backgroundColor');
+        const tx = toRgbTriplet(txVar, 'color');
 
         let scheme = null;
 
@@ -2435,10 +2462,11 @@ st_html(
     }
 
     setScheme();
+    // Re-run a few times to handle initial hydration + user toggling theme.
     W.setTimeout(setScheme, 120);
     W.setTimeout(setScheme, 350);
     W.setTimeout(setScheme, 800);
-    W.setInterval(setScheme, 1000);
+    W.setInterval(setScheme, 1200);
 
     if (W.matchMedia){
       const mq = W.matchMedia('(prefers-color-scheme: dark)');
@@ -2669,6 +2697,7 @@ if view.startswith("📊"):
 **Interpretation**
 - Higher Net Hit = larger rating-impact lever (directionally)
 - Net Hits sum to the total gap (within the table)
+- For **Detractors**, we show Net Hit as a **positive** "rating drag" share (bigger = worse). If you prefer signed values, treat detractor Net Hit as negative.
 - This is a proportional allocation model, not causal regression."""
             )
 
@@ -2709,8 +2738,8 @@ if view.startswith("📊"):
                 vv = float(v)
                 # Requested: only Avg Star colored; threshold 4.5
                 if vv >= 4.5:
-                    return "color:#16a34a;font-weight:800;"
-                return "color:#dc2626;font-weight:800;"
+                    return "color:var(--ok);font-weight:800;"
+                return "color:var(--bad);font-weight:800;"
             except Exception:
                 return ""
 
