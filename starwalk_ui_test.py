@@ -29,7 +29,7 @@ import zlib
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import numpy as np
@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v18"
+APP_VERSION = "2026-03-01-master-v19"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -105,14 +105,43 @@ except Exception:
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk — Master Dashboard")
 
-# ---------- Theme / Plotly helpers ----------
-try:
-    _theme_base = str(st.get_option("theme.base") or "light").lower()
-except Exception:
-    _theme_base = "light"
-IS_DARK_THEME = _theme_base == "dark"
-PLOTLY_TEMPLATE = "plotly_dark" if IS_DARK_THEME else "plotly_white"
-PLOTLY_GRIDCOLOR = "rgba(255,255,255,0.12)" if IS_DARK_THEME else "rgba(0,0,0,0.06)"
+# ---------- Plotly helpers (theme-agnostic + no fragile detection) ----------
+# Streamlit theme can be toggled client-side (Light/Dark/System) and Python-side
+# st.get_option("theme.base") does NOT reliably reflect the current UI theme.
+#
+# To avoid white-on-white (or black-on-black) charts, we:
+# - Use transparent plot/paper backgrounds.
+# - Use CSS keyword `currentColor` for text, so the chart inherits the surrounding
+#   text color (works in light + dark automatically).
+PLOTLY_TEMPLATE = "plotly"
+PLOTLY_GRIDCOLOR = "rgba(148,163,184,0.25)"
+
+
+def style_plotly(fig: go.Figure) -> go.Figure:
+    """Apply a readable, theme-agnostic Plotly style."""
+    try:
+        fig.update_layout(
+            template=PLOTLY_TEMPLATE,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="currentColor"),
+            title=dict(font=dict(color="currentColor")),
+        )
+        fig.update_xaxes(
+            gridcolor=PLOTLY_GRIDCOLOR,
+            zerolinecolor=PLOTLY_GRIDCOLOR,
+            tickfont=dict(color="currentColor"),
+            titlefont=dict(color="currentColor"),
+        )
+        fig.update_yaxes(
+            gridcolor=PLOTLY_GRIDCOLOR,
+            zerolinecolor=PLOTLY_GRIDCOLOR,
+            tickfont=dict(color="currentColor"),
+            titlefont=dict(color="currentColor"),
+        )
+    except Exception:
+        pass
+    return fig
 
 # ---------- Global CSS (always readable in light) ----------
 GLOBAL_CSS = """
@@ -120,61 +149,63 @@ GLOBAL_CSS = """
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
 
-  
-  /* --- Theme-safe tokens (works in Light/Dark/System) ---
-     We default to a polished LIGHT palette, and switch to DARK when the app
-     detects Streamlit is in dark mode and sets: <html data-scheme="dark">.
-     This avoids the “mixed theme” issue where widgets render dark while the page stays light. */
+  /*
+    Theme system (v19):
+    - DO NOT guess light/dark.
+    - DO NOT override Streamlit's theme.
+    - Instead, derive our tokens from Streamlit's live CSS variables.
+
+    This prevents the failure mode you saw: "Light mode" UI with a dark background.
+  */
 
   :root{
-    color-scheme: light;
-    --text: #0f172a;
-    --bg-app: #f6f8fc;
-    --bg-card: #ffffff;
-    --bg-tile: #f8fafc;
+    color-scheme: light dark;
 
-    --border-strong: rgba(148,163,184,0.45);
-    --border: rgba(148,163,184,0.32);
+    /* Streamlit tokens (with safe fallbacks) */
+    --st-bg: var(--background-color, #ffffff);
+    --st-card: var(--secondary-background-color, #f6f8fc);
+    --st-text: var(--text-color, #0f172a);
+    --st-primary: var(--primary-color, #3b82f6);
+
+    /* App tokens derived from Streamlit (with fallbacks for older browsers) */
+    --text: var(--st-text);
+    --bg-app: var(--st-bg);
+    --bg-card: var(--st-card);
+
+    /* Safe fallbacks (overridden below when color-mix is supported) */
+    --bg-tile: var(--st-card);
     --border-soft: rgba(148,163,184,0.22);
-
+    --border: rgba(148,163,184,0.32);
+    --border-strong: rgba(148,163,184,0.45);
     --muted: rgba(71,85,105,0.95);
     --muted-2: rgba(100,116,139,0.95);
 
-    --ring: #3b82f6;
+    --ring: var(--st-primary);
     --ok:#16a34a; --bad:#dc2626;
 
-    --shadow: rgba(15,23,42,0.10);
-    --shadow-lg: rgba(15,23,42,0.16);
+    --shadow: rgba(0,0,0,0.10);
+    --shadow-lg: rgba(0,0,0,0.18);
 
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  :root[data-scheme="dark"]{
-    color-scheme: dark;
-    --text: rgba(255,255,255,0.92);
-    --bg-app: #0b0e14;
-    --bg-card: rgba(255,255,255,0.06);
-    --bg-tile: rgba(255,255,255,0.04);
-
-    --border-strong: rgba(255,255,255,0.22);
-    --border: rgba(255,255,255,0.16);
-    --border-soft: rgba(255,255,255,0.10);
-
-    --muted: rgba(255,255,255,0.74);
-    --muted-2: rgba(255,255,255,0.64);
-
-    --ring: #60a5fa;
-    --ok:#34d399; --bad:#f87171;
-
-    --shadow: rgba(0,0,0,0.35);
-    --shadow-lg: rgba(0,0,0,0.55);
+  /* Modern browsers: derive subtle tints from the live Streamlit theme */
+  @supports (color: color-mix(in srgb, white 50%, black)) {
+    :root{
+      --bg-tile: color-mix(in srgb, var(--st-card) 70%, var(--st-bg) 30%);
+      --border-soft: color-mix(in srgb, var(--st-text) 10%, transparent);
+      --border: color-mix(in srgb, var(--st-text) 16%, transparent);
+      --border-strong: color-mix(in srgb, var(--st-text) 22%, transparent);
+      --muted: color-mix(in srgb, var(--st-text) 78%, transparent);
+      --muted-2: color-mix(in srgb, var(--st-text) 66%, transparent);
+    }
   }
 
-
+  /* Ensure the overall page uses Streamlit's current theme colors */
   html, body, .stApp {
     background: var(--bg-app) !important;
-    font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
     color: var(--text) !important;
+    font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
   }
 
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
@@ -192,7 +223,7 @@ GLOBAL_CSS = """
 
   .small-muted{ color:var(--muted); font-size:.9rem; }
 
-  /* File uploader (prevents ugly mixed-theme first load) */
+  /* File uploader */
   [data-testid="stFileUploadDropzone"]{
     border-radius:14px !important;
     border:1.8px dashed var(--border-strong) !important;
@@ -227,8 +258,9 @@ GLOBAL_CSS = """
     content:"";
     position:absolute;
     inset:-2px;
-    background: radial-gradient(1200px 220px at 20% -20%, rgba(96,165,250,0.26), rgba(0,0,0,0)),
-                radial-gradient(1200px 220px at 80% 120%, rgba(34,197,94,0.16), rgba(0,0,0,0));
+    /* Subtle accent that works in both themes */
+    background: radial-gradient(1200px 220px at 20% -20%, rgba(59,130,246,0.18), rgba(0,0,0,0)),
+                radial-gradient(1200px 220px at 80% 120%, rgba(34,197,94,0.12), rgba(0,0,0,0));
     pointer-events:none;
   }
   .metric-head{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:10px; }
@@ -837,6 +869,12 @@ def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
 def join_list(x: Any, sep: str = " | ") -> Any:
     if x is None:
         return None
+    if isinstance(x, dict):
+        # Preserve nested dicts as a compact JSON string so they can still be filtered/searchable.
+        try:
+            return json.dumps(x, ensure_ascii=False)
+        except Exception:
+            return str(x)
     if isinstance(x, list):
         vals = [str(v).strip() for v in x if v is not None and str(v).strip() != ""]
         return sep.join(vals) if vals else None
@@ -865,23 +903,103 @@ REVIEWS_BASE_COLS: List[Tuple[str, Any]] = [
     ("Review", lambda r: safe_get(r, ["freeText", "Review"])),
 ]
 
-REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
-    ("Key Review Sentiment_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment_Reviews"]))),
-    ("Key Review Sentiment Type_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment Type_Reviews"]))),
-    ("Dominant Customer Journey Step", lambda r: join_list(safe_get(r, ["customAttributes", "Dominant Customer Journey Step"]))),
-    ("Trigger Point_Product", lambda r: join_list(safe_get(r, ["customAttributes", "Trigger Point_Product"]))),
-    ("L2 Delighter Component", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Component"]))),
-    ("L2 Delighter Condition", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Condition"]))),
-    ("L2 Delighter Mode", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Mode"]))),
-    ("L3 Non Product Detractors", lambda r: join_list(safe_get(r, ["customAttributes", "L3 Non Product Detractors"]))),
-    ("Product_Symptom Component", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Component"]))),
-    ("Product_Symptom Conditions", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Conditions"]))),
-]
+def _collect_attribute_keys(records: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Collect *all* attribute keys so they can become filterable columns.
+
+    This is intentionally broad: anything under clientAttributes/customAttributes/
+    customAttributes.taxonomies/axionAttributes becomes a column.
+    """
+
+    def _clean_keys(keys: Iterable[Any]) -> List[str]:
+        out = []
+        for k in keys:
+            s = str(k).strip()
+            if not s or s.lower() in {"unnamed: 0"}:
+                continue
+            out.append(s)
+        return sorted(list(dict.fromkeys(out)))
+
+    client: set[str] = set()
+    custom: set[str] = set()
+    tax: set[str] = set()
+    ax: set[str] = set()
+
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        ca = r.get("clientAttributes")
+        if isinstance(ca, dict):
+            client.update([str(k) for k in ca.keys()])
+
+        cu = r.get("customAttributes")
+        if isinstance(cu, dict):
+            for k, v in cu.items():
+                if str(k) == "taxonomies" and isinstance(v, dict):
+                    tax.update([str(tk) for tk in v.keys()])
+                else:
+                    custom.add(str(k))
+
+        aa = r.get("axionAttributes")
+        if isinstance(aa, dict):
+            ax.update([str(k) for k in aa.keys()])
+
+    return (
+        _clean_keys(client),
+        _clean_keys(custom),
+        _clean_keys(tax),
+        _clean_keys(ax),
+    )
 
 
 def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
-    cols = REVIEWS_BASE_COLS + (REVIEWS_EXTRA_COLS if include_extra else [])
-    rows = [{name: fn(r) for name, fn in cols} for r in records]
+    """Build a "reviews" DataFrame from the JSON export.
+
+    v19 upgrade:
+    - Keeps the original base columns used by the app.
+    - Also flattens **all** JSON attributes (client/custom/taxonomies/axion)
+      into additional columns so they can be used in the "➕ Add Filters" system.
+    """
+
+    client_keys: List[str] = []
+    custom_keys: List[str] = []
+    tax_keys: List[str] = []
+    ax_keys: List[str] = []
+    if include_extra:
+        client_keys, custom_keys, tax_keys, ax_keys = _collect_attribute_keys(records)
+
+    base_cols = list(REVIEWS_BASE_COLS)
+
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+
+        row: Dict[str, Any] = {name: fn(r) for name, fn in base_cols}
+
+        if include_extra:
+            ca = r.get("clientAttributes") if isinstance(r.get("clientAttributes"), dict) else {}
+            cu = r.get("customAttributes") if isinstance(r.get("customAttributes"), dict) else {}
+            tax = cu.get("taxonomies") if isinstance(cu.get("taxonomies"), dict) else {}
+            aa = r.get("axionAttributes") if isinstance(r.get("axionAttributes"), dict) else {}
+
+            for k in client_keys:
+                row[k] = join_list(ca.get(k))
+            for k in custom_keys:
+                # (taxonomies handled separately)
+                row[k] = join_list(cu.get(k))
+            for k in tax_keys:
+                row[k] = join_list(tax.get(k))
+            for k in ax_keys:
+                row[k] = join_list(aa.get(k))
+
+            # A couple useful top-level scalars (kept minimal)
+            if "eventType" in r:
+                row["eventType"] = r.get("eventType")
+            if "eventId" in r:
+                row["eventId"] = r.get("eventId")
+
+        rows.append(row)
+
     df = pd.DataFrame(rows)
     if "Rating (num)" in df.columns:
         df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
@@ -1147,8 +1265,52 @@ def convert_to_starwalk_from_reviews_df(
     """
     src_df = reviews_df.reset_index(drop=True)
     out_cols = list(DEFAULT_STARWALK_COLUMNS)
+
+    # v19: optionally keep **all** extra JSON-derived columns (e.g., Base SKU,
+    # Product Category, Company, Factory Name, etc.) so they can be used in
+    # the "➕ Add Filters" power-user system.
+    extra_cols_dynamic: List[str] = []
+    extra_cols_final: List[str] = []
     if include_extra_cols_after_symptom20:
-        out_cols = insert_after_symptom20(out_cols, DEFAULT_EXTRA_AFTER_SYMPTOM20)
+        base_extras = [c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns]
+
+        # Columns already represented in the Star Walk schema via field_map below.
+        # (We avoid duplicating them as extra columns.)
+        _used_inputs = {
+            "Retailer",
+            "Model",
+            "Seeded Reviews",
+            "Syndicated/Seeded Reviews",
+            "Location",
+            "Opened Timestamp",
+            "Record ID",
+            "Review",
+            "Rating (num)",
+        }
+
+        for c in list(src_df.columns):
+            sc = str(c).strip()
+            if not sc or sc.lower() in {"unnamed: 0"}:
+                continue
+            if sc in _used_inputs:
+                continue
+            if sc in base_extras:
+                continue
+            # Avoid duplicating symptoms / core outputs
+            if sc in out_cols or sc.startswith("Symptom "):
+                continue
+            try:
+                if src_df[sc].isna().all():
+                    continue
+            except Exception:
+                pass
+            extra_cols_dynamic.append(sc)
+
+        # Stable order: known extras first, then the remaining columns sorted.
+        extra_cols_dynamic = sorted(list(dict.fromkeys(extra_cols_dynamic)))
+        extra_cols_final = base_extras + [c for c in extra_cols_dynamic if c not in base_extras]
+
+        out_cols = insert_after_symptom20(out_cols, extra_cols_final)
 
     # Field mapping (source col -> output col)
     field_map = {
@@ -1162,7 +1324,7 @@ def convert_to_starwalk_from_reviews_df(
         "Verbatim": "Review",
         "Star Rating": "Rating (num)",
         # map extras where possible (same names)
-        **{c: c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns},
+        **{c: c for c in extra_cols_final if c in src_df.columns},
     }
 
     # L2 columns
@@ -1337,7 +1499,7 @@ def _json_text_to_starwalk(json_text: str, source_name: str, include_extra_cols:
     records = extract_records(raw_obj)
     if not records:
         raise ValueError("Parsed input, but found 0 record objects to convert.")
-    reviews_df = build_reviews_df(records, include_extra=True)
+    reviews_df = build_reviews_df(records, include_extra=include_extra_cols)
 
     out_df, stats = convert_to_starwalk_from_reviews_df(
         reviews_df,
@@ -1458,12 +1620,24 @@ def _collect_filter_state(additional_columns: list[str]) -> dict:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
+        rk = f"f_{col}_range"
+        if rk in st.session_state:
+            state["filters"][rk] = st.session_state.get(rk)
+        ck = f"f_{col}_contains"
+        if ck in st.session_state:
+            state["filters"][ck] = st.session_state.get(ck)
 
     # additional columns (dynamic)
     for col in additional_columns:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
+        rk = f"f_{col}_range"
+        if rk in st.session_state:
+            state["filters"][rk] = st.session_state.get(rk)
+        ck = f"f_{col}_contains"
+        if ck in st.session_state:
+            state["filters"][ck] = st.session_state.get(ck)
 
     # reviews per page
     state["ui"]["rpp"] = st.session_state.get("rpp", 10)
@@ -1497,6 +1671,14 @@ def _apply_filter_state_to_session(state: dict, available_columns: list[str], ad
         k = f"f_{col}"
         if k in filters:
             st.session_state[k] = _safe_list(filters.get(k))
+
+        rk = f"f_{col}_range"
+        if rk in filters:
+            st.session_state[rk] = filters.get(rk)
+
+        ck = f"f_{col}_contains"
+        if ck in filters:
+            st.session_state[ck] = str(filters.get(ck) or "")
 
     # UI
     ui = (state or {}).get("ui", {})
@@ -1970,16 +2152,40 @@ def _col_options(df_in: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -
         return ["ALL"]
 
     cache = st.session_state.setdefault("_col_opts_cache", {})
-    cache_key = (st.session_state.get("_dataset_sig"), str(col), int(max_vals) if isinstance(max_vals, int) else None)
+
+    s0 = df_in[col].astype("string").replace({"": pd.NA}).dropna()
+    # Detect multi-valued fields we created from lists (we join lists with " | ").
+    # When detected, we explode tokens so the filter shows *actual* values
+    # (e.g., "Factory Name" -> "YDC CN") instead of combo strings.
+    sample = s0.head(300)
+    tokenize_multi = bool(sample.astype(str).str.contains(r"\s\|\s", regex=True).any())
+
+    cache_key = (
+        st.session_state.get("_dataset_sig"),
+        str(col),
+        int(max_vals) if isinstance(max_vals, int) else None,
+        bool(tokenize_multi),
+    )
     if cache_key in cache:
         return cache[cache_key]
 
-    s = df_in[col].astype("string").replace({"": pd.NA}).dropna()
-    if s.empty:
+    if s0.empty:
         cache[cache_key] = ["ALL"]
         return ["ALL"]
 
-    vc = s.value_counts()
+    if tokenize_multi:
+        tok = (
+            s0.astype(str)
+            .str.split(r"\s*\|\s*", regex=True)
+            .explode()
+            .astype("string")
+            .str.strip()
+            .replace({"": pd.NA})
+            .dropna()
+        )
+        vc = tok.value_counts()
+    else:
+        vc = s0.value_counts()
     if isinstance(max_vals, int) and max_vals > 0:
         vc = vc.head(max_vals)
 
@@ -2031,6 +2237,7 @@ def _reset_all_filters():
     for col in st.session_state.get("extra_filter_cols", []):
         st.session_state.pop(f"f_{col}", None)
         st.session_state.pop(f"f_{col}_range", None)
+        st.session_state.pop(f"f_{col}_contains", None)
     st.session_state["extra_filter_cols"] = []
     # Paging
     st.session_state["review_page"] = 0
@@ -2142,10 +2349,25 @@ if extra_cols:
                 st.session_state[key] = (float(default[0]), float(default[1]))
                 st.slider(col, min_value=lo, max_value=hi, value=st.session_state[key], key=key)
             else:
-                # Power-user extra filters: show **all** values found (Streamlit multiselect is searchable).
-                opts = _col_options(df_base, col, max_vals=None)
-                _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
-                st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
+                # Power-user extra filters:
+                # - If cardinality is reasonable, show a searchable multiselect with **all** values.
+                # - If cardinality is huge, show a fast "contains" search box instead.
+                try:
+                    nunique = int(s.astype("string").replace({"": pd.NA}).nunique(dropna=True))
+                except Exception:
+                    nunique = 0
+
+                if nunique > 600:
+                    st.text_input(
+                        f"{col} contains",
+                        value=str(st.session_state.get(f"f_{col}_contains") or ""),
+                        key=f"f_{col}_contains",
+                        help="High-cardinality column — using a contains filter for speed.",
+                    )
+                else:
+                    opts = _col_options(df_base, col, max_vals=None)
+                    _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
+                    st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
 
 # --- Saved Views (still supported) ---
 with st.sidebar.expander("💾 Saved Views / Presets", expanded=False):
@@ -2176,6 +2398,10 @@ with st.sidebar.expander("💾 Saved Views / Presets", expanded=False):
                 for k in (preset.get("filters") or {}).keys():
                     if k.startswith("f_"):
                         col = k[2:]
+                        # Strip suffixes used by range/contains filters
+                        for suf in ("_range", "_contains"):
+                            if col.endswith(suf):
+                                col = col[: -len(suf)]
                         if col in extra_filter_candidates:
                             used.append(col)
                 st.session_state["extra_filter_cols"] = sorted(list(set(used)))
@@ -2245,9 +2471,25 @@ for col in extra_cols:
         num = pd.to_numeric(d0[col], errors="coerce")
         mask &= num.between(float(lo), float(hi))
     else:
-        sel = st.session_state.get(f"f_{col}", ["ALL"])
-        if isinstance(sel, list) and sel and "ALL" not in sel:
-            mask &= d0[col].astype("string").isin([str(x) for x in sel])
+        # high-cardinality text search?
+        contains_key = f"f_{col}_contains"
+        contains_val = (st.session_state.get(contains_key) or "").strip()
+        if contains_val:
+            mask &= d0[col].astype("string").fillna("").str.contains(contains_val, case=False, na=False)
+        else:
+            sel = st.session_state.get(f"f_{col}", ["ALL"])
+            if isinstance(sel, list) and sel and "ALL" not in sel:
+                s = d0[col].astype("string").fillna("")
+                # If the field contains multi-values joined by " | ", treat selections as tokens.
+                sample = s.dropna().head(200).astype(str)
+                if bool(sample.str.contains(r"\s\|\s", regex=True).any()):
+                    # Match whole tokens delimited by pipes (case-insensitive)
+                    toks = [str(x).strip() for x in sel if str(x).strip()]
+                    if toks:
+                        pattern = r"(^|\s*\|\s*)(" + "|".join([re.escape(t) for t in toks]) + r")(\s*\|\s*|$)"
+                        mask &= s.str.contains(pattern, case=False, regex=True, na=False)
+                else:
+                    mask &= s.isin([str(x) for x in sel])
 
 # symptom filters
 sel_del = st.session_state.get("delight", ["All"])
@@ -2278,6 +2520,21 @@ def _summarize_active_filters() -> list[tuple[str, str]]:
     if isinstance(sr_sel, list) and "All" not in sr_sel:
         items.append(("Stars", ", ".join([str(x) for x in sr_sel])))
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + extra_cols:
+        # range filters
+        rk = f"f_{col}_range"
+        if rk in st.session_state and isinstance(st.session_state.get(rk), (tuple, list)) and len(st.session_state.get(rk)) == 2:
+            lo, hi = st.session_state.get(rk)
+            items.append((col, f"{float(lo):g} → {float(hi):g}"))
+            continue
+
+        # contains filters
+        ck = f"f_{col}_contains"
+        cv = (st.session_state.get(ck) or "").strip()
+        if cv:
+            items.append((col, f"contains: {cv}"))
+            continue
+
+        # multiselect filters
         sel = st.session_state.get(f"f_{col}", ["ALL"])
         if isinstance(sel, list) and sel and "ALL" not in sel:
             items.append((col, ", ".join([str(x) for x in sel[:4]]) + ("" if len(sel) <= 4 else f" +{len(sel)-4}")))
@@ -2376,106 +2633,6 @@ st_html(
     }
 
     W.addEventListener('resize', setHeaderH);
-  }catch(e){}
-})();
-</script>
-""",
-    height=0,
-)
-
-
-
-
-st_html(
-    """
-<script>
-(function(){
-  try{
-    const W = window.parent;
-    const doc = W.document;
-
-    // Robustly normalize any CSS color value into an rgb triplet.
-    // This avoids bugs when Streamlit theme vars are in modern syntax like:
-    //   rgb(255 255 255 / 1)
-    //   rgb(255 255 255)
-    // which don't parse with naive comma-splitting.
-    function toRgbTriplet(cssColor, prop){
-      try{
-        cssColor = (cssColor || "").trim();
-        if (!cssColor) return null;
-        if (!doc.body) return null;
-        const el = doc.createElement('div');
-        el.style.position = 'fixed';
-        el.style.left = '-9999px';
-        el.style.top = '-9999px';
-        el.style[prop] = cssColor;
-        doc.body.appendChild(el);
-        const cs = W.getComputedStyle(el)[prop] || "";
-        doc.body.removeChild(el);
-        const m = cs.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-        if (!m) return null;
-        return {r: parseInt(m[1],10), g: parseInt(m[2],10), b: parseInt(m[3],10)};
-      }catch(e){
-        return null;
-      }
-    }
-
-    function luminance(c){
-      function chan(v){
-        v = v / 255;
-        return (v <= 0.03928) ? (v/12.92) : Math.pow((v + 0.055) / 1.055, 2.4);
-      }
-      const r = chan(c.r), g = chan(c.g), b = chan(c.b);
-      return 0.2126*r + 0.7152*g + 0.0722*b;
-    }
-
-    let last = null;
-
-    function setScheme(){
-      try{
-        // Wait until Streamlit has attached the body so our color normalization works.
-        if (!doc.body) return;
-        const rootStyle = W.getComputedStyle(doc.documentElement);
-        const bgVar = (rootStyle.getPropertyValue('--background-color') || "").trim();
-        const txVar = (rootStyle.getPropertyValue('--text-color') || "").trim();
-
-        // Convert whatever Streamlit gives us into computed rgb() with commas.
-        const bg = toRgbTriplet(bgVar, 'backgroundColor');
-        const tx = toRgbTriplet(txVar, 'color');
-
-        let scheme = null;
-
-        if (bg){
-          scheme = (luminance(bg) < 0.45) ? "dark" : "light";
-        } else if (tx){
-          scheme = (luminance(tx) > 0.70) ? "dark" : "light";
-        } else {
-          scheme = (W.matchMedia && W.matchMedia('(prefers-color-scheme: dark)').matches) ? "dark" : "light";
-        }
-
-        if (scheme && scheme !== last){
-          doc.documentElement.setAttribute("data-scheme", scheme);
-          if (doc.body) doc.body.setAttribute("data-scheme", scheme);
-          last = scheme;
-        }
-      }catch(e){}
-    }
-
-    setScheme();
-    // Re-run a few times to handle initial hydration + user toggling theme.
-    W.setTimeout(setScheme, 120);
-    W.setTimeout(setScheme, 350);
-    W.setTimeout(setScheme, 800);
-    W.setInterval(setScheme, 1200);
-
-    if (W.matchMedia){
-      const mq = W.matchMedia('(prefers-color-scheme: dark)');
-      if (mq && mq.addEventListener){
-        mq.addEventListener('change', setScheme);
-      } else if (mq && mq.addListener){
-        mq.addListener(setScheme);
-      }
-    }
   }catch(e){}
 })();
 </script>
@@ -2668,6 +2825,7 @@ if view.startswith("📊"):
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
             )
+            style_plotly(fig)
             st.plotly_chart(fig, use_container_width=True)
 
             if show_table:
@@ -2847,6 +3005,7 @@ if view.startswith("📊"):
             )
             fig_det.update_layout(template=PLOTLY_TEMPLATE, margin=dict(l=170, r=20, t=20, b=40), height=460, xaxis=dict(title=x_label),
                                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            style_plotly(fig_det)
             st.plotly_chart(fig_det, use_container_width=True)
 
     with c2:
@@ -2873,6 +3032,7 @@ if view.startswith("📊"):
             )
             fig_del.update_layout(template=PLOTLY_TEMPLATE, margin=dict(l=170, r=20, t=20, b=40), height=460, xaxis=dict(title=x_label),
                                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            style_plotly(fig_del)
             st.plotly_chart(fig_del, use_container_width=True)
 
     # ---------- Cumulative Avg ★ Over Time by Region (Weighted) ----------
@@ -2999,6 +3159,7 @@ if view.startswith("📊"):
                 fig.update_yaxes(title_text="Cumulative Avg ★", range=[1.0, 5.2], showgrid=True, gridcolor=PLOTLY_GRIDCOLOR, secondary_y=False)
                 fig.update_yaxes(title_text="Reviews/day", showgrid=False, secondary_y=True, rangemode="tozero", showticklabels=False)
 
+                style_plotly(fig)
                 st.plotly_chart(fig, use_container_width=True)
 
     # ---------- Watchouts ----------
@@ -3088,6 +3249,7 @@ if view.startswith("📊"):
             uniformtext_mode="hide",
         )
 
+        style_plotly(fig)
         st.plotly_chart(fig, use_container_width=True)
 
         d2 = d.copy()
