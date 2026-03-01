@@ -1,37 +1,12 @@
-# amazonReviewScraper.py
-# Streamlit: Amazon Reviews Scraper (Apify) — improved UX + Streamlit secrets support
-#
-# ✅ Token UX:
-#   - Auto-uses st.secrets if present (APIFY_TOKEN or [apify].token)
-#   - Manual override optional
-#   - Shows exact secrets.toml format
-#
-# ✅ ASIN UX:
-#   - “Manage ASINs” tab with:
-#       - Add single row form
-#       - Bulk add (one ASIN per line)
-#       - Bulk add CSV-like lines (ASIN, Country, Reviews, Rating, Sort)
-#       - Import/export config CSV
-#       - Editable grid with Enabled + Delete checkboxes
-#       - Buttons: Remove checked / Disable checked / Clear table
-#
-# ✅ Run UX:
-#   - Parallel runs (max concurrency)
-#   - Live progress + ETA (based on observed throughput)
-#   - Cost/CU (best-effort from run details: usageTotalUsd, stats.computeUnits)
-#
-# ✅ Output:
-#   - Excel: one tab per row + MASTER
-#   - CSV: MASTER
-#   - Cleans ReviewContent for video reviews (removes huge VSE player JSON blob)
-#     + optional columns: VideoUrl, VideoPosterImageUrl, VideoCaptionsUrl
+
+# amazonReviewScraper_streamlined.py
+# Streamlit: Amazon Reviews Scraper (Apify) — streamlined queue UI
 #
 # Install:
 #   pip install streamlit apify-client pandas openpyxl
 #
 # Run:
-#   streamlit run amazonReviewScraper.py
-
+#   streamlit run amazonReviewScraper_streamlined.py
 
 from __future__ import annotations
 
@@ -64,7 +39,6 @@ SORT_LABEL_TO_KEY = {"Recent": "recent", "Helpful": "helpful"}
 SORT_OVERRIDE_OPTIONS = ["Default", "Recent", "Helpful"]
 
 # Keep these aligned to what your actor expects.
-# You previously ran successfully with "France" and "United States".
 COUNTRY_VALUES = [
     "France",
     "United States",
@@ -91,6 +65,15 @@ RATING_FALLBACK_ALL = ["one_star", "two_star", "three_star", "four_star", "five_
 
 # Video-widget “junk” signature captured in ReviewContent
 VIDEO_MARKER = "This is a modal window."
+
+# Internal table columns (we still accept/import the older "Delete" column)
+COL_ENABLED = "Enabled"
+COL_COUNTRY = "Country"
+COL_ASIN = "ASIN or URL"
+COL_REVIEWS = "Reviews to pull"
+COL_RATING = "Rating"
+COL_SORT = "Sort"
+COL_SELECTED = "Selected"   # checkbox used for remove/disable/enable actions
 
 
 # ----------------------------
@@ -295,35 +278,249 @@ def export_csv_bytes(master: pd.DataFrame) -> bytes:
 
 
 def export_config_csv_bytes(df: pd.DataFrame) -> bytes:
-    cols = ["Enabled", "Country", "ASIN or URL", "Reviews to pull", "Rating", "Sort"]
-    out = df.copy()
-    for c in cols:
-        if c not in out.columns:
-            out[c] = ""
+    # Backwards compatible config columns
+    cols = [COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_RATING, COL_SORT]
+    out = ensure_table_columns(df).copy()
     out = out[cols]
     return out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
 # ----------------------------
-# Table helpers
+# Queue table helpers
 # ----------------------------
 def ensure_table_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures required columns exist.
+
+    Also accepts legacy exports that have a "Delete" column, mapping it to "Selected".
+    """
     df = df.copy()
-    if "Enabled" not in df.columns:
-        df["Enabled"] = True
-    if "Country" not in df.columns:
-        df["Country"] = "France"
-    if "ASIN or URL" not in df.columns:
-        df["ASIN or URL"] = ""
-    if "Reviews to pull" not in df.columns:
-        df["Reviews to pull"] = 100
-    if "Rating" not in df.columns:
-        df["Rating"] = "All stars"
-    if "Sort" not in df.columns:
-        df["Sort"] = "Default"
-    if "Delete" not in df.columns:
-        df["Delete"] = False
+
+    # Legacy support
+    if "Delete" in df.columns and COL_SELECTED not in df.columns:
+        df = df.rename(columns={"Delete": COL_SELECTED})
+
+    if COL_ENABLED not in df.columns:
+        df[COL_ENABLED] = True
+    if COL_COUNTRY not in df.columns:
+        df[COL_COUNTRY] = "France"
+    if COL_ASIN not in df.columns:
+        df[COL_ASIN] = ""
+    if COL_REVIEWS not in df.columns:
+        df[COL_REVIEWS] = 100
+    if COL_RATING not in df.columns:
+        df[COL_RATING] = "All stars"
+    if COL_SORT not in df.columns:
+        df[COL_SORT] = "Default"
+    if COL_SELECTED not in df.columns:
+        df[COL_SELECTED] = False
+
+    # Clean types
+    df[COL_ENABLED] = df[COL_ENABLED].fillna(True).astype(bool)
+    df[COL_SELECTED] = df[COL_SELECTED].fillna(False).astype(bool)
+    df[COL_COUNTRY] = df[COL_COUNTRY].fillna("France").astype(str)
+    df[COL_ASIN] = df[COL_ASIN].fillna("").astype(str)
+    df[COL_RATING] = df[COL_RATING].fillna("All stars").astype(str)
+    df[COL_SORT] = df[COL_SORT].fillna("Default").astype(str)
+
+    # Reviews column can contain floats/strings after CSV import; keep as-is and validate later
     return df
+
+
+def normalize_table_asins(df: pd.DataFrame) -> pd.DataFrame:
+    df = ensure_table_columns(df)
+    out = df.copy()
+    out[COL_ASIN] = out[COL_ASIN].astype(str).map(normalize_asin)
+    return out
+
+
+def dedupe_table(df: pd.DataFrame, key_cols: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    De-duplicate rows (keeping first) by a reasonable key.
+
+    Default key preserves the ability to run same ASIN in multiple countries or rating/sort.
+    """
+    df = ensure_table_columns(df)
+    key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT]
+    # Keep order stable, keep first
+    return df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
+
+
+def parse_asins_from_text(text: str) -> List[str]:
+    """
+    Extract ASINs (or /dp/ URLs) from pasted text. One per line.
+    """
+    out: List[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in re.split(r"[,\t]", line) if p.strip()]
+        raw = parts[0] if parts else ""
+        asin = normalize_asin(raw)
+        if is_valid_asin(asin):
+            out.append(asin)
+    return out
+
+
+def smart_parse_bulk_add(
+    text: str,
+    default_country: str,
+    default_reviews: int,
+    default_rating: str,
+    default_sort: str,
+) -> Tuple[List[dict], List[str]]:
+    """
+    Accepts:
+      - One ASIN/URL per line
+      - Or CSV-ish lines: ASIN, Country, Reviews, Rating, Sort
+
+    Returns: (rows, invalid_lines)
+    """
+    rows: List[dict] = []
+    invalid: List[str] = []
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = [p.strip() for p in re.split(r"[,\t]", line) if p.strip()]
+
+        raw_asin = parts[0] if len(parts) > 0 else ""
+        country = parts[1] if len(parts) > 1 else default_country
+        reviews = parts[2] if len(parts) > 2 else str(default_reviews)
+        rating = parts[3] if len(parts) > 3 else default_rating
+        sort = parts[4] if len(parts) > 4 else default_sort
+
+        asin = normalize_asin(raw_asin)
+        if not is_valid_asin(asin):
+            invalid.append(raw_line)
+            continue
+
+        if country not in COUNTRY_VALUES:
+            country = default_country
+        try:
+            n = int(float(reviews))
+        except Exception:
+            n = int(default_reviews)
+        n = max(1, min(n, MAX_PER_ASIN_HARD_CAP))
+
+        if rating not in RATING_UI_OPTIONS:
+            rating = default_rating
+        if sort not in SORT_OVERRIDE_OPTIONS:
+            sort = default_sort
+
+        rows.append(
+            {
+                COL_ENABLED: True,
+                COL_COUNTRY: country,
+                COL_ASIN: asin,
+                COL_REVIEWS: n,
+                COL_RATING: rating,
+                COL_SORT: sort,
+                COL_SELECTED: False,
+            }
+        )
+
+    return rows, invalid
+
+
+def upsert_rows(
+    df: pd.DataFrame,
+    new_rows: List[dict],
+    update_existing: bool,
+    key_cols: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Add rows, skipping duplicates (default) or updating existing rows in-place.
+
+    Duplicate key defaults to (ASIN, Country, Rating, Sort).
+    """
+    df = ensure_table_columns(df)
+    key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT]
+
+    if not new_rows:
+        return df, {"added": 0, "updated": 0, "skipped": 0}
+
+    # Map first occurrence of key -> row index
+    key_to_idx: Dict[Tuple[str, ...], int] = {}
+    for idx, r in df.iterrows():
+        key = tuple(str(r.get(c, "")).strip() for c in key_cols)
+        if key not in key_to_idx:
+            key_to_idx[key] = int(idx)
+
+    added = updated = skipped = 0
+    to_append: List[dict] = []
+
+    for row in new_rows:
+        key = tuple(str(row.get(c, "")).strip() for c in key_cols)
+        if key in key_to_idx:
+            if update_existing:
+                idx = key_to_idx[key]
+                for col, val in row.items():
+                    if col == COL_SELECTED:
+                        continue
+                    df.at[idx, col] = val
+                updated += 1
+            else:
+                skipped += 1
+        else:
+            to_append.append(row)
+            added += 1
+
+    if to_append:
+        df = pd.concat([df, pd.DataFrame(to_append)], ignore_index=True)
+
+    df = ensure_table_columns(df)
+    return df, {"added": added, "updated": updated, "skipped": skipped}
+
+
+def apply_action_to_selected(df: pd.DataFrame, action: str) -> Tuple[pd.DataFrame, int]:
+    """
+    action ∈ {"remove", "disable", "enable", "select_all", "clear_selection"}
+    """
+    df = ensure_table_columns(df)
+    sel = df[COL_SELECTED] == True
+    n = int(sel.sum())
+
+    if action == "remove":
+        df = df.loc[~sel].copy()
+        df[COL_SELECTED] = False
+        return ensure_table_columns(df).reset_index(drop=True), n
+
+    if action == "disable":
+        df.loc[sel, COL_ENABLED] = False
+        df[COL_SELECTED] = False
+        return df, n
+
+    if action == "enable":
+        df.loc[sel, COL_ENABLED] = True
+        df[COL_SELECTED] = False
+        return df, n
+
+    if action == "select_all":
+        df[COL_SELECTED] = True
+        return df, len(df)
+
+    if action == "clear_selection":
+        df[COL_SELECTED] = False
+        return df, n
+
+    return df, 0
+
+
+def remove_by_asin_list(df: pd.DataFrame, asins: List[str]) -> Tuple[pd.DataFrame, int]:
+    df = ensure_table_columns(df)
+    if not asins:
+        return df, 0
+    s = set(asins)
+    norm_col = df[COL_ASIN].astype(str).map(normalize_asin)
+    keep = ~norm_col.isin(s)
+    removed = int((~keep).sum())
+    out = df.loc[keep].copy().reset_index(drop=True)
+    out[COL_SELECTED] = False
+    return out, removed
 
 
 def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFrame]:
@@ -333,12 +530,12 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
     df = ensure_table_columns(df)
 
     for i, r in df.fillna("").iterrows():
-        enabled = bool(r.get("Enabled", True))
-        raw = str(r.get("ASIN or URL", "")).strip()
-        country = str(r.get("Country", "")).strip()
-        rating = str(r.get("Rating", "All stars")).strip() or "All stars"
-        sort = str(r.get("Sort", "Default")).strip() or "Default"
-        n = r.get("Reviews to pull", 0)
+        enabled = bool(r.get(COL_ENABLED, True))
+        raw = str(r.get(COL_ASIN, "")).strip()
+        country = str(r.get(COL_COUNTRY, "")).strip()
+        rating = str(r.get(COL_RATING, "All stars")).strip() or "All stars"
+        sort = str(r.get(COL_SORT, "Default")).strip() or "Default"
+        n = r.get(COL_REVIEWS, 0)
 
         if not enabled or not raw:
             continue
@@ -350,19 +547,19 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
             n_int = 0
 
         if country not in COUNTRY_VALUES:
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid country."})
+            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": "Invalid country."})
             continue
         if rating not in RATING_UI_OPTIONS:
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid rating."})
+            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": "Invalid rating."})
             continue
         if sort not in SORT_OVERRIDE_OPTIONS:
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": "Invalid sort."})
+            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": "Invalid sort."})
             continue
         if not is_valid_asin(asin):
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": f"Invalid ASIN parsed: '{asin}'"})
+            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": f"Invalid ASIN parsed: '{asin}'"})
             continue
         if not (1 <= n_int <= MAX_PER_ASIN_HARD_CAP):
-            issues.append({"Row": i + 1, "ASIN or URL": raw, "Problem": f"Reviews must be 1..{MAX_PER_ASIN_HARD_CAP}."})
+            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": f"Reviews must be 1..{MAX_PER_ASIN_HARD_CAP}."})
             continue
 
         jobs.append(
@@ -377,65 +574,6 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
         )
 
     return jobs, pd.DataFrame(issues)
-
-
-def parse_bulk_asin_lines(text: str) -> List[str]:
-    out: List[str] = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        out.append(line)
-    return out
-
-
-def parse_bulk_csv_lines(text: str) -> List[dict]:
-    """
-    Lines like:
-      ASIN
-      ASIN, Country, Reviews, Rating, Sort
-    """
-    rows: List[dict] = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        parts = [p.strip() for p in re.split(r"[,\t]", line) if p.strip()]
-        if not parts:
-            continue
-
-        raw_asin = parts[0]
-        country = parts[1] if len(parts) > 1 else "France"
-        reviews = parts[2] if len(parts) > 2 else "100"
-        rating = parts[3] if len(parts) > 3 else "All stars"
-        sort = parts[4] if len(parts) > 4 else "Default"
-
-        asin = normalize_asin(raw_asin)
-        try:
-            n = int(float(reviews))
-        except Exception:
-            n = 100
-
-        if country not in COUNTRY_VALUES:
-            country = "France"
-        if rating not in RATING_UI_OPTIONS:
-            rating = "All stars"
-        if sort not in SORT_OVERRIDE_OPTIONS:
-            sort = "Default"
-
-        rows.append(
-            {
-                "Enabled": True,
-                "Country": country,
-                "ASIN or URL": asin,
-                "Reviews to pull": max(1, min(n, MAX_PER_ASIN_HARD_CAP)),
-                "Rating": rating,
-                "Sort": sort,
-                "Delete": False,
-            }
-        )
-    return rows
 
 
 # ----------------------------
@@ -611,17 +749,17 @@ def compute_cost_projection(done: List[JobResult], pending: List[JobSpec]) -> Tu
 # ----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
+st.caption("Streamlined queue UI: one paste box to add, one paste box to remove, and action buttons right under the table.")
+
 
 # Session state init
 if "asin_table" not in st.session_state:
     st.session_state.asin_table = ensure_table_columns(
         pd.DataFrame(
             [
-                {"Enabled": True, "Country": "France", "ASIN or URL": "B0DGV9F4X3", "Reviews to pull": 100, "Rating": "All stars", "Sort": "Default", "Delete": False},
-                {"Enabled": True, "Country": "France", "ASIN or URL": "B0DHHG7P99", "Reviews to pull": 100, "Rating": "All stars", "Sort": "Default", "Delete": False},
-                {"Enabled": True, "Country": "France", "ASIN or URL": "B0915C748N", "Reviews to pull": 100, "Rating": "All stars", "Sort": "Default", "Delete": False},
-                {"Enabled": True, "Country": "France", "ASIN or URL": "B0DPP6C5YP", "Reviews to pull": 100, "Rating": "All stars", "Sort": "Default", "Delete": False},
-                {"Enabled": True, "Country": "France", "ASIN or URL": "B0F1DKQXJV", "Reviews to pull": 100, "Rating": "All stars", "Sort": "Default", "Delete": False},
+                {COL_ENABLED: True, COL_COUNTRY: "France", COL_ASIN: "B0DGV9F4X3", COL_REVIEWS: 100, COL_RATING: "All stars", COL_SORT: "Default", COL_SELECTED: False},
+                {COL_ENABLED: True, COL_COUNTRY: "France", COL_ASIN: "B0DHHG7P99", COL_REVIEWS: 100, COL_RATING: "All stars", COL_SORT: "Default", COL_SELECTED: False},
+                {COL_ENABLED: True, COL_COUNTRY: "France", COL_ASIN: "B0915C748N", COL_REVIEWS: 100, COL_RATING: "All stars", COL_SORT: "Default", COL_SELECTED: False},
             ]
         )
     )
@@ -634,7 +772,9 @@ if "last_per_sheet" not in st.session_state:
     st.session_state.last_per_sheet = None
 
 
-# Sidebar
+# ----------------------------
+# Sidebar: token + run settings
+# ----------------------------
 with st.sidebar:
     st.subheader("Token")
     secret_token = get_apify_token_from_secrets()
@@ -678,175 +818,177 @@ with st.sidebar:
         add_effective_filter = st.checkbox("Add EffectiveFilterByStar (debug)", value=True)
 
 
-tabs = st.tabs(["Manage ASINs", "Run", "Results", "Help"])
+tabs = st.tabs(["Queue & Run", "Results", "Help"])
 
 
 # ----------------------------
-# Manage ASINs tab
+# Queue & Run
 # ----------------------------
 with tabs[0]:
-    st.subheader("Manage ASINs")
+    st.subheader("Queue")
 
-    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 2.4])
-    with c1:
-        if st.button("Remove checked rows", use_container_width=True):
-            df = ensure_table_columns(st.session_state.asin_table)
-            df = df[df["Delete"] != True].copy()
-            df["Delete"] = False
-            st.session_state.asin_table = df
-            st.success("Removed checked rows.")
-    with c2:
-        if st.button("Disable checked rows", use_container_width=True):
-            df = ensure_table_columns(st.session_state.asin_table)
-            df.loc[df["Delete"] == True, "Enabled"] = False
-            df["Delete"] = False
-            st.session_state.asin_table = df
-            st.success("Disabled checked rows.")
-    with c3:
-        if st.button("Clear table", use_container_width=True):
-            st.session_state.asin_table = ensure_table_columns(
-                pd.DataFrame(columns=["Enabled", "Country", "ASIN or URL", "Reviews to pull", "Rating", "Sort", "Delete"])
+    # Keep table normalized (but do NOT force normalize on every keystroke in editor)
+    st.session_state.asin_table = ensure_table_columns(st.session_state.asin_table)
+
+    # Quick add / remove area
+    qa, qr = st.columns([1.25, 1.0], vertical_alignment="top")
+
+    with qa:
+        st.markdown("### Quick add (paste once)")
+        st.caption("Paste **one per line**. Optional CSV format per line: `ASIN, Country, Reviews, Rating, Sort`.")
+        default_country = st.selectbox("Defaults: Country", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0, key="qa_country")
+        default_reviews = st.number_input("Defaults: Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25, key="qa_reviews")
+        default_rating = st.selectbox("Defaults: Rating", options=RATING_UI_OPTIONS, index=0, key="qa_rating")
+        default_sort = st.selectbox("Defaults: Sort", options=SORT_OVERRIDE_OPTIONS, index=0, key="qa_sort")
+        update_existing = st.checkbox("If duplicate exists: update settings instead of skipping", value=False, key="qa_upd")
+
+        add_text = st.text_area("Paste ASINs/URLs", height=140, key="qa_text")
+        add_btn = st.button("Add to queue", use_container_width=True)
+
+        if add_btn:
+            rows, invalid = smart_parse_bulk_add(
+                add_text,
+                default_country=default_country,
+                default_reviews=int(default_reviews),
+                default_rating=default_rating,
+                default_sort=default_sort,
             )
-            st.success("Cleared.")
-    with c4:
-        cfg_bytes = export_config_csv_bytes(ensure_table_columns(st.session_state.asin_table))
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, stats = upsert_rows(df0, rows, update_existing=bool(update_existing))
+            df1 = dedupe_table(df1)
+            st.session_state.asin_table = df1
+
+            msg = f"Added **{stats['added']}**"
+            if update_existing:
+                msg += f" · Updated **{stats['updated']}**"
+            else:
+                msg += f" · Skipped duplicates **{stats['skipped']}**"
+            st.success(msg)
+
+            if invalid:
+                with st.expander(f"{len(invalid)} invalid line(s) skipped", expanded=False):
+                    st.code("\n".join(invalid))
+
+    with qr:
+        st.markdown("### Quick remove (paste once)")
+        st.caption("Paste ASINs/URLs to remove (one per line).")
+        remove_text = st.text_area("ASINs/URLs to remove", height=140, key="qr_text")
+        remove_btn = st.button("Remove from queue", use_container_width=True)
+
+        if remove_btn:
+            asins = parse_asins_from_text(remove_text)
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, removed = remove_by_asin_list(df0, asins)
+            st.session_state.asin_table = df1
+            st.success(f"Removed **{removed}** row(s).")
+
+        st.divider()
+        st.markdown("### Import / export")
+        cfg_bytes = export_config_csv_bytes(st.session_state.asin_table)
         st.download_button(
-            "Download current config CSV",
+            "Download config CSV",
             data=cfg_bytes,
             file_name="asin_config.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
-    st.divider()
-    st.markdown("### Add a single ASIN")
-    with st.form("add_single_asin", clear_on_submit=True):
-        a, b, c, d, e = st.columns([1.4, 2.0, 1.2, 1.2, 1.2])
-        add_country = a.selectbox("Country", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0)
-        add_asin = b.text_input("ASIN or Amazon URL", value="")
-        add_reviews = c.number_input("Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25)
-        add_rating = d.selectbox("Rating", options=RATING_UI_OPTIONS, index=0)
-        add_sort = e.selectbox("Sort", options=SORT_OVERRIDE_OPTIONS, index=0)
-        submitted = st.form_submit_button("Add row")
-
-        if submitted:
-            asin = normalize_asin(add_asin)
-            if not is_valid_asin(asin):
-                st.error(f"Could not parse a valid ASIN from: {add_asin}")
-            else:
-                df = ensure_table_columns(st.session_state.asin_table)
-                new_row = {
-                    "Enabled": True,
-                    "Country": add_country,
-                    "ASIN or URL": asin,
-                    "Reviews to pull": int(add_reviews),
-                    "Rating": add_rating,
-                    "Sort": add_sort,
-                    "Delete": False,
-                }
-                st.session_state.asin_table = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                st.success(f"Added {asin}.")
+        up = st.file_uploader("Upload config CSV", type=["csv"])
+        if up is not None:
+            try:
+                imported = pd.read_csv(up)
+                imported = ensure_table_columns(imported)
+                # Don't forcibly normalize URLs into ASINs; keep as user input (validation will parse).
+                st.session_state.asin_table = imported
+                st.success("Config loaded.")
+            except Exception as e:
+                st.error(f"Failed to load CSV: {e}")
 
     st.divider()
-    st.markdown("### Bulk add")
-    left, right = st.columns(2)
 
-    with left:
-        st.write("Paste ASINs/URLs (one per line). They will use the defaults below.")
-        bulk_country = st.selectbox("Default Country (bulk)", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0, key="bulk_country")
-        bulk_reviews = st.number_input("Default Reviews (bulk)", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25, key="bulk_reviews")
-        bulk_rating = st.selectbox("Default Rating (bulk)", options=RATING_UI_OPTIONS, index=0, key="bulk_rating")
-        bulk_sort = st.selectbox("Default Sort (bulk)", options=SORT_OVERRIDE_OPTIONS, index=0, key="bulk_sort")
-        bulk_text = st.text_area("ASINs/URLs", height=140, key="bulk_text")
+    st.markdown("### Edit queue")
+    st.caption("Tip: check **Selected** on rows, then use the action buttons right under the table (no scrolling).")
 
-        if st.button("Add ASIN list", use_container_width=True):
-            lines = parse_bulk_asin_lines(bulk_text)
-            rows = []
-            for raw in lines:
-                asin = normalize_asin(raw)
-                if is_valid_asin(asin):
-                    rows.append(
-                        {
-                            "Enabled": True,
-                            "Country": bulk_country,
-                            "ASIN or URL": asin,
-                            "Reviews to pull": int(bulk_reviews),
-                            "Rating": bulk_rating,
-                            "Sort": bulk_sort,
-                            "Delete": False,
-                        }
-                    )
-            if rows:
-                df = ensure_table_columns(st.session_state.asin_table)
-                st.session_state.asin_table = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
-                st.success(f"Added {len(rows)} rows.")
-            else:
-                st.warning("No valid ASINs found.")
-
-    with right:
-        st.write("CSV-like lines: `ASIN, Country, Reviews, Rating, Sort` (Country/Reviews/Rating/Sort optional)")
-        st.code("B0XXXXXXX1\nB0XXXXXXX2, France, 200, All stars, Default\nB0XXXXXXX3, Germany, 100, 5-star, Helpful")
-        bulk_csv = st.text_area("CSV-like bulk input", height=140, key="bulk_csv")
-        if st.button("Add CSV-like lines", use_container_width=True):
-            rows = parse_bulk_csv_lines(bulk_csv)
-            if rows:
-                df = ensure_table_columns(st.session_state.asin_table)
-                st.session_state.asin_table = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
-                st.success(f"Added {len(rows)} rows.")
-            else:
-                st.warning("No valid rows found.")
-
-    st.divider()
-    st.markdown("### Import config CSV")
-    up = st.file_uploader("Upload config CSV exported from this app", type=["csv"])
-    if up is not None:
-        try:
-            imported = pd.read_csv(up)
-            imported = ensure_table_columns(imported)
-            imported["ASIN or URL"] = imported["ASIN or URL"].astype(str).map(normalize_asin)
-            st.session_state.asin_table = imported
-            st.success("Config loaded.")
-        except Exception as e:
-            st.error(f"Failed to load CSV: {e}")
-
-    st.divider()
-    st.markdown("### Edit list")
-    st.write("Tip: Use **Enabled** to skip a row. Use **Delete** checkbox + **Remove checked rows** to remove quickly.")
-
-    st.session_state.asin_table = ensure_table_columns(st.session_state.asin_table)
+    df_for_editor = ensure_table_columns(st.session_state.asin_table)
 
     edited = st.data_editor(
-        st.session_state.asin_table,
+        df_for_editor,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
+        column_order=[COL_ENABLED, COL_ASIN, COL_COUNTRY, COL_REVIEWS, COL_RATING, COL_SORT, COL_SELECTED],
         column_config={
-            "Enabled": st.column_config.CheckboxColumn("Enabled", width="small"),
-            "Country": st.column_config.SelectboxColumn("Country", options=COUNTRY_VALUES, width="medium"),
-            "ASIN or URL": st.column_config.TextColumn("ASIN or URL", width="large"),
-            "Reviews to pull": st.column_config.NumberColumn("Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, step=25, width="small"),
-            "Rating": st.column_config.SelectboxColumn("Rating", options=RATING_UI_OPTIONS, width="small"),
-            "Sort": st.column_config.SelectboxColumn("Sort", options=SORT_OVERRIDE_OPTIONS, width="small"),
-            "Delete": st.column_config.CheckboxColumn("Delete", width="small"),
+            COL_ENABLED: st.column_config.CheckboxColumn("Enabled", width="small"),
+            COL_COUNTRY: st.column_config.SelectboxColumn("Country", options=COUNTRY_VALUES, width="medium"),
+            COL_ASIN: st.column_config.TextColumn("ASIN or URL", width="large"),
+            COL_REVIEWS: st.column_config.NumberColumn("Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, step=25, width="small"),
+            COL_RATING: st.column_config.SelectboxColumn("Rating", options=RATING_UI_OPTIONS, width="small"),
+            COL_SORT: st.column_config.SelectboxColumn("Sort", options=SORT_OVERRIDE_OPTIONS, width="small"),
+            COL_SELECTED: st.column_config.CheckboxColumn("Selected", width="small"),
         },
+        key="queue_editor",
     )
     st.session_state.asin_table = ensure_table_columns(edited)
 
-    jobs, issues_df = validate_and_build_jobs(st.session_state.asin_table)
+    # Action bar directly under table
+    a1, a2, a3, a4, a5, a6 = st.columns([1, 1, 1, 1, 1, 1], vertical_alignment="center")
+    with a1:
+        if st.button("Remove selected", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, n = apply_action_to_selected(df0, "remove")
+            st.session_state.asin_table = df1
+            st.success(f"Removed {n} row(s).")
+    with a2:
+        if st.button("Disable selected", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, n = apply_action_to_selected(df0, "disable")
+            st.session_state.asin_table = df1
+            st.success(f"Disabled {n} row(s).")
+    with a3:
+        if st.button("Enable selected", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, n = apply_action_to_selected(df0, "enable")
+            st.session_state.asin_table = df1
+            st.success(f"Enabled {n} row(s).")
+    with a4:
+        if st.button("Select all", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, _ = apply_action_to_selected(df0, "select_all")
+            st.session_state.asin_table = df1
+    with a5:
+        if st.button("Clear selection", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, _ = apply_action_to_selected(df0, "clear_selection")
+            st.session_state.asin_table = df1
+    with a6:
+        if st.button("Dedupe", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            before = len(df0)
+            df1 = dedupe_table(df0)
+            st.session_state.asin_table = df1
+            st.success(f"Removed {before - len(df1)} duplicate row(s).")
+
+    b1, b2, b3 = st.columns([1, 1, 2], vertical_alignment="center")
+    with b1:
+        if st.button("Normalize ASINs", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            st.session_state.asin_table = normalize_table_asins(df0)
+            st.success("Normalized ASIN/URL column (URLs → ASIN when possible).")
+    with b2:
+        if st.button("Clear queue", use_container_width=True):
+            st.session_state.asin_table = ensure_table_columns(pd.DataFrame(columns=[COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_RATING, COL_SORT, COL_SELECTED]))
+            st.success("Cleared queue.")
+    with b3:
+        df0 = ensure_table_columns(st.session_state.asin_table)
+        jobs, issues_df = validate_and_build_jobs(df0)
+        st.caption(f"Enabled rows ready: **{len(jobs)}** · Table rows: **{len(df0)}**")
+
     if not issues_df.empty:
         st.warning("Fix these rows before running:")
         st.dataframe(issues_df, use_container_width=True, hide_index=True)
-    st.caption(f"Enabled rows ready: {len(jobs)}")
 
-
-# ----------------------------
-# Run tab
-# ----------------------------
-with tabs[1]:
+    st.divider()
     st.subheader("Run")
-
-    df = ensure_table_columns(st.session_state.asin_table)
-    jobs, issues_df = validate_and_build_jobs(df)
 
     can_run = bool(token) and bool(actor_id.strip()) and len(jobs) > 0 and issues_df.empty
 
@@ -861,7 +1003,7 @@ with tabs[1]:
     if not token:
         st.info("Add your Apify token (sidebar). You can store it in Streamlit secrets.")
     if not issues_df.empty:
-        st.warning("Fix table issues first (Manage ASINs tab).")
+        st.warning("Fix queue issues first (above).")
 
     if clear_clicked:
         st.session_state.last_results = []
@@ -1019,13 +1161,13 @@ with tabs[1]:
         st.session_state.last_per_sheet = per_sheet
         st.session_state.last_master_df = master_df
 
-        status_ph.markdown(f"**[{now_ts()}]** Done ✅  (Go to Results tab to download.)")
+        status_ph.markdown(f"**[{now_ts()}]** Done ✅  (Switch to the Results tab to download.)")
 
 
 # ----------------------------
 # Results tab
 # ----------------------------
-with tabs[2]:
+with tabs[1]:
     st.subheader("Results")
 
     results: List[JobResult] = st.session_state.last_results or []
@@ -1089,10 +1231,18 @@ with tabs[2]:
 
 
 # ----------------------------
-# Help tab (no triple-quoted strings)
+# Help tab
 # ----------------------------
-with tabs[3]:
+with tabs[2]:
     st.subheader("Help")
+
+    st.markdown("### Queue UX changes (what’s different vs your previous UI)")
+    st.markdown(
+        "- **One paste box to add**, instead of separate “single add” + multiple bulk modes.\n"
+        "- **One paste box to remove** (remove by ASIN list), plus **Selected** checkboxes + action buttons **right under the table**.\n"
+        "- “Delete” column was renamed to **Selected** (legacy CSVs that have `Delete` still import correctly).\n"
+        "- Optional buttons: **Dedupe** and **Normalize ASINs**."
+    )
 
     st.markdown("### Streamlit secrets")
     st.markdown("Create `.streamlit/secrets.toml` locally, or paste the same TOML in Streamlit Cloud → App → Settings → Secrets.")
@@ -1112,3 +1262,4 @@ with tabs[3]:
         "back to requesting all five star buckets. If you still see only 5★, turn on the debug column "
         "`EffectiveFilterByStar` and check the generated filter."
     )
+
