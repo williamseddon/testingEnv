@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v14"
+APP_VERSION = "2026-03-01-master-v15"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -121,32 +121,49 @@ GLOBAL_CSS = """
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; color-scheme: light dark; }
   *, ::before, ::after { box-sizing: border-box; }
 
+  /* Derive our UI tokens from Streamlit's theme variables so Light/Dark/System are always consistent */
   :root{
-    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
-    --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-    --shadow: rgba(15,23,42,0.06);
-    --shadow-lg: rgba(15,23,42,0.10);
+    --text: var(--text-color, #0f172a);
+    --bg-app: var(--background-color, #f6f8fc);
+    --bg-card: var(--secondary-background-color, #ffffff);
+
+    /* Slightly raised surface that adapts to light/dark */
+    --bg-tile: color-mix(in srgb, var(--secondary-background-color, #ffffff) 92%, var(--text-color, #0f172a) 8%);
+
+    --border-strong: color-mix(in srgb, var(--text-color, #0f172a) 30%, transparent);
+    --border: color-mix(in srgb, var(--text-color, #0f172a) 20%, transparent);
+    --border-soft: color-mix(in srgb, var(--text-color, #0f172a) 12%, transparent);
+
+    --muted: color-mix(in srgb, var(--text-color, #0f172a) 70%, transparent);
+    --muted-2: color-mix(in srgb, var(--text-color, #0f172a) 58%, transparent);
+
+    --ring: var(--primary-color, #3b82f6);
+    --ok:#16a34a; --bad:#dc2626;
+
+    --shadow: color-mix(in srgb, #000 18%, transparent);
+    --shadow-lg: color-mix(in srgb, #000 30%, transparent);
+
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  /* Dark mode palette (fixes white-on-white and mismatched components) */
-  html[data-theme="dark"], body[data-theme="dark"]{
-    --text:#e5e7eb; --muted:#a1a1aa; --muted-2:#94a3b8;
-    --border-strong:rgba(148,163,184,0.35);
-    --border:rgba(148,163,184,0.25);
-    --border-soft:rgba(148,163,184,0.18);
-    --bg-app:#0b1220; --bg-card:#0f172a; --bg-tile:#111c33;
-    --ring:#60a5fa; --ok:#22c55e; --bad:#f87171;
-    --shadow: rgba(0,0,0,0.35);
-    --shadow-lg: rgba(0,0,0,0.55);
+  /* Fallback for older browsers without color-mix (keeps things readable) */
+  @supports not (color: color-mix(in srgb, white, black)) {
+    :root{
+      --bg-tile: var(--secondary-background-color, #ffffff);
+      --border-strong: rgba(148,163,184,0.35);
+      --border: rgba(148,163,184,0.25);
+      --border-soft: rgba(148,163,184,0.18);
+      --muted: rgba(100,116,139,0.95);
+      --muted-2: rgba(148,163,184,0.95);
+      --shadow: rgba(0,0,0,0.10);
+      --shadow-lg: rgba(0,0,0,0.18);
+    }
   }
 
   html, body, .stApp {
-    background: var(--bg-app);
+    background: var(--bg-app) !important;
     font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
-    color: var(--text);
+    color: var(--text) !important;
   }
 
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
@@ -165,14 +182,14 @@ GLOBAL_CSS = """
   .small-muted{ color:var(--muted); font-size:.9rem; }
 
   /* File uploader (prevents ugly mixed-theme first load) */
-  section[data-testid="stFileUploadDropzone"]{
+  [data-testid="stFileUploadDropzone"]{
     border-radius:14px !important;
     border:1.8px dashed var(--border-strong) !important;
     background:var(--bg-card) !important;
     box-shadow:0 0 0 1px var(--border-soft) inset;
   }
-  section[data-testid="stFileUploadDropzone"] *{ color:var(--text) !important; }
-  section[data-testid="stFileUploadDropzone"] button{
+  [data-testid="stFileUploadDropzone"] *{ color:var(--text) !important; }
+  [data-testid="stFileUploadDropzone"] button{
     background:var(--bg-tile) !important;
     border:1.2px solid var(--border) !important;
     color:var(--text) !important;
