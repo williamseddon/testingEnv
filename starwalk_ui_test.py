@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v16"
+APP_VERSION = "2026-03-01-master-v17"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -117,47 +117,59 @@ PLOTLY_GRIDCOLOR = "rgba(255,255,255,0.12)" if IS_DARK_THEME else "rgba(0,0,0,0.
 # ---------- Global CSS (always readable in light) ----------
 GLOBAL_CSS = """
 <style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 96px; color-scheme: light dark; }
+  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
 
-  /* Derive our UI tokens from Streamlit's theme variables so Light/Dark/System are always consistent */
+  
+  /* --- Theme-safe tokens (works in Light/Dark/System) ---
+     We default to a polished LIGHT palette, and switch to DARK when the app
+     detects Streamlit is in dark mode and sets: <html data-scheme="dark">.
+     This avoids the “mixed theme” issue where widgets render dark while the page stays light. */
+
   :root{
-    --text: var(--text-color, #0f172a);
-    --bg-app: var(--background-color, #f6f8fc);
-    --bg-card: var(--secondary-background-color, #ffffff);
+    color-scheme: light;
+    --text: #0f172a;
+    --bg-app: #f6f8fc;
+    --bg-card: #ffffff;
+    --bg-tile: #f8fafc;
 
-    /* Slightly raised surface that adapts to light/dark */
-    --bg-tile: color-mix(in srgb, var(--secondary-background-color, #ffffff) 92%, var(--text-color, #0f172a) 8%);
+    --border-strong: rgba(148,163,184,0.45);
+    --border: rgba(148,163,184,0.32);
+    --border-soft: rgba(148,163,184,0.22);
 
-    --border-strong: color-mix(in srgb, var(--text-color, #0f172a) 30%, transparent);
-    --border: color-mix(in srgb, var(--text-color, #0f172a) 20%, transparent);
-    --border-soft: color-mix(in srgb, var(--text-color, #0f172a) 12%, transparent);
+    --muted: rgba(71,85,105,0.95);
+    --muted-2: rgba(100,116,139,0.95);
 
-    --muted: color-mix(in srgb, var(--text-color, #0f172a) 70%, transparent);
-    --muted-2: color-mix(in srgb, var(--text-color, #0f172a) 58%, transparent);
-
-    --ring: var(--primary-color, #3b82f6);
+    --ring: #3b82f6;
     --ok:#16a34a; --bad:#dc2626;
 
-    --shadow: color-mix(in srgb, #000 18%, transparent);
-    --shadow-lg: color-mix(in srgb, #000 30%, transparent);
+    --shadow: rgba(15,23,42,0.10);
+    --shadow-lg: rgba(15,23,42,0.16);
 
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  /* Fallback for older browsers without color-mix (keeps things readable) */
-  @supports not (color: color-mix(in srgb, white, black)) {
-    :root{
-      --bg-tile: var(--secondary-background-color, #ffffff);
-      --border-strong: rgba(148,163,184,0.35);
-      --border: rgba(148,163,184,0.25);
-      --border-soft: rgba(148,163,184,0.18);
-      --muted: rgba(100,116,139,0.95);
-      --muted-2: rgba(148,163,184,0.95);
-      --shadow: rgba(0,0,0,0.10);
-      --shadow-lg: rgba(0,0,0,0.18);
-    }
+  :root[data-scheme="dark"]{
+    color-scheme: dark;
+    --text: rgba(255,255,255,0.92);
+    --bg-app: #0b0e14;
+    --bg-card: rgba(255,255,255,0.06);
+    --bg-tile: rgba(255,255,255,0.04);
+
+    --border-strong: rgba(255,255,255,0.22);
+    --border: rgba(255,255,255,0.16);
+    --border-soft: rgba(255,255,255,0.10);
+
+    --muted: rgba(255,255,255,0.74);
+    --muted-2: rgba(255,255,255,0.64);
+
+    --ring: #60a5fa;
+    --ok:#34d399; --bad:#f87171;
+
+    --shadow: rgba(0,0,0,0.35);
+    --shadow-lg: rgba(0,0,0,0.55);
   }
+
 
   html, body, .stApp {
     background: var(--bg-app) !important;
@@ -951,7 +963,7 @@ def extract_records(raw: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# Reviews DF -> Star Walk DF (from axionReviews.py)
+# Reviews DF -> Star Walk DF (from reviews_transform.py)
 # ============================================================
 DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Source",
@@ -1689,65 +1701,7 @@ def vector_search(query: str, index, api_key: str, top_k: int = 8):
 # ============================================================
 # - Defaults NEW users to light (only if they have no stored preference)
 # - Ensures our surfaces follow Streamlit theme vars with safe fallbacks
-st_html(
-    """
-<script>
-(function(){
-  try{
-    const W = window.parent;
-    const ls = W.localStorage;
-    // Streamlit stores a 'theme' preference. If none exists, default to light
-    // so first-load sessions never look "half dark / half light".
-    if (ls && !ls.getItem('theme')) {
-      ls.setItem('theme','light');
-    }
-  }catch(e){}
-})();
-</script>
-""",
-    height=0,
-)
-
-THEME_PATCH_CSS = """
-<style>
-  /* Robust fallbacks for when Streamlit theme CSS vars are not hydrated yet */
-  :root{
-    --sw-bg-fallback: #f6f8fc;
-    --sw-card-fallback: #ffffff;
-    --sw-text-fallback: #0f172a;
-  }
-  @media (prefers-color-scheme: dark){
-    :root{
-      --sw-bg-fallback: #0e1117;
-      --sw-card-fallback: #151a23;
-      --sw-text-fallback: #e5e7eb;
-    }
-  }
-
-  /* Rebind the tokens used throughout the app to Streamlit theme vars with safe fallbacks */
-  :root{
-    --text: var(--text-color, var(--sw-text-fallback));
-    --bg-app: var(--background-color, var(--sw-bg-fallback));
-    --bg-card: var(--secondary-background-color, var(--sw-card-fallback));
-  }
-
-  html, body, .stApp{
-    background: var(--bg-app) !important;
-    color: var(--text) !important;
-  }
-
-  /* File uploader: keep readable in BOTH themes on first paint */
-  [data-testid="stFileUploadDropzone"]{
-    background: var(--bg-card) !important;
-  }
-  [data-testid="stFileUploadDropzone"] *{
-    color: var(--text) !important;
-  }
-</style>
-"""
-st.markdown(THEME_PATCH_CSS, unsafe_allow_html=True)
-
-
+THEME_PATCH_CSS = ""
 # ============================================================
 # Improved flexible JSON parsing (more forgiving for copy/paste)
 # ============================================================
@@ -2402,6 +2356,105 @@ st_html(
 """,
     height=0,
 )
+
+
+
+
+st_html(
+    """
+<script>
+(function(){
+  try{
+    const W = window.parent;
+    const doc = W.document;
+
+    function parseColor(s){
+      s = (s || "").trim();
+      if (!s) return null;
+      // rgb/rgba
+      let m = s.match(/^rgba?\(([^)]+)\)/i);
+      if (m){
+        let parts = m[1].split(",").map(x => parseFloat(x));
+        if (parts.length >= 3){
+          return {r: parts[0], g: parts[1], b: parts[2]};
+        }
+      }
+      // hex
+      if (s[0] === "#"){
+        let hex = s.slice(1).trim();
+        if (hex.length === 3){
+          hex = hex.split("").map(c => c + c).join("");
+        }
+        if (hex.length === 6){
+          return {
+            r: parseInt(hex.slice(0,2), 16),
+            g: parseInt(hex.slice(2,4), 16),
+            b: parseInt(hex.slice(4,6), 16)
+          };
+        }
+      }
+      return null;
+    }
+
+    function luminance(c){
+      function chan(v){
+        v = v / 255;
+        return (v <= 0.03928) ? (v/12.92) : Math.pow((v + 0.055) / 1.055, 2.4);
+      }
+      const r = chan(c.r), g = chan(c.g), b = chan(c.b);
+      return 0.2126*r + 0.7152*g + 0.0722*b;
+    }
+
+    let last = null;
+
+    function setScheme(){
+      try{
+        const rootStyle = W.getComputedStyle(doc.documentElement);
+        const bgVar = (rootStyle.getPropertyValue('--background-color') || "").trim();
+        const txVar = (rootStyle.getPropertyValue('--text-color') || "").trim();
+
+        const bg = parseColor(bgVar);
+        const tx = parseColor(txVar);
+
+        let scheme = null;
+
+        if (bg){
+          scheme = (luminance(bg) < 0.45) ? "dark" : "light";
+        } else if (tx){
+          scheme = (luminance(tx) > 0.70) ? "dark" : "light";
+        } else {
+          scheme = (W.matchMedia && W.matchMedia('(prefers-color-scheme: dark)').matches) ? "dark" : "light";
+        }
+
+        if (scheme && scheme !== last){
+          doc.documentElement.setAttribute("data-scheme", scheme);
+          if (doc.body) doc.body.setAttribute("data-scheme", scheme);
+          last = scheme;
+        }
+      }catch(e){}
+    }
+
+    setScheme();
+    W.setTimeout(setScheme, 120);
+    W.setTimeout(setScheme, 350);
+    W.setTimeout(setScheme, 800);
+    W.setInterval(setScheme, 1000);
+
+    if (W.matchMedia){
+      const mq = W.matchMedia('(prefers-color-scheme: dark)');
+      if (mq && mq.addEventListener){
+        mq.addEventListener('change', setScheme);
+      } else if (mq && mq.addListener){
+        mq.addListener(setScheme);
+      }
+    }
+  }catch(e){}
+})();
+</script>
+""",
+    height=0,
+)
+
 
 st.caption("Tip: **📝 All Reviews** shows individual review cards (with green/red symptom tiles).")
 
