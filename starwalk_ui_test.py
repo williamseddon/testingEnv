@@ -1,4 +1,4 @@
-# starwalk_master_app_v16.py
+# starwalk_master_app_v20.py
 # Streamlit master app:
 # - Accepts either:
 #   1) Star Walk scrubbed verbatims Excel/CSV (same behavior as starwalk_ui_test.py), OR
@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v19"
+APP_VERSION = "2026-03-01-master-v20"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -158,7 +158,7 @@ GLOBAL_CSS = """
     This prevents the failure mode you saw: "Light mode" UI with a dark background.
   */
 
-  :root{
+  .stApp{
     color-scheme: light dark;
 
     /* Streamlit tokens (with safe fallbacks) */
@@ -191,7 +191,7 @@ GLOBAL_CSS = """
 
   /* Modern browsers: derive subtle tints from the live Streamlit theme */
   @supports (color: color-mix(in srgb, white 50%, black)) {
-    :root{
+    .stApp{
       --bg-tile: color-mix(in srgb, var(--st-card) 70%, var(--st-bg) 30%);
       --border-soft: color-mix(in srgb, var(--st-text) 10%, transparent);
       --border: color-mix(in srgb, var(--st-text) 16%, transparent);
@@ -202,7 +202,7 @@ GLOBAL_CSS = """
   }
 
   /* Ensure the overall page uses Streamlit's current theme colors */
-  html, body, .stApp {
+  .stApp {
     background: var(--bg-app) !important;
     color: var(--text) !important;
     font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
@@ -1016,17 +1016,67 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _extract_json_substring(s: str) -> str:
+    """Extract the first balanced JSON object/array from pasted text.
+
+    Why this exists:
+    - Users often paste JSON preceded/followed by commentary.
+    - Naive "slice from first { to last }" breaks when review text contains stray
+      brackets like "]" or "}" inside strings.
+
+    This implementation finds the first balanced {...} or [...] region while
+    correctly ignoring brackets that appear inside quoted strings.
+    """
     s = s.strip()
-    if s.startswith("{") or s.startswith("["):
+    if not s:
         return s
-    start_candidates = [i for i in [s.find("{"), s.find("[")] if i != -1]
-    if not start_candidates:
+    if s[0] in "{[":
         return s
-    start = min(start_candidates)
-    end = max(s.rfind("}"), s.rfind("]"))
-    if end != -1 and end > start:
-        return s[start : end + 1].strip()
-    return s
+
+    starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
+    if not starts:
+        return s
+    start = min(starts)
+    sub = s[start:]
+
+    stack: List[str] = []
+    in_str = False
+    quote = ""
+    escape = False
+
+    for i, ch in enumerate(sub):
+        if in_str:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == quote:
+                in_str = False
+            continue
+
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            continue
+
+        if ch in "{[":
+            stack.append(ch)
+            continue
+
+        if ch in "}]":
+            if not stack:
+                continue
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                # Mismatch. Reset stack and keep scanning.
+                stack = []
+                continue
+            if not stack:
+                return sub[: i + 1].strip()
+
+    # Fallback: return everything after the first brace/bracket
+    return sub.strip()
 
 
 def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
@@ -1073,11 +1123,52 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
 
 
 def extract_records(raw: Any) -> List[Dict[str, Any]]:
-    if isinstance(raw, dict) and "results" in raw and isinstance(raw["results"], list):
-        return raw["results"]
+    """Extract review record objects from a variety of JSON export shapes.
+
+    Supported:
+    - {"results": [ {...}, {...} ], ...}
+    - [ {...}, {...} ]
+    - {...}  (single record)
+    - nested wrappers where a list-of-dicts lives under some key
+    """
+
+    if isinstance(raw, dict) and isinstance(raw.get("results"), list):
+        return [r for r in raw.get("results") if isinstance(r, dict)]
+
     if isinstance(raw, list):
         return [r for r in raw if isinstance(r, dict)]
-    raise ValueError("Unrecognized JSON shape. Expected a dict with `results: []` or a list of record objects.")
+
+    if isinstance(raw, dict):
+        # Sometimes a single record is pasted
+        if ("freeText" in raw) and ("clientAttributes" in raw or "customAttributes" in raw):
+            return [raw]
+
+    # Fallback: recursively search for the first list-of-dicts
+    def _search(obj: Any, depth: int = 0) -> Optional[List[Dict[str, Any]]]:
+        if depth > 6:
+            return None
+        if isinstance(obj, list):
+            # list-of-dicts candidate
+            if obj and all(isinstance(x, dict) for x in obj[: min(len(obj), 5)]):
+                return [x for x in obj if isinstance(x, dict)]
+            for x in obj:
+                found = _search(x, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(obj, dict):
+            for _, v in obj.items():
+                found = _search(v, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    found = _search(raw)
+    if found is not None:
+        return found
+
+    raise ValueError(
+        "Unrecognized JSON shape. Expected a dict with `results: []`, a list of record objects, or a wrapper containing a list of records."
+    )
 
 
 # ============================================================
@@ -1724,9 +1815,10 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
     # Avg star (review-level, de-dup symptom within a review)
     avg_map = {}
     if "Star Rating" in df_in.columns:
-        stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
+        # Robust join-based approach (avoids brittle index->dict mapping edge cases)
+        stars = pd.to_numeric(df_in["Star Rating"], errors="coerce").rename("star")
         tmp = long.drop_duplicates(subset=["__idx", "symptom"]).copy()
-        tmp["star"] = tmp["__idx"].map(stars.to_dict())
+        tmp = tmp.join(stars, on="__idx")
         avg = tmp.groupby("symptom")["star"].mean()
         avg_map = avg.to_dict()
 
@@ -2896,8 +2988,8 @@ if view.startswith("📊"):
                 vv = float(v)
                 # Requested: only Avg Star colored; threshold 4.5
                 if vv >= 4.5:
-                    return "color:var(--ok);font-weight:800;"
-                return "color:var(--bad);font-weight:800;"
+                    return "color:#16a34a;font-weight:800;"
+                return "color:#dc2626;font-weight:800;"
             except Exception:
                 return ""
 
