@@ -1,4 +1,4 @@
-# starwalk_master_app_v20.py
+# starwalk_master_app_v22.py
 # Streamlit master app:
 # - Accepts either:
 #   1) Star Walk scrubbed verbatims Excel/CSV (same behavior as starwalk_ui_test.py), OR
@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v21"
+APP_VERSION = "2026-03-02-master-v22"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -1984,99 +1984,414 @@ THEME_PATCH_CSS = ""
 # ============================================================
 # Improved flexible JSON parsing (more forgiving for copy/paste)
 # ============================================================
+
+def _find_first_json_start(s: str) -> int:
+    i_obj = s.find("{")
+    i_arr = s.find("[")
+    if i_obj == -1 and i_arr == -1:
+        return -1
+    if i_obj == -1:
+        return i_arr
+    if i_arr == -1:
+        return i_obj
+    return min(i_obj, i_arr)
+
+
+def _try_raw_decode_first(s: str) -> Tuple[Optional[Any], Optional[int], Optional[Exception]]:
+    """Attempts to decode the first JSON value in `s` (object or array) and returns (obj, end_pos, err)."""
+    try:
+        obj, end = json.JSONDecoder().raw_decode(s)
+        return obj, end, None
+    except Exception as e:
+        return None, None, e
+
+
+def _strip_js_comments(s: str) -> str:
+    """Remove //... and /*...*/ comments (outside of strings)."""
+    out: List[str] = []
+    in_str = False
+    quote = ""
+    esc = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        nxt = s[i + 1] if i + 1 < n else ""
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            else:
+                if ch == "\\":  # escape next char
+                    esc = True
+                elif ch == quote:
+                    in_str = False
+                    quote = ""
+            i += 1
+            continue
+
+        # not in string
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        # line comment
+        if ch == "/" and nxt == "/":
+            # skip to end of line
+            i += 2
+            while i < n and s[i] not in ("\n", "\r"):
+                i += 1
+            continue
+
+        # block comment
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
+                i += 1
+            i += 2  # consume */
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _remove_trailing_commas_outside_strings(s: str) -> str:
+    """Remove trailing commas before } or ] (outside of strings)."""
+    out: List[str] = []
+    in_str = False
+    quote = ""
+    esc = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            else:
+                if ch == "\\":  # escape
+                    esc = True
+                elif ch == quote:
+                    in_str = False
+                    quote = ""
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            # lookahead for next non-whitespace
+            j = i + 1
+            while j < n and s[j].isspace():
+                j += 1
+            if j < n and s[j] in ("]", "}"):
+                # skip this comma
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _escape_bad_controls_in_strings(s: str) -> str:
+    """Escape raw control characters inside strings (\n, \r, \t, and other <0x20)."""
+    out: List[str] = []
+    in_str = False
+    quote = ""
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                out.append(ch)
+                esc = False
+                continue
+
+            if ch == "\\":  # start escape
+                out.append(ch)
+                esc = True
+                continue
+
+            # raw control chars inside JSON strings are invalid; escape them
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            if ord(ch) < 0x20:
+                out.append(f"\\u{ord(ch):04x}")
+                continue
+
+            out.append(ch)
+            if ch == quote:
+                in_str = False
+                quote = ""
+            continue
+
+        # not in string
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            out.append(ch)
+            continue
+
+        out.append(ch)
+
+    return "".join(out)
+
+
+def _replace_tokens_outside_strings(s: str, mapping: Dict[str, str]) -> str:
+    """Replace whole-word tokens outside of strings (e.g., NaN -> null)."""
+    out: List[str] = []
+    in_str = False
+    quote = ""
+    esc = False
+    i = 0
+    n = len(s)
+
+    def is_tok_char(c: str) -> bool:
+        return c.isalnum() or c in ("_", "-", ".")
+
+    while i < n:
+        ch = s[i]
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            else:
+                if ch == "\\":  # escape
+                    esc = True
+                elif ch == quote:
+                    in_str = False
+                    quote = ""
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch.isalpha() or ch in ("-",):
+            # read token
+            j = i
+            while j < n and is_tok_char(s[j]):
+                j += 1
+            tok = s[i:j]
+            repl = mapping.get(tok)
+            if repl is None:
+                out.append(tok)
+            else:
+                out.append(repl)
+            i = j
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _decode_bytes_to_text(b: bytes) -> str:
+    """Best-effort decoding for uploaded JSON files (handles UTF-8/UTF-16)."""
+    if b is None:
+        return ""
+    # BOM-based quick path
+    if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
+        try:
+            return b.decode("utf-16")
+        except Exception:
+            pass
+    if b.startswith(b"\xef\xbb\xbf"):
+        try:
+            return b.decode("utf-8-sig")
+        except Exception:
+            pass
+
+    for enc in ("utf-8-sig", "utf-16", "utf-16le", "utf-16be", "utf-8", "latin-1"):
+        try:
+            s = b.decode(enc)
+            # If we still see lots of NULs, it's likely the wrong codec
+            if s.count("\x00") > 0 and enc.startswith("utf-8"):
+                continue
+            return s
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="replace")
+
+
+def pct_12(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float((s <= 2).mean() * 100.0) if len(s) else 0.0
+
+
+def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
+    cnt = int(len(sub))
+    if cnt == 0 or "Star Rating" not in sub.columns:
+        return 0, 0.0, 0.0
+    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
+    low = pct_12(sub["Star Rating"])
+    return cnt, avg, low
+
+
 def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
     """
     Parses:
     - Normal JSON object/array
     - JSON Lines (one object per line)
-    - Common copy/paste variants: code fences, BOM, smart quotes, trailing commas
+    - Common copy/paste variants: code fences, BOM, smart quotes, trailing commas, JS comments
+    - Some non-standard tokens: NaN/Infinity/undefined -> null
     - Python-literal dict/list (best-effort via ast.literal_eval)
+
+    Returns (obj, warnings).
     """
     warnings: List[str] = []
-
     if text_in is None:
         raise ValueError("No JSON provided.")
 
+    # 1) Normalize / strip wrappers
     s = str(text_in)
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    s = s.replace("\u00a0", " ")
+    s = _strip_code_fences(s).strip()
 
-    # Remove BOM / zero-width / non-breaking spaces
-    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
-    s = _strip_code_fences(s)
-    s = _extract_json_substring(s).strip()
+    if not s:
+        raise ValueError("No JSON provided. Paste JSON or upload a .json file.")
 
-    # Remove ASCII control characters that sometimes sneak into copy/paste and break json.loads.
-    # (JSON strings cannot contain raw control characters.)
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
-
-    # Normalize smart quotes
-    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-
-    # Fast path: standard JSON
-    try:
-        return json.loads(s), warnings
-    except Exception as e1:
-        last_err = e1
-
-    # Attempt: remove trailing commas
-    s2 = re.sub(r",\s*([}\]])", r"\1", s)
-    if s2 != s:
-        try:
-            warnings.append("Removed trailing commas to make JSON valid.")
-            return json.loads(s2), warnings
-        except Exception as e2:
-            last_err = e2
-            warnings = [w for w in warnings if "trailing commas" not in w.lower()]
-
-    # Attempt: JSON Lines
+    # 2) Fast path: JSON Lines
     jl = _try_parse_json_lines(s)
     if jl is not None:
-        warnings.append("Detected JSON Lines and parsed each line as a record.")
+        warnings.append(f"Detected JSON Lines: {len(jl)} objects.")
         return jl, warnings
 
-    # Attempt: common copy/paste fragment — multiple JSON objects separated by commas
-    # (e.g., "{...},\n{...},\n{...}" without the surrounding "[ ... ]").
-    # Heuristic: if we see the pattern "}{" with a comma in between at the top level,
-    # try wrapping the whole thing as a JSON array.
-    s_strip2 = s.strip()
-    if s_strip2.startswith("{") and ("\n{" in s_strip2 or re.search(r"\}\s*,\s*\{", s_strip2)):
-        candidate = s_strip2
-        # Remove a trailing comma (if present)
-        candidate = re.sub(r",\s*$", "", candidate)
-        try:
-            arr = json.loads("[" + candidate + "]")
-            if isinstance(arr, list):
-                warnings.append("Wrapped comma-separated JSON objects into a JSON array (best-effort).")
-                return arr, warnings
-        except Exception as e_wrap:
-            last_err = e_wrap
+    # 3) Trim to first JSON-looking payload
+    start = _find_first_json_start(s)
+    if start == -1:
+        raise ValueError("Could not find a JSON object/array in the input.")
+    if start > 0:
+        warnings.append("Ignored leading text before the first JSON payload.")
+        s = s[start:]
 
-    # Attempt: Python-literal (dict/list with single quotes, None/True/False)
-    try:
-        obj = ast.literal_eval(s)
-        if isinstance(obj, (dict, list)):
-            warnings.append("Parsed as a Python literal (best-effort). Consider exporting valid JSON for reliability.")
+    # 4) Smart quotes -> standard quotes
+    s = (
+        s.replace("“", '"')
+        .replace("”", '"')
+        .replace("„", '"')
+        .replace("‟", '"')
+        .replace("’", "'")
+        .replace("‘", "'")
+    )
+
+    # 5) Try raw decode first (lets us ignore trailing text)
+    obj, end, err = _try_raw_decode_first(s)
+    if obj is not None:
+        if s[end:].strip():
+            warnings.append("Ignored trailing text after the first JSON payload.")
+        return obj, warnings
+    last_err: Exception = err if err else ValueError("Unknown JSON parse error.")
+
+    # 6) Repair passes (only after a failed parse)
+    s_work = s
+    repairs = [
+        ("Stripped JS comments", _strip_js_comments),
+        ("Removed trailing commas", _remove_trailing_commas_outside_strings),
+        ("Escaped control characters inside strings", _escape_bad_controls_in_strings),
+        ("Replaced NaN/Infinity/undefined with null", lambda x: _replace_tokens_outside_strings(
+            x,
+            {
+                "NaN": "null",
+                "Infinity": "null",
+                "-Infinity": "null",
+                "undefined": "null",
+            },
+        )),
+    ]
+
+    for label, fn in repairs:
+        s_work = fn(s_work)
+        obj, end, err = _try_raw_decode_first(s_work)
+        if obj is not None:
+            warnings.append(label + ".")
+            if s_work[end:].strip():
+                warnings.append("Ignored trailing text after the first JSON payload.")
             return obj, warnings
-    except Exception as e3:
-        last_err = e3
+        if err:
+            last_err = err
 
-    # Attempt: if content is wrapped in quotes (rare copy/paste)
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        try:
-            inner = s[1:-1]
-            return json.loads(inner), warnings + ["Removed outer quotes around pasted JSON text."]
-        except Exception as e4:
-            last_err = e4
+    # 7) If the paste looks like the inside of a wrapper (common), try adding the missing prefix
+    if (re.search(r'\]\s*,\s*"total"\s*:', s_work) and '"results"' not in s_work):
+        candidate = '{"results": [' + s_work
+        obj, end, err = _try_raw_decode_first(candidate)
+        if obj is not None:
+            warnings.append("Auto-repaired missing wrapper: added {'results': [...] } prefix.")
+            return obj, warnings
+        if err:
+            last_err = err
 
-    s_strip = s.strip()
+    # 8) Try balanced substring extraction (handles some trailing garbage)
+    s_bal = _extract_json_substring(s_work).strip()
+    if s_bal and s_bal != s_work:
+        obj, end, err = _try_raw_decode_first(s_bal)
+        if obj is not None:
+            warnings.append("Parsed first balanced JSON payload (ignored extra text).")
+            return obj, warnings
+        if err:
+            last_err = err
+
+    # 9) Try Python literal fallback (handles single quotes / None / True / False)
+    py_txt = _replace_tokens_outside_strings(
+        s_work,
+        {"null": "None", "true": "True", "false": "False"},
+    )
+    try:
+        obj = ast.literal_eval(py_txt)
+        warnings.append("Parsed using Python-literal fallback (ast.literal_eval).")
+        return obj, warnings
+    except Exception as e:
+        last_err = e
+
+    # 10) If there is a JSONDecodeError, provide details + context
     hint = ""
-    if s_strip.startswith("{") and not s_strip.endswith("}"):
-        hint = "\nHint: your paste starts with '{' but does not end with '}'. It may be truncated. Try uploading the full .json file instead of pasting."
-    elif s_strip.startswith("[") and not s_strip.endswith("]"):
-        hint = "\nHint: your paste starts with '[' but does not end with ']'. It may be truncated. Try uploading the full .json file instead of pasting."
+    if isinstance(last_err, json.JSONDecodeError):
+        pos = getattr(last_err, "pos", None)
+        if isinstance(pos, int):
+            ctx = s_work[max(0, pos - 120): pos + 120]
+            try:
+                ctx = _mask_pii(ctx)
+            except Exception:
+                pass
+            hint = (
+                f"\nDecoder details: {last_err.msg} (line {last_err.lineno}, col {last_err.colno})."
+                f"\nContext: …{ctx}…"
+            )
+
+        if "\x00" in s_work:
+            hint += "\nNote: Detected NUL characters. Your file may be UTF-16 encoded — upload the file (instead of paste) or re-save as UTF-8."
 
     raise ValueError(
         "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines.\n"
-        "Tips: remove any leading/trailing commentary, ensure quotes are standard \" characters, and avoid trailing commas."
+        'Tips: remove any leading/trailing commentary, ensure quotes are standard " characters, and avoid trailing commas.'
         + hint
     ) from last_err
 
@@ -2125,7 +2440,7 @@ else:
     source_label = "pasted_json"
     if json_file is not None and getattr(json_file, "size", 0) > 0:
         source_label = json_file.name
-        raw_text = json_file.getvalue().decode("utf-8", errors="replace")
+        raw_text = _decode_bytes_to_text(json_file.getvalue())
     elif pasted and pasted.strip():
         raw_text = pasted.strip()
 
