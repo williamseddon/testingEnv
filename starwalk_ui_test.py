@@ -1,4 +1,4 @@
-# starwalk_master_app_v22.py
+# starwalk_master_app_v16.py
 # Streamlit master app:
 # - Accepts either:
 #   1) Star Walk scrubbed verbatims Excel/CSV (same behavior as starwalk_ui_test.py), OR
@@ -29,7 +29,7 @@ import zlib
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import numpy as np
@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-02-master-v22"
+APP_VERSION = "2026-03-01-master-v17"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -105,43 +105,14 @@ except Exception:
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk — Master Dashboard")
 
-# ---------- Plotly helpers (theme-agnostic + no fragile detection) ----------
-# Streamlit theme can be toggled client-side (Light/Dark/System) and Python-side
-# st.get_option("theme.base") does NOT reliably reflect the current UI theme.
-#
-# To avoid white-on-white (or black-on-black) charts, we:
-# - Use transparent plot/paper backgrounds.
-# - Use CSS keyword `currentColor` for text, so the chart inherits the surrounding
-#   text color (works in light + dark automatically).
-PLOTLY_TEMPLATE = "plotly"
-PLOTLY_GRIDCOLOR = "rgba(148,163,184,0.25)"
-
-
-def style_plotly(fig: go.Figure) -> go.Figure:
-    """Apply a readable, theme-agnostic Plotly style."""
-    try:
-        fig.update_layout(
-            template=PLOTLY_TEMPLATE,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="currentColor"),
-            title=dict(font=dict(color="currentColor")),
-        )
-        fig.update_xaxes(
-            gridcolor=PLOTLY_GRIDCOLOR,
-            zerolinecolor=PLOTLY_GRIDCOLOR,
-            tickfont=dict(color="currentColor"),
-            titlefont=dict(color="currentColor"),
-        )
-        fig.update_yaxes(
-            gridcolor=PLOTLY_GRIDCOLOR,
-            zerolinecolor=PLOTLY_GRIDCOLOR,
-            tickfont=dict(color="currentColor"),
-            titlefont=dict(color="currentColor"),
-        )
-    except Exception:
-        pass
-    return fig
+# ---------- Theme / Plotly helpers ----------
+try:
+    _theme_base = str(st.get_option("theme.base") or "light").lower()
+except Exception:
+    _theme_base = "light"
+IS_DARK_THEME = _theme_base == "dark"
+PLOTLY_TEMPLATE = "plotly_dark" if IS_DARK_THEME else "plotly_white"
+PLOTLY_GRIDCOLOR = "rgba(255,255,255,0.12)" if IS_DARK_THEME else "rgba(0,0,0,0.06)"
 
 # ---------- Global CSS (always readable in light) ----------
 GLOBAL_CSS = """
@@ -149,63 +120,61 @@ GLOBAL_CSS = """
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
 
-  /*
-    Theme system (v19):
-    - DO NOT guess light/dark.
-    - DO NOT override Streamlit's theme.
-    - Instead, derive our tokens from Streamlit's live CSS variables.
+  
+  /* --- Theme-safe tokens (works in Light/Dark/System) ---
+     We default to a polished LIGHT palette, and switch to DARK when the app
+     detects Streamlit is in dark mode and sets: <html data-scheme="dark">.
+     This avoids the “mixed theme” issue where widgets render dark while the page stays light. */
 
-    This prevents the failure mode you saw: "Light mode" UI with a dark background.
-  */
+  :root{
+    color-scheme: light;
+    --text: #0f172a;
+    --bg-app: #f6f8fc;
+    --bg-card: #ffffff;
+    --bg-tile: #f8fafc;
 
-  .stApp{
-    color-scheme: light dark;
-
-    /* Streamlit tokens (with safe fallbacks) */
-    --st-bg: var(--background-color, #ffffff);
-    --st-card: var(--secondary-background-color, #f6f8fc);
-    --st-text: var(--text-color, #0f172a);
-    --st-primary: var(--primary-color, #3b82f6);
-
-    /* App tokens derived from Streamlit (with fallbacks for older browsers) */
-    --text: var(--st-text);
-    --bg-app: var(--st-bg);
-    --bg-card: var(--st-card);
-
-    /* Safe fallbacks (overridden below when color-mix is supported) */
-    --bg-tile: var(--st-card);
-    --border-soft: rgba(148,163,184,0.22);
-    --border: rgba(148,163,184,0.32);
     --border-strong: rgba(148,163,184,0.45);
+    --border: rgba(148,163,184,0.32);
+    --border-soft: rgba(148,163,184,0.22);
+
     --muted: rgba(71,85,105,0.95);
     --muted-2: rgba(100,116,139,0.95);
 
-    --ring: var(--st-primary);
+    --ring: #3b82f6;
     --ok:#16a34a; --bad:#dc2626;
 
-    --shadow: rgba(0,0,0,0.10);
-    --shadow-lg: rgba(0,0,0,0.18);
+    --shadow: rgba(15,23,42,0.10);
+    --shadow-lg: rgba(15,23,42,0.16);
 
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  /* Modern browsers: derive subtle tints from the live Streamlit theme */
-  @supports (color: color-mix(in srgb, white 50%, black)) {
-    .stApp{
-      --bg-tile: color-mix(in srgb, var(--st-card) 70%, var(--st-bg) 30%);
-      --border-soft: color-mix(in srgb, var(--st-text) 10%, transparent);
-      --border: color-mix(in srgb, var(--st-text) 16%, transparent);
-      --border-strong: color-mix(in srgb, var(--st-text) 22%, transparent);
-      --muted: color-mix(in srgb, var(--st-text) 78%, transparent);
-      --muted-2: color-mix(in srgb, var(--st-text) 66%, transparent);
-    }
+  :root[data-scheme="dark"]{
+    color-scheme: dark;
+    --text: rgba(255,255,255,0.92);
+    --bg-app: #0b0e14;
+    --bg-card: rgba(255,255,255,0.06);
+    --bg-tile: rgba(255,255,255,0.04);
+
+    --border-strong: rgba(255,255,255,0.22);
+    --border: rgba(255,255,255,0.16);
+    --border-soft: rgba(255,255,255,0.10);
+
+    --muted: rgba(255,255,255,0.74);
+    --muted-2: rgba(255,255,255,0.64);
+
+    --ring: #60a5fa;
+    --ok:#34d399; --bad:#f87171;
+
+    --shadow: rgba(0,0,0,0.35);
+    --shadow-lg: rgba(0,0,0,0.55);
   }
 
-  /* Ensure the overall page uses Streamlit's current theme colors */
-  .stApp {
+
+  html, body, .stApp {
     background: var(--bg-app) !important;
-    color: var(--text) !important;
     font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
+    color: var(--text) !important;
   }
 
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
@@ -223,7 +192,7 @@ GLOBAL_CSS = """
 
   .small-muted{ color:var(--muted); font-size:.9rem; }
 
-  /* File uploader */
+  /* File uploader (prevents ugly mixed-theme first load) */
   [data-testid="stFileUploadDropzone"]{
     border-radius:14px !important;
     border:1.8px dashed var(--border-strong) !important;
@@ -258,9 +227,8 @@ GLOBAL_CSS = """
     content:"";
     position:absolute;
     inset:-2px;
-    /* Subtle accent that works in both themes */
-    background: radial-gradient(1200px 220px at 20% -20%, rgba(59,130,246,0.18), rgba(0,0,0,0)),
-                radial-gradient(1200px 220px at 80% 120%, rgba(34,197,94,0.12), rgba(0,0,0,0));
+    background: radial-gradient(1200px 220px at 20% -20%, rgba(96,165,250,0.26), rgba(0,0,0,0)),
+                radial-gradient(1200px 220px at 80% 120%, rgba(34,197,94,0.16), rgba(0,0,0,0));
     pointer-events:none;
   }
   .metric-head{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:10px; }
@@ -869,12 +837,6 @@ def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
 def join_list(x: Any, sep: str = " | ") -> Any:
     if x is None:
         return None
-    if isinstance(x, dict):
-        # Preserve nested dicts as a compact JSON string so they can still be filtered/searchable.
-        try:
-            return json.dumps(x, ensure_ascii=False)
-        except Exception:
-            return str(x)
     if isinstance(x, list):
         vals = [str(v).strip() for v in x if v is not None and str(v).strip() != ""]
         return sep.join(vals) if vals else None
@@ -903,103 +865,23 @@ REVIEWS_BASE_COLS: List[Tuple[str, Any]] = [
     ("Review", lambda r: safe_get(r, ["freeText", "Review"])),
 ]
 
-def _collect_attribute_keys(records: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """Collect *all* attribute keys so they can become filterable columns.
-
-    This is intentionally broad: anything under clientAttributes/customAttributes/
-    customAttributes.taxonomies/axionAttributes becomes a column.
-    """
-
-    def _clean_keys(keys: Iterable[Any]) -> List[str]:
-        out = []
-        for k in keys:
-            s = str(k).strip()
-            if not s or s.lower() in {"unnamed: 0"}:
-                continue
-            out.append(s)
-        return sorted(list(dict.fromkeys(out)))
-
-    client: set[str] = set()
-    custom: set[str] = set()
-    tax: set[str] = set()
-    ax: set[str] = set()
-
-    for r in records:
-        if not isinstance(r, dict):
-            continue
-        ca = r.get("clientAttributes")
-        if isinstance(ca, dict):
-            client.update([str(k) for k in ca.keys()])
-
-        cu = r.get("customAttributes")
-        if isinstance(cu, dict):
-            for k, v in cu.items():
-                if str(k) == "taxonomies" and isinstance(v, dict):
-                    tax.update([str(tk) for tk in v.keys()])
-                else:
-                    custom.add(str(k))
-
-        aa = r.get("axionAttributes")
-        if isinstance(aa, dict):
-            ax.update([str(k) for k in aa.keys()])
-
-    return (
-        _clean_keys(client),
-        _clean_keys(custom),
-        _clean_keys(tax),
-        _clean_keys(ax),
-    )
+REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
+    ("Key Review Sentiment_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment_Reviews"]))),
+    ("Key Review Sentiment Type_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment Type_Reviews"]))),
+    ("Dominant Customer Journey Step", lambda r: join_list(safe_get(r, ["customAttributes", "Dominant Customer Journey Step"]))),
+    ("Trigger Point_Product", lambda r: join_list(safe_get(r, ["customAttributes", "Trigger Point_Product"]))),
+    ("L2 Delighter Component", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Component"]))),
+    ("L2 Delighter Condition", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Condition"]))),
+    ("L2 Delighter Mode", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Mode"]))),
+    ("L3 Non Product Detractors", lambda r: join_list(safe_get(r, ["customAttributes", "L3 Non Product Detractors"]))),
+    ("Product_Symptom Component", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Component"]))),
+    ("Product_Symptom Conditions", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Conditions"]))),
+]
 
 
 def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
-    """Build a "reviews" DataFrame from the JSON export.
-
-    v19 upgrade:
-    - Keeps the original base columns used by the app.
-    - Also flattens **all** JSON attributes (client/custom/taxonomies/axion)
-      into additional columns so they can be used in the "➕ Add Filters" system.
-    """
-
-    client_keys: List[str] = []
-    custom_keys: List[str] = []
-    tax_keys: List[str] = []
-    ax_keys: List[str] = []
-    if include_extra:
-        client_keys, custom_keys, tax_keys, ax_keys = _collect_attribute_keys(records)
-
-    base_cols = list(REVIEWS_BASE_COLS)
-
-    rows: List[Dict[str, Any]] = []
-    for r in records:
-        if not isinstance(r, dict):
-            continue
-
-        row: Dict[str, Any] = {name: fn(r) for name, fn in base_cols}
-
-        if include_extra:
-            ca = r.get("clientAttributes") if isinstance(r.get("clientAttributes"), dict) else {}
-            cu = r.get("customAttributes") if isinstance(r.get("customAttributes"), dict) else {}
-            tax = cu.get("taxonomies") if isinstance(cu.get("taxonomies"), dict) else {}
-            aa = r.get("axionAttributes") if isinstance(r.get("axionAttributes"), dict) else {}
-
-            for k in client_keys:
-                row[k] = join_list(ca.get(k))
-            for k in custom_keys:
-                # (taxonomies handled separately)
-                row[k] = join_list(cu.get(k))
-            for k in tax_keys:
-                row[k] = join_list(tax.get(k))
-            for k in ax_keys:
-                row[k] = join_list(aa.get(k))
-
-            # A couple useful top-level scalars (kept minimal)
-            if "eventType" in r:
-                row["eventType"] = r.get("eventType")
-            if "eventId" in r:
-                row["eventId"] = r.get("eventId")
-
-        rows.append(row)
-
+    cols = REVIEWS_BASE_COLS + (REVIEWS_EXTRA_COLS if include_extra else [])
+    rows = [{name: fn(r) for name, fn in cols} for r in records]
     df = pd.DataFrame(rows)
     if "Rating (num)" in df.columns:
         df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
@@ -1016,72 +898,17 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _extract_json_substring(s: str) -> str:
-    """Extract the first balanced JSON object/array from pasted text.
-
-    Why this exists:
-    - Users often paste JSON preceded/followed by commentary.
-    - Naive "slice from first { to last }" breaks when review text contains stray
-      brackets like "]" or "}" inside strings.
-
-    This implementation finds the first balanced {...} or [...] region while
-    correctly ignoring brackets that appear inside quoted strings.
-    """
     s = s.strip()
-    if not s:
+    if s.startswith("{") or s.startswith("["):
         return s
-
-    # IMPORTANT:
-    # Even if the paste begins with '{' or '[', the user may have trailing
-    # commentary / extra characters after the JSON. We therefore ALWAYS scan
-    # for the first balanced JSON object/array region and return just that.
-    # This avoids the common failure mode: json.loads() failing because of
-    # non-whitespace text after the valid JSON payload.
-
-    starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
-    if not starts:
+    start_candidates = [i for i in [s.find("{"), s.find("[")] if i != -1]
+    if not start_candidates:
         return s
-    start = min(starts)
-    sub = s[start:]
-
-    stack: List[str] = []
-    in_str = False
-    quote = ""
-    escape = False
-
-    for i, ch in enumerate(sub):
-        if in_str:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == quote:
-                in_str = False
-            continue
-
-        if ch in ('"', "'"):
-            in_str = True
-            quote = ch
-            continue
-
-        if ch in "{[":
-            stack.append(ch)
-            continue
-
-        if ch in "}]":
-            if not stack:
-                continue
-            opener = stack.pop()
-            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
-                # Mismatch. Reset stack and keep scanning.
-                stack = []
-                continue
-            if not stack:
-                return sub[: i + 1].strip()
-
-    # Fallback: return everything after the first brace/bracket
-    return sub.strip()
+    start = min(start_candidates)
+    end = max(s.rfind("}"), s.rfind("]"))
+    if end != -1 and end > start:
+        return s[start : end + 1].strip()
+    return s
 
 
 def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
@@ -1128,52 +955,11 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
 
 
 def extract_records(raw: Any) -> List[Dict[str, Any]]:
-    """Extract review record objects from a variety of JSON export shapes.
-
-    Supported:
-    - {"results": [ {...}, {...} ], ...}
-    - [ {...}, {...} ]
-    - {...}  (single record)
-    - nested wrappers where a list-of-dicts lives under some key
-    """
-
-    if isinstance(raw, dict) and isinstance(raw.get("results"), list):
-        return [r for r in raw.get("results") if isinstance(r, dict)]
-
+    if isinstance(raw, dict) and "results" in raw and isinstance(raw["results"], list):
+        return raw["results"]
     if isinstance(raw, list):
         return [r for r in raw if isinstance(r, dict)]
-
-    if isinstance(raw, dict):
-        # Sometimes a single record is pasted
-        if ("freeText" in raw) and ("clientAttributes" in raw or "customAttributes" in raw):
-            return [raw]
-
-    # Fallback: recursively search for the first list-of-dicts
-    def _search(obj: Any, depth: int = 0) -> Optional[List[Dict[str, Any]]]:
-        if depth > 6:
-            return None
-        if isinstance(obj, list):
-            # list-of-dicts candidate
-            if obj and all(isinstance(x, dict) for x in obj[: min(len(obj), 5)]):
-                return [x for x in obj if isinstance(x, dict)]
-            for x in obj:
-                found = _search(x, depth + 1)
-                if found is not None:
-                    return found
-        elif isinstance(obj, dict):
-            for _, v in obj.items():
-                found = _search(v, depth + 1)
-                if found is not None:
-                    return found
-        return None
-
-    found = _search(raw)
-    if found is not None:
-        return found
-
-    raise ValueError(
-        "Unrecognized JSON shape. Expected a dict with `results: []`, a list of record objects, or a wrapper containing a list of records."
-    )
+    raise ValueError("Unrecognized JSON shape. Expected a dict with `results: []` or a list of record objects.")
 
 
 # ============================================================
@@ -1361,52 +1147,8 @@ def convert_to_starwalk_from_reviews_df(
     """
     src_df = reviews_df.reset_index(drop=True)
     out_cols = list(DEFAULT_STARWALK_COLUMNS)
-
-    # v19: optionally keep **all** extra JSON-derived columns (e.g., Base SKU,
-    # Product Category, Company, Factory Name, etc.) so they can be used in
-    # the "➕ Add Filters" power-user system.
-    extra_cols_dynamic: List[str] = []
-    extra_cols_final: List[str] = []
     if include_extra_cols_after_symptom20:
-        base_extras = [c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns]
-
-        # Columns already represented in the Star Walk schema via field_map below.
-        # (We avoid duplicating them as extra columns.)
-        _used_inputs = {
-            "Retailer",
-            "Model",
-            "Seeded Reviews",
-            "Syndicated/Seeded Reviews",
-            "Location",
-            "Opened Timestamp",
-            "Record ID",
-            "Review",
-            "Rating (num)",
-        }
-
-        for c in list(src_df.columns):
-            sc = str(c).strip()
-            if not sc or sc.lower() in {"unnamed: 0"}:
-                continue
-            if sc in _used_inputs:
-                continue
-            if sc in base_extras:
-                continue
-            # Avoid duplicating symptoms / core outputs
-            if sc in out_cols or sc.startswith("Symptom "):
-                continue
-            try:
-                if src_df[sc].isna().all():
-                    continue
-            except Exception:
-                pass
-            extra_cols_dynamic.append(sc)
-
-        # Stable order: known extras first, then the remaining columns sorted.
-        extra_cols_dynamic = sorted(list(dict.fromkeys(extra_cols_dynamic)))
-        extra_cols_final = base_extras + [c for c in extra_cols_dynamic if c not in base_extras]
-
-        out_cols = insert_after_symptom20(out_cols, extra_cols_final)
+        out_cols = insert_after_symptom20(out_cols, DEFAULT_EXTRA_AFTER_SYMPTOM20)
 
     # Field mapping (source col -> output col)
     field_map = {
@@ -1420,7 +1162,7 @@ def convert_to_starwalk_from_reviews_df(
         "Verbatim": "Review",
         "Star Rating": "Rating (num)",
         # map extras where possible (same names)
-        **{c: c for c in extra_cols_final if c in src_df.columns},
+        **{c: c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns},
     }
 
     # L2 columns
@@ -1595,7 +1337,7 @@ def _json_text_to_starwalk(json_text: str, source_name: str, include_extra_cols:
     records = extract_records(raw_obj)
     if not records:
         raise ValueError("Parsed input, but found 0 record objects to convert.")
-    reviews_df = build_reviews_df(records, include_extra=include_extra_cols)
+    reviews_df = build_reviews_df(records, include_extra=True)
 
     out_df, stats = convert_to_starwalk_from_reviews_df(
         reviews_df,
@@ -1716,24 +1458,12 @@ def _collect_filter_state(additional_columns: list[str]) -> dict:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
-        rk = f"f_{col}_range"
-        if rk in st.session_state:
-            state["filters"][rk] = st.session_state.get(rk)
-        ck = f"f_{col}_contains"
-        if ck in st.session_state:
-            state["filters"][ck] = st.session_state.get(ck)
 
     # additional columns (dynamic)
     for col in additional_columns:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
-        rk = f"f_{col}_range"
-        if rk in st.session_state:
-            state["filters"][rk] = st.session_state.get(rk)
-        ck = f"f_{col}_contains"
-        if ck in st.session_state:
-            state["filters"][ck] = st.session_state.get(ck)
 
     # reviews per page
     state["ui"]["rpp"] = st.session_state.get("rpp", 10)
@@ -1767,14 +1497,6 @@ def _apply_filter_state_to_session(state: dict, available_columns: list[str], ad
         k = f"f_{col}"
         if k in filters:
             st.session_state[k] = _safe_list(filters.get(k))
-
-        rk = f"f_{col}_range"
-        if rk in filters:
-            st.session_state[rk] = filters.get(rk)
-
-        ck = f"f_{col}_contains"
-        if ck in filters:
-            st.session_state[ck] = str(filters.get(ck) or "")
 
     # UI
     ui = (state or {}).get("ui", {})
@@ -1820,10 +1542,9 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
     # Avg star (review-level, de-dup symptom within a review)
     avg_map = {}
     if "Star Rating" in df_in.columns:
-        # Robust join-based approach (avoids brittle index->dict mapping edge cases)
-        stars = pd.to_numeric(df_in["Star Rating"], errors="coerce").rename("star")
+        stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
         tmp = long.drop_duplicates(subset=["__idx", "symptom"]).copy()
-        tmp = tmp.join(stars, on="__idx")
+        tmp["star"] = tmp["__idx"].map(stars.to_dict())
         avg = tmp.groupby("symptom")["star"].mean()
         avg_map = avg.to_dict()
 
@@ -1984,415 +1705,71 @@ THEME_PATCH_CSS = ""
 # ============================================================
 # Improved flexible JSON parsing (more forgiving for copy/paste)
 # ============================================================
-
-def _find_first_json_start(s: str) -> int:
-    i_obj = s.find("{")
-    i_arr = s.find("[")
-    if i_obj == -1 and i_arr == -1:
-        return -1
-    if i_obj == -1:
-        return i_arr
-    if i_arr == -1:
-        return i_obj
-    return min(i_obj, i_arr)
-
-
-def _try_raw_decode_first(s: str) -> Tuple[Optional[Any], Optional[int], Optional[Exception]]:
-    """Attempts to decode the first JSON value in `s` (object or array) and returns (obj, end_pos, err)."""
-    try:
-        obj, end = json.JSONDecoder().raw_decode(s)
-        return obj, end, None
-    except Exception as e:
-        return None, None, e
-
-
-def _strip_js_comments(s: str) -> str:
-    """Remove //... and /*...*/ comments (outside of strings)."""
-    out: List[str] = []
-    in_str = False
-    quote = ""
-    esc = False
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        nxt = s[i + 1] if i + 1 < n else ""
-
-        if in_str:
-            out.append(ch)
-            if esc:
-                esc = False
-            else:
-                if ch == "\\":  # escape next char
-                    esc = True
-                elif ch == quote:
-                    in_str = False
-                    quote = ""
-            i += 1
-            continue
-
-        # not in string
-        if ch in ('"', "'"):
-            in_str = True
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-
-        # line comment
-        if ch == "/" and nxt == "/":
-            # skip to end of line
-            i += 2
-            while i < n and s[i] not in ("\n", "\r"):
-                i += 1
-            continue
-
-        # block comment
-        if ch == "/" and nxt == "*":
-            i += 2
-            while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
-                i += 1
-            i += 2  # consume */
-            continue
-
-        out.append(ch)
-        i += 1
-
-    return "".join(out)
-
-
-def _remove_trailing_commas_outside_strings(s: str) -> str:
-    """Remove trailing commas before } or ] (outside of strings)."""
-    out: List[str] = []
-    in_str = False
-    quote = ""
-    esc = False
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-
-        if in_str:
-            out.append(ch)
-            if esc:
-                esc = False
-            else:
-                if ch == "\\":  # escape
-                    esc = True
-                elif ch == quote:
-                    in_str = False
-                    quote = ""
-            i += 1
-            continue
-
-        if ch in ('"', "'"):
-            in_str = True
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-
-        if ch == ",":
-            # lookahead for next non-whitespace
-            j = i + 1
-            while j < n and s[j].isspace():
-                j += 1
-            if j < n and s[j] in ("]", "}"):
-                # skip this comma
-                i += 1
-                continue
-
-        out.append(ch)
-        i += 1
-
-    return "".join(out)
-
-
-def _escape_bad_controls_in_strings(s: str) -> str:
-    """Escape raw control characters inside strings (\n, \r, \t, and other <0x20)."""
-    out: List[str] = []
-    in_str = False
-    quote = ""
-    esc = False
-    for ch in s:
-        if in_str:
-            if esc:
-                out.append(ch)
-                esc = False
-                continue
-
-            if ch == "\\":  # start escape
-                out.append(ch)
-                esc = True
-                continue
-
-            # raw control chars inside JSON strings are invalid; escape them
-            if ch == "\n":
-                out.append("\\n")
-                continue
-            if ch == "\r":
-                out.append("\\r")
-                continue
-            if ch == "\t":
-                out.append("\\t")
-                continue
-            if ord(ch) < 0x20:
-                out.append(f"\\u{ord(ch):04x}")
-                continue
-
-            out.append(ch)
-            if ch == quote:
-                in_str = False
-                quote = ""
-            continue
-
-        # not in string
-        if ch in ('"', "'"):
-            in_str = True
-            quote = ch
-            out.append(ch)
-            continue
-
-        out.append(ch)
-
-    return "".join(out)
-
-
-def _replace_tokens_outside_strings(s: str, mapping: Dict[str, str]) -> str:
-    """Replace whole-word tokens outside of strings (e.g., NaN -> null)."""
-    out: List[str] = []
-    in_str = False
-    quote = ""
-    esc = False
-    i = 0
-    n = len(s)
-
-    def is_tok_char(c: str) -> bool:
-        return c.isalnum() or c in ("_", "-", ".")
-
-    while i < n:
-        ch = s[i]
-
-        if in_str:
-            out.append(ch)
-            if esc:
-                esc = False
-            else:
-                if ch == "\\":  # escape
-                    esc = True
-                elif ch == quote:
-                    in_str = False
-                    quote = ""
-            i += 1
-            continue
-
-        if ch in ('"', "'"):
-            in_str = True
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-
-        if ch.isalpha() or ch in ("-",):
-            # read token
-            j = i
-            while j < n and is_tok_char(s[j]):
-                j += 1
-            tok = s[i:j]
-            repl = mapping.get(tok)
-            if repl is None:
-                out.append(tok)
-            else:
-                out.append(repl)
-            i = j
-            continue
-
-        out.append(ch)
-        i += 1
-
-    return "".join(out)
-
-
-def _decode_bytes_to_text(b: bytes) -> str:
-    """Best-effort decoding for uploaded JSON files (handles UTF-8/UTF-16)."""
-    if b is None:
-        return ""
-    # BOM-based quick path
-    if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
-        try:
-            return b.decode("utf-16")
-        except Exception:
-            pass
-    if b.startswith(b"\xef\xbb\xbf"):
-        try:
-            return b.decode("utf-8-sig")
-        except Exception:
-            pass
-
-    for enc in ("utf-8-sig", "utf-16", "utf-16le", "utf-16be", "utf-8", "latin-1"):
-        try:
-            s = b.decode(enc)
-            # If we still see lots of NULs, it's likely the wrong codec
-            if s.count("\x00") > 0 and enc.startswith("utf-8"):
-                continue
-            return s
-        except Exception:
-            continue
-    return b.decode("utf-8", errors="replace")
-
-
-def pct_12(series: pd.Series) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    return float((s <= 2).mean() * 100.0) if len(s) else 0.0
-
-
-def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
-    cnt = int(len(sub))
-    if cnt == 0 or "Star Rating" not in sub.columns:
-        return 0, 0.0, 0.0
-    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
-    low = pct_12(sub["Star Rating"])
-    return cnt, avg, low
-
-
 def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
     """
     Parses:
     - Normal JSON object/array
     - JSON Lines (one object per line)
-    - Common copy/paste variants: code fences, BOM, smart quotes, trailing commas, JS comments
-    - Some non-standard tokens: NaN/Infinity/undefined -> null
+    - Common copy/paste variants: code fences, BOM, smart quotes, trailing commas
     - Python-literal dict/list (best-effort via ast.literal_eval)
-
-    Returns (obj, warnings).
     """
     warnings: List[str] = []
+
     if text_in is None:
         raise ValueError("No JSON provided.")
 
-    # 1) Normalize / strip wrappers
     s = str(text_in)
-    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
-    s = s.replace("\u00a0", " ")
-    s = _strip_code_fences(s).strip()
 
-    if not s:
-        raise ValueError("No JSON provided. Paste JSON or upload a .json file.")
+    # Remove BOM / zero-width / non-breaking spaces
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+    s = _strip_code_fences(s)
+    s = _extract_json_substring(s).strip()
 
-    # 2) Fast path: JSON Lines
+    # Normalize smart quotes
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+
+    # Fast path: standard JSON
+    try:
+        return json.loads(s), warnings
+    except Exception as e1:
+        last_err = e1
+
+    # Attempt: remove trailing commas
+    s2 = re.sub(r",\s*([}\]])", r"\1", s)
+    if s2 != s:
+        try:
+            warnings.append("Removed trailing commas to make JSON valid.")
+            return json.loads(s2), warnings
+        except Exception as e2:
+            last_err = e2
+            warnings = [w for w in warnings if "trailing commas" not in w.lower()]
+
+    # Attempt: JSON Lines
     jl = _try_parse_json_lines(s)
     if jl is not None:
-        warnings.append(f"Detected JSON Lines: {len(jl)} objects.")
+        warnings.append("Detected JSON Lines and parsed each line as a record.")
         return jl, warnings
 
-    # 3) Trim to first JSON-looking payload
-    start = _find_first_json_start(s)
-    if start == -1:
-        raise ValueError("Could not find a JSON object/array in the input.")
-    if start > 0:
-        warnings.append("Ignored leading text before the first JSON payload.")
-        s = s[start:]
-
-    # 4) Smart quotes -> standard quotes
-    s = (
-        s.replace("“", '"')
-        .replace("”", '"')
-        .replace("„", '"')
-        .replace("‟", '"')
-        .replace("’", "'")
-        .replace("‘", "'")
-    )
-
-    # 5) Try raw decode first (lets us ignore trailing text)
-    obj, end, err = _try_raw_decode_first(s)
-    if obj is not None:
-        if s[end:].strip():
-            warnings.append("Ignored trailing text after the first JSON payload.")
-        return obj, warnings
-    last_err: Exception = err if err else ValueError("Unknown JSON parse error.")
-
-    # 6) Repair passes (only after a failed parse)
-    s_work = s
-    repairs = [
-        ("Stripped JS comments", _strip_js_comments),
-        ("Removed trailing commas", _remove_trailing_commas_outside_strings),
-        ("Escaped control characters inside strings", _escape_bad_controls_in_strings),
-        ("Replaced NaN/Infinity/undefined with null", lambda x: _replace_tokens_outside_strings(
-            x,
-            {
-                "NaN": "null",
-                "Infinity": "null",
-                "-Infinity": "null",
-                "undefined": "null",
-            },
-        )),
-    ]
-
-    for label, fn in repairs:
-        s_work = fn(s_work)
-        obj, end, err = _try_raw_decode_first(s_work)
-        if obj is not None:
-            warnings.append(label + ".")
-            if s_work[end:].strip():
-                warnings.append("Ignored trailing text after the first JSON payload.")
-            return obj, warnings
-        if err:
-            last_err = err
-
-    # 7) If the paste looks like the inside of a wrapper (common), try adding the missing prefix
-    if (re.search(r'\]\s*,\s*"total"\s*:', s_work) and '"results"' not in s_work):
-        candidate = '{"results": [' + s_work
-        obj, end, err = _try_raw_decode_first(candidate)
-        if obj is not None:
-            warnings.append("Auto-repaired missing wrapper: added {'results': [...] } prefix.")
-            return obj, warnings
-        if err:
-            last_err = err
-
-    # 8) Try balanced substring extraction (handles some trailing garbage)
-    s_bal = _extract_json_substring(s_work).strip()
-    if s_bal and s_bal != s_work:
-        obj, end, err = _try_raw_decode_first(s_bal)
-        if obj is not None:
-            warnings.append("Parsed first balanced JSON payload (ignored extra text).")
-            return obj, warnings
-        if err:
-            last_err = err
-
-    # 9) Try Python literal fallback (handles single quotes / None / True / False)
-    py_txt = _replace_tokens_outside_strings(
-        s_work,
-        {"null": "None", "true": "True", "false": "False"},
-    )
+    # Attempt: Python-literal (dict/list with single quotes, None/True/False)
     try:
-        obj = ast.literal_eval(py_txt)
-        warnings.append("Parsed using Python-literal fallback (ast.literal_eval).")
-        return obj, warnings
-    except Exception as e:
-        last_err = e
+        obj = ast.literal_eval(s)
+        if isinstance(obj, (dict, list)):
+            warnings.append("Parsed as a Python literal (best-effort). Consider exporting valid JSON for reliability.")
+            return obj, warnings
+    except Exception as e3:
+        last_err = e3
 
-    # 10) If there is a JSONDecodeError, provide details + context
-    hint = ""
-    if isinstance(last_err, json.JSONDecodeError):
-        pos = getattr(last_err, "pos", None)
-        if isinstance(pos, int):
-            ctx = s_work[max(0, pos - 120): pos + 120]
-            try:
-                ctx = _mask_pii(ctx)
-            except Exception:
-                pass
-            hint = (
-                f"\nDecoder details: {last_err.msg} (line {last_err.lineno}, col {last_err.colno})."
-                f"\nContext: …{ctx}…"
-            )
-
-        if "\x00" in s_work:
-            hint += "\nNote: Detected NUL characters. Your file may be UTF-16 encoded — upload the file (instead of paste) or re-save as UTF-8."
+    # Attempt: if content is wrapped in quotes (rare copy/paste)
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        try:
+            inner = s[1:-1]
+            return json.loads(inner), warnings + ["Removed outer quotes around pasted JSON text."]
+        except Exception as e4:
+            last_err = e4
 
     raise ValueError(
         "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines.\n"
-        'Tips: remove any leading/trailing commentary, ensure quotes are standard " characters, and avoid trailing commas.'
-        + hint
+        "Tips: remove any leading/trailing commentary, ensure quotes are standard \" characters, and avoid trailing commas."
     ) from last_err
 
 
@@ -2440,7 +1817,7 @@ else:
     source_label = "pasted_json"
     if json_file is not None and getattr(json_file, "size", 0) > 0:
         source_label = json_file.name
-        raw_text = _decode_bytes_to_text(json_file.getvalue())
+        raw_text = json_file.getvalue().decode("utf-8", errors="replace")
     elif pasted and pasted.strip():
         raw_text = pasted.strip()
 
@@ -2490,7 +1867,6 @@ except Exception:
 if st.session_state.get("_dataset_sig") != _dataset_sig:
     for _k in [
         "_review_sort_cache",
-        "_col_opts_cache",
         "_ai_local_index",
         "_ai_last_answer",
         "_ai_last_q",
@@ -2582,58 +1958,16 @@ if st.session_state.get("_symptom_opts_key") != _sym_key:
 detractor_symptoms_all = st.session_state.get("_symptom_opts_det", []) or []
 delighter_symptoms_all = st.session_state.get("_symptom_opts_del", []) or []
 
-def _col_options(df_in: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -> list:
-    """Return filter options for a column.
-
-    - Uses frequency order (e-commerce style: most common values first).
-    - If max_vals is None, returns **all** values found.
-    - Cached per dataset+column so it stays fast even with many reruns.
-    """
+def _col_options(df_in: pd.DataFrame, col: str, max_vals: int = 250) -> list:
     if col not in df_in.columns:
         return ["ALL"]
-
-    cache = st.session_state.setdefault("_col_opts_cache", {})
-
-    s0 = df_in[col].astype("string").replace({"": pd.NA}).dropna()
-    # Detect multi-valued fields we created from lists (we join lists with " | ").
-    # When detected, we explode tokens so the filter shows *actual* values
-    # (e.g., "Factory Name" -> "YDC CN") instead of combo strings.
-    sample = s0.head(300)
-    tokenize_multi = bool(sample.astype(str).str.contains(r"\s\|\s", regex=True).any())
-
-    cache_key = (
-        st.session_state.get("_dataset_sig"),
-        str(col),
-        int(max_vals) if isinstance(max_vals, int) else None,
-        bool(tokenize_multi),
-    )
-    if cache_key in cache:
-        return cache[cache_key]
-
-    if s0.empty:
-        cache[cache_key] = ["ALL"]
+    s = df_in[col].astype("string").replace({"": pd.NA}).dropna()
+    if s.empty:
         return ["ALL"]
-
-    if tokenize_multi:
-        tok = (
-            s0.astype(str)
-            .str.split(r"\s*\|\s*", regex=True)
-            .explode()
-            .astype("string")
-            .str.strip()
-            .replace({"": pd.NA})
-            .dropna()
-        )
-        vc = tok.value_counts()
-    else:
-        vc = s0.value_counts()
-    if isinstance(max_vals, int) and max_vals > 0:
-        vc = vc.head(max_vals)
-
+    # For very high-cardinality columns, use top-N by frequency
+    vc = s.value_counts().head(max_vals)
     vals = vc.index.astype(str).tolist()
-    out = ["ALL"] + vals
-    cache[cache_key] = out
-    return out
+    return ["ALL"] + vals
 
 def _sanitize_multiselect(key: str, options: list, default: list):
     cur = st.session_state.get(key, default)
@@ -2678,16 +2012,9 @@ def _reset_all_filters():
     for col in st.session_state.get("extra_filter_cols", []):
         st.session_state.pop(f"f_{col}", None)
         st.session_state.pop(f"f_{col}_range", None)
-        st.session_state.pop(f"f_{col}_contains", None)
     st.session_state["extra_filter_cols"] = []
     # Paging
     st.session_state["review_page"] = 0
-
-
-# Home (requested): quick way back to main dashboard from anywhere
-if st.sidebar.button("🏠 Home", use_container_width=True):
-    st.session_state["main_view"] = "📊 Dashboard"
-    st.rerun()
 
 st.sidebar.header("🔍 Filters")
 
@@ -2790,25 +2117,9 @@ if extra_cols:
                 st.session_state[key] = (float(default[0]), float(default[1]))
                 st.slider(col, min_value=lo, max_value=hi, value=st.session_state[key], key=key)
             else:
-                # Power-user extra filters:
-                # - If cardinality is reasonable, show a searchable multiselect with **all** values.
-                # - If cardinality is huge, show a fast "contains" search box instead.
-                try:
-                    nunique = int(s.astype("string").replace({"": pd.NA}).nunique(dropna=True))
-                except Exception:
-                    nunique = 0
-
-                if nunique > 600:
-                    st.text_input(
-                        f"{col} contains",
-                        value=str(st.session_state.get(f"f_{col}_contains") or ""),
-                        key=f"f_{col}_contains",
-                        help="High-cardinality column — using a contains filter for speed.",
-                    )
-                else:
-                    opts = _col_options(df_base, col, max_vals=None)
-                    _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
-                    st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
+                opts = _col_options(df_base, col, max_vals=250)
+                _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
+                st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
 
 # --- Saved Views (still supported) ---
 with st.sidebar.expander("💾 Saved Views / Presets", expanded=False):
@@ -2839,10 +2150,6 @@ with st.sidebar.expander("💾 Saved Views / Presets", expanded=False):
                 for k in (preset.get("filters") or {}).keys():
                     if k.startswith("f_"):
                         col = k[2:]
-                        # Strip suffixes used by range/contains filters
-                        for suf in ("_range", "_contains"):
-                            if col.endswith(suf):
-                                col = col[: -len(suf)]
                         if col in extra_filter_candidates:
                             used.append(col)
                 st.session_state["extra_filter_cols"] = sorted(list(set(used)))
@@ -2912,25 +2219,9 @@ for col in extra_cols:
         num = pd.to_numeric(d0[col], errors="coerce")
         mask &= num.between(float(lo), float(hi))
     else:
-        # high-cardinality text search?
-        contains_key = f"f_{col}_contains"
-        contains_val = (st.session_state.get(contains_key) or "").strip()
-        if contains_val:
-            mask &= d0[col].astype("string").fillna("").str.contains(contains_val, case=False, na=False)
-        else:
-            sel = st.session_state.get(f"f_{col}", ["ALL"])
-            if isinstance(sel, list) and sel and "ALL" not in sel:
-                s = d0[col].astype("string").fillna("")
-                # If the field contains multi-values joined by " | ", treat selections as tokens.
-                sample = s.dropna().head(200).astype(str)
-                if bool(sample.str.contains(r"\s\|\s", regex=True).any()):
-                    # Match whole tokens delimited by pipes (case-insensitive)
-                    toks = [str(x).strip() for x in sel if str(x).strip()]
-                    if toks:
-                        pattern = r"(^|\s*\|\s*)(" + "|".join([re.escape(t) for t in toks]) + r")(\s*\|\s*|$)"
-                        mask &= s.str.contains(pattern, case=False, regex=True, na=False)
-                else:
-                    mask &= s.isin([str(x) for x in sel])
+        sel = st.session_state.get(f"f_{col}", ["ALL"])
+        if isinstance(sel, list) and sel and "ALL" not in sel:
+            mask &= d0[col].astype("string").isin([str(x) for x in sel])
 
 # symptom filters
 sel_del = st.session_state.get("delight", ["All"])
@@ -2961,21 +2252,6 @@ def _summarize_active_filters() -> list[tuple[str, str]]:
     if isinstance(sr_sel, list) and "All" not in sr_sel:
         items.append(("Stars", ", ".join([str(x) for x in sr_sel])))
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + extra_cols:
-        # range filters
-        rk = f"f_{col}_range"
-        if rk in st.session_state and isinstance(st.session_state.get(rk), (tuple, list)) and len(st.session_state.get(rk)) == 2:
-            lo, hi = st.session_state.get(rk)
-            items.append((col, f"{float(lo):g} → {float(hi):g}"))
-            continue
-
-        # contains filters
-        ck = f"f_{col}_contains"
-        cv = (st.session_state.get(ck) or "").strip()
-        if cv:
-            items.append((col, f"contains: {cv}"))
-            continue
-
-        # multiselect filters
         sel = st.session_state.get(f"f_{col}", ["ALL"])
         if isinstance(sel, list) and sel and "ALL" not in sel:
             items.append((col, ", ".join([str(x) for x in sel[:4]]) + ("" if len(sel) <= 4 else f" +{len(sel)-4}")))
@@ -3074,6 +2350,104 @@ st_html(
     }
 
     W.addEventListener('resize', setHeaderH);
+  }catch(e){}
+})();
+</script>
+""",
+    height=0,
+)
+
+
+
+
+st_html(
+    """
+<script>
+(function(){
+  try{
+    const W = window.parent;
+    const doc = W.document;
+
+    function parseColor(s){
+      s = (s || "").trim();
+      if (!s) return null;
+      // rgb/rgba
+      let m = s.match(/^rgba?\(([^)]+)\)/i);
+      if (m){
+        let parts = m[1].split(",").map(x => parseFloat(x));
+        if (parts.length >= 3){
+          return {r: parts[0], g: parts[1], b: parts[2]};
+        }
+      }
+      // hex
+      if (s[0] === "#"){
+        let hex = s.slice(1).trim();
+        if (hex.length === 3){
+          hex = hex.split("").map(c => c + c).join("");
+        }
+        if (hex.length === 6){
+          return {
+            r: parseInt(hex.slice(0,2), 16),
+            g: parseInt(hex.slice(2,4), 16),
+            b: parseInt(hex.slice(4,6), 16)
+          };
+        }
+      }
+      return null;
+    }
+
+    function luminance(c){
+      function chan(v){
+        v = v / 255;
+        return (v <= 0.03928) ? (v/12.92) : Math.pow((v + 0.055) / 1.055, 2.4);
+      }
+      const r = chan(c.r), g = chan(c.g), b = chan(c.b);
+      return 0.2126*r + 0.7152*g + 0.0722*b;
+    }
+
+    let last = null;
+
+    function setScheme(){
+      try{
+        const rootStyle = W.getComputedStyle(doc.documentElement);
+        const bgVar = (rootStyle.getPropertyValue('--background-color') || "").trim();
+        const txVar = (rootStyle.getPropertyValue('--text-color') || "").trim();
+
+        const bg = parseColor(bgVar);
+        const tx = parseColor(txVar);
+
+        let scheme = null;
+
+        if (bg){
+          scheme = (luminance(bg) < 0.45) ? "dark" : "light";
+        } else if (tx){
+          scheme = (luminance(tx) > 0.70) ? "dark" : "light";
+        } else {
+          scheme = (W.matchMedia && W.matchMedia('(prefers-color-scheme: dark)').matches) ? "dark" : "light";
+        }
+
+        if (scheme && scheme !== last){
+          doc.documentElement.setAttribute("data-scheme", scheme);
+          if (doc.body) doc.body.setAttribute("data-scheme", scheme);
+          last = scheme;
+        }
+      }catch(e){}
+    }
+
+    setScheme();
+    W.setTimeout(setScheme, 120);
+    W.setTimeout(setScheme, 350);
+    W.setTimeout(setScheme, 800);
+    W.setInterval(setScheme, 1000);
+
+    if (W.matchMedia){
+      const mq = W.matchMedia('(prefers-color-scheme: dark)');
+      if (mq && mq.addEventListener){
+        mq.addEventListener('change', setScheme);
+      } else if (mq && mq.addListener){
+        mq.addListener(setScheme);
+      }
+    }
   }catch(e){}
 })();
 </script>
@@ -3266,7 +2640,6 @@ if view.startswith("📊"):
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
             )
-            style_plotly(fig)
             st.plotly_chart(fig, use_container_width=True)
 
             if show_table:
@@ -3296,7 +2669,6 @@ if view.startswith("📊"):
 **Interpretation**
 - Higher Net Hit = larger rating-impact lever (directionally)
 - Net Hits sum to the total gap (within the table)
-- For **Detractors**, we show Net Hit as a **positive** "rating drag" share (bigger = worse). If you prefer signed values, treat detractor Net Hit as negative.
 - This is a proportional allocation model, not causal regression."""
             )
 
@@ -3446,7 +2818,6 @@ if view.startswith("📊"):
             )
             fig_det.update_layout(template=PLOTLY_TEMPLATE, margin=dict(l=170, r=20, t=20, b=40), height=460, xaxis=dict(title=x_label),
                                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            style_plotly(fig_det)
             st.plotly_chart(fig_det, use_container_width=True)
 
     with c2:
@@ -3473,7 +2844,6 @@ if view.startswith("📊"):
             )
             fig_del.update_layout(template=PLOTLY_TEMPLATE, margin=dict(l=170, r=20, t=20, b=40), height=460, xaxis=dict(title=x_label),
                                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            style_plotly(fig_del)
             st.plotly_chart(fig_del, use_container_width=True)
 
     # ---------- Cumulative Avg ★ Over Time by Region (Weighted) ----------
@@ -3600,7 +2970,6 @@ if view.startswith("📊"):
                 fig.update_yaxes(title_text="Cumulative Avg ★", range=[1.0, 5.2], showgrid=True, gridcolor=PLOTLY_GRIDCOLOR, secondary_y=False)
                 fig.update_yaxes(title_text="Reviews/day", showgrid=False, secondary_y=True, rangemode="tozero", showticklabels=False)
 
-                style_plotly(fig)
                 st.plotly_chart(fig, use_container_width=True)
 
     # ---------- Watchouts ----------
@@ -3690,7 +3059,6 @@ if view.startswith("📊"):
             uniformtext_mode="hide",
         )
 
-        style_plotly(fig)
         st.plotly_chart(fig, use_container_width=True)
 
         d2 = d.copy()
