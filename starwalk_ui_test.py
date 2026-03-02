@@ -1003,6 +1003,17 @@ def _strip_code_fences(s: str) -> str:
     return s
 
 
+
+def _remove_trailing_commas(s: str) -> str:
+    """Remove trailing commas that appear immediately before a closing '}' or ']'.
+
+    This is a safe, common "JSON5-ish" cleanup for pasted/exported payloads.
+    It does NOT touch commas inside strings.
+    """
+    return re.sub(r",\s*([}\]])", r"\1", s)
+
+
+
 def _extract_json_substring(s: str) -> str:
     """
     Return the best guess of the JSON object/array substring inside a larger pasted blob.
@@ -1095,7 +1106,18 @@ def loads_flexible_json(json_text: str) -> Tuple[Any, List[str]]:
     except Exception as e_as_is:
         last_err: Exception = e_as_is
 
-    # 3) Try extracting the largest {...} substring
+    
+
+    # 2b) Second try: remove trailing commas (common in pasted JSON)
+    try:
+        cleaned = _remove_trailing_commas(clean)
+        if cleaned != clean:
+            obj = json.loads(cleaned)
+            warnings.append("Parsed JSON after removing trailing commas before } or ].")
+            return obj, warnings
+    except Exception as e_tc:
+        last_err = e_tc
+# 3) Try extracting the largest {...} substring
     candidate = _extract_json_substring(clean)
     if candidate and candidate != clean:
         try:
@@ -1104,7 +1126,17 @@ def loads_flexible_json(json_text: str) -> Tuple[Any, List[str]]:
         except Exception as e_sub:
             last_err = e_sub
 
-    # 4) Try JSON Lines
+    
+        # 3b) Try the extracted substring again after removing trailing commas
+        try:
+            cand2 = _remove_trailing_commas(candidate)
+            if cand2 != candidate:
+                obj = json.loads(cand2)
+                warnings.append("Parsed JSON after extracting JSON substring and removing trailing commas.")
+                return obj, warnings
+        except Exception as e_sub2:
+            last_err = e_sub2
+# 4) Try JSON Lines
     line_obj = _try_parse_json_lines(clean)
     if line_obj is not None:
         warnings.append("Parsed as JSON Lines (one JSON object per line).")
