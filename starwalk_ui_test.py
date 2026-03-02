@@ -3284,6 +3284,7 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
 
     # ---------- Cumulative Avg ★ Over Time by Region (Weighted) ----------
     st.markdown("## 📈 Cumulative Avg ★ Over Time by Region (Weighted)")
+    st.caption("Cumulative average star rating by Country with subtle review-volume bars in the background.")
 
     if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
         st.info("Need Review Date and Star Rating columns for the cumulative chart.")
@@ -3302,159 +3303,235 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             if region_col is None:
                 st.info("Need a Country column to break down regions.")
             else:
-                # Weighting options
-                c1, c2, c3, c4 = st.columns([1.05, 1.0, 0.95, 0.95])
+                # Controls
+                c1, c2, c3, c4, c5 = st.columns([1.15, 1.05, 0.95, 0.95, 1.15])
                 with c1:
-                    weight_mode = st.selectbox("Weighting", options=["Equal", "By review count"], index=1, key="cum_weight_mode")
+                    # Keep legacy option strings to avoid breaking existing session_state keys
+                    weight_mode = st.selectbox(
+                        "Overall weighting",
+                        options=["By review count", "Equal"],
+                        index=0,
+                        key="cum_weight_mode",
+                        help="Overall line weighting across regions.",
+                    )
                 with c2:
                     smooth = st.selectbox("Smoothing", options=["None", "7-day", "14-day"], index=1, key="cum_smooth")
                 with c3:
-                    organic_only = st.toggle("Organic only", value=False, key="cum_org_only")
+                    organic_only = st.toggle("Organic only", value=False, key="cum_organic_only")
                 with c4:
                     show_overall = st.toggle("Show overall", value=True, key="cum_show_overall")
-
-                # Organic-only option (exclude seeded reviews)
-                if organic_only:
-                    if "Seeded" in data.columns:
-                        data = data[
-                            ~data["Seeded"]
-                            .astype("string")
-                            .str.upper()
-                            .isin(["YES", "Y", "TRUE", "1", "SEEDED"])
-                        ]
-                    else:
-                        st.caption("Organic only: no 'Seeded' column found (no effect).")
-
-                # Use top regions by volume (after organic toggle)
-                top_regions: List[str] = []
-                if region_col in data.columns:
-                    top_regions = (
-                        data[region_col]
-                        .astype("string")
-                        .value_counts()
-                        .head(8)
-                        .index.tolist()
+                with c5:
+                    vol_gran = st.selectbox(
+                        "Volume bars",
+                        options=["Auto", "Daily", "Weekly", "Monthly"],
+                        index=0,
+                        key="cum_volume_gran",
+                        help="Auto picks a readable granularity based on the date range.",
                     )
+
+                # Optional Organic-only (excludes Seeded=YES)
+                if organic_only and "Seeded" in data.columns:
+                    seed_mask_local = data["Seeded"].astype("string").str.upper().eq("YES")
+                    data = data[~seed_mask_local]
+
+                if data.empty:
+                    st.info("No time-series data after applying Organic-only.")
+                else:
+                    # Use top regions by volume (after Organic-only)
+                    top_regions = data[region_col].astype("string").value_counts().head(8).index.tolist()
                     data = data[data[region_col].astype("string").isin(top_regions)]
 
+                    # Choose a readable bucket frequency (prevents 'invisible' hairline volume bars on long ranges)
+                    dt_min = data["Review Date"].min()
+                    dt_max = data["Review Date"].max()
+                    try:
+                        days_range = int((dt_max - dt_min).days) if pd.notna(dt_min) and pd.notna(dt_max) else 0
+                    except Exception:
+                        days_range = 0
 
-                data["date"] = data["Review Date"].dt.date
+                    if vol_gran == "Daily":
+                        freq = "D"
+                    elif vol_gran == "Weekly":
+                        freq = "W-MON"
+                    elif vol_gran == "Monthly":
+                        freq = "M"
+                    else:
+                        # Auto
+                        if days_range > 540:
+                            freq = "M"
+                        elif days_range > 120:
+                            freq = "W-MON"
+                        else:
+                            freq = "D"
 
-                # Daily aggregation by region
-                grp = (
-                    data.groupby(["date", region_col])["Star Rating"]
-                    .agg(cnt="count", sum_star="sum")
-                    .reset_index()
-                )
+                    # Bucket column for BOTH the lines and the volume bars
+                    if freq == "D":
+                        data["bucket"] = data["Review Date"].dt.date
+                    else:
+                        data["bucket"] = data["Review Date"].dt.to_period(freq).dt.start_time.dt.date
 
-                # Volume bars (overall daily count) on a secondary axis (kept subtle)
-                daily_vol = (
-                    grp.groupby("date", as_index=False)["cnt"]
-                    .sum()
-                    .sort_values("date")
-                )
-
-                fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-                if not daily_vol.empty:
-                    fig.add_trace(
-                        go.Bar(
-                            x=daily_vol["date"],
-                            y=daily_vol["cnt"],
-                            name="Volume",
-                            opacity=0.18,
-                            marker_color="rgba(148, 163, 184, 0.22)",
-                            hovertemplate="Date: %{x}<br>Reviews: %{y}<extra></extra>",
-                            showlegend=False,
-                        ),
-                        secondary_y=True,
+                    grp = (
+                        data.groupby(["bucket", region_col])["Star Rating"]
+                        .agg(cnt="count", sum_star="sum")
+                        .reset_index()
                     )
 
-                # Cumulative lines per region (weighted by volume)
-                for r in top_regions:
-                    sub = grp[grp[region_col].astype("string") == str(r)].sort_values("date")
-                    if sub.empty:
-                        continue
-                    sub["cum_cnt"] = sub["cnt"].cumsum()
-                    sub["cum_sum"] = sub["sum_star"].cumsum()
-                    sub["cum_avg"] = sub["cum_sum"] / sub["cum_cnt"]
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-                    y = sub["cum_avg"].astype(float)
-                    if smooth != "None" and len(y) >= 3:
-                        win = {"7-day": 7, "14-day": 14}.get(smooth, 7)
-                        y = y.rolling(window=win, min_periods=1).mean()
+                    # Volume bars (overall)
+                    vol = grp.groupby("bucket", as_index=False)["cnt"].sum().sort_values("bucket")
+                    if not vol.empty:
+                        # Important: do NOT double-apply alpha (marker rgba + trace opacity), or bars become invisible.
+                        bar_opacity = 0.18 if IS_DARK_THEME else 0.12
+                        bar_color = "rgb(148, 163, 184)" if IS_DARK_THEME else "rgb(100, 116, 139)"
+                        fig.add_trace(
+                            go.Bar(
+                                x=vol["bucket"],
+                                y=vol["cnt"],
+                                name="Review volume",
+                                marker_color=bar_color,
+                                opacity=bar_opacity,
+                                hovertemplate="Date: %{x}<br>Reviews: %{y:,}<extra></extra>",
+                                showlegend=False,
+                            ),
+                            secondary_y=True,
+                        )
 
-                    fig.add_trace(
-                        go.Scatter(
-                            x=sub["date"],
-                            y=y,
-                            mode="lines",
-                            name=f"{r}",
-                            hovertemplate=f"{r}<br>Date: %{{x}}<br>Cumulative Avg ★: %{{y:.3f}}<br>cum N: %{{customdata[0]}}<extra></extra>",
-                            customdata=np.stack([sub["cum_cnt"]], axis=-1),
-                        ),
-                        secondary_y=False,
-                    )
+                    # Region cumulative curves
+                    region_curves = {}
+                    for r in top_regions:
+                        sub = grp[grp[region_col].astype("string") == str(r)].sort_values("bucket")
+                        if sub.empty:
+                            continue
+                        sub["cum_cnt"] = sub["cnt"].cumsum()
+                        sub["cum_sum"] = sub["sum_star"].cumsum()
+                        sub["cum_avg"] = sub["cum_sum"] / sub["cum_cnt"]
 
-                # Overall
-                if show_overall:
-                    overall = (
-                        grp.groupby("date", as_index=False)
-                        .agg(cnt=("cnt", "sum"), sum_star=("sum_star", "sum"))
-                        .sort_values("date")
-                    )
-                    if not overall.empty:
-                        overall["cum_cnt"] = overall["cnt"].cumsum()
-                        overall["cum_sum"] = overall["sum_star"].cumsum()
-                        overall["cum_avg"] = overall["cum_sum"] / overall["cum_cnt"]
-
-                        y = overall["cum_avg"].astype(float)
-                        if smooth != "None" and len(y) >= 3:
-                            win = {"7-day": 7, "14-day": 14}.get(smooth, 7)
-                            y = y.rolling(window=win, min_periods=1).mean()
+                        y = sub["cum_avg"].astype(float)
+                        if smooth != "None" and len(y) > 2:
+                            if freq == "D":
+                                win = 7 if smooth == "7-day" else 14
+                            elif str(freq).startswith("W"):
+                                win = 2 if smooth == "7-day" else 4
+                            else:
+                                win = 2 if smooth == "7-day" else 3
+                            y = y.rolling(window=int(win), min_periods=1).mean()
 
                         fig.add_trace(
                             go.Scatter(
-                                x=overall["date"],
+                                x=sub["bucket"],
                                 y=y,
                                 mode="lines",
-                                name="Overall",
-                                line=dict(width=4, dash="solid"),
-                                hovertemplate="Overall<br>Date: %{x}<br>Cumulative Avg ★: %{y:.3f}<br>cum N: %{customdata[0]}<extra></extra>",
-                                customdata=np.stack([overall["cum_cnt"]], axis=-1),
+                                name=str(r),
+                                hovertemplate=(
+                                    f"{region_col}: {r}<br>"
+                                    "Date: %{x}<br>"
+                                    "Cumulative Avg ★: %{y:.3f}<br>"
+                                    "Cum N: %{customdata:,}<extra></extra>"
+                                ),
+                                customdata=sub["cum_cnt"],
                             ),
                             secondary_y=False,
                         )
+                        region_curves[str(r)] = pd.DataFrame({"bucket": sub["bucket"], "cum_avg": y.to_numpy()})
 
-                fig.update_layout(
-                    template=PLOTLY_TEMPLATE,
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    height=520,
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                    hovermode="x unified",
-                    barmode="overlay",
-                )
+                    # Overall curve
+                    if show_overall:
+                        if weight_mode == "Equal" and region_curves:
+                            wide = None
+                            for rr, df_rr in region_curves.items():
+                                part = df_rr.rename(columns={"cum_avg": rr})
+                                wide = part if wide is None else wide.merge(part, on="bucket", how="outer")
 
-                fig.update_yaxes(
-                    title_text="Cumulative Avg ★",
-                    range=[1.0, 5.2],
-                    showgrid=True,
-                    gridcolor=PLOTLY_GRIDCOLOR,
-                    secondary_y=False,
-                )
-                fig.update_yaxes(
-                    title_text="Review volume",
-                    showgrid=False,
-                    showticklabels=False,
-                    rangemode="tozero",
-                    secondary_y=True,
-                )
-                fig.update_xaxes(title_text="Date", showgrid=False)
+                            if wide is not None and not wide.empty:
+                                wide = wide.sort_values("bucket")
+                                region_cols = [c for c in wide.columns if c != "bucket"]
+                                wide["overall_equal"] = wide[region_cols].mean(axis=1, skipna=True)
 
-                st.plotly_chart(fig, use_container_width=True)
+                                y = wide["overall_equal"].astype(float)
+                                if smooth != "None" and len(y) > 2:
+                                    if freq == "D":
+                                        win = 7 if smooth == "7-day" else 14
+                                    elif str(freq).startswith("W"):
+                                        win = 2 if smooth == "7-day" else 4
+                                    else:
+                                        win = 2 if smooth == "7-day" else 3
+                                    y = y.rolling(window=int(win), min_periods=1).mean()
 
+                                n_regions = wide[region_cols].notna().sum(axis=1)
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=wide["bucket"],
+                                        y=y,
+                                        mode="lines",
+                                        name="Overall (equal regions)",
+                                        line=dict(width=4),
+                                        hovertemplate=(
+                                            "Overall (equal regions)<br>Date: %{x}<br>"
+                                            "Cumulative Avg ★: %{y:.3f}<br>"
+                                            "Regions with data: %{customdata}<extra></extra>"
+                                        ),
+                                        customdata=n_regions,
+                                    ),
+                                    secondary_y=False,
+                                )
+                        else:
+                            overall = (
+                                grp.groupby("bucket", as_index=False)
+                                .agg(cnt=("cnt", "sum"), sum_star=("sum_star", "sum"))
+                                .sort_values("bucket")
+                            )
+                            overall["cum_cnt"] = overall["cnt"].cumsum()
+                            overall["cum_sum"] = overall["sum_star"].cumsum()
+                            overall["cum_avg"] = overall["cum_sum"] / overall["cum_cnt"]
+
+                            y = overall["cum_avg"].astype(float)
+                            if smooth != "None" and len(y) > 2:
+                                if freq == "D":
+                                    win = 7 if smooth == "7-day" else 14
+                                elif str(freq).startswith("W"):
+                                    win = 2 if smooth == "7-day" else 4
+                                else:
+                                    win = 2 if smooth == "7-day" else 3
+                                y = y.rolling(window=int(win), min_periods=1).mean()
+
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=overall["bucket"],
+                                    y=y,
+                                    mode="lines",
+                                    name="Overall",
+                                    line=dict(width=4),
+                                    hovertemplate=(
+                                        "Overall<br>Date: %{x}<br>"
+                                        "Cumulative Avg ★: %{y:.3f}<br>"
+                                        "Cum N: %{customdata:,}<extra></extra>"
+                                    ),
+                                    customdata=overall["cum_cnt"],
+                                ),
+                                secondary_y=False,
+                            )
+
+                    fig.update_layout(
+                        template=PLOTLY_TEMPLATE,
+                        margin=dict(l=40, r=20, t=30, b=30),
+                        height=560,
+                        yaxis=dict(
+                            title="Cumulative Avg ★",
+                            range=[1.0, 5.2],
+                            showgrid=True,
+                            gridcolor=PLOTLY_GRIDCOLOR,
+                        ),
+                        xaxis=dict(title="Date", showgrid=False),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                        barmode="overlay",
+                    )
+                    fig.update_yaxes(title_text="Cumulative Avg ★", secondary_y=False)
+                    fig.update_yaxes(title_text="Reviews", secondary_y=True, showgrid=False, showticklabels=False)
+
+                    st.plotly_chart(fig, use_container_width=True)
 
     # ---------- Opportunity Matrix (high impact) ----------
     st.markdown("## 🎯 Opportunity Matrix")
