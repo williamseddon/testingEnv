@@ -871,12 +871,126 @@ REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
 ]
 
 
+def _normalize_json_value(v: Any) -> Any:
+    """Normalize JSON values into dataframe-friendly scalars."""
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple, set)):
+        return join_list(list(v))
+    if isinstance(v, dict):
+        # As a fallback, serialize dicts (keeps JSON upload robust even with unexpected shapes)
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return v
+
+
+def _flatten_dict(
+    d: Dict[str, Any],
+    out: Dict[str, Any],
+    *,
+    prefix: str = "",
+    max_depth: int = 3,
+    _depth: int = 0,
+) -> None:
+    """Recursively flatten a dict into `out` using dotted keys.
+
+    This is conservative (depth-limited) to avoid exploding columns on weird payloads.
+    """
+    if not isinstance(d, dict) or _depth >= max_depth:
+        return
+    for k, v in d.items():
+        key = f"{prefix}{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            _flatten_dict(v, out, prefix=key + ".", max_depth=max_depth, _depth=_depth + 1)
+        else:
+            out[key] = _normalize_json_value(v)
+
+
+def _flatten_record_extras(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract *all* useful JSON fields into flat columns.
+
+    Goal: make columns like Base SKU, Brand, Product Name, Factory Name,
+    Dominant Customer Journey Step, Key Review Sentiment, etc. available for filtering.
+
+    - `clientAttributes.*` keys become columns with the same names (e.g., "Brand").
+    - `customAttributes.taxonomies.*` keys become top-level columns with the taxonomy name
+      (e.g., "Product_Symptom Conditions").
+    - Other nested dicts are flattened using dotted keys.
+    """
+    out: Dict[str, Any] = {}
+
+    # clientAttributes (usually already flat)
+    ca = r.get("clientAttributes") or {}
+    if isinstance(ca, dict):
+        for k, v in ca.items():
+            out[str(k)] = _normalize_json_value(v)
+
+    # customAttributes (may contain taxonomies + other nested bits)
+    cust = r.get("customAttributes") or {}
+    if isinstance(cust, dict):
+        for k, v in cust.items():
+            if k == "taxonomies" and isinstance(v, dict):
+                for tk, tv in v.items():
+                    col = str(tk)
+                    # Avoid collisions if any (rare)
+                    if col in out and out.get(col) != _normalize_json_value(tv):
+                        col = f"taxonomies.{col}"
+                    out[col] = _normalize_json_value(tv)
+            elif isinstance(v, dict):
+                _flatten_dict(v, out, prefix=str(k) + ".")
+            else:
+                out[str(k)] = _normalize_json_value(v)
+
+    # axionAttributes (if present)
+    ax = r.get("axionAttributes") or {}
+    if isinstance(ax, dict):
+        for k, v in ax.items():
+            if str(k) not in out:
+                out[str(k)] = _normalize_json_value(v)
+
+    # freeText extras (Title/Review handled separately in base cols)
+    ft = r.get("freeText") or {}
+    if isinstance(ft, dict):
+        for k, v in ft.items():
+            if k in {"Title", "Review"}:
+                continue
+            if str(k) not in out:
+                out[str(k)] = _normalize_json_value(v)
+
+    # A few lightweight top-level scalars that sometimes help filtering/debugging
+    for k in ["eventType", "eventId", "eventGroupId"]:
+        if k in r and not isinstance(r.get(k), (dict, list)):
+            out[k] = _normalize_json_value(r.get(k))
+
+    return out
+
+
 def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
-    cols = REVIEWS_BASE_COLS + (REVIEWS_EXTRA_COLS if include_extra else [])
-    rows = [{name: fn(r) for name, fn in cols} for r in records]
+    """Build a Reviews DataFrame from JSON export records.
+
+    This keeps the original required columns for conversion, *and* (when include_extra=True)
+    flattens the rest of the JSON so users can filter by fields like:
+    Base SKU, Brand, Product Name, Dominant Customer Journey Step, Key Review Sentiment, etc.
+    """
+    base_cols = REVIEWS_BASE_COLS
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        row = {name: fn(r) for name, fn in base_cols}
+        if include_extra:
+            extras = _flatten_record_extras(r)
+            # Don't overwrite base columns (but allow filling missing ones)
+            for k, v in extras.items():
+                if k not in row or row.get(k) in (None, ""):
+                    row[k] = v
+        rows.append(row)
+
     df = pd.DataFrame(rows)
+
     if "Rating (num)" in df.columns:
         df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
+
     return df
 
 
@@ -1235,7 +1349,8 @@ def convert_to_starwalk_from_reviews_df(
     reviews_df: pd.DataFrame,
     include_extra_cols_after_symptom20: bool = True,
     weight_mode: str = "Leave blank",
-    split_regex: str = r"[;\|\n,]+",
+    split_regex: str = r"[;|\n,]+",
+    extra_cols_after_symptom20: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Opinionated conversion for THIS master app:
@@ -1245,7 +1360,15 @@ def convert_to_starwalk_from_reviews_df(
     src_df = reviews_df.reset_index(drop=True)
     out_cols = list(DEFAULT_STARWALK_COLUMNS)
     if include_extra_cols_after_symptom20:
-        out_cols = insert_after_symptom20(out_cols, DEFAULT_EXTRA_AFTER_SYMPTOM20)
+        extra_cols: List[str] = list(DEFAULT_EXTRA_AFTER_SYMPTOM20)
+        if extra_cols_after_symptom20:
+            extra_cols.extend([c for c in extra_cols_after_symptom20 if isinstance(c, str) and c.strip()])
+
+        # Never move core Starwalk columns around; only *add* truly extra fields after Symptom 20.
+        core_set = set(DEFAULT_STARWALK_COLUMNS)
+        extra_cols = [c for c in extra_cols if c not in core_set]
+
+        out_cols = insert_after_symptom20(out_cols, extra_cols)
 
     # Field mapping (source col -> output col)
     field_map = {
@@ -1307,6 +1430,16 @@ def convert_to_starwalk_from_reviews_df(
         out["Seeded"] = clean_seeded_series(out["Seeded"])
     if "Star Rating" in out.columns:
         out["Star Rating"] = clean_star_rating_series(out["Star Rating"])
+
+
+    # Copy through any additional JSON fields (same-name passthrough) requested for post-Symptom 20 columns
+    if include_extra_cols_after_symptom20 and extra_cols_after_symptom20:
+        for c in extra_cols_after_symptom20:
+            if c in src_df.columns and c in out.columns:
+                # Avoid overriding the canonical Starwalk columns; only fill genuinely "extra" columns.
+                if c in set(DEFAULT_STARWALK_COLUMNS):
+                    continue
+                out[c] = src_df[c].values
 
     detr_matrix = [[pd.NA] * 10 for _ in range(n)]
     deli_matrix = [[pd.NA] * 10 for _ in range(n)]
@@ -1436,10 +1569,16 @@ def _json_text_to_starwalk(json_text: str, source_name: str, include_extra_cols:
         raise ValueError("Parsed input, but found 0 record objects to convert.")
     reviews_df = build_reviews_df(records, include_extra=True)
 
+    # Include ALL additional JSON fields as optional columns after Symptom 20 so users can filter
+    # by Base SKU, Brand, Product Name, Dominant Customer Journey Step, review sentiments, etc.
+    base_col_names = [c for c, _ in REVIEWS_BASE_COLS]
+    dynamic_extra_cols = [c for c in reviews_df.columns if c not in base_col_names]
+
     out_df, stats = convert_to_starwalk_from_reviews_df(
         reviews_df,
         include_extra_cols_after_symptom20=include_extra_cols,
         weight_mode="Leave blank",
+        extra_cols_after_symptom20=dynamic_extra_cols,
     )
 
     # clean types like loader does
@@ -1526,6 +1665,103 @@ def _safe_list(v) -> list:
         return list(v)
     return [v]
 
+def _is_multi_valued_series(s: pd.Series) -> bool:
+    """Heuristic: treat a column as multi-valued if values look like "A | B | C"."""
+    if s is None:
+        return False
+    s2 = s.astype("string").dropna()
+    if s2.empty:
+        return False
+    sample = s2.head(800)
+    # Our JSON flattener joins lists with " | "
+    frac = (sample.str.contains(r"\|", regex=True)).mean()
+    return frac >= 0.03
+
+
+def _extra_filter_options(
+    df_in: pd.DataFrame,
+    col: str,
+    *,
+    max_options: int = 800,
+) -> Tuple[List[str], bool, str]:
+    """Return (options, is_multi, note) for an extra filter column.
+
+    - Always includes "ALL" as the first option.
+    - For multi-valued columns ("A | B"), options are tokenized.
+    - For high-cardinality columns, we show the top values by frequency to keep the UI fast.
+    """
+    if col not in df_in.columns:
+        return ["ALL"], False, ""
+
+    s = df_in[col].astype("string").replace({"": pd.NA}).dropna()
+    if s.empty:
+        return ["ALL"], False, ""
+
+    is_multi = _is_multi_valued_series(s)
+    note = ""
+
+    if is_multi:
+        # Tokenize on pipe. (We intentionally keep this simple/fast.)
+        tokens: List[str] = []
+        for v in s.head(50000):
+            parts = [p.strip() for p in str(v).split("|") if p.strip()]
+            tokens.extend(parts)
+
+        if not tokens:
+            vc = s.value_counts()
+            vals = vc.index.astype(str).tolist()
+        else:
+            vc = pd.Series(tokens).value_counts()
+            vals = vc.index.astype(str).tolist()
+
+        if len(vals) <= 200:
+            vals = sorted(vals, key=lambda x: x.lower())
+
+        if len(vals) > max_options:
+            note = f"Showing top {max_options} values by frequency (of {len(vals)} total)."
+            vals = vals[:max_options]
+
+        return ["ALL"] + vals, True, note
+
+    # Single-valued
+    vc = s.value_counts()
+    vals = vc.index.astype(str).tolist()
+
+    if len(vals) <= 200:
+        vals = sorted(vals, key=lambda x: x.lower())
+
+    if len(vals) > max_options:
+        note = f"Showing top {max_options} values by frequency (of {len(vals)} total)."
+        vals = vals[:max_options]
+
+    return ["ALL"] + vals, False, note
+
+
+def _apply_extra_filter_mask(
+    s: pd.Series,
+    selected: List[str],
+    *,
+    is_multi: bool,
+) -> pd.Series:
+    """Return boolean mask for a column series given selected filter values."""
+    if not selected or "ALL" in selected:
+        return pd.Series([True] * len(s), index=s.index)
+
+    s_str = s.astype("string").fillna("")
+
+    # Single value column → exact match
+    if not is_multi:
+        return s_str.isin([str(v) for v in selected])
+
+    # Multi-valued column joined by "|" → token match.
+    # Use a boundary-aware regex: (^|\s*\|\s*)(val1|val2)(\s*\|\s*|$)
+    pats = [re.escape(str(v)) for v in selected if str(v).strip() != ""]
+    if not pats:
+        return pd.Series([True] * len(s), index=s.index)
+    union = "|".join(pats)
+    regex = rf"(?:^|\s*\|\s*)(?:{union})(?:\s*\|\s*|$)"
+    return s_str.str.contains(regex, case=False, regex=True, na=False)
+
 
 def _collect_filter_state(additional_columns: list[str]) -> dict:
     """
@@ -1556,8 +1792,11 @@ def _collect_filter_state(additional_columns: list[str]) -> dict:
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
 
-    # additional columns (dynamic)
-    for col in additional_columns:
+    # additional columns (dynamic) – user-selected only (default = none)
+    extra_cols = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
+    extra_cols = [c for c in extra_cols if c in additional_columns]
+    state["filters"]["extra_cols"] = extra_cols
+    for col in extra_cols:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
@@ -1588,9 +1827,29 @@ def _apply_filter_state_to_session(state: dict, available_columns: list[str], ad
         st.session_state["delight"] = _safe_list(filters.get("delight"))
     if "detract" in filters:
         st.session_state["detract"] = _safe_list(filters.get("detract"))
+    # column filters (core)
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+        k = f"f_{col}"
+        if k in filters:
+            st.session_state[k] = _safe_list(filters.get(k))
 
-    # column filters
-    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + list(additional_columns):
+    # column filters (extra) — restore which extra columns are active, then their selections
+    extra_cols = _safe_list(filters.get("extra_cols"))
+    extra_cols = [c for c in extra_cols if c in additional_columns]
+
+    # Back-compat for older saved views: infer selected extra columns from stored keys
+    if not extra_cols:
+        inferred: List[str] = []
+        for col in additional_columns:
+            k = f"f_{col}"
+            v = _safe_list(filters.get(k))
+            if v and "ALL" not in v:
+                inferred.append(col)
+        extra_cols = inferred
+
+    st.session_state["extra_filter_cols_selected"] = extra_cols
+
+    for col in extra_cols:
         k = f"f_{col}"
         if k in filters:
             st.session_state[k] = _safe_list(filters.get(k))
@@ -1655,6 +1914,56 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
         }
     )
     return out.sort_values("Mentions", ascending=False, ignore_index=True)
+
+
+def organic_mention_stats(
+    df_in: pd.DataFrame,
+    symptom_cols: List[str],
+    *,
+    seeded_col: str = "Seeded",
+) -> Tuple[Dict[str, float], Dict[str, int], int]:
+    """Compute organic mention share per symptom item.
+
+    Returns:
+      - pct_by_item: {item: percent_of_organic_reviews_with_any_symptom_cols_that_mention_item}
+      - n_by_item:   {item: count_of_unique_organic_reviews_that_mention_item}
+      - denom:       total unique organic reviews that mention at least one symptom in symptom_cols
+
+    Notes:
+      - Uses *review-level* uniqueness (a review mentioning the same item in multiple symptom slots still counts once).
+      - Treats Seeded == YES as non-organic.
+    """
+    if df_in is None or df_in.empty or not symptom_cols:
+        return {}, {}, 0
+
+    cols = [c for c in symptom_cols if c in df_in.columns]
+    if not cols:
+        return {}, {}, 0
+
+    df = df_in
+    if seeded_col in df.columns:
+        organic = df[~df[seeded_col].astype("string").str.upper().isin(["YES", "Y", "TRUE", "1", "SEEDED"])].copy()
+    else:
+        organic = df.copy()
+
+    if organic.empty:
+        return {}, {}, 0
+
+    tmp = organic[cols].copy()
+    tmp["__rid__"] = organic.index
+
+    long = tmp.melt(id_vars="__rid__", value_vars=cols, value_name="Item").dropna(subset=["Item"])
+    long["Item"] = long["Item"].astype("string").str.strip()
+    long = long[long["Item"] != ""]
+
+    denom = int(long["__rid__"].nunique())
+    if denom == 0:
+        return {}, {}, 0
+
+    n_by_item = long.groupby("Item")["__rid__"].nunique().astype(int).to_dict()
+    pct_by_item = {k: (v / denom) * 100.0 for k, v in n_by_item.items()}
+    return pct_by_item, n_by_item, denom
+
 
 
 # ============================================================
@@ -2055,17 +2364,37 @@ def _render_filter_widgets():
             key="kw",
             help="Case-insensitive match in review text. Emails/phone numbers are masked in AI mode.",
         )
-
-    with st.sidebar.expander("📋 Additional Filters", expanded=False):
+    with st.sidebar.expander("➕ Add Filters", expanded=False):
         if additional_columns:
-            for column in additional_columns:
-                opts = _col_options(df_base, column)
-                _ensure_multiselect(f"f_{column}", opts, ["ALL"])
-                st.multiselect(f"Select {column}", options=opts, key=f"f_{column}")
+            # By default there are *no* extra filters. Users can add the ones they want.
+            current_selected = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
+            current_selected = [c for c in current_selected if c in additional_columns]
+            st.session_state["extra_filter_cols_selected"] = current_selected
+
+            st.multiselect(
+                "Choose extra columns to filter by",
+                options=sorted(additional_columns),
+                default=current_selected,
+                key="extra_filter_cols_selected",
+                help="Pick any additional column (e.g., Base SKU, Brand, Product Name, Dominant Customer Journey Step, Review Sentiment, etc.) to add its filter.",
+            )
+
+            selected_cols = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
+            if selected_cols:
+                st.markdown("**Extra filter values**")
+                for column in selected_cols:
+                    opts, is_multi, note = _extra_filter_options(df_base, column)
+                    _ensure_multiselect(f"f_{column}", opts, ["ALL"])
+                    if note:
+                        st.caption(note)
+                    st.multiselect(f"Select {column}", options=opts, key=f"f_{column}")
+            else:
+                st.caption("No extra filters selected.")
         else:
-            st.caption("No additional filters available.")
+            st.caption("No additional columns found beyond the core + symptoms.")
 
     with st.sidebar.expander("📄 Review List", expanded=False):
+
         rpp_opts = [10, 20, 50, 100]
         if int(st.session_state.get("rpp", 10)) not in rpp_opts:
             st.session_state["rpp"] = 10
@@ -2081,9 +2410,15 @@ def _collect_current_filters_dict() -> dict:
     f["delight"] = st.session_state.get("delight", ["All"])
     f["detract"] = st.session_state.get("detract", ["All"])
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-        f[f"f_{col}"] = st.session_state.get(f"f_{col}", ["ALL"])
-    for col in additional_columns:
-        f[f"f_{col}"] = st.session_state.get(f"f_{col}", ["ALL"])
+        f[f"f_{col}"] = _safe_list(st.session_state.get(f"f_{col}", ["ALL"]))
+
+    # Extra filters: user-selected columns only (default = none)
+    extra_cols = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
+    extra_cols = [c for c in extra_cols if c in additional_columns]
+    f["extra_cols"] = extra_cols
+    for col in extra_cols:
+        f[f"f_{col}"] = _safe_list(st.session_state.get(f"f_{col}", ["ALL"]))
+
     return f
 
 
@@ -2117,6 +2452,7 @@ if st.sidebar.button("🧹 Clear all filters", use_container_width=True):
         "_active_filters",
         "product_summary_text",
         "ask_q",
+        "extra_filter_cols_selected",
     ] + [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
         if k in st.session_state:
             del st.session_state[k]
@@ -2206,15 +2542,27 @@ with st.sidebar.expander("💾 Saved Views / Presets", expanded=False):
         except Exception as e:
             st.error(f"Could not import preset: {e}")
 
+
     if st.button("Reset filters to default", type="secondary", use_container_width=True):
         # Clear known keys
-        for k in ["tf", "tf_range", "sr", "kw", "delight", "detract", "review_page", "_active_filters"]:
+        for k in [
+            "tf",
+            "tf_range",
+            "sr",
+            "kw",
+            "delight",
+            "detract",
+            "review_page",
+            "_active_filters",
+            "extra_filter_cols_selected",
+        ]:
             if k in st.session_state:
                 del st.session_state[k]
-        for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + additional_columns:
-            k = f"f_{col}"
-            if k in st.session_state:
-                del st.session_state[k]
+
+        # Clear all filter multi-select keys (core + extras)
+        for k in [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
+            del st.session_state[k]
+
         st.rerun()
 
 # ---- Filter UX mode ----
@@ -2266,11 +2614,16 @@ for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
     if col in filtered.columns and sel and "ALL" not in sel:
         filtered = filtered[filtered[col].astype("string").isin(sel)]
 
-# additional filters
-for col in additional_columns:
-    sel = active_filters.get(f"f_{col}", ["ALL"])
+# extra (user-added) filters
+extra_cols_active = _safe_list(active_filters.get("extra_cols", []))
+extra_cols_active = [c for c in extra_cols_active if c in additional_columns]
+
+for col in extra_cols_active:
+    sel = _safe_list(active_filters.get(f"f_{col}", ["ALL"]))
     if col in filtered.columns and sel and "ALL" not in sel:
-        filtered = filtered[filtered[col].astype("string").isin(sel)]
+        is_multi = _is_multi_valued_series(filtered[col])
+        mask = _apply_extra_filter_mask(filtered[col], [str(v) for v in sel], is_multi=is_multi)
+        filtered = filtered[mask]
 
 # symptom filters
 selected_delighter = active_filters.get("delight", ["All"])
@@ -2300,7 +2653,10 @@ def _summarize_active_filters(df_in: pd.DataFrame) -> list[tuple[str, str]]:
             items.append(("Timeframe", tf))
     if "All" not in selected_ratings:
         items.append(("Stars", ", ".join([str(x) for x in selected_ratings])))
-    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + additional_columns:
+    extra_cols_active = _safe_list(active_filters.get("extra_cols", []))
+    extra_cols_active = [c for c in extra_cols_active if c in additional_columns]
+
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + extra_cols_active:
         sel = active_filters.get(f"f_{col}", ["ALL"])
         if sel and "ALL" not in sel:
             items.append((col, ", ".join([str(x) for x in sel[:4]]) + ("" if len(sel) <= 4 else f" +{len(sel)-4}")))
@@ -2445,12 +2801,21 @@ if need_agg:
     with st.spinner("Analyzing symptoms…"):
         detractors_results_full = analyze_symptoms_fast(filtered, existing_detractor_columns)
         delighters_results_full = analyze_symptoms_fast(filtered, existing_delighter_columns)
+        # Organic mention share per opportunity (review-level), used in opportunity hover tooltips
+        org_del_pct_by_item, org_del_n_by_item, org_del_total = organic_mention_stats(
+            filtered, existing_delighter_columns
+        )
+        org_det_pct_by_item, org_det_n_by_item, org_det_total = organic_mention_stats(
+            filtered, existing_detractor_columns
+        )
         trend_watchouts = _detect_trends(filtered, symptom_cols=all_sym_cols_present, min_mentions=3)
     agg_s = time.perf_counter() - t_agg0
 else:
     detractors_results_full = pd.DataFrame(columns=["Item", "Mentions", "Avg Star", "% Total"])
     delighters_results_full = pd.DataFrame(columns=["Item", "Mentions", "Avg Star", "% Total"])
     trend_watchouts = []
+    org_del_pct_by_item, org_del_n_by_item, org_del_total = {}, {}, 0
+    org_det_pct_by_item, org_det_n_by_item, org_det_total = {}, {}, 0
     agg_s = 0.0
 
 if show_perf:
@@ -2752,7 +3117,7 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
 
         sty = df_in.style
         if "Avg Star" in df_in.columns:
-            sty = sty.applymap(style_avg, subset=["Avg Star"]).format({"Avg Star": "{:.2f}"})
+            sty = sty.applymap(style_avg, subset=["Avg Star"]).format({"Avg Star": "{:.1f}"})
         if "Net Hit" in df_in.columns:
             sty = sty.format({"Net Hit": "{:.3f}"})
         if "Mentions" in df_in.columns:
@@ -2922,95 +3287,159 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             if region_col is None:
                 st.info("Need a Country column to break down regions.")
             else:
-                # Use top regions by volume
-                top_regions = data[region_col].astype("string").value_counts().head(8).index.tolist()
-                data = data[data[region_col].astype("string").isin(top_regions)]
-
                 # Weighting options
-                c1, c2, c3 = st.columns([1.1, 1.1, 1.2])
+                c1, c2, c3, c4 = st.columns([1.05, 1.0, 0.95, 0.95])
                 with c1:
                     weight_mode = st.selectbox("Weighting", options=["Equal", "By review count"], index=1, key="cum_weight_mode")
                 with c2:
                     smooth = st.selectbox("Smoothing", options=["None", "7-day", "14-day"], index=1, key="cum_smooth")
                 with c3:
+                    organic_only = st.toggle("Organic only", value=False, key="cum_org_only")
+                with c4:
                     show_overall = st.toggle("Show overall", value=True, key="cum_show_overall")
+
+                # Organic-only option (exclude seeded reviews)
+                if organic_only:
+                    if "Seeded" in data.columns:
+                        data = data[
+                            ~data["Seeded"]
+                            .astype("string")
+                            .str.upper()
+                            .isin(["YES", "Y", "TRUE", "1", "SEEDED"])
+                        ]
+                    else:
+                        st.caption("Organic only: no 'Seeded' column found (no effect).")
+
+                # Use top regions by volume (after organic toggle)
+                top_regions: List[str] = []
+                if region_col in data.columns:
+                    top_regions = (
+                        data[region_col]
+                        .astype("string")
+                        .value_counts()
+                        .head(8)
+                        .index.tolist()
+                    )
+                    data = data[data[region_col].astype("string").isin(top_regions)]
+
 
                 data["date"] = data["Review Date"].dt.date
 
                 # Daily aggregation by region
-                grp = data.groupby(["date", region_col])["Star Rating"].agg(cnt="count", sum="sum").reset_index()
+                grp = (
+                    data.groupby(["date", region_col])["Star Rating"]
+                    .agg(cnt="count", sum_star="sum")
+                    .reset_index()
+                )
 
-                # Build cumulative per region
-                fig = go.Figure()
+                # Volume bars (overall daily count) on a secondary axis (kept subtle)
+                daily_vol = (
+                    grp.groupby("date", as_index=False)["cnt"]
+                    .sum()
+                    .sort_values("date")
+                )
+
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                if not daily_vol.empty:
+                    fig.add_trace(
+                        go.Bar(
+                            x=daily_vol["date"],
+                            y=daily_vol["cnt"],
+                            name="Volume",
+                            opacity=0.18,
+                            marker_color="rgba(148, 163, 184, 0.22)",
+                            hovertemplate="Date: %{x}<br>Reviews: %{y}<extra></extra>",
+                            showlegend=False,
+                        ),
+                        secondary_y=True,
+                    )
+
+                # Cumulative lines per region (weighted by volume)
                 for r in top_regions:
                     sub = grp[grp[region_col].astype("string") == str(r)].sort_values("date")
                     if sub.empty:
                         continue
                     sub["cum_cnt"] = sub["cnt"].cumsum()
-                    sub["cum_sum"] = sub["sum"].cumsum()
-                    sub["Cumulative Avg ★"] = sub["cum_sum"] / sub["cum_cnt"]
+                    sub["cum_sum"] = sub["sum_star"].cumsum()
+                    sub["cum_avg"] = sub["cum_sum"] / sub["cum_cnt"]
 
-                    y = sub["Cumulative Avg ★"].to_numpy()
-                    if smooth != "None" and len(y) > 2:
-                        win = 7 if smooth == "7-day" else 14
-                        y = pd.Series(y).rolling(window=win, min_periods=1).mean().to_numpy()
+                    y = sub["cum_avg"].astype(float)
+                    if smooth != "None" and len(y) >= 3:
+                        win = {"7-day": 7, "14-day": 14}.get(smooth, 7)
+                        y = y.rolling(window=win, min_periods=1).mean()
 
                     fig.add_trace(
                         go.Scatter(
                             x=sub["date"],
                             y=y,
                             mode="lines",
-                            name=str(r),
-                            hovertemplate=(
-                                f"{region_col}: {r}<br>"
-                                "Date: %{x}<br>"
-                                "Cumulative Avg ★: %{y:.3f}<br>"
-                                "Cum N: %{customdata}<extra></extra>"
-                            ),
-                            customdata=sub["cum_cnt"],
-                        )
+                            name=f"{r}",
+                            hovertemplate=f"{r}<br>Date: %{{x}}<br>Cumulative Avg ★: %{{y:.3f}}<br>cum N: %{{customdata[0]}}<extra></extra>",
+                            customdata=np.stack([sub["cum_cnt"]], axis=-1),
+                        ),
+                        secondary_y=False,
                     )
 
-                # Overall (weighted)
+                # Overall
                 if show_overall:
-                    overall = grp.groupby("date").agg(cnt=("cnt", "sum"), sum=("sum", "sum")).reset_index().sort_values("date")
-                    overall["cum_cnt"] = overall["cnt"].cumsum()
-                    overall["cum_sum"] = overall["sum"].cumsum()
-                    overall["Cumulative Avg ★"] = overall["cum_sum"] / overall["cum_cnt"]
-
-                    y = overall["Cumulative Avg ★"].to_numpy()
-                    if smooth != "None" and len(y) > 2:
-                        win = 7 if smooth == "7-day" else 14
-                        y = pd.Series(y).rolling(window=win, min_periods=1).mean().to_numpy()
-
-                    fig.add_trace(
-                        go.Scatter(
-                            x=overall["date"],
-                            y=y,
-                            mode="lines",
-                            name="Overall",
-                            line=dict(width=4),
-                            hovertemplate=(
-                                "Overall<br>Date: %{x}<br>"
-                                "Cumulative Avg ★: %{y:.3f}<br>"
-                                "Cum N: %{customdata}<extra></extra>"
-                            ),
-                            customdata=overall["cum_cnt"],
-                        )
+                    overall = (
+                        grp.groupby("date", as_index=False)
+                        .agg(cnt=("cnt", "sum"), sum_star=("sum_star", "sum"))
+                        .sort_values("date")
                     )
+                    if not overall.empty:
+                        overall["cum_cnt"] = overall["cnt"].cumsum()
+                        overall["cum_sum"] = overall["sum_star"].cumsum()
+                        overall["cum_avg"] = overall["cum_sum"] / overall["cum_cnt"]
+
+                        y = overall["cum_avg"].astype(float)
+                        if smooth != "None" and len(y) >= 3:
+                            win = {"7-day": 7, "14-day": 14}.get(smooth, 7)
+                            y = y.rolling(window=win, min_periods=1).mean()
+
+                        fig.add_trace(
+                            go.Scatter(
+                                x=overall["date"],
+                                y=y,
+                                mode="lines",
+                                name="Overall",
+                                line=dict(width=4, dash="solid"),
+                                hovertemplate="Overall<br>Date: %{x}<br>Cumulative Avg ★: %{y:.3f}<br>cum N: %{customdata[0]}<extra></extra>",
+                                customdata=np.stack([overall["cum_cnt"]], axis=-1),
+                            ),
+                            secondary_y=False,
+                        )
 
                 fig.update_layout(
                     template=PLOTLY_TEMPLATE,
-                    margin=dict(l=40, r=20, t=30, b=30),
+                    margin=dict(l=10, r=10, t=10, b=10),
                     height=520,
-                    yaxis=dict(title="Cumulative Avg ★", range=[1.0, 5.2], showgrid=True, gridcolor=PLOTLY_GRIDCOLOR),
-                    xaxis=dict(title="Date", showgrid=False),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    hovermode="x unified",
+                    barmode="overlay",
                 )
 
+                fig.update_yaxes(
+                    title_text="Cumulative Avg ★",
+                    range=[1.0, 5.2],
+                    showgrid=True,
+                    gridcolor=PLOTLY_GRIDCOLOR,
+                    secondary_y=False,
+                )
+                fig.update_yaxes(
+                    title_text="Review volume",
+                    showgrid=False,
+                    showticklabels=False,
+                    rangemode="tozero",
+                    secondary_y=True,
+                )
+                fig.update_xaxes(title_text="Date", showgrid=False)
+
                 st.plotly_chart(fig, use_container_width=True)
+
 
     # ---------- Opportunity Matrix (high impact) ----------
     st.markdown("## 🎯 Opportunity Matrix")
@@ -3065,6 +3494,30 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
         else:
             size = np.full_like(x, 14.0, dtype=float)
 
+        # Hover includes organic mention share (review-level, organic-only)
+        items = d["Item"].astype("string").fillna("").tolist()
+        hovertext: List[str] = []
+        for i, it in enumerate(items):
+            key = str(it).strip()
+            disp = key if key else "(blank)"
+
+            del_pct = float(org_del_pct_by_item.get(key, 0.0)) if isinstance(org_del_pct_by_item, dict) else 0.0
+            del_n = int(org_del_n_by_item.get(key, 0)) if isinstance(org_del_n_by_item, dict) else 0
+            det_pct = float(org_det_pct_by_item.get(key, 0.0)) if isinstance(org_det_pct_by_item, dict) else 0.0
+            det_n = int(org_det_n_by_item.get(key, 0)) if isinstance(org_det_n_by_item, dict) else 0
+
+            del_line = f"{del_pct:.0f}% ({del_n}/{org_del_total})" if org_del_total else "n/a"
+            det_line = f"{det_pct:.0f}% ({det_n}/{org_det_total})" if org_det_total else "n/a"
+
+            hovertext.append(
+                f"{disp}"
+                f"<br>Mentions={x[i]:.0f}"
+                f"<br>Avg ★={y[i]:.2f}"
+                f"<br>Organic delighters mentioning: {del_line}"
+                f"<br>Organic detractors mentioning: {det_line}"
+            )
+
+
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
@@ -3073,7 +3526,8 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
                 mode="markers+text" if show_labels else "markers",
                 text=labels,
                 textposition="top center",
-                hovertemplate="%{text}<br>Mentions=%{x:.0f}<br>Avg ★=%{y:.2f}<extra></extra>",
+                hovertext=hovertext,
+                hovertemplate="%{hovertext}<extra></extra>",
                 marker=dict(size=size, opacity=0.78, line=dict(width=1, color="rgba(148,163,184,0.45)")),
             )
         )
