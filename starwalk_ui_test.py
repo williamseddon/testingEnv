@@ -79,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v20"
+APP_VERSION = "2026-03-01-master-v21"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -1029,8 +1029,13 @@ def _extract_json_substring(s: str) -> str:
     s = s.strip()
     if not s:
         return s
-    if s[0] in "{[":
-        return s
+
+    # IMPORTANT:
+    # Even if the paste begins with '{' or '[', the user may have trailing
+    # commentary / extra characters after the JSON. We therefore ALWAYS scan
+    # for the first balanced JSON object/array region and return just that.
+    # This avoids the common failure mode: json.loads() failing because of
+    # non-whitespace text after the valid JSON payload.
 
     starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
     if not starts:
@@ -1999,6 +2004,10 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
     s = _strip_code_fences(s)
     s = _extract_json_substring(s).strip()
 
+    # Remove ASCII control characters that sometimes sneak into copy/paste and break json.loads.
+    # (JSON strings cannot contain raw control characters.)
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+
     # Normalize smart quotes
     s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
 
@@ -2024,6 +2033,23 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
         warnings.append("Detected JSON Lines and parsed each line as a record.")
         return jl, warnings
 
+    # Attempt: common copy/paste fragment — multiple JSON objects separated by commas
+    # (e.g., "{...},\n{...},\n{...}" without the surrounding "[ ... ]").
+    # Heuristic: if we see the pattern "}{" with a comma in between at the top level,
+    # try wrapping the whole thing as a JSON array.
+    s_strip2 = s.strip()
+    if s_strip2.startswith("{") and ("\n{" in s_strip2 or re.search(r"\}\s*,\s*\{", s_strip2)):
+        candidate = s_strip2
+        # Remove a trailing comma (if present)
+        candidate = re.sub(r",\s*$", "", candidate)
+        try:
+            arr = json.loads("[" + candidate + "]")
+            if isinstance(arr, list):
+                warnings.append("Wrapped comma-separated JSON objects into a JSON array (best-effort).")
+                return arr, warnings
+        except Exception as e_wrap:
+            last_err = e_wrap
+
     # Attempt: Python-literal (dict/list with single quotes, None/True/False)
     try:
         obj = ast.literal_eval(s)
@@ -2041,9 +2067,17 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
         except Exception as e4:
             last_err = e4
 
+    s_strip = s.strip()
+    hint = ""
+    if s_strip.startswith("{") and not s_strip.endswith("}"):
+        hint = "\nHint: your paste starts with '{' but does not end with '}'. It may be truncated. Try uploading the full .json file instead of pasting."
+    elif s_strip.startswith("[") and not s_strip.endswith("]"):
+        hint = "\nHint: your paste starts with '[' but does not end with ']'. It may be truncated. Try uploading the full .json file instead of pasting."
+
     raise ValueError(
         "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines.\n"
         "Tips: remove any leading/trailing commentary, ensure quotes are standard \" characters, and avoid trailing commas."
+        + hint
     ) from last_err
 
 
