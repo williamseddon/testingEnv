@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v15"
+APP_VERSION = "2026-03-02-master-v23"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -121,49 +121,32 @@ GLOBAL_CSS = """
   :root { scroll-behavior: smooth; scroll-padding-top: 96px; color-scheme: light dark; }
   *, ::before, ::after { box-sizing: border-box; }
 
-  /* Derive our UI tokens from Streamlit's theme variables so Light/Dark/System are always consistent */
   :root{
-    --text: var(--text-color, #0f172a);
-    --bg-app: var(--background-color, #f6f8fc);
-    --bg-card: var(--secondary-background-color, #ffffff);
-
-    /* Slightly raised surface that adapts to light/dark */
-    --bg-tile: color-mix(in srgb, var(--secondary-background-color, #ffffff) 92%, var(--text-color, #0f172a) 8%);
-
-    --border-strong: color-mix(in srgb, var(--text-color, #0f172a) 30%, transparent);
-    --border: color-mix(in srgb, var(--text-color, #0f172a) 20%, transparent);
-    --border-soft: color-mix(in srgb, var(--text-color, #0f172a) 12%, transparent);
-
-    --muted: color-mix(in srgb, var(--text-color, #0f172a) 70%, transparent);
-    --muted-2: color-mix(in srgb, var(--text-color, #0f172a) 58%, transparent);
-
-    --ring: var(--primary-color, #3b82f6);
-    --ok:#16a34a; --bad:#dc2626;
-
-    --shadow: color-mix(in srgb, #000 18%, transparent);
-    --shadow-lg: color-mix(in srgb, #000 30%, transparent);
-
+    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
+    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
+    --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
+    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
+    --shadow: rgba(15,23,42,0.06);
+    --shadow-lg: rgba(15,23,42,0.10);
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  /* Fallback for older browsers without color-mix (keeps things readable) */
-  @supports not (color: color-mix(in srgb, white, black)) {
-    :root{
-      --bg-tile: var(--secondary-background-color, #ffffff);
-      --border-strong: rgba(148,163,184,0.35);
-      --border: rgba(148,163,184,0.25);
-      --border-soft: rgba(148,163,184,0.18);
-      --muted: rgba(100,116,139,0.95);
-      --muted-2: rgba(148,163,184,0.95);
-      --shadow: rgba(0,0,0,0.10);
-      --shadow-lg: rgba(0,0,0,0.18);
-    }
+  /* Dark mode palette (fixes white-on-white and mismatched components) */
+  html[data-theme="dark"], body[data-theme="dark"]{
+    --text:#e5e7eb; --muted:#a1a1aa; --muted-2:#94a3b8;
+    --border-strong:rgba(148,163,184,0.35);
+    --border:rgba(148,163,184,0.25);
+    --border-soft:rgba(148,163,184,0.18);
+    --bg-app:#0b1220; --bg-card:#0f172a; --bg-tile:#111c33;
+    --ring:#60a5fa; --ok:#22c55e; --bad:#f87171;
+    --shadow: rgba(0,0,0,0.35);
+    --shadow-lg: rgba(0,0,0,0.55);
   }
 
   html, body, .stApp {
-    background: var(--bg-app) !important;
+    background: var(--bg-app);
     font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
-    color: var(--text) !important;
+    color: var(--text);
   }
 
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
@@ -182,14 +165,14 @@ GLOBAL_CSS = """
   .small-muted{ color:var(--muted); font-size:.9rem; }
 
   /* File uploader (prevents ugly mixed-theme first load) */
-  [data-testid="stFileUploadDropzone"]{
+  section[data-testid="stFileUploadDropzone"]{
     border-radius:14px !important;
     border:1.8px dashed var(--border-strong) !important;
     background:var(--bg-card) !important;
     box-shadow:0 0 0 1px var(--border-soft) inset;
   }
-  [data-testid="stFileUploadDropzone"] *{ color:var(--text) !important; }
-  [data-testid="stFileUploadDropzone"] button{
+  section[data-testid="stFileUploadDropzone"] *{ color:var(--text) !important; }
+  section[data-testid="stFileUploadDropzone"] button{
     background:var(--bg-tile) !important;
     border:1.2px solid var(--border) !important;
     color:var(--text) !important;
@@ -813,6 +796,26 @@ def _detect_trends(df_in: pd.DataFrame, symptom_cols: list[str], min_mentions: i
 EXCEL_MAX_CHARS = 32767
 
 
+
+def _decode_bytes_to_text(b: bytes) -> str:
+    """
+    Decode uploaded JSON bytes robustly (handles UTF-8/UTF-16/BOM and common Windows encodings).
+
+    This prevents JSON parsing failures when the export is UTF-16 or has a BOM.
+    """
+    if b is None:
+        return ""
+    for enc in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin1"):
+        try:
+            t = b.decode(enc)
+            # If it decodes but is mostly NULs, skip (common when decoding UTF-16 as UTF-8)
+            if t.count("\x00") > 0 and t.count("\x00") > len(t) // 20:
+                continue
+            return t
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="replace")
+
 def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
     cur: Any = d
     for k in path:
@@ -887,17 +890,49 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _extract_json_substring(s: str) -> str:
+    """
+    Return the best guess of the JSON object/array substring inside a larger pasted blob.
+
+    This is more robust than a naive first/last brace slice because it tries to find the
+    first complete balanced {..} or [..] region.
+    """
     s = s.strip()
+    if not s:
+        return s
     if s.startswith("{") or s.startswith("["):
         return s
+
     start_candidates = [i for i in [s.find("{"), s.find("[")] if i != -1]
     if not start_candidates:
         return s
     start = min(start_candidates)
-    end = max(s.rfind("}"), s.rfind("]"))
-    if end != -1 and end > start:
+
+    stack = []
+    end = None
+    pairs = {"{": "}", "[": "]"}
+    openers = set(pairs.keys())
+    closers = set(pairs.values())
+
+    for i, ch in enumerate(s[start:], start=start):
+        if ch in openers:
+            stack.append(pairs[ch])
+        elif ch in closers:
+            if stack and ch == stack[-1]:
+                stack.pop()
+                if not stack:
+                    end = i
+                    break
+
+    if end is not None:
         return s[start : end + 1].strip()
-    return s
+
+    # Fallback: last brace/bracket
+    end2 = max(s.rfind("}"), s.rfind("]"))
+    if end2 != -1 and end2 > start:
+        return s[start : end2 + 1].strip()
+    return s[start:].strip()
+
+
 
 
 def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
@@ -918,9 +953,82 @@ def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
+    """
+    Parse JSON more forgivingly for real-world exports / copy-paste.
+
+    Supports:
+    - Code fences (```json ...```)
+    - Leading/trailing non-JSON text (extracts first balanced {..} or [..])
+    - Trailing commas
+    - JavaScript-style comments (// or /* ... */)
+    - JSON Lines (one JSON object per line)
+    - Python-literal dict/list (single quotes, None/True/False) via ast.literal_eval
+    """
     warnings: List[str] = []
     s = _strip_code_fences(text_in)
+
+    # Remove BOM + normalize common unicode line separators
+    s = (s or "").lstrip("\ufeff").replace("\u2028", "\n").replace("\u2029", "\n")
+
+    # Normalize smart quotes (common when pasting from docs/email)
+    s = (
+        s.replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
+
     s = _extract_json_substring(s)
+
+    # 1) Strict JSON
+    try:
+        return json.loads(s), warnings
+    except Exception as e1:
+        last_err = e1
+
+    # 2) Remove trailing commas
+    s2 = re.sub(r",\s*([}\]])", r"\1", s)
+    if s2 != s:
+        try:
+            warnings.append("Removed trailing commas to make JSON valid.")
+            return json.loads(s2), warnings
+        except Exception as e2:
+            last_err = e2
+            if warnings:
+                warnings.pop()
+
+    # 3) Strip JS comments
+    s3 = re.sub(r"//.*?$|/\*[\s\S]*?\*/", "", s, flags=re.MULTILINE)
+    if s3 != s:
+        try:
+            warnings.append("Stripped JavaScript-style comments to make JSON valid.")
+            return json.loads(s3), warnings
+        except Exception as e3:
+            last_err = e3
+            if warnings:
+                warnings.pop()
+
+    # 4) JSON Lines
+    jl = _try_parse_json_lines(s)
+    if jl is not None:
+        warnings.append("Detected JSON Lines and parsed each line as a record.")
+        return jl, warnings
+
+    # 5) Python-literal fallback (single quotes, None/True/False)
+    try:
+        obj = ast.literal_eval(s)
+        if isinstance(obj, (dict, list)):
+            warnings.append("Parsed input as a Python literal (single quotes / None / True/False).")
+            return obj, warnings
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Could not parse input as JSON. Paste valid JSON (or JSON Lines). "
+        "If this came from a tool that exports non-standard JSON, try exporting again as strict JSON."
+    ) from last_err
+
+
 
     try:
         return json.loads(s), warnings
@@ -1728,7 +1836,7 @@ else:
     source_label = "pasted_json"
     if json_file is not None and getattr(json_file, "size", 0) > 0:
         source_label = json_file.name
-        raw_text = json_file.getvalue().decode("utf-8", errors="replace")
+        raw_text = _decode_bytes_to_text(json_file.getvalue())
     elif pasted and pasted.strip():
         raw_text = pasted.strip()
 
@@ -2383,6 +2491,8 @@ if view.startswith("📊"):
     # Baseline for Net Hit (overall average of the CURRENT filtered dataset)
     baseline_avg = float(all_avg) if isinstance(all_avg, (int, float)) and np.isfinite(all_avg) else 0.0
 
+    gap_to_5 = max(0.0, 5.0 - baseline_avg)
+
     def _mini_bar_html(pct: float) -> str:
         # pct is 0-100; clamp
         try:
@@ -2567,16 +2677,19 @@ if view.startswith("📊"):
 
     if st.session_state.get("show_net_hit_info"):
         st.info(
-            """**Net Hit (WIP)** estimates how strongly a symptom is pulling ratings up or down in the current filter scope.
+            """**Net Hit (WIP)** estimates how much each symptom accounts for the current **gap to 5★** in the active filter scope.
 
-**Formula:** `Net Hit = (Avg★(reviews mentioning symptom) − Avg★(all filtered reviews)) × Mentions`
+**Step 1 — Current Avg ★ (filtered):** `Avg★`
+**Step 2 — Gap to 5★:** `Gap = 5 − Avg★`
+**Step 3 — Symptom share of mentions:** `Share = Mentions / Total Mentions` *(within this table)*
+**Net Hit:** `Net Hit = Gap × Share`
 
-- Positive Net Hit → symptom is associated with **higher** ratings than baseline (a strength).
-- Negative Net Hit → symptom is associated with **lower** ratings than baseline (a risk/opportunity).
+**How to read it**
+- Larger Net Hit → bigger *rating opportunity* to focus on first (given the current data).
+- All Net Hits in a table sum to the total Gap (this is a proportional allocation model).
 
-**Intuition:** This is equivalent to comparing each symptom’s **gap-to-5★** vs the baseline gap, then scaling by mentions.
-
-This is directionally useful for prioritization; treat it as an **insight signal**, not a causal estimate."""
+**Important**
+This is a prioritization heuristic, not a causal model — use it to rank themes, then validate with deeper analysis / experiments."""
         )
 
     # Default display limit; show a "View full" affordance if truncated.
@@ -2584,13 +2697,24 @@ This is directionally useful for prioritization; treat it as an **insight signal
     table_limit = st.selectbox("Rows to preview", options=[25, 50, 100], index=[25, 50, 100].index(50), key="symptom_table_limit")
 
     def _add_net_hit(tbl: pd.DataFrame) -> pd.DataFrame:
+        """
+        Net Hit (WIP): distributes the current gap-to-5★ across symptoms based on share of mentions.
+
+        Net Hit = (5 - Avg★_filtered) * (Mentions / Total Mentions)
+        """
         if tbl is None or tbl.empty:
             return tbl
         d = tbl.copy()
         d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0).astype(int)
         d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
-        lift = d["Avg Star"] - baseline_avg
-        d["Net Hit"] = (lift * d["Mentions"]).round(1)
+
+        total_mentions = float(d["Mentions"].sum())
+        if total_mentions <= 0:
+            d["Net Hit"] = 0.0
+        else:
+            share = d["Mentions"] / total_mentions
+            d["Net Hit"] = (gap_to_5 * share).round(3)
+
         # column order
         cols = [c for c in ["Item", "Mentions", "% Total", "Avg Star", "Net Hit"] if c in d.columns]
         d = d[cols]
@@ -2605,6 +2729,13 @@ This is directionally useful for prioritization; treat it as an **insight signal
     view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0, key="symptom_table_view_mode")
 
     def _styled_table(df_in: pd.DataFrame):
+        """
+        Table styling rule:
+        - Keep default text color for all columns (so it stays readable in BOTH light + dark mode).
+        - Only color the Avg Star column:
+            * >= 4.5 → green
+            * <  4.5 → red
+        """
         if df_in is None or df_in.empty:
             return df_in
 
@@ -2615,30 +2746,15 @@ This is directionally useful for prioritization; treat it as an **insight signal
                 vv = float(v)
                 if vv >= 4.5:
                     return "color:#16a34a;font-weight:800;"
-                if vv <= 3.6:
-                    return "color:#dc2626;font-weight:800;"
-                return "font-weight:700;"
+                return "color:#dc2626;font-weight:800;"
             except Exception:
                 return ""
-
-        def style_net(v):
-            if pd.isna(v):
-                return ""
-            try:
-                vv = float(v)
-                if vv > 0.0:
-                    return "color:#16a34a;font-weight:800;"
-                if vv < 0.0:
-                    return "color:#dc2626;font-weight:800;"
-            except Exception:
-                pass
-            return "font-weight:700;"
 
         sty = df_in.style
         if "Avg Star" in df_in.columns:
             sty = sty.applymap(style_avg, subset=["Avg Star"]).format({"Avg Star": "{:.2f}"})
         if "Net Hit" in df_in.columns:
-            sty = sty.applymap(style_net, subset=["Net Hit"]).format({"Net Hit": "{:+.1f}"})
+            sty = sty.format({"Net Hit": "{:.3f}"})
         if "Mentions" in df_in.columns:
             sty = sty.format({"Mentions": "{:,.0f}"})
         return sty
