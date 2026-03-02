@@ -1066,103 +1066,86 @@ def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
     return objs
 
 
-def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
-    """
-    Parse JSON more forgivingly for real-world exports / copy-paste.
-
-    Supports:
-    - Code fences (```json ...```)
-    - Leading/trailing non-JSON text (extracts first balanced {..} or [..])
-    - Trailing commas
-    - JavaScript-style comments (// or /* ... */)
+def loads_flexible_json(json_text: str) -> Tuple[Any, List[str]]:
+    """Best-effort JSON loader that is robust to:
+    - Markdown code fences
+    - Leading BOM
+    - Pasted text that contains extra pre/post content
     - JSON Lines (one JSON object per line)
-    - Python-literal dict/list (single quotes, None/True/False) via ast.literal_eval
+
+    IMPORTANT: We **do not** aggressively normalize “smart quotes” up-front because valid JSON can
+    legitimately contain curly quotes inside string values (e.g., review text). Normalizing them to
+    ASCII quotes would corrupt otherwise-valid JSON.
+
+    Returns: (obj, warnings)
     """
     warnings: List[str] = []
-    s = _strip_code_fences(text_in)
+    if json_text is None:
+        raise ValueError("No JSON text provided.")
 
-    # Remove BOM + normalize common unicode line separators
-    s = (s or "").lstrip("\ufeff").replace("\u2028", "\n").replace("\u2029", "\n")
+    # 1) Minimal cleanup that cannot corrupt valid JSON strings
+    clean = _strip_code_fences(str(json_text))
+    clean = clean.lstrip("\ufeff").strip()
+    if not clean:
+        raise ValueError("Empty JSON input.")
 
-    # Normalize smart quotes (common when pasting from docs/email)
-    s = (
-        s.replace("“", '"')
-        .replace("”", '"')
-        .replace("‘", "'")
-        .replace("’", "'")
-    )
-
-    s = _extract_json_substring(s)
-
-    # 1) Strict JSON
+    # 2) First try: parse as-is (most reliable)
     try:
-        return json.loads(s), warnings
-    except Exception as e1:
-        last_err = e1
+        return json.loads(clean), warnings
+    except Exception as e_as_is:
+        last_err: Exception = e_as_is
 
-    # 2) Remove trailing commas
-    s2 = re.sub(r",\s*([}\]])", r"\1", s)
-    if s2 != s:
+    # 3) Try extracting the largest {...} substring
+    candidate = _extract_json_substring(clean)
+    if candidate and candidate != clean:
         try:
-            warnings.append("Removed trailing commas to make JSON valid.")
-            return json.loads(s2), warnings
-        except Exception as e2:
-            last_err = e2
-            if warnings:
-                warnings.pop()
+            warnings.append("Parsed JSON after extracting the largest {...} substring from pasted text.")
+            return json.loads(candidate), warnings
+        except Exception as e_sub:
+            last_err = e_sub
 
-    # 3) Strip JS comments
-    s3 = re.sub(r"//.*?$|/\*[\s\S]*?\*/", "", s, flags=re.MULTILINE)
-    if s3 != s:
+    # 4) Try JSON Lines
+    line_obj = _try_parse_json_lines(clean)
+    if line_obj is not None:
+        warnings.append("Parsed as JSON Lines (one JSON object per line).")
+        return line_obj, warnings
+
+    # 5) LAST resort: attempt to convert smart quotes **only when used as delimiters**
+    #    This targets cases where users paste pseudo-JSON from Word/Docs that uses curly quotes
+    #    for keys/strings, without touching curly quotes inside already-quoted values.
+    def _normalize_curly_delimiters(s: str) -> str:
+        # Replace curly double quotes that appear immediately after structural chars
+        # or at the start of the string (likely acting as delimiters), and the matching closing ones
+        # before structural chars. This is a heuristic; we keep it conservative.
+        s = re.sub(r'(^|[\{\[\s,:])“', r'\1"', s)
+        s = re.sub(r'”([\s,\}\]])', r'"\1', s)
+        # Also handle the common variant where closing curly quote is right before colon
+        s = re.sub(r'”\s*:', r'":', s)
+        # If the entire document seems to use curly quotes for all delimiters, a broader pass can help
+        # but only do it if we still fail after the conservative replacements.
+        return s
+
+    normalized = _normalize_curly_delimiters(clean)
+    if normalized != clean:
         try:
-            warnings.append("Stripped JavaScript-style comments to make JSON valid.")
-            return json.loads(s3), warnings
-        except Exception as e3:
-            last_err = e3
-            if warnings:
-                warnings.pop()
+            warnings.append("Parsed JSON after conservatively normalizing curly quotes used as delimiters.")
+            return json.loads(normalized), warnings
+        except Exception as e_norm:
+            last_err = e_norm
 
-    # 4) JSON Lines
-    jl = _try_parse_json_lines(s)
-    if jl is not None:
-        warnings.append("Detected JSON Lines and parsed each line as a record.")
-        return jl, warnings
-
-    # 5) Python-literal fallback (single quotes, None/True/False)
-    try:
-        obj = ast.literal_eval(s)
-        if isinstance(obj, (dict, list)):
-            warnings.append("Parsed input as a Python literal (single quotes / None / True/False).")
-            return obj, warnings
-    except Exception:
-        pass
+        # Broad fallback: replace remaining curly delimiters (still risky, but better than hard fail)
+        broader = normalized.replace("“", '"').replace("”", '"')
+        if broader != normalized:
+            try:
+                warnings.append("Parsed JSON after broadly normalizing curly double-quotes to ASCII quotes.")
+                return json.loads(broader), warnings
+            except Exception as e_broad:
+                last_err = e_broad
 
     raise ValueError(
-        "Could not parse input as JSON. Paste valid JSON (or JSON Lines). "
-        "If this came from a tool that exports non-standard JSON, try exporting again as strict JSON."
-    ) from last_err
-
-
-
-    try:
-        return json.loads(s), warnings
-    except Exception as e1:
-        # Attempt: remove trailing commas
-        s2 = re.sub(r",\s*([}\]])", r"\1", s)
-        if s2 != s:
-            try:
-                warnings.append("Removed trailing commas to make JSON valid.")
-                return json.loads(s2), warnings
-            except Exception:
-                warnings.pop()
-
-        # Attempt: JSON Lines
-        jl = _try_parse_json_lines(s)
-        if jl is not None:
-            warnings.append("Detected JSON Lines and parsed each line as a record.")
-            return jl, warnings
-
-        raise ValueError("Could not parse input as JSON. Paste valid JSON (or JSON Lines).") from e1
+        "Could not parse JSON. If you pasted text, ensure it is valid JSON (double quotes around keys, no trailing commas).\n"
+        f"Last error: {type(last_err).__name__}: {last_err}"
+    )
 
 
 def extract_records(raw: Any) -> List[Dict[str, Any]]:
