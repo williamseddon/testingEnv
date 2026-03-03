@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-02-master-v28"
+APP_VERSION = "2026-03-03-master-v29"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -3130,13 +3130,27 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             except Exception:
                 return ""
 
+        # IMPORTANT: Pandas Styler.format() overrides previously-set formatters
+        # when it's called multiple times.
+        #
+        # So we:
+        #   1) apply the Avg Star color rule
+        #   2) build ONE combined formatter dict
+        #   3) call .format() exactly once
         sty = df_in.style
         if "Avg Star" in df_in.columns:
-            sty = sty.applymap(style_avg, subset=["Avg Star"]).format({"Avg Star": "{:.1f}"})
+            sty = sty.applymap(style_avg, subset=["Avg Star"])
+
+        fmt: dict = {}
+        if "Avg Star" in df_in.columns:
+            fmt["Avg Star"] = "{:.1f}"  # nearest tenth
         if "Net Hit" in df_in.columns:
-            sty = sty.format({"Net Hit": "{:.3f}"})
+            fmt["Net Hit"] = "{:.3f}"   # keep stable + non-distracting
         if "Mentions" in df_in.columns:
-            sty = sty.format({"Mentions": "{:,.0f}"})
+            fmt["Mentions"] = "{:,.0f}"
+        if fmt:
+            sty = sty.format(fmt)
+
         return sty
 
     def _render_symptom_table(df_preview: pd.DataFrame, df_full: pd.DataFrame, title: str, key_prefix: str):
