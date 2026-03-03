@@ -1,4 +1,4 @@
-# starwalk_master_app_v14.py
+# starwalk_master_app_v20.py
 # Streamlit master app:
 # - Accepts either:
 #   1) Star Walk scrubbed verbatims Excel/CSV (same behavior as starwalk_ui_test.py), OR
@@ -6,7 +6,6 @@
 #
 # Improvements in v4:
 # - Saved Views / Shareable Filter Presets (export/import + URL param)
-# - Smoother/faster filtering with "Apply filters" mode (reduces reruns)
 # - Major performance fix: symptom analysis is vectorized (no per-symptom row scans)
 # - Removed redundant monthly chart (kept cumulative weighted chart)
 # - Country × Source breakdown now unifies Avg ★ (color) + Count (labels)
@@ -30,7 +29,7 @@ import zlib
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import numpy as np
@@ -80,7 +79,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-03-master-v29"
+APP_VERSION = "2026-03-01-master-v21"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -106,47 +105,107 @@ except Exception:
 # ---------- Page config ----------
 st.set_page_config(layout="wide", page_title="Star Walk — Master Dashboard")
 
-# ---------- Theme / Plotly helpers ----------
-try:
-    _theme_base = str(st.get_option("theme.base") or "light").lower()
-except Exception:
-    _theme_base = "light"
-IS_DARK_THEME = _theme_base == "dark"
-PLOTLY_TEMPLATE = "plotly_dark" if IS_DARK_THEME else "plotly_white"
-PLOTLY_GRIDCOLOR = "rgba(255,255,255,0.12)" if IS_DARK_THEME else "rgba(0,0,0,0.06)"
+# ---------- Plotly helpers (theme-agnostic + no fragile detection) ----------
+# Streamlit theme can be toggled client-side (Light/Dark/System) and Python-side
+# st.get_option("theme.base") does NOT reliably reflect the current UI theme.
+#
+# To avoid white-on-white (or black-on-black) charts, we:
+# - Use transparent plot/paper backgrounds.
+# - Use CSS keyword `currentColor` for text, so the chart inherits the surrounding
+#   text color (works in light + dark automatically).
+PLOTLY_TEMPLATE = "plotly"
+PLOTLY_GRIDCOLOR = "rgba(148,163,184,0.25)"
+
+
+def style_plotly(fig: go.Figure) -> go.Figure:
+    """Apply a readable, theme-agnostic Plotly style."""
+    try:
+        fig.update_layout(
+            template=PLOTLY_TEMPLATE,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="currentColor"),
+            title=dict(font=dict(color="currentColor")),
+        )
+        fig.update_xaxes(
+            gridcolor=PLOTLY_GRIDCOLOR,
+            zerolinecolor=PLOTLY_GRIDCOLOR,
+            tickfont=dict(color="currentColor"),
+            titlefont=dict(color="currentColor"),
+        )
+        fig.update_yaxes(
+            gridcolor=PLOTLY_GRIDCOLOR,
+            zerolinecolor=PLOTLY_GRIDCOLOR,
+            tickfont=dict(color="currentColor"),
+            titlefont=dict(color="currentColor"),
+        )
+    except Exception:
+        pass
+    return fig
 
 # ---------- Global CSS (always readable in light) ----------
 GLOBAL_CSS = """
 <style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 96px; color-scheme: light dark; }
+  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
   *, ::before, ::after { box-sizing: border-box; }
 
-  :root{
-    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
-    --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-    --shadow: rgba(15,23,42,0.06);
-    --shadow-lg: rgba(15,23,42,0.10);
+  /*
+    Theme system (v19):
+    - DO NOT guess light/dark.
+    - DO NOT override Streamlit's theme.
+    - Instead, derive our tokens from Streamlit's live CSS variables.
+
+    This prevents the failure mode you saw: "Light mode" UI with a dark background.
+  */
+
+  .stApp{
+    color-scheme: light dark;
+
+    /* Streamlit tokens (with safe fallbacks) */
+    --st-bg: var(--background-color, #ffffff);
+    --st-card: var(--secondary-background-color, #f6f8fc);
+    --st-text: var(--text-color, #0f172a);
+    --st-primary: var(--primary-color, #3b82f6);
+
+    /* App tokens derived from Streamlit (with fallbacks for older browsers) */
+    --text: var(--st-text);
+    --bg-app: var(--st-bg);
+    --bg-card: var(--st-card);
+
+    /* Safe fallbacks (overridden below when color-mix is supported) */
+    --bg-tile: var(--st-card);
+    --border-soft: rgba(148,163,184,0.22);
+    --border: rgba(148,163,184,0.32);
+    --border-strong: rgba(148,163,184,0.45);
+    --muted: rgba(71,85,105,0.95);
+    --muted-2: rgba(100,116,139,0.95);
+
+    --ring: var(--st-primary);
+    --ok:#16a34a; --bad:#dc2626;
+
+    --shadow: rgba(0,0,0,0.10);
+    --shadow-lg: rgba(0,0,0,0.18);
+
     --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
   }
 
-  /* Dark mode palette (fixes white-on-white and mismatched components) */
-  html[data-theme="dark"], body[data-theme="dark"]{
-    --text:#e5e7eb; --muted:#a1a1aa; --muted-2:#94a3b8;
-    --border-strong:rgba(148,163,184,0.35);
-    --border:rgba(148,163,184,0.25);
-    --border-soft:rgba(148,163,184,0.18);
-    --bg-app:#0b1220; --bg-card:#0f172a; --bg-tile:#111c33;
-    --ring:#60a5fa; --ok:#22c55e; --bad:#f87171;
-    --shadow: rgba(0,0,0,0.35);
-    --shadow-lg: rgba(0,0,0,0.55);
+  /* Modern browsers: derive subtle tints from the live Streamlit theme */
+  @supports (color: color-mix(in srgb, white 50%, black)) {
+    .stApp{
+      --bg-tile: color-mix(in srgb, var(--st-card) 70%, var(--st-bg) 30%);
+      --border-soft: color-mix(in srgb, var(--st-text) 10%, transparent);
+      --border: color-mix(in srgb, var(--st-text) 16%, transparent);
+      --border-strong: color-mix(in srgb, var(--st-text) 22%, transparent);
+      --muted: color-mix(in srgb, var(--st-text) 78%, transparent);
+      --muted-2: color-mix(in srgb, var(--st-text) 66%, transparent);
+    }
   }
 
-  html, body, .stApp {
-    background: var(--bg-app);
+  /* Ensure the overall page uses Streamlit's current theme colors */
+  .stApp {
+    background: var(--bg-app) !important;
+    color: var(--text) !important;
     font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
-    color: var(--text);
   }
 
   .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
@@ -164,15 +223,15 @@ GLOBAL_CSS = """
 
   .small-muted{ color:var(--muted); font-size:.9rem; }
 
-  /* File uploader (prevents ugly mixed-theme first load) */
-  section[data-testid="stFileUploadDropzone"]{
+  /* File uploader */
+  [data-testid="stFileUploadDropzone"]{
     border-radius:14px !important;
     border:1.8px dashed var(--border-strong) !important;
     background:var(--bg-card) !important;
     box-shadow:0 0 0 1px var(--border-soft) inset;
   }
-  section[data-testid="stFileUploadDropzone"] *{ color:var(--text) !important; }
-  section[data-testid="stFileUploadDropzone"] button{
+  [data-testid="stFileUploadDropzone"] *{ color:var(--text) !important; }
+  [data-testid="stFileUploadDropzone"] button{
     background:var(--bg-tile) !important;
     border:1.2px solid var(--border) !important;
     color:var(--text) !important;
@@ -199,8 +258,9 @@ GLOBAL_CSS = """
     content:"";
     position:absolute;
     inset:-2px;
-    background: radial-gradient(1200px 220px at 20% -20%, rgba(96,165,250,0.26), rgba(0,0,0,0)),
-                radial-gradient(1200px 220px at 80% 120%, rgba(34,197,94,0.16), rgba(0,0,0,0));
+    /* Subtle accent that works in both themes */
+    background: radial-gradient(1200px 220px at 20% -20%, rgba(59,130,246,0.18), rgba(0,0,0,0)),
+                radial-gradient(1200px 220px at 80% 120%, rgba(34,197,94,0.12), rgba(0,0,0,0));
     pointer-events:none;
   }
   .metric-head{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:10px; }
@@ -796,26 +856,6 @@ def _detect_trends(df_in: pd.DataFrame, symptom_cols: list[str], min_mentions: i
 EXCEL_MAX_CHARS = 32767
 
 
-
-def _decode_bytes_to_text(b: bytes) -> str:
-    """
-    Decode uploaded JSON bytes robustly (handles UTF-8/UTF-16/BOM and common Windows encodings).
-
-    This prevents JSON parsing failures when the export is UTF-16 or has a BOM.
-    """
-    if b is None:
-        return ""
-    for enc in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin1"):
-        try:
-            t = b.decode(enc)
-            # If it decodes but is mostly NULs, skip (common when decoding UTF-16 as UTF-8)
-            if t.count("\x00") > 0 and t.count("\x00") > len(t) // 20:
-                continue
-            return t
-        except Exception:
-            continue
-    return b.decode("utf-8", errors="replace")
-
 def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
     cur: Any = d
     for k in path:
@@ -829,6 +869,12 @@ def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
 def join_list(x: Any, sep: str = " | ") -> Any:
     if x is None:
         return None
+    if isinstance(x, dict):
+        # Preserve nested dicts as a compact JSON string so they can still be filtered/searchable.
+        try:
+            return json.dumps(x, ensure_ascii=False)
+        except Exception:
+            return str(x)
     if isinstance(x, list):
         vals = [str(v).strip() for v in x if v is not None and str(v).strip() != ""]
         return sep.join(vals) if vals else None
@@ -857,140 +903,106 @@ REVIEWS_BASE_COLS: List[Tuple[str, Any]] = [
     ("Review", lambda r: safe_get(r, ["freeText", "Review"])),
 ]
 
-REVIEWS_EXTRA_COLS: List[Tuple[str, Any]] = [
-    ("Key Review Sentiment_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment_Reviews"]))),
-    ("Key Review Sentiment Type_Reviews", lambda r: join_list(safe_get(r, ["customAttributes", "Key Review Sentiment Type_Reviews"]))),
-    ("Dominant Customer Journey Step", lambda r: join_list(safe_get(r, ["customAttributes", "Dominant Customer Journey Step"]))),
-    ("Trigger Point_Product", lambda r: join_list(safe_get(r, ["customAttributes", "Trigger Point_Product"]))),
-    ("L2 Delighter Component", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Component"]))),
-    ("L2 Delighter Condition", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Condition"]))),
-    ("L2 Delighter Mode", lambda r: join_list(safe_get(r, ["customAttributes", "L2 Delighter Mode"]))),
-    ("L3 Non Product Detractors", lambda r: join_list(safe_get(r, ["customAttributes", "L3 Non Product Detractors"]))),
-    ("Product_Symptom Component", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Component"]))),
-    ("Product_Symptom Conditions", lambda r: join_list(safe_get(r, ["customAttributes", "taxonomies", "Product_Symptom Conditions"]))),
-]
+def _collect_attribute_keys(records: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Collect *all* attribute keys so they can become filterable columns.
 
-
-def _normalize_json_value(v: Any) -> Any:
-    """Normalize JSON values into dataframe-friendly scalars."""
-    if v is None:
-        return None
-    if isinstance(v, (list, tuple, set)):
-        return join_list(list(v))
-    if isinstance(v, dict):
-        # As a fallback, serialize dicts (keeps JSON upload robust even with unexpected shapes)
-        try:
-            return json.dumps(v, ensure_ascii=False)
-        except Exception:
-            return str(v)
-    return v
-
-
-def _flatten_dict(
-    d: Dict[str, Any],
-    out: Dict[str, Any],
-    *,
-    prefix: str = "",
-    max_depth: int = 3,
-    _depth: int = 0,
-) -> None:
-    """Recursively flatten a dict into `out` using dotted keys.
-
-    This is conservative (depth-limited) to avoid exploding columns on weird payloads.
+    This is intentionally broad: anything under clientAttributes/customAttributes/
+    customAttributes.taxonomies/axionAttributes becomes a column.
     """
-    if not isinstance(d, dict) or _depth >= max_depth:
-        return
-    for k, v in d.items():
-        key = f"{prefix}{k}" if prefix else str(k)
-        if isinstance(v, dict):
-            _flatten_dict(v, out, prefix=key + ".", max_depth=max_depth, _depth=_depth + 1)
-        else:
-            out[key] = _normalize_json_value(v)
 
-
-def _flatten_record_extras(r: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract *all* useful JSON fields into flat columns.
-
-    Goal: make columns like Base SKU, Brand, Product Name, Factory Name,
-    Dominant Customer Journey Step, Key Review Sentiment, etc. available for filtering.
-
-    - `clientAttributes.*` keys become columns with the same names (e.g., "Brand").
-    - `customAttributes.taxonomies.*` keys become top-level columns with the taxonomy name
-      (e.g., "Product_Symptom Conditions").
-    - Other nested dicts are flattened using dotted keys.
-    """
-    out: Dict[str, Any] = {}
-
-    # clientAttributes (usually already flat)
-    ca = r.get("clientAttributes") or {}
-    if isinstance(ca, dict):
-        for k, v in ca.items():
-            out[str(k)] = _normalize_json_value(v)
-
-    # customAttributes (may contain taxonomies + other nested bits)
-    cust = r.get("customAttributes") or {}
-    if isinstance(cust, dict):
-        for k, v in cust.items():
-            if k == "taxonomies" and isinstance(v, dict):
-                for tk, tv in v.items():
-                    col = str(tk)
-                    # Avoid collisions if any (rare)
-                    if col in out and out.get(col) != _normalize_json_value(tv):
-                        col = f"taxonomies.{col}"
-                    out[col] = _normalize_json_value(tv)
-            elif isinstance(v, dict):
-                _flatten_dict(v, out, prefix=str(k) + ".")
-            else:
-                out[str(k)] = _normalize_json_value(v)
-
-    # axionAttributes (if present)
-    ax = r.get("axionAttributes") or {}
-    if isinstance(ax, dict):
-        for k, v in ax.items():
-            if str(k) not in out:
-                out[str(k)] = _normalize_json_value(v)
-
-    # freeText extras (Title/Review handled separately in base cols)
-    ft = r.get("freeText") or {}
-    if isinstance(ft, dict):
-        for k, v in ft.items():
-            if k in {"Title", "Review"}:
+    def _clean_keys(keys: Iterable[Any]) -> List[str]:
+        out = []
+        for k in keys:
+            s = str(k).strip()
+            if not s or s.lower() in {"unnamed: 0"}:
                 continue
-            if str(k) not in out:
-                out[str(k)] = _normalize_json_value(v)
+            out.append(s)
+        return sorted(list(dict.fromkeys(out)))
 
-    # A few lightweight top-level scalars that sometimes help filtering/debugging
-    for k in ["eventType", "eventId", "eventGroupId"]:
-        if k in r and not isinstance(r.get(k), (dict, list)):
-            out[k] = _normalize_json_value(r.get(k))
+    client: set[str] = set()
+    custom: set[str] = set()
+    tax: set[str] = set()
+    ax: set[str] = set()
 
-    return out
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        ca = r.get("clientAttributes")
+        if isinstance(ca, dict):
+            client.update([str(k) for k in ca.keys()])
+
+        cu = r.get("customAttributes")
+        if isinstance(cu, dict):
+            for k, v in cu.items():
+                if str(k) == "taxonomies" and isinstance(v, dict):
+                    tax.update([str(tk) for tk in v.keys()])
+                else:
+                    custom.add(str(k))
+
+        aa = r.get("axionAttributes")
+        if isinstance(aa, dict):
+            ax.update([str(k) for k in aa.keys()])
+
+    return (
+        _clean_keys(client),
+        _clean_keys(custom),
+        _clean_keys(tax),
+        _clean_keys(ax),
+    )
 
 
 def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
-    """Build a Reviews DataFrame from JSON export records.
+    """Build a "reviews" DataFrame from the JSON export.
 
-    This keeps the original required columns for conversion, *and* (when include_extra=True)
-    flattens the rest of the JSON so users can filter by fields like:
-    Base SKU, Brand, Product Name, Dominant Customer Journey Step, Key Review Sentiment, etc.
+    v19 upgrade:
+    - Keeps the original base columns used by the app.
+    - Also flattens **all** JSON attributes (client/custom/taxonomies/axion)
+      into additional columns so they can be used in the "➕ Add Filters" system.
     """
-    base_cols = REVIEWS_BASE_COLS
+
+    client_keys: List[str] = []
+    custom_keys: List[str] = []
+    tax_keys: List[str] = []
+    ax_keys: List[str] = []
+    if include_extra:
+        client_keys, custom_keys, tax_keys, ax_keys = _collect_attribute_keys(records)
+
+    base_cols = list(REVIEWS_BASE_COLS)
+
     rows: List[Dict[str, Any]] = []
     for r in records:
-        row = {name: fn(r) for name, fn in base_cols}
+        if not isinstance(r, dict):
+            continue
+
+        row: Dict[str, Any] = {name: fn(r) for name, fn in base_cols}
+
         if include_extra:
-            extras = _flatten_record_extras(r)
-            # Don't overwrite base columns (but allow filling missing ones)
-            for k, v in extras.items():
-                if k not in row or row.get(k) in (None, ""):
-                    row[k] = v
+            ca = r.get("clientAttributes") if isinstance(r.get("clientAttributes"), dict) else {}
+            cu = r.get("customAttributes") if isinstance(r.get("customAttributes"), dict) else {}
+            tax = cu.get("taxonomies") if isinstance(cu.get("taxonomies"), dict) else {}
+            aa = r.get("axionAttributes") if isinstance(r.get("axionAttributes"), dict) else {}
+
+            for k in client_keys:
+                row[k] = join_list(ca.get(k))
+            for k in custom_keys:
+                # (taxonomies handled separately)
+                row[k] = join_list(cu.get(k))
+            for k in tax_keys:
+                row[k] = join_list(tax.get(k))
+            for k in ax_keys:
+                row[k] = join_list(aa.get(k))
+
+            # A couple useful top-level scalars (kept minimal)
+            if "eventType" in r:
+                row["eventType"] = r.get("eventType")
+            if "eventId" in r:
+                row["eventId"] = r.get("eventId")
+
         rows.append(row)
 
     df = pd.DataFrame(rows)
-
     if "Rating (num)" in df.columns:
         df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
-
     return df
 
 
@@ -1003,61 +1015,73 @@ def _strip_code_fences(s: str) -> str:
     return s
 
 
-
-def _remove_trailing_commas(s: str) -> str:
-    """Remove trailing commas that appear immediately before a closing '}' or ']'.
-
-    This is a safe, common "JSON5-ish" cleanup for pasted/exported payloads.
-    It does NOT touch commas inside strings.
-    """
-    return re.sub(r",\s*([}\]])", r"\1", s)
-
-
-
 def _extract_json_substring(s: str) -> str:
-    """
-    Return the best guess of the JSON object/array substring inside a larger pasted blob.
+    """Extract the first balanced JSON object/array from pasted text.
 
-    This is more robust than a naive first/last brace slice because it tries to find the
-    first complete balanced {..} or [..] region.
+    Why this exists:
+    - Users often paste JSON preceded/followed by commentary.
+    - Naive "slice from first { to last }" breaks when review text contains stray
+      brackets like "]" or "}" inside strings.
+
+    This implementation finds the first balanced {...} or [...] region while
+    correctly ignoring brackets that appear inside quoted strings.
     """
     s = s.strip()
     if not s:
         return s
-    if s.startswith("{") or s.startswith("["):
+
+    # IMPORTANT:
+    # Even if the paste begins with '{' or '[', the user may have trailing
+    # commentary / extra characters after the JSON. We therefore ALWAYS scan
+    # for the first balanced JSON object/array region and return just that.
+    # This avoids the common failure mode: json.loads() failing because of
+    # non-whitespace text after the valid JSON payload.
+
+    starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
+    if not starts:
         return s
+    start = min(starts)
+    sub = s[start:]
 
-    start_candidates = [i for i in [s.find("{"), s.find("[")] if i != -1]
-    if not start_candidates:
-        return s
-    start = min(start_candidates)
+    stack: List[str] = []
+    in_str = False
+    quote = ""
+    escape = False
 
-    stack = []
-    end = None
-    pairs = {"{": "}", "[": "]"}
-    openers = set(pairs.keys())
-    closers = set(pairs.values())
+    for i, ch in enumerate(sub):
+        if in_str:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == quote:
+                in_str = False
+            continue
 
-    for i, ch in enumerate(s[start:], start=start):
-        if ch in openers:
-            stack.append(pairs[ch])
-        elif ch in closers:
-            if stack and ch == stack[-1]:
-                stack.pop()
-                if not stack:
-                    end = i
-                    break
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            continue
 
-    if end is not None:
-        return s[start : end + 1].strip()
+        if ch in "{[":
+            stack.append(ch)
+            continue
 
-    # Fallback: last brace/bracket
-    end2 = max(s.rfind("}"), s.rfind("]"))
-    if end2 != -1 and end2 > start:
-        return s[start : end2 + 1].strip()
-    return s[start:].strip()
+        if ch in "}]":
+            if not stack:
+                continue
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                # Mismatch. Reset stack and keep scanning.
+                stack = []
+                continue
+            if not stack:
+                return sub[: i + 1].strip()
 
-
+    # Fallback: return everything after the first brace/bracket
+    return sub.strip()
 
 
 def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
@@ -1077,119 +1101,116 @@ def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
     return objs
 
 
-def loads_flexible_json(json_text: str) -> Tuple[Any, List[str]]:
-    """Best-effort JSON loader that is robust to:
-    - Markdown code fences
-    - Leading BOM
-    - Pasted text that contains extra pre/post content
-    - JSON Lines (one JSON object per line)
+def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
+    """Parse JSON robustly.
 
-    IMPORTANT: We **do not** aggressively normalize “smart quotes” up-front because valid JSON can
-    legitimately contain curly quotes inside string values (e.g., review text). Normalizing them to
-    ASCII quotes would corrupt otherwise-valid JSON.
-
-    Returns: (obj, warnings)
+    Accepts:
+      • A normal JSON object/array
+      • JSON wrapped in code fences
+      • JSON with a UTF‑8 BOM
+      • JSON Lines (one JSON object per line)
+      • Minor issues like trailing commas
     """
     warnings: List[str] = []
-    if json_text is None:
-        raise ValueError("No JSON text provided.")
+    if text_in is None:
+        raise ValueError("No JSON provided.")
 
-    # 1) Minimal cleanup that cannot corrupt valid JSON strings
-    clean = _strip_code_fences(str(json_text))
-    clean = clean.lstrip("\ufeff").strip()
-    if not clean:
-        raise ValueError("Empty JSON input.")
+    s = str(text_in)
+    # Strip UTF-8 BOM if present
+    s = s.lstrip("\ufeff").strip()
+    s = _strip_code_fences(s).strip()
+    s = _extract_json_substring(s)
 
-    # 2) First try: parse as-is (most reliable)
+    # 1) Strict parse
     try:
-        return json.loads(clean), warnings
-    except Exception as e_as_is:
-        last_err: Exception = e_as_is
+        return json.loads(s), warnings
+    except Exception as e1:
+        pass
 
-    
+    # 2) Remove trailing commas (common human edit issue)
+    s2 = re.sub(r",\s*([}\]])", r"\1", s)
+    if s2 != s:
+        try:
+            warnings.append("Removed trailing commas to make JSON valid.")
+            return json.loads(s2), warnings
+        except Exception:
+            warnings.pop()
 
-    # 2b) Second try: remove trailing commas (common in pasted JSON)
-    try:
-        cleaned = _remove_trailing_commas(clean)
-        if cleaned != clean:
-            obj = json.loads(cleaned)
-            warnings.append("Parsed JSON after removing trailing commas before } or ].")
+    # 3) JSON Lines
+    jl = _try_parse_json_lines(s)
+    if jl is not None:
+        warnings.append("Detected JSON Lines and parsed each line as a record list.")
+        return jl, warnings
+
+    # 4) JSONDecoder raw_decode (helps when extra text surrounds JSON)
+    dec = json.JSONDecoder()
+    for start in [s.find("{"), s.find("[")]:
+        if start == -1:
+            continue
+        try:
+            obj, end = dec.raw_decode(s[start:])
+            tail = s[start + end :].strip()
+            if tail:
+                warnings.append("Ignored trailing text after JSON payload.")
             return obj, warnings
-    except Exception as e_tc:
-        last_err = e_tc
-# 3) Try extracting the largest {...} substring
-    candidate = _extract_json_substring(clean)
-    if candidate and candidate != clean:
-        try:
-            warnings.append("Parsed JSON after extracting the largest {...} substring from pasted text.")
-            return json.loads(candidate), warnings
-        except Exception as e_sub:
-            last_err = e_sub
-
-    
-        # 3b) Try the extracted substring again after removing trailing commas
-        try:
-            cand2 = _remove_trailing_commas(candidate)
-            if cand2 != candidate:
-                obj = json.loads(cand2)
-                warnings.append("Parsed JSON after extracting JSON substring and removing trailing commas.")
-                return obj, warnings
-        except Exception as e_sub2:
-            last_err = e_sub2
-# 4) Try JSON Lines
-    line_obj = _try_parse_json_lines(clean)
-    if line_obj is not None:
-        warnings.append("Parsed as JSON Lines (one JSON object per line).")
-        return line_obj, warnings
-
-    # 5) LAST resort: attempt to convert smart quotes **only when used as delimiters**
-    #    This targets cases where users paste pseudo-JSON from Word/Docs that uses curly quotes
-    #    for keys/strings, without touching curly quotes inside already-quoted values.
-    def _normalize_curly_delimiters(s: str) -> str:
-        # Replace curly double quotes that appear immediately after structural chars
-        # or at the start of the string (likely acting as delimiters), and the matching closing ones
-        # before structural chars. This is a heuristic; we keep it conservative.
-        s = re.sub(r'(^|[\{\[\s,:])“', r'\1"', s)
-        s = re.sub(r'”([\s,\}\]])', r'"\1', s)
-        # Also handle the common variant where closing curly quote is right before colon
-        s = re.sub(r'”\s*:', r'":', s)
-        # If the entire document seems to use curly quotes for all delimiters, a broader pass can help
-        # but only do it if we still fail after the conservative replacements.
-        return s
-
-    normalized = _normalize_curly_delimiters(clean)
-    if normalized != clean:
-        try:
-            warnings.append("Parsed JSON after conservatively normalizing curly quotes used as delimiters.")
-            return json.loads(normalized), warnings
-        except Exception as e_norm:
-            last_err = e_norm
-
-        # Broad fallback: replace remaining curly delimiters (still risky, but better than hard fail)
-        broader = normalized.replace("“", '"').replace("”", '"')
-        if broader != normalized:
-            try:
-                warnings.append("Parsed JSON after broadly normalizing curly double-quotes to ASCII quotes.")
-                return json.loads(broader), warnings
-            except Exception as e_broad:
-                last_err = e_broad
+        except Exception:
+            continue
 
     raise ValueError(
-        "Could not parse JSON. If you pasted text, ensure it is valid JSON (double quotes around keys, no trailing commas).\n"
-        f"Last error: {type(last_err).__name__}: {last_err}"
+        "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines."
+    )
+
+def extract_records(raw: Any) -> List[Dict[str, Any]]:
+    """Extract review record objects from a variety of JSON export shapes.
+
+    Supported:
+    - {"results": [ {...}, {...} ], ...}
+    - [ {...}, {...} ]
+    - {...}  (single record)
+    - nested wrappers where a list-of-dicts lives under some key
+    """
+
+    if isinstance(raw, dict) and isinstance(raw.get("results"), list):
+        return [r for r in raw.get("results") if isinstance(r, dict)]
+
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, dict)]
+
+    if isinstance(raw, dict):
+        # Sometimes a single record is pasted
+        if ("freeText" in raw) and ("clientAttributes" in raw or "customAttributes" in raw):
+            return [raw]
+
+    # Fallback: recursively search for the first list-of-dicts
+    def _search(obj: Any, depth: int = 0) -> Optional[List[Dict[str, Any]]]:
+        if depth > 6:
+            return None
+        if isinstance(obj, list):
+            # list-of-dicts candidate
+            if obj and all(isinstance(x, dict) for x in obj[: min(len(obj), 5)]):
+                return [x for x in obj if isinstance(x, dict)]
+            for x in obj:
+                found = _search(x, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(obj, dict):
+            for _, v in obj.items():
+                found = _search(v, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    found = _search(raw)
+    if found is not None:
+        return found
+
+    raise ValueError(
+        "Unrecognized JSON shape. Expected a dict with `results: []`, a list of record objects, or a wrapper containing a list of records."
     )
 
 
-def extract_records(raw: Any) -> List[Dict[str, Any]]:
-    if isinstance(raw, dict) and "results" in raw and isinstance(raw["results"], list):
-        return raw["results"]
-    if isinstance(raw, list):
-        return [r for r in raw if isinstance(r, dict)]
-    raise ValueError("Unrecognized JSON shape. Expected a dict with `results: []` or a list of record objects.")
-
-
 # ============================================================
-# Reviews DF -> Star Walk DF (from axionReviews.py)
+# Reviews DF -> Star Walk DF (from reviews_transform.py)
 # ============================================================
 DEFAULT_STARWALK_COLUMNS: List[str] = [
     "Source",
@@ -1364,8 +1385,7 @@ def convert_to_starwalk_from_reviews_df(
     reviews_df: pd.DataFrame,
     include_extra_cols_after_symptom20: bool = True,
     weight_mode: str = "Leave blank",
-    split_regex: str = r"[;|\n,]+",
-    extra_cols_after_symptom20: Optional[List[str]] = None,
+    split_regex: str = r"[;\|\n,]+",
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Opinionated conversion for THIS master app:
@@ -1374,16 +1394,52 @@ def convert_to_starwalk_from_reviews_df(
     """
     src_df = reviews_df.reset_index(drop=True)
     out_cols = list(DEFAULT_STARWALK_COLUMNS)
+
+    # v19: optionally keep **all** extra JSON-derived columns (e.g., Base SKU,
+    # Product Category, Company, Factory Name, etc.) so they can be used in
+    # the "➕ Add Filters" power-user system.
+    extra_cols_dynamic: List[str] = []
+    extra_cols_final: List[str] = []
     if include_extra_cols_after_symptom20:
-        extra_cols: List[str] = list(DEFAULT_EXTRA_AFTER_SYMPTOM20)
-        if extra_cols_after_symptom20:
-            extra_cols.extend([c for c in extra_cols_after_symptom20 if isinstance(c, str) and c.strip()])
+        base_extras = [c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns]
 
-        # Never move core Starwalk columns around; only *add* truly extra fields after Symptom 20.
-        core_set = set(DEFAULT_STARWALK_COLUMNS)
-        extra_cols = [c for c in extra_cols if c not in core_set]
+        # Columns already represented in the Star Walk schema via field_map below.
+        # (We avoid duplicating them as extra columns.)
+        _used_inputs = {
+            "Retailer",
+            "Model",
+            "Seeded Reviews",
+            "Syndicated/Seeded Reviews",
+            "Location",
+            "Opened Timestamp",
+            "Record ID",
+            "Review",
+            "Rating (num)",
+        }
 
-        out_cols = insert_after_symptom20(out_cols, extra_cols)
+        for c in list(src_df.columns):
+            sc = str(c).strip()
+            if not sc or sc.lower() in {"unnamed: 0"}:
+                continue
+            if sc in _used_inputs:
+                continue
+            if sc in base_extras:
+                continue
+            # Avoid duplicating symptoms / core outputs
+            if sc in out_cols or sc.startswith("Symptom "):
+                continue
+            try:
+                if src_df[sc].isna().all():
+                    continue
+            except Exception:
+                pass
+            extra_cols_dynamic.append(sc)
+
+        # Stable order: known extras first, then the remaining columns sorted.
+        extra_cols_dynamic = sorted(list(dict.fromkeys(extra_cols_dynamic)))
+        extra_cols_final = base_extras + [c for c in extra_cols_dynamic if c not in base_extras]
+
+        out_cols = insert_after_symptom20(out_cols, extra_cols_final)
 
     # Field mapping (source col -> output col)
     field_map = {
@@ -1397,7 +1453,7 @@ def convert_to_starwalk_from_reviews_df(
         "Verbatim": "Review",
         "Star Rating": "Rating (num)",
         # map extras where possible (same names)
-        **{c: c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns},
+        **{c: c for c in extra_cols_final if c in src_df.columns},
     }
 
     # L2 columns
@@ -1445,16 +1501,6 @@ def convert_to_starwalk_from_reviews_df(
         out["Seeded"] = clean_seeded_series(out["Seeded"])
     if "Star Rating" in out.columns:
         out["Star Rating"] = clean_star_rating_series(out["Star Rating"])
-
-
-    # Copy through any additional JSON fields (same-name passthrough) requested for post-Symptom 20 columns
-    if include_extra_cols_after_symptom20 and extra_cols_after_symptom20:
-        for c in extra_cols_after_symptom20:
-            if c in src_df.columns and c in out.columns:
-                # Avoid overriding the canonical Starwalk columns; only fill genuinely "extra" columns.
-                if c in set(DEFAULT_STARWALK_COLUMNS):
-                    continue
-                out[c] = src_df[c].values
 
     detr_matrix = [[pd.NA] * 10 for _ in range(n)]
     deli_matrix = [[pd.NA] * 10 for _ in range(n)]
@@ -1582,18 +1628,12 @@ def _json_text_to_starwalk(json_text: str, source_name: str, include_extra_cols:
     records = extract_records(raw_obj)
     if not records:
         raise ValueError("Parsed input, but found 0 record objects to convert.")
-    reviews_df = build_reviews_df(records, include_extra=True)
-
-    # Include ALL additional JSON fields as optional columns after Symptom 20 so users can filter
-    # by Base SKU, Brand, Product Name, Dominant Customer Journey Step, review sentiments, etc.
-    base_col_names = [c for c, _ in REVIEWS_BASE_COLS]
-    dynamic_extra_cols = [c for c in reviews_df.columns if c not in base_col_names]
+    reviews_df = build_reviews_df(records, include_extra=include_extra_cols)
 
     out_df, stats = convert_to_starwalk_from_reviews_df(
         reviews_df,
         include_extra_cols_after_symptom20=include_extra_cols,
         weight_mode="Leave blank",
-        extra_cols_after_symptom20=dynamic_extra_cols,
     )
 
     # clean types like loader does
@@ -1680,103 +1720,6 @@ def _safe_list(v) -> list:
         return list(v)
     return [v]
 
-def _is_multi_valued_series(s: pd.Series) -> bool:
-    """Heuristic: treat a column as multi-valued if values look like "A | B | C"."""
-    if s is None:
-        return False
-    s2 = s.astype("string").dropna()
-    if s2.empty:
-        return False
-    sample = s2.head(800)
-    # Our JSON flattener joins lists with " | "
-    frac = (sample.str.contains(r"\|", regex=True)).mean()
-    return frac >= 0.03
-
-
-def _extra_filter_options(
-    df_in: pd.DataFrame,
-    col: str,
-    *,
-    max_options: int = 800,
-) -> Tuple[List[str], bool, str]:
-    """Return (options, is_multi, note) for an extra filter column.
-
-    - Always includes "ALL" as the first option.
-    - For multi-valued columns ("A | B"), options are tokenized.
-    - For high-cardinality columns, we show the top values by frequency to keep the UI fast.
-    """
-    if col not in df_in.columns:
-        return ["ALL"], False, ""
-
-    s = df_in[col].astype("string").replace({"": pd.NA}).dropna()
-    if s.empty:
-        return ["ALL"], False, ""
-
-    is_multi = _is_multi_valued_series(s)
-    note = ""
-
-    if is_multi:
-        # Tokenize on pipe. (We intentionally keep this simple/fast.)
-        tokens: List[str] = []
-        for v in s.head(50000):
-            parts = [p.strip() for p in str(v).split("|") if p.strip()]
-            tokens.extend(parts)
-
-        if not tokens:
-            vc = s.value_counts()
-            vals = vc.index.astype(str).tolist()
-        else:
-            vc = pd.Series(tokens).value_counts()
-            vals = vc.index.astype(str).tolist()
-
-        if len(vals) <= 200:
-            vals = sorted(vals, key=lambda x: x.lower())
-
-        if len(vals) > max_options:
-            note = f"Showing top {max_options} values by frequency (of {len(vals)} total)."
-            vals = vals[:max_options]
-
-        return ["ALL"] + vals, True, note
-
-    # Single-valued
-    vc = s.value_counts()
-    vals = vc.index.astype(str).tolist()
-
-    if len(vals) <= 200:
-        vals = sorted(vals, key=lambda x: x.lower())
-
-    if len(vals) > max_options:
-        note = f"Showing top {max_options} values by frequency (of {len(vals)} total)."
-        vals = vals[:max_options]
-
-    return ["ALL"] + vals, False, note
-
-
-def _apply_extra_filter_mask(
-    s: pd.Series,
-    selected: List[str],
-    *,
-    is_multi: bool,
-) -> pd.Series:
-    """Return boolean mask for a column series given selected filter values."""
-    if not selected or "ALL" in selected:
-        return pd.Series([True] * len(s), index=s.index)
-
-    s_str = s.astype("string").fillna("")
-
-    # Single value column → exact match
-    if not is_multi:
-        return s_str.isin([str(v) for v in selected])
-
-    # Multi-valued column joined by "|" → token match.
-    # Use a boundary-aware regex: (^|\s*\|\s*)(val1|val2)(\s*\|\s*|$)
-    pats = [re.escape(str(v)) for v in selected if str(v).strip() != ""]
-    if not pats:
-        return pd.Series([True] * len(s), index=s.index)
-    union = "|".join(pats)
-    regex = rf"(?:^|\s*\|\s*)(?:{union})(?:\s*\|\s*|$)"
-    return s_str.str.contains(regex, case=False, regex=True, na=False)
-
 
 def _collect_filter_state(additional_columns: list[str]) -> dict:
     """
@@ -1806,15 +1749,24 @@ def _collect_filter_state(additional_columns: list[str]) -> dict:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
+        rk = f"f_{col}_range"
+        if rk in st.session_state:
+            state["filters"][rk] = st.session_state.get(rk)
+        ck = f"f_{col}_contains"
+        if ck in st.session_state:
+            state["filters"][ck] = st.session_state.get(ck)
 
-    # additional columns (dynamic) – user-selected only (default = none)
-    extra_cols = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
-    extra_cols = [c for c in extra_cols if c in additional_columns]
-    state["filters"]["extra_cols"] = extra_cols
-    for col in extra_cols:
+    # additional columns (dynamic)
+    for col in additional_columns:
         k = f"f_{col}"
         if k in st.session_state:
             state["filters"][k] = st.session_state.get(k)
+        rk = f"f_{col}_range"
+        if rk in st.session_state:
+            state["filters"][rk] = st.session_state.get(rk)
+        ck = f"f_{col}_contains"
+        if ck in st.session_state:
+            state["filters"][ck] = st.session_state.get(ck)
 
     # reviews per page
     state["ui"]["rpp"] = st.session_state.get("rpp", 10)
@@ -1842,32 +1794,20 @@ def _apply_filter_state_to_session(state: dict, available_columns: list[str], ad
         st.session_state["delight"] = _safe_list(filters.get("delight"))
     if "detract" in filters:
         st.session_state["detract"] = _safe_list(filters.get("detract"))
-    # column filters (core)
-    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+
+    # column filters
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + list(additional_columns):
         k = f"f_{col}"
         if k in filters:
             st.session_state[k] = _safe_list(filters.get(k))
 
-    # column filters (extra) — restore which extra columns are active, then their selections
-    extra_cols = _safe_list(filters.get("extra_cols"))
-    extra_cols = [c for c in extra_cols if c in additional_columns]
+        rk = f"f_{col}_range"
+        if rk in filters:
+            st.session_state[rk] = filters.get(rk)
 
-    # Back-compat for older saved views: infer selected extra columns from stored keys
-    if not extra_cols:
-        inferred: List[str] = []
-        for col in additional_columns:
-            k = f"f_{col}"
-            v = _safe_list(filters.get(k))
-            if v and "ALL" not in v:
-                inferred.append(col)
-        extra_cols = inferred
-
-    st.session_state["extra_filter_cols_selected"] = extra_cols
-
-    for col in extra_cols:
-        k = f"f_{col}"
-        if k in filters:
-            st.session_state[k] = _safe_list(filters.get(k))
+        ck = f"f_{col}_contains"
+        if ck in filters:
+            st.session_state[ck] = str(filters.get(ck) or "")
 
     # UI
     ui = (state or {}).get("ui", {})
@@ -1913,9 +1853,10 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
     # Avg star (review-level, de-dup symptom within a review)
     avg_map = {}
     if "Star Rating" in df_in.columns:
-        stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
+        # Robust join-based approach (avoids brittle index->dict mapping edge cases)
+        stars = pd.to_numeric(df_in["Star Rating"], errors="coerce").rename("star")
         tmp = long.drop_duplicates(subset=["__idx", "symptom"]).copy()
-        tmp["star"] = tmp["__idx"].map(stars.to_dict())
+        tmp = tmp.join(stars, on="__idx")
         avg = tmp.groupby("symptom")["star"].mean()
         avg_map = avg.to_dict()
 
@@ -1923,62 +1864,12 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
     out = pd.DataFrame(
         {
             "Item": [str(x).title() for x in counts.index.tolist()],
-            "Avg Star": [np.nan if pd.isna(avg_map.get(x, pd.NA)) else round(float(avg_map.get(x)), 1) for x in counts.index.tolist()],
+            "Avg Star": [None if pd.isna(avg_map.get(x, pd.NA)) else round(float(avg_map.get(x)), 1) for x in counts.index.tolist()],
             "Mentions": counts.values.astype(int),
             "% Total": (counts.values / total_rows * 100).round(1).astype(str) + "%",
         }
     )
     return out.sort_values("Mentions", ascending=False, ignore_index=True)
-
-
-def organic_mention_stats(
-    df_in: pd.DataFrame,
-    symptom_cols: List[str],
-    *,
-    seeded_col: str = "Seeded",
-) -> Tuple[Dict[str, float], Dict[str, int], int]:
-    """Compute organic mention share per symptom item.
-
-    Returns:
-      - pct_by_item: {item: percent_of_organic_reviews_with_any_symptom_cols_that_mention_item}
-      - n_by_item:   {item: count_of_unique_organic_reviews_that_mention_item}
-      - denom:       total unique organic reviews that mention at least one symptom in symptom_cols
-
-    Notes:
-      - Uses *review-level* uniqueness (a review mentioning the same item in multiple symptom slots still counts once).
-      - Treats Seeded == YES as non-organic.
-    """
-    if df_in is None or df_in.empty or not symptom_cols:
-        return {}, {}, 0
-
-    cols = [c for c in symptom_cols if c in df_in.columns]
-    if not cols:
-        return {}, {}, 0
-
-    df = df_in
-    if seeded_col in df.columns:
-        organic = df[~df[seeded_col].astype("string").str.upper().isin(["YES", "Y", "TRUE", "1", "SEEDED"])].copy()
-    else:
-        organic = df.copy()
-
-    if organic.empty:
-        return {}, {}, 0
-
-    tmp = organic[cols].copy()
-    tmp["__rid__"] = organic.index
-
-    long = tmp.melt(id_vars="__rid__", value_vars=cols, value_name="Item").dropna(subset=["Item"])
-    long["Item"] = long["Item"].astype("string").str.strip()
-    long = long[long["Item"] != ""]
-
-    denom = int(long["__rid__"].nunique())
-    if denom == 0:
-        return {}, {}, 0
-
-    n_by_item = long.groupby("Item")["__rid__"].nunique().astype(int).to_dict()
-    pct_by_item = {k: (v / denom) * 100.0 for k, v in n_by_item.items()}
-    return pct_by_item, n_by_item, denom
-
 
 
 # ============================================================
@@ -2116,10 +2007,117 @@ def vector_search(query: str, index, api_key: str, top_k: int = 8):
     return [(texts[i], float(sims[i])) for i in idx]
 
 
+
+# ============================================================
+# Theme bootstrap + extra CSS patch (fix mixed light/dark on fresh sessions)
+# ============================================================
+# - Defaults NEW users to light (only if they have no stored preference)
+# - Ensures our surfaces follow Streamlit theme vars with safe fallbacks
+THEME_PATCH_CSS = ""
+# ============================================================
+# Improved flexible JSON parsing (more forgiving for copy/paste)
+# ============================================================
+def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
+    """
+    Parses:
+    - Normal JSON object/array
+    - JSON Lines (one object per line)
+    - Common copy/paste variants: code fences, BOM, smart quotes, trailing commas
+    - Python-literal dict/list (best-effort via ast.literal_eval)
+    """
+    warnings: List[str] = []
+
+    if text_in is None:
+        raise ValueError("No JSON provided.")
+
+    s = str(text_in)
+
+    # Remove BOM / zero-width / non-breaking spaces
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+    s = _strip_code_fences(s)
+    s = _extract_json_substring(s).strip()
+
+    # Remove ASCII control characters that sometimes sneak into copy/paste and break json.loads.
+    # (JSON strings cannot contain raw control characters.)
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+
+    # Normalize smart quotes
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+
+    # Fast path: standard JSON
+    try:
+        return json.loads(s), warnings
+    except Exception as e1:
+        last_err = e1
+
+    # Attempt: remove trailing commas
+    s2 = re.sub(r",\s*([}\]])", r"\1", s)
+    if s2 != s:
+        try:
+            warnings.append("Removed trailing commas to make JSON valid.")
+            return json.loads(s2), warnings
+        except Exception as e2:
+            last_err = e2
+            warnings = [w for w in warnings if "trailing commas" not in w.lower()]
+
+    # Attempt: JSON Lines
+    jl = _try_parse_json_lines(s)
+    if jl is not None:
+        warnings.append("Detected JSON Lines and parsed each line as a record.")
+        return jl, warnings
+
+    # Attempt: common copy/paste fragment — multiple JSON objects separated by commas
+    # (e.g., "{...},\n{...},\n{...}" without the surrounding "[ ... ]").
+    # Heuristic: if we see the pattern "}{" with a comma in between at the top level,
+    # try wrapping the whole thing as a JSON array.
+    s_strip2 = s.strip()
+    if s_strip2.startswith("{") and ("\n{" in s_strip2 or re.search(r"\}\s*,\s*\{", s_strip2)):
+        candidate = s_strip2
+        # Remove a trailing comma (if present)
+        candidate = re.sub(r",\s*$", "", candidate)
+        try:
+            arr = json.loads("[" + candidate + "]")
+            if isinstance(arr, list):
+                warnings.append("Wrapped comma-separated JSON objects into a JSON array (best-effort).")
+                return arr, warnings
+        except Exception as e_wrap:
+            last_err = e_wrap
+
+    # Attempt: Python-literal (dict/list with single quotes, None/True/False)
+    try:
+        obj = ast.literal_eval(s)
+        if isinstance(obj, (dict, list)):
+            warnings.append("Parsed as a Python literal (best-effort). Consider exporting valid JSON for reliability.")
+            return obj, warnings
+    except Exception as e3:
+        last_err = e3
+
+    # Attempt: if content is wrapped in quotes (rare copy/paste)
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        try:
+            inner = s[1:-1]
+            return json.loads(inner), warnings + ["Removed outer quotes around pasted JSON text."]
+        except Exception as e4:
+            last_err = e4
+
+    s_strip = s.strip()
+    hint = ""
+    if s_strip.startswith("{") and not s_strip.endswith("}"):
+        hint = "\nHint: your paste starts with '{' but does not end with '}'. It may be truncated. Try uploading the full .json file instead of pasting."
+    elif s_strip.startswith("[") and not s_strip.endswith("]"):
+        hint = "\nHint: your paste starts with '[' but does not end with ']'. It may be truncated. Try uploading the full .json file instead of pasting."
+
+    raise ValueError(
+        "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines.\n"
+        "Tips: remove any leading/trailing commentary, ensure quotes are standard \" characters, and avoid trailing commas."
+        + hint
+    ) from last_err
+
+
 # ============================================================
 # Main UI
 # ============================================================
-st.title("Star Walk — Master Dashboard")
+st.title("Star Walk — Consumer Insights Dashboard")
 st.caption(f"Version: {APP_VERSION}")
 
 # ----------------------------
@@ -2154,13 +2152,13 @@ else:
     with left:
         json_file = st.file_uploader("Upload JSON export", type=["json"], key="upl_json")
     with right:
-        pasted = st.text_area("…or paste JSON text", height=180, key="json_paste", placeholder="Paste JSON or JSON Lines here.")
+        pasted = st.text_area("…or paste JSON / JSON Lines", height=200, key="json_paste", placeholder="Paste JSON or JSON Lines here.")
 
     raw_text: Optional[str] = None
     source_label = "pasted_json"
     if json_file is not None and getattr(json_file, "size", 0) > 0:
         source_label = json_file.name
-        raw_text = _decode_bytes_to_text(json_file.getvalue())
+        raw_text = json_file.getvalue().decode("utf-8-sig", errors="replace")
     elif pasted and pasted.strip():
         raw_text = pasted.strip()
 
@@ -2172,10 +2170,13 @@ else:
 
     with st.spinner("Parsing JSON and converting to Star Walk format…"):
         t0 = time.perf_counter()
-        df_base, meta_info = _json_text_to_starwalk(raw_text, source_label, include_extra_cols=include_extra_cols)
-        meta_info["convert_s"] = round(time.perf_counter() - t0, 3)
+        try:
+            df_base, meta_info = _json_text_to_starwalk(raw_text, source_label, include_extra_cols=include_extra_cols)
+            meta_info["convert_s"] = round(time.perf_counter() - t0, 3)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
 
-    # Conversion diagnostics
     with st.expander("✅ JSON conversion details", expanded=False):
         for w in meta_info.get("warnings", []):
             st.info(w)
@@ -2183,7 +2184,12 @@ else:
         st.write("Truncation stats:", meta_info.get("stats"))
         st.caption("You can download the converted Star Walk file below if you want.")
         out_bytes = df_base.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Download converted Star Walk CSV", out_bytes, file_name=f"{Path(source_label).stem}_starwalk.csv", mime="text/csv")
+        st.download_button(
+            "Download converted Star Walk CSV",
+            out_bytes,
+            file_name=f"{Path(source_label).stem}_starwalk.csv",
+            mime="text/csv",
+        )
 
 # ----------------------------
 # Dataset basics
@@ -2194,17 +2200,24 @@ product_label = _infer_product_label(df_base, source_label)
 # Reset heavyweight caches when a new dataset is loaded (prevents stale AI insights across uploads)
 try:
     _dataset_sig = hashlib.sha1(
-        (str(source_label) + "|" + str(df_base.shape) + "|" + "|".join([str(c) for c in df_base.columns.tolist()[:40]])).encode("utf-8")
+        (str(source_label) + "|" + str(df_base.shape) + "|" + "|".join([str(c) for c in df_base.columns.tolist()[:60]])).encode("utf-8")
     ).hexdigest()
 except Exception:
     _dataset_sig = str(getattr(df_base, "shape", ""))
 
 if st.session_state.get("_dataset_sig") != _dataset_sig:
-    for _k in ["_ai_csat_cache", "_ai_enriched_texts", "_ai_last_search_results", "_vec_idx", "_local_text_idx", "_review_sort_cache", "ai_chat_messages"]:
+    for _k in [
+        "_review_sort_cache",
+        "_col_opts_cache",
+        "_ai_local_index",
+        "_ai_last_answer",
+        "_ai_last_q",
+        "saved_views",
+        "_sv_loaded_once",
+        "_pending_preset_from_url",
+    ]:
         st.session_state.pop(_k, None)
     st.session_state["_dataset_sig"] = _dataset_sig
-    # Also clear last error so users don't see stale failures
-    st.session_state.pop("ai_last_error", None)
 
 st.markdown(
     f"""
@@ -2220,10 +2233,10 @@ st.markdown(
 )
 
 # ============================================================
-# Sidebar: Saved Views + Filters
+# Sidebar: Filters + Saved Views
 # ============================================================
 
-# ---- Load preset from URL param once (no UI; applies before widgets render) ----
+# ---- Load preset from URL param once ----
 qp = _get_query_params()
 if (not st.session_state.get("_sv_loaded_once")) and qp.get("sv"):
     try:
@@ -2231,381 +2244,358 @@ if (not st.session_state.get("_sv_loaded_once")) and qp.get("sv"):
         if isinstance(sv, list):
             sv = sv[0] if sv else ""
         preset_obj = decode_preset_from_url_param(str(sv))
-        # only apply if it looks like our schema
         if isinstance(preset_obj, dict) and preset_obj.get("schema_version") == PRESET_SCHEMA_VERSION:
             st.session_state["_sv_loaded_once"] = True
-            st.session_state["_last_loaded_preset_name"] = preset_obj.get("name") or "Shared View"
-            # We'll apply after we know additional columns
             st.session_state["_pending_preset_from_url"] = preset_obj
     except Exception:
         st.session_state["_sv_loaded_once"] = True
         st.sidebar.warning("Could not load Saved View from URL (invalid or truncated).")
 
-# Determine columns for dynamic filters
 core_cols = {"Country", "Source", "Model (SKU)", "Seeded", "New Review", "Star Rating", "Review Date", "Verbatim"}
 symptom_cols = {f"Symptom {i}" for i in range(1, 21)}
-additional_columns = [c for c in df_base.columns if c not in (core_cols | symptom_cols)]
+
+extra_filter_candidates = [c for c in df_base.columns if c not in (core_cols | symptom_cols)]
+extra_filter_candidates = [c for c in extra_filter_candidates if str(c).strip() and str(c).strip().lower() not in {"unnamed: 0"}]
+
+st.session_state.setdefault("extra_filter_cols", [])  # user-selected extra filters to show
+st.session_state.setdefault("saved_views", {})        # name -> preset object
 
 # Apply pending URL preset now that we know columns
 pending = st.session_state.pop("_pending_preset_from_url", None)
 if pending:
-    _apply_filter_state_to_session(pending, available_columns=list(df_base.columns), additional_columns=additional_columns)
+    # Apply will also populate f_{col} keys; we then set extra_filter_cols from the preset keys
+    _apply_filter_state_to_session(pending, available_columns=list(df_base.columns), additional_columns=extra_filter_candidates)
+    # infer which extra filters were used
+    used = []
+    for k in (pending.get("filters") or {}).keys():
+        if k.startswith("f_"):
+            col = k[2:]
+            if col in extra_filter_candidates:
+                used.append(col)
+    st.session_state["extra_filter_cols"] = sorted(list(set(used)))
 
-# Ensure containers + defaults
-st.session_state.setdefault("saved_views", {})  # name -> preset object
-st.session_state.setdefault("live_filters", False)
-st.session_state.setdefault("show_perf", False)
-
-live_update_setting = bool(st.session_state.get("live_filters", False))
-# Force live filters in non-dashboard views so review lists + AI stay in sync
-_current_view = str(st.session_state.get("main_view", "📊 Dashboard"))
-force_live_for_view = not _current_view.startswith("📊")
-live_update = live_update_setting or force_live_for_view
-show_perf = bool(st.session_state.get("show_perf", False))
-
-# ----------------------------
-# Sidebar filters (Apply mode)
-# ----------------------------
-st.sidebar.header("🔍 Filters")
-
-# Create stable default values
+# defaults
 tz_today = datetime.now(_NY_TZ).date() if _NY_TZ else datetime.today().date()
 today = tz_today
-
-# Ensure default keys
 st.session_state.setdefault("tf", "All Time")
+st.session_state.setdefault("tf_range", (today - timedelta(days=30), today))
 st.session_state.setdefault("sr", ["All"])
 st.session_state.setdefault("kw", "")
 st.session_state.setdefault("delight", ["All"])
 st.session_state.setdefault("detract", ["All"])
 st.session_state.setdefault("rpp", 10)
-st.session_state.setdefault("tf_range", (today - timedelta(days=30), today))
 
-# Utility to build options
-def _col_options(df_in: pd.DataFrame, col: str) -> list:
-    if col not in df_in.columns:
-        return ["ALL"]
-    s = df_in[col].astype("string").replace({"": pd.NA}).dropna()
-    vals = sorted(pd.unique(s.to_numpy()).tolist())
-    return ["ALL"] + [v for v in vals if str(v).strip() != ""]
-
-
-# Precompute symptom columns lists from base dataset
+# Precompute symptom columns lists
 detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
 delighter_columns = [f"Symptom {i}" for i in range(11, 21)]
 existing_detractor_columns = [c for c in detractor_columns if c in df_base.columns]
 existing_delighter_columns = [c for c in delighter_columns if c in df_base.columns]
-all_sym_cols_present = [c for c in [f"Symptom {i}" for i in range(1, 21)] if c in df_base.columns]
 
-# Build symptom options once per dataset (store in session_state to avoid expensive DataFrame hashing)
-_sym_key = (
-    f"{source_label}|{len(df_base)}|" + hashlib.md5("|".join(df_base.columns).encode("utf-8")).hexdigest()
-)
+# Build symptom options once per dataset
+_sym_key = f"{source_label}|{len(df_base)}|" + hashlib.md5("|".join(df_base.columns).encode("utf-8")).hexdigest()
 if st.session_state.get("_symptom_opts_key") != _sym_key:
     st.session_state["_symptom_opts_key"] = _sym_key
     st.session_state["_symptom_opts_det"] = collect_unique_symptoms(df_base, existing_detractor_columns)
     st.session_state["_symptom_opts_del"] = collect_unique_symptoms(df_base, existing_delighter_columns)
-
 detractor_symptoms_all = st.session_state.get("_symptom_opts_det", []) or []
 delighter_symptoms_all = st.session_state.get("_symptom_opts_del", []) or []
 
-# Apply-form
-def _render_filter_widgets():
-    """Render sidebar filter widgets and sanitize any preset-loaded values."""
-    def _as_list(v):
-        if v is None:
-            return []
-        if isinstance(v, list):
-            return v
-        if isinstance(v, tuple):
-            return list(v)
-        return [v]
+def _col_options(df_in: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -> list:
+    """Return filter options for a column.
 
-    def _ensure_multiselect(key: str, options: list, fallback: list):
-        cur = _as_list(st.session_state.get(key, fallback))
-        cur = [v for v in cur if v in options]
-        if not cur:
-            cur = list(fallback)
-        st.session_state[key] = cur
-        return cur
+    - Uses frequency order (e-commerce style: most common values first).
+    - If max_vals is None, returns **all** values found.
+    - Cached per dataset+column so it stays fast even with many reruns.
+    """
+    if col not in df_in.columns:
+        return ["ALL"]
 
-    # timeframe
+    cache = st.session_state.setdefault("_col_opts_cache", {})
+
+    s0 = df_in[col].astype("string").replace({"": pd.NA}).dropna()
+    # Detect multi-valued fields we created from lists (we join lists with " | ").
+    # When detected, we explode tokens so the filter shows *actual* values
+    # (e.g., "Factory Name" -> "YDC CN") instead of combo strings.
+    sample = s0.head(300)
+    tokenize_multi = bool(sample.astype(str).str.contains(r"\s\|\s", regex=True).any())
+
+    cache_key = (
+        st.session_state.get("_dataset_sig"),
+        str(col),
+        int(max_vals) if isinstance(max_vals, int) else None,
+        bool(tokenize_multi),
+    )
+    if cache_key in cache:
+        return cache[cache_key]
+
+    if s0.empty:
+        cache[cache_key] = ["ALL"]
+        return ["ALL"]
+
+    if tokenize_multi:
+        tok = (
+            s0.astype(str)
+            .str.split(r"\s*\|\s*", regex=True)
+            .explode()
+            .astype("string")
+            .str.strip()
+            .replace({"": pd.NA})
+            .dropna()
+        )
+        vc = tok.value_counts()
+    else:
+        vc = s0.value_counts()
+    if isinstance(max_vals, int) and max_vals > 0:
+        vc = vc.head(max_vals)
+
+    vals = vc.index.astype(str).tolist()
+    out = ["ALL"] + vals
+    cache[cache_key] = out
+    return out
+
+def _sanitize_multiselect(key: str, options: list, default: list):
+    cur = st.session_state.get(key, default)
+    if cur is None:
+        cur = list(default)
+    if not isinstance(cur, list):
+        cur = [cur]
+    cur = [v for v in cur if v in options]
+    if not cur:
+        cur = list(default)
+    # If user selected values besides ALL, drop ALL
+    if "ALL" in cur and len(cur) > 1:
+        cur = [v for v in cur if v != "ALL"]
+    st.session_state[key] = cur
+    return cur
+
+def _sanitize_multiselect_sym(key: str, options: list, default: list):
+    cur = st.session_state.get(key, default)
+    if cur is None:
+        cur = list(default)
+    if not isinstance(cur, list):
+        cur = [cur]
+    cur = [v for v in cur if v in options]
+    if not cur:
+        cur = list(default)
+    if "All" in cur and len(cur) > 1:
+        cur = [v for v in cur if v != "All"]
+    st.session_state[key] = cur
+    return cur
+
+def _reset_all_filters():
+    # Core
+    st.session_state["tf"] = "All Time"
+    st.session_state["tf_range"] = (today - timedelta(days=30), today)
+    st.session_state["sr"] = ["All"]
+    st.session_state["kw"] = ""
+    st.session_state["delight"] = ["All"]
+    st.session_state["detract"] = ["All"]
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+        st.session_state[f"f_{col}"] = ["ALL"]
+    # Extra
+    for col in st.session_state.get("extra_filter_cols", []):
+        st.session_state.pop(f"f_{col}", None)
+        st.session_state.pop(f"f_{col}_range", None)
+        st.session_state.pop(f"f_{col}_contains", None)
+    st.session_state["extra_filter_cols"] = []
+    # Paging
+    st.session_state["review_page"] = 0
+
+
+# Home (requested): quick way back to main dashboard from anywhere
+if st.sidebar.button("🏠 Home", use_container_width=True):
+    st.session_state["main_view"] = "📊 Dashboard"
+    st.rerun()
+
+st.sidebar.header("🔍 Filters")
+
+# Clear button FIRST (requested)
+if st.sidebar.button("🧹 Clear all filters", use_container_width=True):
+    _reset_all_filters()
+    st.rerun()
+
+# --- Timeframe ---
+with st.sidebar.expander("🗓️ Timeframe", expanded=False):
     tf_opts = ["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"]
     if st.session_state.get("tf") not in tf_opts:
         st.session_state["tf"] = "All Time"
+    st.selectbox("Select timeframe", options=tf_opts, key="tf")
+    if st.session_state["tf"] == "Custom Range":
+        rng = st.session_state.get("tf_range", (today - timedelta(days=30), today))
+        if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+            rng = (today - timedelta(days=30), today)
+        st.session_state["tf_range"] = tuple(rng)
+        st.date_input("Start / end", value=st.session_state["tf_range"], key="tf_range")
 
-    with st.sidebar.expander("🗓️ Timeframe", expanded=False):
-        st.selectbox("Select Timeframe", options=tf_opts, key="tf")
-        if st.session_state["tf"] == "Custom Range":
-            rng = st.session_state.get("tf_range", (today - timedelta(days=30), today))
-            if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
-                rng = (today - timedelta(days=30), today)
-            st.session_state["tf_range"] = tuple(rng)
-            st.date_input(
-                "Date Range",
-                value=st.session_state["tf_range"],
-                min_value=date(2000, 1, 1),
-                max_value=today,
-                key="tf_range",
-            )
+# --- Star rating ---
+with st.sidebar.expander("⭐ Star rating", expanded=False):
+    sr_opts = ["All", 5, 4, 3, 2, 1]
+    cur = st.session_state.get("sr", ["All"])
+    if not isinstance(cur, list):
+        cur = [cur]
+    # sanitize
+    cur = [v for v in cur if v in sr_opts]
+    if not cur:
+        cur = ["All"]
+    if "All" in cur and len(cur) > 1:
+        cur = [v for v in cur if v != "All"]
+    st.session_state["sr"] = cur
+    st.multiselect("Select stars", options=sr_opts, default=st.session_state["sr"], key="sr")
 
-    # star ratings
-    with st.sidebar.expander("🌟 Star Rating", expanded=False):
-        sr_opts = ["All", 1, 2, 3, 4, 5]
-        _ensure_multiselect("sr", sr_opts, ["All"])
-        st.multiselect("Select Star Ratings", options=sr_opts, key="sr")
-
-    # standard filters
-    with st.sidebar.expander("🌍 Standard Filters", expanded=False):
-        for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-            opts = _col_options(df_base, col)
-            _ensure_multiselect(f"f_{col}", opts, ["ALL"])
-            st.multiselect(f"Select {col}", options=opts, key=f"f_{col}")
-
-    # symptoms
-    with st.sidebar.expander("🩺 Review Symptoms", expanded=False):
-        del_opts = ["All"] + sorted(delighter_symptoms_all)
-        det_opts = ["All"] + sorted(detractor_symptoms_all)
-        _ensure_multiselect("delight", del_opts, ["All"])
-        _ensure_multiselect("detract", det_opts, ["All"])
-
-        st.multiselect("Select Delighter Symptoms", options=del_opts, key="delight")
-        st.multiselect("Select Detractor Symptoms", options=det_opts, key="detract")
-
-    with st.sidebar.expander("🔎 Keyword", expanded=False):
-        st.text_input(
-            "Keyword to search (in review text)",
-            value=str(st.session_state.get("kw", "")),
-            key="kw",
-            help="Case-insensitive match in review text. Emails/phone numbers are masked in AI mode.",
-        )
-    with st.sidebar.expander("➕ Add Filters", expanded=False):
-        if additional_columns:
-            # By default there are *no* extra filters. Users can add the ones they want.
-            current_selected = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
-            current_selected = [c for c in current_selected if c in additional_columns]
-            st.session_state["extra_filter_cols_selected"] = current_selected
-
-            st.multiselect(
-                "Choose extra columns to filter by",
-                options=sorted(additional_columns),
-                default=current_selected,
-                key="extra_filter_cols_selected",
-                help="Pick any additional column (e.g., Base SKU, Brand, Product Name, Dominant Customer Journey Step, Review Sentiment, etc.) to add its filter.",
-            )
-
-            selected_cols = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
-            if selected_cols:
-                st.markdown("**Extra filter values**")
-                for column in selected_cols:
-                    opts, is_multi, note = _extra_filter_options(df_base, column)
-                    _ensure_multiselect(f"f_{column}", opts, ["ALL"])
-                    if note:
-                        st.caption(note)
-                    st.multiselect(f"Select {column}", options=opts, key=f"f_{column}")
-            else:
-                st.caption("No extra filters selected.")
-        else:
-            st.caption("No additional columns found beyond the core + symptoms.")
-
-    with st.sidebar.expander("📄 Review List", expanded=False):
-
-        rpp_opts = [10, 20, 50, 100]
-        if int(st.session_state.get("rpp", 10)) not in rpp_opts:
-            st.session_state["rpp"] = 10
-        st.selectbox("Reviews per page", options=rpp_opts, key="rpp")
-
-
-def _collect_current_filters_dict() -> dict:
-    f = {}
-    f["tf"] = st.session_state.get("tf", "All Time")
-    f["tf_range"] = st.session_state.get("tf_range", None)
-    f["sr"] = st.session_state.get("sr", ["All"])
-    f["kw"] = st.session_state.get("kw", "")
-    f["delight"] = st.session_state.get("delight", ["All"])
-    f["detract"] = st.session_state.get("detract", ["All"])
+# --- Standard categorical filters ---
+with st.sidebar.expander("🌍 Country / Source / Model / Seeded", expanded=True):
     for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-        f[f"f_{col}"] = _safe_list(st.session_state.get(f"f_{col}", ["ALL"]))
+        opts = _col_options(df_base, col, max_vals=250)
+        _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
+        st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
 
-    # Extra filters: user-selected columns only (default = none)
-    extra_cols = _safe_list(st.session_state.get("extra_filter_cols_selected", []))
-    extra_cols = [c for c in extra_cols if c in additional_columns]
-    f["extra_cols"] = extra_cols
-    for col in extra_cols:
-        f[f"f_{col}"] = _safe_list(st.session_state.get(f"f_{col}", ["ALL"]))
+# --- Symptom filters ---
+with st.sidebar.expander("🩺 Symptom filters", expanded=False):
+    det_opts = ["All"] + detractor_symptoms_all
+    del_opts = ["All"] + delighter_symptoms_all
+    _sanitize_multiselect_sym("detract", det_opts, ["All"])
+    _sanitize_multiselect_sym("delight", del_opts, ["All"])
+    st.multiselect("Detractors", options=det_opts, default=st.session_state["detract"], key="detract")
+    st.multiselect("Delighters", options=del_opts, default=st.session_state["delight"], key="delight")
 
-    return f
+# --- Keyword ---
+with st.sidebar.expander("🔎 Keyword", expanded=False):
+    st.text_input("Search in review text", value=st.session_state.get("kw", ""), key="kw")
 
+# --- Extra filters builder ---
+with st.sidebar.expander("➕ Add Filters (power user)", expanded=False):
+    st.caption("Choose additional columns to show as filters in the sidebar.")
+    # Use a multiselect so users can quickly add/remove extra filters
+    extra_cols = st.multiselect(
+        "Available columns",
+        options=extra_filter_candidates,
+        default=st.session_state.get("extra_filter_cols", []),
+        key="extra_filter_cols",
+    )
 
-if not live_update:
-    with st.sidebar.form("filters_form", clear_on_submit=False):
-        _render_filter_widgets()
-        apply_btn = st.form_submit_button("✅ Apply filters")
-    # Initialize active filters once, or update on apply
-    if ("_active_filters" not in st.session_state) or apply_btn:
-        st.session_state["_active_filters"] = _collect_current_filters_dict()
-        st.session_state["review_page"] = 0
-        if apply_btn:
-            st.rerun()
-    active_filters = st.session_state.get("_active_filters", {})
-else:
-    _render_filter_widgets()
-    active_filters = _collect_current_filters_dict()
-    st.session_state["_active_filters"] = active_filters
+# Render selected extra filter widgets
+extra_cols = st.session_state.get("extra_filter_cols", []) or []
+if extra_cols:
+    with st.sidebar.expander("🧩 Extra filters", expanded=True):
+        for col in extra_cols:
+            if col not in df_base.columns:
+                continue
+            s = df_base[col]
+            # Detect numeric/date vs categorical
+            kind = "categorical"
+            try:
+                if pd.api.types.is_datetime64_any_dtype(s):
+                    kind = "date"
+                else:
+                    num = pd.to_numeric(s, errors="coerce")
+                    if num.notna().mean() >= 0.9 and num.nunique(dropna=True) > 6:
+                        kind = "numeric"
+            except Exception:
+                kind = "categorical"
 
-# Clear filters button
-if st.sidebar.button("🧹 Clear all filters", use_container_width=True):
-    for k in [
-        "tf",
-        "tf_range",
-        "sr",
-        "kw",
-        "delight",
-        "detract",
-        "rpp",
-        "review_page",
-        "_active_filters",
-        "product_summary_text",
-        "ask_q",
-        "extra_filter_cols_selected",
-    ] + [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
-        if k in st.session_state:
-            del st.session_state[k]
-    st.rerun()
+            if kind == "numeric":
+                num = pd.to_numeric(s, errors="coerce").dropna()
+                if num.empty:
+                    continue
+                lo, hi = float(num.min()), float(num.max())
+                if lo == hi:
+                    st.caption(f"{col}: {lo:g} (constant)")
+                    continue
+                key = f"f_{col}_range"
+                default = st.session_state.get(key, (lo, hi))
+                if not (isinstance(default, (tuple, list)) and len(default) == 2):
+                    default = (lo, hi)
+                st.session_state[key] = (float(default[0]), float(default[1]))
+                st.slider(col, min_value=lo, max_value=hi, value=st.session_state[key], key=key)
+            else:
+                # Power-user extra filters:
+                # - If cardinality is reasonable, show a searchable multiselect with **all** values.
+                # - If cardinality is huge, show a fast "contains" search box instead.
+                try:
+                    nunique = int(s.astype("string").replace({"": pd.NA}).nunique(dropna=True))
+                except Exception:
+                    nunique = 0
 
-# ----------------------------
-# Controls (under Clear button)
-# ----------------------------
-st.sidebar.header("🧰 Controls")
+                if nunique > 600:
+                    st.text_input(
+                        f"{col} contains",
+                        value=str(st.session_state.get(f"f_{col}_contains") or ""),
+                        key=f"f_{col}_contains",
+                        help="High-cardinality column — using a contains filter for speed.",
+                    )
+                else:
+                    opts = _col_options(df_base, col, max_vals=None)
+                    _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
+                    st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
 
-# ---- Saved Views UI ----
+# --- Saved Views (still supported) ---
 with st.sidebar.expander("💾 Saved Views / Presets", expanded=False):
-    st.caption("Save your current *applied* filters, reload later, or share via URL.")
+    st.caption("Save your current filters and share them as a link.")
+    name = st.text_input("Preset name", value="", key="sv_name")
+    cA, cB = st.columns([1, 1])
+    with cA:
+        if st.button("💾 Save", use_container_width=True):
+            nm = (st.session_state.get("sv_name") or "").strip() or f"Preset {len(st.session_state['saved_views'])+1}"
+            state = _collect_filter_state(additional_columns=extra_cols)
+            state["name"] = nm
+            st.session_state["saved_views"][nm] = state
+            st.success(f"Saved: {nm}")
+    with cB:
+        if st.button("🗑️ Clear presets", use_container_width=True):
+            st.session_state["saved_views"] = {}
+            st.success("Cleared saved presets.")
 
-    if not live_update:
-        st.info("Tip: Live-update is OFF, so Saved Views capture the last **applied** filters (click ✅ Apply filters first).")
-
-    def _collect_applied_preset_state() -> dict:
-        state = {
-            "schema_version": PRESET_SCHEMA_VERSION,
-            "created_at": _now_iso(),
-            "filters": {},
-            "ui": {},
-        }
-        f = st.session_state.get("_active_filters") or _collect_current_filters_dict()
-        if isinstance(f, dict):
-            state["filters"] = dict(f)
-        state["ui"]["rpp"] = st.session_state.get("rpp", 10)
-        return state
-
-    # Save current
-    name = st.text_input("Preset name", value="", placeholder="e.g., US • Amazon • Last Month", key="sv_name")
-    c1, c2 = st.columns([1, 1])
-    if c1.button("Save current", use_container_width=True):
-        if not name.strip():
-            st.warning("Please enter a preset name.")
-        else:
-            preset = _collect_applied_preset_state()
-            preset["name"] = name.strip()
-            st.session_state["saved_views"][name.strip()] = preset
-            st.success(f"Saved: {name.strip()}")
-
-    # Load preset
-    preset_names = sorted(st.session_state["saved_views"].keys())
-    chosen = st.selectbox("Load preset", options=["(none)"] + preset_names, index=0, key="sv_load_select")
-    if c2.button("Load selected", use_container_width=True):
-        if chosen and chosen != "(none)":
-            preset = st.session_state["saved_views"].get(chosen)
+    names = sorted(st.session_state.get("saved_views", {}).keys())
+    if names:
+        sel = st.selectbox("Load preset", options=["—"] + names, index=0, key="sv_load_sel")
+        if sel != "—" and st.button("Load selected preset", use_container_width=True):
+            preset = st.session_state["saved_views"].get(sel)
             if preset:
-                _apply_filter_state_to_session(preset, available_columns=list(df_base.columns), additional_columns=additional_columns)
+                _apply_filter_state_to_session(preset, available_columns=list(df_base.columns), additional_columns=extra_filter_candidates)
+                # restore extra cols used
+                used = []
+                for k in (preset.get("filters") or {}).keys():
+                    if k.startswith("f_"):
+                        col = k[2:]
+                        # Strip suffixes used by range/contains filters
+                        for suf in ("_range", "_contains"):
+                            if col.endswith(suf):
+                                col = col[: -len(suf)]
+                        if col in extra_filter_candidates:
+                            used.append(col)
+                st.session_state["extra_filter_cols"] = sorted(list(set(used)))
                 st.rerun()
 
-    # Export / Import
-    if preset_names:
-        export_choice = st.selectbox("Export preset", options=preset_names, key="sv_export_select")
-        export_obj = st.session_state["saved_views"].get(export_choice)
-        if export_obj:
-            export_bytes = json.dumps(export_obj, ensure_ascii=False, indent=2).encode("utf-8")
-            st.download_button(
-                "Download preset JSON",
-                data=export_bytes,
-                file_name=f"saved_view_{_norm(export_choice) or 'preset'}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-            # Share link
-            share_obj = dict(export_obj)
-            share_obj["name"] = export_choice
-            sv_param = encode_preset_to_url_param(share_obj)
-            if st.button("Create shareable URL param", use_container_width=True):
+        # Share link
+        if sel != "—" and sel in st.session_state["saved_views"]:
+            preset = st.session_state["saved_views"][sel]
+            sv_param = encode_preset_to_url_param(preset)
+            # Keep existing params but set sv
+            try:
+                base = st.get_option("server.baseUrlPath")  # may be ""
+            except Exception:
+                base = ""
+            # Use query param (Streamlit will show it in browser)
+            if st.button("🔗 Make this preset shareable (URL)", use_container_width=True):
                 _set_query_params(sv=sv_param)
-                st.success("URL param set. Copy the query string below.")
-            st.code(f"?sv={sv_param}", language="text")
-            st.caption("Append this to your app URL, or click 'Create shareable URL param' to set it in the browser.")
-
-    import_file = st.file_uploader("Import preset JSON", type=["json"], key="sv_import_upl")
-    if import_file is not None:
-        try:
-            obj = json.loads(import_file.getvalue().decode("utf-8", errors="replace"))
-            if isinstance(obj, dict) and obj.get("schema_version") == PRESET_SCHEMA_VERSION:
-                pname = obj.get("name") or f"Imported {len(st.session_state['saved_views'])+1}"
-                st.session_state["saved_views"][pname] = obj
-                st.success(f"Imported preset: {pname}")
-            else:
-                st.error("That JSON doesn't look like a Star Walk Saved View preset.")
-        except Exception as e:
-            st.error(f"Could not import preset: {e}")
-
-
-    if st.button("Reset filters to default", type="secondary", use_container_width=True):
-        # Clear known keys
-        for k in [
-            "tf",
-            "tf_range",
-            "sr",
-            "kw",
-            "delight",
-            "detract",
-            "review_page",
-            "_active_filters",
-            "extra_filter_cols_selected",
-        ]:
-            if k in st.session_state:
-                del st.session_state[k]
-
-        # Clear all filter multi-select keys (core + extras)
-        for k in [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
-            del st.session_state[k]
-
-        st.rerun()
-
-# ---- Filter UX mode ----
-with st.sidebar.expander("⚡ Performance", expanded=False):
-    st.toggle(
-        "Live-update filters (slower on big files)",
-        value=bool(st.session_state.get("live_filters", False)),
-        key="live_filters",
-        help="Off = change multiple filters, then click Apply once (recommended for speed). Note: 📝 All Reviews and 🤖 AI always apply filters live so the review list/csat copilot stays in sync.",
-    )
-    st.toggle("Show perf timings (debug)", value=bool(st.session_state.get("show_perf", False)), key="show_perf")
+                st.success("URL updated with ?sv=... (copy from browser address bar)")
 
 # ============================================================
-# Apply filters to dataset
+# Apply filters (LIVE — no Apply button)
 # ============================================================
 t_filter0 = time.perf_counter()
+d0 = df_base
 
-filtered = df_base
+# Start with mask = all True
+mask = pd.Series(True, index=d0.index)
 
 # timeframe
+tf = st.session_state.get("tf", "All Time")
 start_date = end_date = None
-tf = active_filters.get("tf", "All Time")
 if tf == "Custom Range":
-    rng = active_filters.get("tf_range")
-    if isinstance(rng, tuple) and len(rng) == 2:
+    rng = st.session_state.get("tf_range", (today - timedelta(days=30), today))
+    if isinstance(rng, (tuple, list)) and len(rng) == 2:
         start_date, end_date = rng
-    else:
-        start_date = end_date = rng
 elif tf == "Last Week":
     start_date, end_date = today - timedelta(days=7), today
 elif tf == "Last Month":
@@ -2613,78 +2603,121 @@ elif tf == "Last Month":
 elif tf == "Last Year":
     start_date, end_date = today - timedelta(days=365), today
 
-if start_date and end_date and "Review Date" in filtered.columns:
-    dt = pd.to_datetime(filtered["Review Date"], errors="coerce")
+if start_date and end_date and "Review Date" in d0.columns:
+    dt = pd.to_datetime(d0["Review Date"], errors="coerce")
     end_inclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-    filtered = filtered[(dt >= pd.Timestamp(start_date)) & (dt <= end_inclusive)]
+    mask &= (dt >= pd.Timestamp(start_date)) & (dt <= end_inclusive)
 
 # star rating
-selected_ratings = active_filters.get("sr", ["All"])
-if "All" not in selected_ratings and "Star Rating" in filtered.columns:
-    filtered = filtered[filtered["Star Rating"].isin(selected_ratings)]
+sr_sel_raw = st.session_state.get("sr", ["All"])
+sr_sel = [x for x in (sr_sel_raw if isinstance(sr_sel_raw, list) else [sr_sel_raw]) if str(x).strip() and str(x).lower() != "all"]
+if sr_sel and "Star Rating" in d0.columns:
+    sr_nums = [int(x) for x in sr_sel if str(x).isdigit()]
+    if sr_nums:
+        mask &= pd.to_numeric(d0["Star Rating"], errors="coerce").isin(sr_nums)
 
-# standard column filters
+# standard categorical
 for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
-    sel = active_filters.get(f"f_{col}", ["ALL"])
-    if col in filtered.columns and sel and "ALL" not in sel:
-        filtered = filtered[filtered[col].astype("string").isin(sel)]
+    sel_raw = st.session_state.get(f"f_{col}", ["ALL"])
+    sel_list = sel_raw if isinstance(sel_raw, list) else [sel_raw]
+    sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
+    if col in d0.columns and sel_clean:
+        mask &= d0[col].astype("string").isin([str(x) for x in sel_clean])
 
-# extra (user-added) filters
-extra_cols_active = _safe_list(active_filters.get("extra_cols", []))
-extra_cols_active = [c for c in extra_cols_active if c in additional_columns]
+# extra filters
+for col in extra_cols:
+    if col not in d0.columns:
+        continue
+    # numeric range?
+    range_key = f"f_{col}_range"
+    if range_key in st.session_state and isinstance(st.session_state.get(range_key), (tuple, list)):
+        lo, hi = st.session_state.get(range_key)
+        num = pd.to_numeric(d0[col], errors="coerce")
+        mask &= num.between(float(lo), float(hi))
+    else:
+        # high-cardinality text search?
+        contains_key = f"f_{col}_contains"
+        contains_val = (st.session_state.get(contains_key) or "").strip()
+        if contains_val:
+            mask &= d0[col].astype("string").fillna("").str.contains(contains_val, case=False, na=False)
+        else:
+            sel_raw = st.session_state.get(f"f_{col}", ["ALL"])
+            sel_list = sel_raw if isinstance(sel_raw, list) else [sel_raw]
+            sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
+            if sel_clean:
+                s = d0[col].astype("string").fillna("")
+                # If the field contains multi-values joined by " | ", treat selections as tokens.
+                sample = s.dropna().head(200).astype(str)
+                if bool(sample.str.contains(r"\s\|\s", regex=True).any()):
+                    # Match whole tokens delimited by pipes (case-insensitive)
+                    toks = [str(x).strip() for x in sel_clean if str(x).strip()]
+                    if toks:
+                        pattern = r"(^|\s*\|\s*)(" + "|".join([re.escape(t) for t in toks]) + r")(\s*\|\s*|$)"
+                        mask &= s.str.contains(pattern, case=False, regex=True, na=False)
+                else:
+                    mask &= s.isin([str(x) for x in sel_clean])
 
-for col in extra_cols_active:
-    sel = _safe_list(active_filters.get(f"f_{col}", ["ALL"]))
-    if col in filtered.columns and sel and "ALL" not in sel:
-        is_multi = _is_multi_valued_series(filtered[col])
-        mask = _apply_extra_filter_mask(filtered[col], [str(v) for v in sel], is_multi=is_multi)
-        filtered = filtered[mask]
 
 # symptom filters
-selected_delighter = active_filters.get("delight", ["All"])
-selected_detractor = active_filters.get("detract", ["All"])
-if "All" not in selected_delighter and existing_delighter_columns:
-    filtered = filtered[filtered[existing_delighter_columns].isin(selected_delighter).any(axis=1)]
-if "All" not in selected_detractor and existing_detractor_columns:
-    filtered = filtered[filtered[existing_detractor_columns].isin(selected_detractor).any(axis=1)]
+sel_del_raw = st.session_state.get("delight", ["All"])
+sel_del_list = sel_del_raw if isinstance(sel_del_raw, list) else [sel_del_raw]
+sel_del = [x for x in sel_del_list if str(x).strip() and str(x).lower() != "all"]
+sel_det_raw = st.session_state.get("detract", ["All"])
+sel_det_list = sel_det_raw if isinstance(sel_det_raw, list) else [sel_det_raw]
+sel_det = [x for x in sel_det_list if str(x).strip() and str(x).lower() != "all"]
+if sel_del and existing_delighter_columns:
+    mask &= d0[existing_delighter_columns].isin(sel_del).any(axis=1)
+if sel_det and existing_detractor_columns:
+    mask &= d0[existing_detractor_columns].isin(sel_det).any(axis=1)
 
 # keyword
-keyword = (active_filters.get("kw") or "").strip()
-if keyword and "Verbatim" in filtered.columns:
-    mask_kw = filtered["Verbatim"].astype("string").fillna("").str.contains(keyword, case=False, na=False)
-    filtered = filtered[mask_kw]
+keyword = (st.session_state.get("kw") or "").strip()
+if keyword and "Verbatim" in d0.columns:
+    mask &= d0["Verbatim"].astype("string").fillna("").str.contains(keyword, case=False, na=False)
 
+filtered = d0[mask].copy()
 filter_s = time.perf_counter() - t_filter0
 
 # ============================================================
-# Active filter summary panel (high-impact UI)
+# Active filter summary panel
 # ============================================================
-def _summarize_active_filters(df_in: pd.DataFrame) -> list[tuple[str, str]]:
+def _summarize_active_filters() -> list[tuple[str, str]]:
     items = []
     if tf != "All Time":
         if tf == "Custom Range" and start_date and end_date:
             items.append(("Timeframe", f"{start_date} → {end_date}"))
         else:
             items.append(("Timeframe", tf))
-    if "All" not in selected_ratings:
-        items.append(("Stars", ", ".join([str(x) for x in selected_ratings])))
-    extra_cols_active = _safe_list(active_filters.get("extra_cols", []))
-    extra_cols_active = [c for c in extra_cols_active if c in additional_columns]
+    if isinstance(sr_sel, list) and "All" not in sr_sel:
+        items.append(("Stars", ", ".join([str(x) for x in sr_sel])))
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + extra_cols:
+        # range filters
+        rk = f"f_{col}_range"
+        if rk in st.session_state and isinstance(st.session_state.get(rk), (tuple, list)) and len(st.session_state.get(rk)) == 2:
+            lo, hi = st.session_state.get(rk)
+            items.append((col, f"{float(lo):g} → {float(hi):g}"))
+            continue
 
-    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + extra_cols_active:
-        sel = active_filters.get(f"f_{col}", ["ALL"])
-        if sel and "ALL" not in sel:
+        # contains filters
+        ck = f"f_{col}_contains"
+        cv = (st.session_state.get(ck) or "").strip()
+        if cv:
+            items.append((col, f"contains: {cv}"))
+            continue
+
+        # multiselect filters
+        sel = st.session_state.get(f"f_{col}", ["ALL"])
+        if isinstance(sel, list) and sel and "ALL" not in sel:
             items.append((col, ", ".join([str(x) for x in sel[:4]]) + ("" if len(sel) <= 4 else f" +{len(sel)-4}")))
-    if "All" not in selected_delighter:
-        items.append(("Delighters", ", ".join([str(x) for x in selected_delighter[:3]]) + ("" if len(selected_delighter) <= 3 else f" +{len(selected_delighter)-3}")))
-    if "All" not in selected_detractor:
-        items.append(("Detractors", ", ".join([str(x) for x in selected_detractor[:3]]) + ("" if len(selected_detractor) <= 3 else f" +{len(selected_detractor)-3}")))
+    if isinstance(sel_del, list) and "All" not in sel_del:
+        items.append(("Delighters", ", ".join([str(x) for x in sel_del[:3]]) + ("" if len(sel_del) <= 3 else f" +{len(sel_del)-3}")))
+    if isinstance(sel_det, list) and "All" not in sel_det:
+        items.append(("Detractors", ", ".join([str(x) for x in sel_det[:3]]) + ("" if len(sel_det) <= 3 else f" +{len(sel_det)-3}")))
     if keyword:
         items.append(("Keyword", keyword))
     return items
 
-
-active_items = _summarize_active_filters(filtered)
+active_items = _summarize_active_filters()
 pills = []
 for k, v in active_items[:12]:
     pills.append(f"<div class='pill'><span class='muted'>{esc(k)}:</span> {esc(v)}</div>")
@@ -2701,24 +2734,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # ============================================================
-# Navigation / Views (sticky top bar, NO page refresh)
+# Navigation / Views (sticky top bar)
 # ============================================================
-
-# Marker lets us find-and-sticky this exact widget via a tiny DOM hook (no session reset).
 st.markdown("<div id='view-nav-marker'></div>", unsafe_allow_html=True)
 
 view = st.radio(
     "View",
     options=["📊 Dashboard", "📝 All Reviews", "🤖 AI"],
     horizontal=True,
-    index=0,
+    index=["📊 Dashboard", "📝 All Reviews", "🤖 AI"].index(st.session_state.get("main_view", "📊 Dashboard")) if st.session_state.get("main_view") else 0,
     key="main_view",
     label_visibility="collapsed",
 )
 
-# Make ONLY the view switcher sticky + centered after the file loads
+# Sticky: reapply after reruns so it never disappears
 st_html(
     """
 <script>
@@ -2727,47 +2757,53 @@ st_html(
     const W = window.parent;
     const doc = W.document;
 
+    function setHeaderH(){
+      const header = doc.querySelector('header[data-testid="stHeader"]');
+      const h = header ? header.getBoundingClientRect().height : 0;
+      doc.documentElement.style.setProperty('--stHeaderH', (h || 0) + 'px');
+    }
+
     function applySticky(){
       const marker = doc.getElementById('view-nav-marker');
       if (!marker) return false;
 
-      // Find the *first* stRadio widget after the marker in DOM order.
       const radios = Array.from(doc.querySelectorAll('[data-testid="stRadio"]'));
-      let host = null;
-
+      let target = null;
       for (const r of radios){
         const rel = marker.compareDocumentPosition(r);
         if (rel & Node.DOCUMENT_POSITION_FOLLOWING){
-          host = (r.closest('div.element-container') || r.parentElement || r);
+          target = r;
           break;
         }
       }
-      if (!host) return false;
+      if (!target) return false;
 
-      host.classList.add('sticky-topnav-host');
+      const host = target.closest('div.element-container') || target.parentElement || target;
+      if (host) host.classList.add('sticky-topnav-host');
       return true;
     }
 
     function schedule(){
+      setHeaderH();
       applySticky();
-      setTimeout(applySticky, 50);
-      setTimeout(applySticky, 150);
-      setTimeout(applySticky, 350);
-      setTimeout(applySticky, 800);
+      setTimeout(applySticky, 60);
+      setTimeout(applySticky, 200);
+      setTimeout(applySticky, 650);
     }
 
     schedule();
 
-    // Re-apply after Streamlit reruns replace the widget DOM (prevents the nav from "going away")
     if (!W.__swStickyNavObserver){
       let t = null;
       const obs = new W.MutationObserver(() => {
         if (t) return;
-        t = setTimeout(() => { t=null; schedule(); }, 90);
+        t = setTimeout(() => { t=null; schedule(); }, 120);
       });
       obs.observe(doc.body, {childList:true, subtree:true});
       W.__swStickyNavObserver = obs;
     }
+
+    W.addEventListener('resize', setHeaderH);
   }catch(e){}
 })();
 </script>
@@ -2776,72 +2812,27 @@ st_html(
 )
 
 
-
-
-st_html(
-    """
-<script>
-(function(){
-  try{
-    const doc = window.parent.document;
-    const root = doc.documentElement;
-    function update(){
-      const header = doc.querySelector('header[data-testid="stHeader"]');
-      const h = header ? header.getBoundingClientRect().height : 0;
-      root.style.setProperty('--stHeaderH', (h || 0) + 'px');
-    }
-    update();
-    const header = doc.querySelector('header[data-testid="stHeader"]');
-    if (header && window.ResizeObserver){
-      new ResizeObserver(update).observe(header);
-    }
-    window.addEventListener('resize', update);
-    setTimeout(update, 250);
-  }catch(e){}
-})();
-</script>
-""",
-    height=0,
-)
-
-st.caption("Tip: **📝 All Reviews** contains the individual review cards (with green/red symptom tiles).")
+st.caption("Tip: **📝 All Reviews** shows individual review cards (with green/red symptom tiles).")
 
 # ============================================================
-# Precompute analysis tables (fast) — only when needed
+# Precompute aggregates (only when needed)
 # ============================================================
-need_agg = view.startswith("📊")
+need_dashboard = view.startswith("📊")
 
-if need_agg:
-    t_agg0 = time.perf_counter()
+if need_dashboard:
     with st.spinner("Analyzing symptoms…"):
         detractors_results_full = analyze_symptoms_fast(filtered, existing_detractor_columns)
         delighters_results_full = analyze_symptoms_fast(filtered, existing_delighter_columns)
-        # Organic mention share per opportunity (review-level), used in opportunity hover tooltips
-        org_del_pct_by_item, org_del_n_by_item, org_del_total = organic_mention_stats(
-            filtered, existing_delighter_columns
-        )
-        org_det_pct_by_item, org_det_n_by_item, org_det_total = organic_mention_stats(
-            filtered, existing_detractor_columns
-        )
-        trend_watchouts = _detect_trends(filtered, symptom_cols=all_sym_cols_present, min_mentions=3)
-    agg_s = time.perf_counter() - t_agg0
+        trend_watchouts = _detect_trends(filtered, symptom_cols=[c for c in df_base.columns if str(c).startswith("Symptom")], min_mentions=3)
 else:
     detractors_results_full = pd.DataFrame(columns=["Item", "Mentions", "Avg Star", "% Total"])
     delighters_results_full = pd.DataFrame(columns=["Item", "Mentions", "Avg Star", "% Total"])
     trend_watchouts = []
-    org_del_pct_by_item, org_del_n_by_item, org_del_total = {}, {}, 0
-    org_det_pct_by_item, org_det_n_by_item, org_det_total = {}, {}, 0
-    agg_s = 0.0
-
-if show_perf:
-    st.sidebar.caption(f"Filter time: {filter_s:.3f}s • Agg time: {agg_s:.3f}s")
-
 
 # ============================================================
 # Dashboard view
 # ============================================================
 if view.startswith("📊"):
-    # ---------- Metrics ----------
     st.markdown("## ⭐ Star Rating Metrics")
     st.caption("All metrics below reflect the **currently filtered** dataset.")
 
@@ -2868,13 +2859,9 @@ if view.startswith("📊"):
     org_cnt, org_avg, org_low = section_stats(org)
     seed_cnt, seed_avg, seed_low = section_stats(seed)
 
-    # Baseline for Net Hit (overall average of the CURRENT filtered dataset)
     baseline_avg = float(all_avg) if isinstance(all_avg, (int, float)) and np.isfinite(all_avg) else 0.0
 
-    gap_to_5 = max(0.0, 5.0 - baseline_avg)
-
     def _mini_bar_html(pct: float) -> str:
-        # pct is 0-100; clamp
         try:
             w = max(0.0, min(100.0, float(pct)))
         except Exception:
@@ -2882,7 +2869,6 @@ if view.startswith("📊"):
         return f"<div class='mini-bar'><div style='width:{w:.1f}%;'></div></div>"
 
     def card_html(title: str, count: int, avg: float, pct_low: float, subtitle: str = "") -> str:
-        # Keep digits visible; rely on responsive grid instead of truncating numbers.
         return textwrap.dedent(f"""
         <div class="metric-card">
           <div class="metric-head">
@@ -2891,7 +2877,7 @@ if view.startswith("📊"):
           </div>
           <div class="metric-row">
             <div class="metric-box">
-              <div class="metric-label">Reviews</div>
+              <div class="metric-label">Count</div>
               <div class="metric-kpi">{count:,}</div>
             </div>
             <div class="metric-box">
@@ -2911,7 +2897,7 @@ if view.startswith("📊"):
         (
             '<div class="metrics-grid">'
             + card_html("All Reviews", all_cnt, all_avg, all_low, subtitle="Current filters")
-            + card_html("Organic", org_cnt, org_avg, org_low, subtitle="Seeded ≠ YES")
+            + card_html("Organic (non-Seeded)", org_cnt, org_avg, org_low, subtitle="Seeded ≠ YES")
             + card_html("Seeded", seed_cnt, seed_avg, seed_low, subtitle="Seeded = YES")
             + "</div>"
         ),
@@ -2920,7 +2906,7 @@ if view.startswith("📊"):
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # ---------- Country × Source breakdown (connected Avg + Count) ----------
+    # ---------- Country × Source breakdown ----------
     st.markdown("## 🧭 Country × Source Breakdown")
     st.caption("Color = Avg ★ (red→green), label = Count. This ties average and volume together in one view.")
 
@@ -2949,7 +2935,6 @@ if view.startswith("📊"):
             count_m = grp.pivot(index="Country", columns="Source", values="count").fillna(0).astype(int)
             mean_m = grp.pivot(index="Country", columns="Source", values="mean").astype(float)
 
-            # Apply min count threshold: hide avg if low N
             if int(min_cell_n) > 0:
                 mean_m = mean_m.where(count_m >= int(min_cell_n))
 
@@ -2977,10 +2962,9 @@ if view.startswith("📊"):
                 )
             )
 
-            # overlay counts as text (contrast-aware)
+            # overlay counts as text
             xs_light, ys_light, texts_light = [], [], []
             xs_dark, ys_dark, texts_dark = [], [], []
-
             for yi, country in enumerate(y):
                 for xi, source in enumerate(x):
                     c = int(counts[yi][xi])
@@ -2995,38 +2979,15 @@ if view.startswith("📊"):
                                 is_dark = True
                     except Exception:
                         is_dark = False
-
                     if is_dark:
-                        xs_dark.append(source)
-                        ys_dark.append(country)
-                        texts_dark.append(str(c))
+                        xs_dark.append(source); ys_dark.append(country); texts_dark.append(str(c))
                     else:
-                        xs_light.append(source)
-                        ys_light.append(country)
-                        texts_light.append(str(c))
+                        xs_light.append(source); ys_light.append(country); texts_light.append(str(c))
 
             if xs_light:
-                fig.add_trace(
-                    go.Scatter(
-                        x=xs_light,
-                        y=ys_light,
-                        mode="text",
-                        text=texts_light,
-                        textfont=dict(size=12, color="black"),
-                        hoverinfo="skip",
-                    )
-                )
+                fig.add_trace(go.Scatter(x=xs_light, y=ys_light, mode="text", text=texts_light, textfont=dict(size=12, color="black"), hoverinfo="skip"))
             if xs_dark:
-                fig.add_trace(
-                    go.Scatter(
-                        x=xs_dark,
-                        y=ys_dark,
-                        mode="text",
-                        text=texts_dark,
-                        textfont=dict(size=12, color="white"),
-                        hoverinfo="skip",
-                    )
-                )
+                fig.add_trace(go.Scatter(x=xs_dark, y=ys_dark, mode="text", text=texts_dark, textfont=dict(size=12, color="white"), hoverinfo="skip"))
 
             fig.update_layout(
                 template=PLOTLY_TEMPLATE,
@@ -3035,7 +2996,7 @@ if view.startswith("📊"):
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
             )
-
+            style_plotly(fig)
             st.plotly_chart(fig, use_container_width=True)
 
             if show_table:
@@ -3048,188 +3009,156 @@ if view.startswith("📊"):
         st.info("Need Country, Source, and Star Rating columns to compute this breakdown.")
 
     # ---------- Symptom Tables ----------
-    headL, headR = st.columns([1, 0.24])
+    headL, headR = st.columns([1, 0.22])
     with headL:
         st.markdown("## 🩺 Symptom Tables")
     with headR:
-        if st.button("ℹ️ Net Hit", key="net_hit_info_btn"):
-            st.session_state["show_net_hit_info"] = not bool(st.session_state.get("show_net_hit_info", False))
+        with st.popover("ℹ️ Net Hit"):
+            st.markdown(
+                """**Net Hit (WIP)** estimates how much each theme contributes to your current **gap from 5★**.
 
-    if st.session_state.get("show_net_hit_info"):
-        st.info(
-            """**Net Hit (WIP)** estimates how much each symptom accounts for the current **gap to 5★** in the active filter scope.
+**Steps**
+1) Compute current average ★ from the filtered dataset  
+2) Compute the total gap: `Gap = 5 − Avg★`  
+3) For each symptom, compute its share of mentions within that table  
+4) `Net Hit = Gap × (Symptom Mentions / Total Mentions)`
 
-**Step 1 — Current Avg ★ (filtered):** `Avg★`
-**Step 2 — Gap to 5★:** `Gap = 5 − Avg★`
-**Step 3 — Symptom share of mentions:** `Share = Mentions / Total Mentions` *(within this table)*
-**Net Hit:** `Net Hit = Gap × Share`
+**Interpretation**
+- Higher Net Hit = larger rating-impact lever (directionally)
+- Net Hits sum to the total gap (within the table)
+- For **Detractors**, we show Net Hit as a **positive** "rating drag" share (bigger = worse). If you prefer signed values, treat detractor Net Hit as negative.
+- This is a proportional allocation model, not causal regression."""
+            )
 
-**How to read it**
-- Larger Net Hit → bigger *rating opportunity* to focus on first (given the current data).
-- All Net Hits in a table sum to the total Gap (this is a proportional allocation model).
+    gap_to_5 = max(0.0, 5.0 - baseline_avg)
 
-**Important**
-This is a prioritization heuristic, not a causal model — use it to rank themes, then validate with deeper analysis / experiments."""
-        )
-
-    # Default display limit; show a "View full" affordance if truncated.
-    table_limit = int(st.session_state.get("symptom_table_limit", 50))
-    table_limit = st.selectbox("Rows to preview", options=[25, 50, 100], index=[25, 50, 100].index(50), key="symptom_table_limit")
+    table_limit = st.selectbox("Rows to preview", options=[25, 50, 100], index=1, key="symptom_table_limit")
 
     def _add_net_hit(tbl: pd.DataFrame) -> pd.DataFrame:
-        """
-        Net Hit (WIP): distributes the current gap-to-5★ across symptoms based on share of mentions.
-
-        Net Hit = (5 - Avg★_filtered) * (Mentions / Total Mentions)
-        """
         if tbl is None or tbl.empty:
             return tbl
         d = tbl.copy()
         d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0).astype(int)
-        d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce").round(1)
-
-        total_mentions = float(d["Mentions"].sum())
-        if total_mentions <= 0:
-            d["Net Hit"] = 0.0
+        d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
+        total_mentions = float(d["Mentions"].sum()) if d["Mentions"].sum() else 0.0
+        if total_mentions > 0:
+            d["Net Hit"] = (gap_to_5 * (d["Mentions"] / total_mentions)).round(3)
         else:
-            share = d["Mentions"] / total_mentions
-            d["Net Hit"] = (gap_to_5 * share).round(3)
-
-        # column order
+            d["Net Hit"] = 0.0
         cols = [c for c in ["Item", "Mentions", "% Total", "Avg Star", "Net Hit"] if c in d.columns]
-        d = d[cols]
-        return d
+        return d[cols]
 
     detractors_full = _add_net_hit(detractors_results_full)
     delighters_full = _add_net_hit(delighters_results_full)
 
-    detractors_preview = detractors_full.head(table_limit) if detractors_full is not None else detractors_full
-    delighters_preview = delighters_full.head(table_limit) if delighters_full is not None else delighters_full
+    detractors_preview = detractors_full.head(int(table_limit)) if detractors_full is not None else detractors_full
+    delighters_preview = delighters_full.head(int(table_limit)) if delighters_full is not None else delighters_full
 
     view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0, key="symptom_table_view_mode")
 
     def _styled_table(df_in: pd.DataFrame):
-        """
-        Table styling rule:
-        - Keep default text color for all columns (so it stays readable in BOTH light + dark mode).
-        - Only color the Avg Star column:
-            * >= 4.5 → green
-            * <  4.5 → red
-        """
         if df_in is None or df_in.empty:
             return df_in
 
+        # NOTE: Streamlit's interactive dataframe can ignore Styler.format when rendering values.
+        # To guarantee 1-decimal Avg Star (and tidy Net Hit), we pre-format those columns as strings for display.
+        df_disp = df_in.copy()
+
+        if "Avg Star" in df_disp.columns:
+            s = pd.to_numeric(df_disp["Avg Star"], errors="coerce").round(1)
+            df_disp["Avg Star"] = s.map(lambda x: f"{x:.1f}" if pd.notna(x) else "")
+        if "Net Hit" in df_disp.columns:
+            s = pd.to_numeric(df_disp["Net Hit"], errors="coerce").round(3)
+            df_disp["Net Hit"] = s.map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+        if "Mentions" in df_disp.columns:
+            df_disp["Mentions"] = pd.to_numeric(df_disp["Mentions"], errors="coerce").fillna(0).astype(int)
+
         def style_avg(v):
-            if pd.isna(v):
-                return ""
             try:
                 vv = float(v)
-                if vv >= 4.5:
-                    return "color:#16a34a;font-weight:800;"
-                return "color:#dc2626;font-weight:800;"
             except Exception:
                 return ""
+            # Requested: only Avg Star colored; threshold 4.5
+            if vv >= 4.5:
+                return "color:#16a34a;font-weight:800;"
+            return "color:#dc2626;font-weight:800;"
 
-        # IMPORTANT: Pandas Styler.format() overrides previously-set formatters
-        # when it's called multiple times.
-        #
-        # So we:
-        #   1) apply the Avg Star color rule
-        #   2) build ONE combined formatter dict
-        #   3) call .format() exactly once
-        sty = df_in.style
-        if "Avg Star" in df_in.columns:
+        sty = df_disp.style.set_properties(**{"color": "var(--fg)"})
+        if "Avg Star" in df_disp.columns:
             sty = sty.applymap(style_avg, subset=["Avg Star"])
-
-        fmt: dict = {}
-        if "Avg Star" in df_in.columns:
-            fmt["Avg Star"] = "{:.1f}"  # nearest tenth
-        if "Net Hit" in df_in.columns:
-            fmt["Net Hit"] = "{:.3f}"   # keep stable + non-distracting
-        if "Mentions" in df_in.columns:
-            fmt["Mentions"] = "{:,.0f}"
-        if fmt:
-            sty = sty.format(fmt)
-
         return sty
 
-    def _render_symptom_table(df_preview: pd.DataFrame, df_full: pd.DataFrame, title: str, key_prefix: str):
-        st.subheader(title)
-
-        st.dataframe(
-            _styled_table(df_preview) if df_preview is not None and not df_preview.empty else df_preview,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        if df_full is not None and df_preview is not None and len(df_full) > len(df_preview) and len(df_preview) > 0:
-            if st.button(f"View full table ({len(df_full):,} rows)", key=f"view_full_{key_prefix}"):
-                st.session_state[f"show_full_{key_prefix}"] = True
-            if st.session_state.get(f"show_full_{key_prefix}"):
-                with st.expander(f"Full {title} table", expanded=True):
-                    st.dataframe(
-                        _styled_table(df_full) if not df_full.empty else df_full,
-                        use_container_width=True,
-                        hide_index=True,
-                        height=680,
-                    )
+    def _full_table_actions(label: str, full_df: pd.DataFrame):
+        if full_df is None or full_df.empty:
+            st.info("No data.")
+            return
+        if len(full_df) > int(table_limit):
+            if st.button(f"View full {label} table", key=f"view_full_{label}"):
+                st.dataframe(_styled_table(full_df), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(_styled_table(full_df), use_container_width=True, hide_index=True)
 
     if view_mode == "Split":
-        c1, c2 = st.columns([1, 1])
+        c1, c2 = st.columns(2)
         with c1:
-            _render_symptom_table(detractors_preview, detractors_full, "All Detractors", "detractors")
+            st.markdown("### All Detractors")
+            if detractors_preview is None or detractors_preview.empty:
+                st.info("No detractor symptoms available.")
+            else:
+                st.dataframe(_styled_table(detractors_preview), use_container_width=True, hide_index=True)
+                _full_table_actions("detractors", detractors_full)
         with c2:
-            _render_symptom_table(delighters_preview, delighters_full, "All Delighters", "delighters")
+            st.markdown("### All Delighters")
+            if delighters_preview is None or delighters_preview.empty:
+                st.info("No delighter symptoms available.")
+            else:
+                st.dataframe(_styled_table(delighters_preview), use_container_width=True, hide_index=True)
+                _full_table_actions("delighters", delighters_full)
     else:
         tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
         with tab1:
-            _render_symptom_table(detractors_preview, detractors_full, "All Detractors", "detractors")
+            if detractors_preview is None or detractors_preview.empty:
+                st.info("No detractor symptoms available.")
+            else:
+                st.dataframe(_styled_table(detractors_preview), use_container_width=True, hide_index=True)
+                _full_table_actions("detractors", detractors_full)
         with tab2:
-            _render_symptom_table(delighters_preview, delighters_full, "All Delighters", "delighters")
+            if delighters_preview is None or delighters_preview.empty:
+                st.info("No delighter symptoms available.")
+            else:
+                st.dataframe(_styled_table(delighters_preview), use_container_width=True, hide_index=True)
+                _full_table_actions("delighters", delighters_full)
 
-    # Combined download (both full tables in a single 2-tab Excel file)
-    if (detractors_full is not None and not detractors_full.empty) or (delighters_full is not None and not delighters_full.empty):
-        xbuf = BytesIO()
-        with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
-            (detractors_full if detractors_full is not None else pd.DataFrame()).to_excel(writer, sheet_name="Detractors", index=False)
-            (delighters_full if delighters_full is not None else pd.DataFrame()).to_excel(writer, sheet_name="Delighters", index=False)
-
+    # Combined download (requested: one button, two tabs) — placed BELOW view full buttons
+    if detractors_full is not None and delighters_full is not None and (not detractors_full.empty or not delighters_full.empty):
+        out_xlsx = BytesIO()
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            detractors_full.to_excel(writer, sheet_name="Detractors", index=False)
+            delighters_full.to_excel(writer, sheet_name="Delighters", index=False)
         st.download_button(
-            "⬇️ Full Delighter and Detractor Tables (Excel)",
-            data=xbuf.getvalue(),
-            file_name="full_delighter_and_detractor_tables.xlsx",
+            "⬇️ Download full Delighter + Detractor tables (Excel)",
+            data=out_xlsx.getvalue(),
+            file_name="delighters_detractors_full.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
         )
 
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-
-    if trend_watchouts:
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-        with st.expander("⚠️ Watchouts & Recent Movement (local)", expanded=False):
-            st.markdown("\n"
-.join([f"- {t}" for t in trend_watchouts]))
-
-    # ---------- Top symptoms bars ----------
+    # ---------- Top Delighters & Detractors ----------
     st.markdown("## 🧩 Top Delighters & Detractors")
+    st.caption("Optional: show Mentions as % of total reviews in the current filter range, and/or restrict to Organic only.")
 
-    ctlA, ctlB, ctlC = st.columns([1.3, 1.1, 1.2])
-    with ctlA:
-        show_pct = st.toggle("Show mentions as % of reviews", value=False, key="top_syms_show_pct")
-    with ctlB:
-        organic_only = st.toggle("Organic only", value=False, key="top_syms_organic_only")
-    with ctlC:
-        top_n = st.slider("Top N", 6, 25, 12, 1, key="top_syms_top_n")
+    ctrl1, ctrl2, ctrl3 = st.columns([1.1, 1.2, 1.2])
+    with ctrl1:
+        top_n = st.slider("Top N", 5, 30, 12, 1, key="top_dd_n")
+    with ctrl2:
+        show_pct = st.toggle("Show % of reviews", value=False, key="top_dd_pct")
+    with ctrl3:
+        organic_only = st.toggle("Organic only", value=False, key="top_dd_org")
 
-    base_df = org if organic_only else filtered
-    denom = max(1, len(base_df))
+    dd_df = org if organic_only else filtered
+    denom = max(1, len(dd_df))
 
-    if organic_only:
-        det_tbl = analyze_symptoms_fast(base_df, existing_detractor_columns)
-        del_tbl = analyze_symptoms_fast(base_df, existing_delighter_columns)
-    else:
-        det_tbl = detractors_results_full
-        del_tbl = delighters_results_full
+    det_tbl = analyze_symptoms_fast(dd_df, existing_detractor_columns)
+    del_tbl = analyze_symptoms_fast(dd_df, existing_delighter_columns)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -3243,25 +3172,20 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             det["Mentions %"] = (det["Mentions"] / denom * 100.0)
             x = det["Mentions %"][::-1] if show_pct else det["Mentions"][::-1]
             x_label = "Mentions (% of reviews)" if show_pct else "Mentions (count)"
-            hover = "%{y}<br>Mentions: %{customdata[0]:,.0f}<br>Mentions %: %{customdata[1]:.1f}%<extra></extra>"
+            hover = "%{customdata[2]}<br>Mentions: %{customdata[0]:,.0f}<br>Mentions %: %{customdata[1]:.1f}%<extra></extra>"
             fig_det = go.Figure(
                 go.Bar(
                     x=x,
                     y=det["Item"][::-1],
                     orientation="h",
                     opacity=0.88,
-                    customdata=np.stack([det["Mentions"].to_numpy()[::-1], det["Mentions %"].to_numpy()[::-1]], axis=1),
+                    customdata=np.stack([det["Mentions"].to_numpy()[::-1], det["Mentions %"].to_numpy()[::-1], det["Item"].astype(str).to_numpy()[::-1]], axis=1),
                     hovertemplate=hover,
                 )
             )
-            fig_det.update_layout(
-                template=PLOTLY_TEMPLATE,
-                margin=dict(l=170, r=20, t=20, b=40),
-                height=460,
-                xaxis=dict(title=x_label),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-            )
+            fig_det.update_layout(template=PLOTLY_TEMPLATE, margin=dict(l=170, r=20, t=20, b=40), height=460, xaxis=dict(title=x_label),
+                                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            style_plotly(fig_det)
             st.plotly_chart(fig_det, use_container_width=True)
 
     with c2:
@@ -3275,30 +3199,25 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             deli["Mentions %"] = (deli["Mentions"] / denom * 100.0)
             x = deli["Mentions %"][::-1] if show_pct else deli["Mentions"][::-1]
             x_label = "Mentions (% of reviews)" if show_pct else "Mentions (count)"
-            hover = "%{y}<br>Mentions: %{customdata[0]:,.0f}<br>Mentions %: %{customdata[1]:.1f}%<extra></extra>"
+            hover = "%{customdata[2]}<br>Mentions: %{customdata[0]:,.0f}<br>Mentions %: %{customdata[1]:.1f}%<extra></extra>"
             fig_del = go.Figure(
                 go.Bar(
                     x=x,
                     y=deli["Item"][::-1],
                     orientation="h",
                     opacity=0.88,
-                    customdata=np.stack([deli["Mentions"].to_numpy()[::-1], deli["Mentions %"].to_numpy()[::-1]], axis=1),
+                    customdata=np.stack([deli["Mentions"].to_numpy()[::-1], deli["Mentions %"].to_numpy()[::-1], deli["Item"].astype(str).to_numpy()[::-1]], axis=1),
                     hovertemplate=hover,
                 )
             )
-            fig_del.update_layout(
-                template=PLOTLY_TEMPLATE,
-                margin=dict(l=170, r=20, t=20, b=40),
-                height=460,
-                xaxis=dict(title=x_label),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-            )
+            fig_del.update_layout(template=PLOTLY_TEMPLATE, margin=dict(l=170, r=20, t=20, b=40), height=460, xaxis=dict(title=x_label),
+                                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            style_plotly(fig_del)
             st.plotly_chart(fig_del, use_container_width=True)
 
     # ---------- Cumulative Avg ★ Over Time by Region (Weighted) ----------
     st.markdown("## 📈 Cumulative Avg ★ Over Time by Region (Weighted)")
-    st.caption("Cumulative average star rating by Country with subtle review-volume bars in the background.")
+    st.caption("Includes subtle volume bars (review count per day) on a secondary axis.")
 
     if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
         st.info("Need Review Date and Star Rating columns for the cumulative chart.")
@@ -3306,7 +3225,6 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
         data = filtered.copy()
         data["Star Rating"] = pd.to_numeric(data["Star Rating"], errors="coerce")
         data = data.dropna(subset=["Star Rating"])
-
         data["Review Date"] = pd.to_datetime(data["Review Date"], errors="coerce")
         data = data.dropna(subset=["Review Date"])
 
@@ -3317,246 +3235,134 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             if region_col is None:
                 st.info("Need a Country column to break down regions.")
             else:
-                # Controls
-                c1, c2, c3, c4, c5 = st.columns([1.15, 1.05, 0.95, 0.95, 1.15])
+                top_regions = data[region_col].astype("string").value_counts().head(8).index.tolist()
+                data = data[data[region_col].astype("string").isin(top_regions)]
+
+                c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.1, 1.0])
                 with c1:
-                    # Keep legacy option strings to avoid breaking existing session_state keys
-                    weight_mode = st.selectbox(
-                        "Overall weighting",
-                        options=["By review count", "Equal"],
-                        index=0,
-                        key="cum_weight_mode",
-                        help="Overall line weighting across regions.",
-                    )
-                with c2:
                     smooth = st.selectbox("Smoothing", options=["None", "7-day", "14-day"], index=1, key="cum_smooth")
-                with c3:
-                    organic_only = st.toggle("Organic only", value=False, key="cum_organic_only")
-                with c4:
+                with c2:
                     show_overall = st.toggle("Show overall", value=True, key="cum_show_overall")
-                with c5:
-                    vol_gran = st.selectbox(
-                        "Volume bars",
-                        options=["Auto", "Daily", "Weekly", "Monthly"],
-                        index=0,
-                        key="cum_volume_gran",
-                        help="Auto picks a readable granularity based on the date range.",
-                    )
+                with c3:
+                    show_volume = st.toggle("Show volume bars", value=True, key="cum_show_volume")
+                with c4:
+                    organic_only_cum = st.toggle("Organic only", value=False, help="Exclude seeded / incentivized reviews (Seeded == YES) from this chart.", key="cum_organic_only")
 
-                # Optional Organic-only (excludes Seeded=YES)
-                if organic_only and "Seeded" in data.columns:
-                    seed_mask_local = data["Seeded"].astype("string").str.upper().eq("YES")
-                    data = data[~seed_mask_local]
 
-                if data.empty:
-                    st.info("No time-series data after applying Organic-only.")
-                else:
-                    # Use top regions by volume (after Organic-only)
-                    top_regions = data[region_col].astype("string").value_counts().head(8).index.tolist()
-                    data = data[data[region_col].astype("string").isin(top_regions)]
+                if organic_only_cum and "Seeded" in data.columns:
+                    data = data[~data["Seeded"].astype("string").str.upper().eq("YES")].copy()
+                data["date"] = data["Review Date"].dt.date
 
-                    # Choose a readable bucket frequency (prevents 'invisible' hairline volume bars on long ranges)
-                    dt_min = data["Review Date"].min()
-                    dt_max = data["Review Date"].max()
-                    try:
-                        days_range = int((dt_max - dt_min).days) if pd.notna(dt_min) and pd.notna(dt_max) else 0
-                    except Exception:
-                        days_range = 0
+                grp = data.groupby(["date", region_col])["Star Rating"].agg(cnt="count", sum="sum").reset_index()
 
-                    if vol_gran == "Daily":
-                        freq = "D"
-                    elif vol_gran == "Weekly":
-                        freq = "W-MON"
-                    elif vol_gran == "Monthly":
-                        freq = "M"
-                    else:
-                        # Auto
-                        if days_range > 540:
-                            freq = "M"
-                        elif days_range > 120:
-                            freq = "W-MON"
-                        else:
-                            freq = "D"
+                # overall daily volume
+                vol = grp.groupby("date")["cnt"].sum().reset_index().sort_values("date")
+                vol["cum_cnt"] = vol["cnt"].cumsum()
 
-                    # Bucket column for BOTH the lines and the volume bars
-                    if freq == "D":
-                        data["bucket"] = data["Review Date"].dt.date
-                    else:
-                        data["bucket"] = data["Review Date"].dt.to_period(freq).dt.start_time.dt.date
-
-                    grp = (
-                        data.groupby(["bucket", region_col])["Star Rating"]
-                        .agg(cnt="count", sum_star="sum")
-                        .reset_index()
-                    )
-
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-                    # Volume bars (overall)
-                    vol = grp.groupby("bucket", as_index=False)["cnt"].sum().sort_values("bucket")
-                    if not vol.empty:
-                        # Important: do NOT double-apply alpha (marker rgba + trace opacity), or bars become invisible.
-                        bar_opacity = 0.18 if IS_DARK_THEME else 0.12
-                        bar_color = "rgb(148, 163, 184)" if IS_DARK_THEME else "rgb(100, 116, 139)"
-                        fig.add_trace(
-                            go.Bar(
-                                x=vol["bucket"],
-                                y=vol["cnt"],
-                                name="Review volume",
-                                marker_color=bar_color,
-                                opacity=bar_opacity,
-                                hovertemplate="Date: %{x}<br>Reviews: %{y:,}<extra></extra>",
-                                showlegend=False,
-                            ),
-                            secondary_y=True,
-                        )
-
-                    # Region cumulative curves
-                    region_curves = {}
-                    for r in top_regions:
-                        sub = grp[grp[region_col].astype("string") == str(r)].sort_values("bucket")
-                        if sub.empty:
-                            continue
-                        sub["cum_cnt"] = sub["cnt"].cumsum()
-                        sub["cum_sum"] = sub["sum_star"].cumsum()
-                        sub["cum_avg"] = sub["cum_sum"] / sub["cum_cnt"]
-
-                        y = sub["cum_avg"].astype(float)
-                        if smooth != "None" and len(y) > 2:
-                            if freq == "D":
-                                win = 7 if smooth == "7-day" else 14
-                            elif str(freq).startswith("W"):
-                                win = 2 if smooth == "7-day" else 4
-                            else:
-                                win = 2 if smooth == "7-day" else 3
-                            y = y.rolling(window=int(win), min_periods=1).mean()
-
-                        fig.add_trace(
-                            go.Scatter(
-                                x=sub["bucket"],
-                                y=y,
-                                mode="lines",
-                                name=str(r),
-                                hovertemplate=(
-                                    f"{region_col}: {r}<br>"
-                                    "Date: %{x}<br>"
-                                    "Cumulative Avg ★: %{y:.3f}<br>"
-                                    "Cum N: %{customdata:,}<extra></extra>"
-                                ),
-                                customdata=sub["cum_cnt"],
-                            ),
-                            secondary_y=False,
-                        )
-                        region_curves[str(r)] = pd.DataFrame({"bucket": sub["bucket"], "cum_avg": y.to_numpy()})
-
-                    # Overall curve
-                    if show_overall:
-                        if weight_mode == "Equal" and region_curves:
-                            wide = None
-                            for rr, df_rr in region_curves.items():
-                                part = df_rr.rename(columns={"cum_avg": rr})
-                                wide = part if wide is None else wide.merge(part, on="bucket", how="outer")
-
-                            if wide is not None and not wide.empty:
-                                wide = wide.sort_values("bucket")
-                                region_cols = [c for c in wide.columns if c != "bucket"]
-                                wide["overall_equal"] = wide[region_cols].mean(axis=1, skipna=True)
-
-                                y = wide["overall_equal"].astype(float)
-                                if smooth != "None" and len(y) > 2:
-                                    if freq == "D":
-                                        win = 7 if smooth == "7-day" else 14
-                                    elif str(freq).startswith("W"):
-                                        win = 2 if smooth == "7-day" else 4
-                                    else:
-                                        win = 2 if smooth == "7-day" else 3
-                                    y = y.rolling(window=int(win), min_periods=1).mean()
-
-                                n_regions = wide[region_cols].notna().sum(axis=1)
-                                fig.add_trace(
-                                    go.Scatter(
-                                        x=wide["bucket"],
-                                        y=y,
-                                        mode="lines",
-                                        name="Overall (equal regions)",
-                                        line=dict(width=4),
-                                        hovertemplate=(
-                                            "Overall (equal regions)<br>Date: %{x}<br>"
-                                            "Cumulative Avg ★: %{y:.3f}<br>"
-                                            "Regions with data: %{customdata}<extra></extra>"
-                                        ),
-                                        customdata=n_regions,
-                                    ),
-                                    secondary_y=False,
-                                )
-                        else:
-                            overall = (
-                                grp.groupby("bucket", as_index=False)
-                                .agg(cnt=("cnt", "sum"), sum_star=("sum_star", "sum"))
-                                .sort_values("bucket")
-                            )
-                            overall["cum_cnt"] = overall["cnt"].cumsum()
-                            overall["cum_sum"] = overall["sum_star"].cumsum()
-                            overall["cum_avg"] = overall["cum_sum"] / overall["cum_cnt"]
-
-                            y = overall["cum_avg"].astype(float)
-                            if smooth != "None" and len(y) > 2:
-                                if freq == "D":
-                                    win = 7 if smooth == "7-day" else 14
-                                elif str(freq).startswith("W"):
-                                    win = 2 if smooth == "7-day" else 4
-                                else:
-                                    win = 2 if smooth == "7-day" else 3
-                                y = y.rolling(window=int(win), min_periods=1).mean()
-
-                            fig.add_trace(
-                                go.Scatter(
-                                    x=overall["bucket"],
-                                    y=y,
-                                    mode="lines",
-                                    name="Overall",
-                                    line=dict(width=4),
-                                    hovertemplate=(
-                                        "Overall<br>Date: %{x}<br>"
-                                        "Cumulative Avg ★: %{y:.3f}<br>"
-                                        "Cum N: %{customdata:,}<extra></extra>"
-                                    ),
-                                    customdata=overall["cum_cnt"],
-                                ),
-                                secondary_y=False,
-                            )
-
-                    fig.update_layout(
-                        template=PLOTLY_TEMPLATE,
-                        margin=dict(l=40, r=20, t=30, b=30),
-                        height=560,
-                        yaxis=dict(
-                            title="Cumulative Avg ★",
-                            range=[1.0, 5.2],
-                            showgrid=True,
-                            gridcolor=PLOTLY_GRIDCOLOR,
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                # volume bars (subtle)
+                if show_volume:
+                    fig.add_trace(
+                        go.Bar(
+                            x=vol["date"],
+                            y=vol["cnt"],
+                            name="Daily volume",
+                            opacity=0.22,
+                            marker=dict(color="rgba(148,163,184,0.55)"),
+                            hovertemplate="Date: %{x}<br>Reviews: %{y}<extra></extra>",
                         ),
-                        xaxis=dict(title="Date", showgrid=False),
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                        barmode="overlay",
+                        secondary_y=True,
                     )
-                    fig.update_yaxes(title_text="Cumulative Avg ★", secondary_y=False)
-                    fig.update_yaxes(title_text="Reviews", secondary_y=True, showgrid=False, showticklabels=False)
 
-                    st.plotly_chart(fig, use_container_width=True)
+                for r in top_regions:
+                    sub = grp[grp[region_col].astype("string") == str(r)].sort_values("date")
+                    if sub.empty:
+                        continue
+                    sub["cum_cnt"] = sub["cnt"].cumsum()
+                    sub["cum_sum"] = sub["sum"].cumsum()
+                    sub["Cumulative Avg ★"] = sub["cum_sum"] / sub["cum_cnt"]
 
-    # ---------- Opportunity Matrix (high impact) ----------
+                    y = sub["Cumulative Avg ★"].to_numpy()
+                    if smooth != "None" and len(y) > 2:
+                        win = 7 if smooth == "7-day" else 14
+                        y = pd.Series(y).rolling(window=win, min_periods=1).mean().to_numpy()
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=sub["date"],
+                            y=y,
+                            mode="lines",
+                            name=str(r),
+                            hovertemplate=(
+                                f"{region_col}: {r}<br>"
+                                "Date: %{x}<br>"
+                                "Cumulative Avg ★: %{y:.3f}<br>"
+                                "Cum N: %{customdata}<extra></extra>"
+                            ),
+                            customdata=sub["cum_cnt"],
+                        ),
+                        secondary_y=False,
+                    )
+
+                if show_overall:
+                    overall = grp.groupby("date").agg(cnt=("cnt", "sum"), sum=("sum", "sum")).reset_index().sort_values("date")
+                    overall["cum_cnt"] = overall["cnt"].cumsum()
+                    overall["cum_sum"] = overall["sum"].cumsum()
+                    overall["Cumulative Avg ★"] = overall["cum_sum"] / overall["cum_cnt"]
+
+                    y = overall["Cumulative Avg ★"].to_numpy()
+                    if smooth != "None" and len(y) > 2:
+                        win = 7 if smooth == "7-day" else 14
+                        y = pd.Series(y).rolling(window=win, min_periods=1).mean().to_numpy()
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=overall["date"],
+                            y=y,
+                            mode="lines",
+                            name="Overall",
+                            line=dict(width=4),
+                            hovertemplate=(
+                                "Overall<br>Date: %{x}<br>"
+                                "Cumulative Avg ★: %{y:.3f}<br>"
+                                "Cum N: %{customdata}<extra></extra>"
+                            ),
+                            customdata=overall["cum_cnt"],
+                        ),
+                        secondary_y=False,
+                    )
+
+                fig.update_layout(
+                    template=PLOTLY_TEMPLATE,
+                    margin=dict(l=40, r=20, t=30, b=30),
+                    height=520,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    barmode="overlay",
+                )
+                fig.update_yaxes(title_text="Cumulative Avg ★", range=[1.0, 5.2], showgrid=True, gridcolor=PLOTLY_GRIDCOLOR, secondary_y=False)
+                fig.update_yaxes(title_text="Reviews/day", showgrid=False, secondary_y=True, rangemode="tozero", showticklabels=False)
+
+                style_plotly(fig)
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ---------- Watchouts ----------
+    if trend_watchouts:
+        st.markdown("## ⚠️ Watchouts & Recent Movement (local)")
+        st.write("")  # spacing from above section (requested)
+        for ln in trend_watchouts:
+            st.warning(ln)
+
+    # ---------- Opportunity Matrix (bottom) ----------
     st.markdown("## 🎯 Opportunity Matrix")
     st.caption("Mentions vs Avg ★. Fix high-mention low-star detractors first; amplify high-mention high-star delighters.")
 
-    # Baseline = overall average star rating (CURRENT filtered dataset)
     baseline_overall = baseline_avg
 
     tab_det, tab_del = st.tabs(["Detractors", "Delighters"])
 
-    def _opportunity_scatter(tbl: pd.DataFrame, title: str, kind: str, baseline: float):
+    def _opportunity_scatter(tbl: pd.DataFrame, kind: str, baseline: float):
         if tbl is None or tbl.empty:
             st.info("No data available.")
             return
@@ -3565,15 +3371,14 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
         d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0)
         d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
         d = d.dropna(subset=["Avg Star"])
-
         if d.empty:
             st.info("No data available.")
             return
 
         x = d["Mentions"].astype(float).to_numpy()
         y = d["Avg Star"].astype(float).to_numpy()
+        symptom_names = d["Item"].astype(str).to_numpy()
 
-        # Priority score (used for labels + table)
         if kind == "detractors":
             score = x * np.clip(baseline - y, 0, None)
             table_label = "Fix first (high mentions × below-baseline ★)"
@@ -3581,7 +3386,6 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             score = x * np.clip(y - baseline, 0, None)
             table_label = "Amplify (high mentions × above-baseline ★)"
 
-        # Controls (labels are OFF by default to prevent overlap)
         c1, c2, c3 = st.columns([1.1, 1.5, 1.6])
         show_labels = c1.toggle("Show labels", value=False, key=f"opp_show_labels_{kind}")
         max_labels = int(min(25, len(d)))
@@ -3592,37 +3396,12 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
         labels = np.array([""] * len(d), dtype=object)
         if show_labels and label_n > 0:
             top_idx = np.argsort(-score)[:label_n]
-            labels[top_idx] = d["Item"].astype(str).to_numpy()[top_idx]
+            labels[top_idx] = symptom_names[top_idx]
 
-        # Marker sizing (sqrt scale for stability)
         if size_by_mentions and np.nanmax(x) > 0:
             size = (np.sqrt(x) / (np.sqrt(np.nanmax(x)) + 1e-9)) * 28 + 10
         else:
             size = np.full_like(x, 14.0, dtype=float)
-
-        # Hover includes organic mention share (review-level, organic-only)
-        items = d["Item"].astype("string").fillna("").tolist()
-        hovertext: List[str] = []
-        for i, it in enumerate(items):
-            key = str(it).strip()
-            disp = key if key else "(blank)"
-
-            del_pct = float(org_del_pct_by_item.get(key, 0.0)) if isinstance(org_del_pct_by_item, dict) else 0.0
-            del_n = int(org_del_n_by_item.get(key, 0)) if isinstance(org_del_n_by_item, dict) else 0
-            det_pct = float(org_det_pct_by_item.get(key, 0.0)) if isinstance(org_det_pct_by_item, dict) else 0.0
-            det_n = int(org_det_n_by_item.get(key, 0)) if isinstance(org_det_n_by_item, dict) else 0
-
-            del_line = f"{del_pct:.0f}% ({del_n}/{org_del_total})" if org_del_total else "n/a"
-            det_line = f"{det_pct:.0f}% ({det_n}/{org_det_total})" if org_det_total else "n/a"
-
-            hovertext.append(
-                f"{disp}"
-                f"<br>Mentions={x[i]:.0f}"
-                f"<br>Avg ★={y[i]:.2f}"
-                f"<br>Organic delighters mentioning: {del_line}"
-                f"<br>Organic detractors mentioning: {det_line}"
-            )
-
 
         fig = go.Figure()
         fig.add_trace(
@@ -3632,13 +3411,14 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
                 mode="markers+text" if show_labels else "markers",
                 text=labels,
                 textposition="top center",
-                hovertext=hovertext,
-                hovertemplate="%{hovertext}<extra></extra>",
+                textfont=dict(size=11),
+                customdata=np.stack([symptom_names], axis=1),
+                # ALWAYS show symptom name on hover (requested)
+                hovertemplate="%{customdata[0]}<br>Mentions=%{x:.0f}<br>Avg ★=%{y:.2f}<extra></extra>",
                 marker=dict(size=size, opacity=0.78, line=dict(width=1, color="rgba(148,163,184,0.45)")),
             )
         )
 
-        # Baseline lines
         fig.add_hline(y=baseline, line_dash="dash", opacity=0.6)
         fig.add_vline(x=float(np.median(x)), line_dash="dot", opacity=0.35)
 
@@ -3650,11 +3430,13 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             yaxis_title="Avg ★",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
+            uniformtext_minsize=9,
+            uniformtext_mode="hide",
         )
 
+        style_plotly(fig)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Ranked table under the chart
         d2 = d.copy()
         d2["Score"] = score
         d2 = d2.sort_values("Score", ascending=False).head(15)
@@ -3662,10 +3444,10 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             st.dataframe(d2[["Item", "Mentions", "Avg Star", "Score"]], use_container_width=True, hide_index=True)
 
     with tab_det:
-        _opportunity_scatter(detractors_results_full, "Detractors", "detractors", baseline_overall)
-
+        _opportunity_scatter(detractors_results_full, "detractors", baseline_overall)
     with tab_del:
-        _opportunity_scatter(delighters_results_full, "Delighters", "delighters", baseline_overall)
+        _opportunity_scatter(delighters_results_full, "delighters", baseline_overall)
+
 # ============================================================
 # Reviews view
 # ============================================================
@@ -3680,7 +3462,6 @@ if view.startswith("📝"):
     sort_options = []
     has_date = "Review Date" in filtered.columns
     has_star = "Star Rating" in filtered.columns
-
     if has_date:
         sort_options += ["Newest → Oldest", "Oldest → Newest"]
     if has_star:
@@ -3692,20 +3473,44 @@ if view.startswith("📝"):
     with topL:
         sort_choice = st.selectbox("Sort", options=sort_options, index=0, key="review_sort_choice")
     with topR:
-        # Download of currently filtered reviews (ordering matches the current sort)
-        pass
+        if not filtered.empty:
+            csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Download reviews (filtered)",
+                csv_bytes,
+                file_name="filtered_reviews.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     # Reset paging when sort changes
-    if "review_page" not in st.session_state:
-        st.session_state["review_page"] = 0
+    st.session_state.setdefault("review_page", 0)
     if st.session_state.get("_review_sort_prev") != sort_choice:
         st.session_state["_review_sort_prev"] = sort_choice
         st.session_state["review_page"] = 0
 
-    # Cache sort order per (dataset, filters, sort) to keep paging snappy
+    # Cache sorted index per filter-state
     sort_cache = st.session_state.setdefault("_review_sort_cache", {})
+
+    # Filter hash
     try:
-        _filters_hash_r = hashlib.sha1(json.dumps(active_filters, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        _filters_hash_r = hashlib.sha1(
+            json.dumps(
+                {
+                    "tf": tf,
+                    "tf_range": st.session_state.get("tf_range"),
+                    "sr": sr_sel,
+                    "kw": keyword,
+                    "delight": sel_del,
+                    "detract": sel_det,
+                    "std": {c: st.session_state.get(f"f_{c}") for c in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]},
+                    "extra_cols": extra_cols,
+                    "extra": {c: st.session_state.get(f"f_{c}") or st.session_state.get(f"f_{c}_range") for c in extra_cols},
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
     except Exception:
         _filters_hash_r = str(len(filtered))
 
@@ -3731,12 +3536,10 @@ if view.startswith("📝"):
                     df_sorted = filtered.sort_values(["Star Rating"], ascending=[True], na_position="last", kind="mergesort")
         except Exception:
             df_sorted = filtered
-
         try:
             sorted_idx = df_sorted.index.to_numpy()
         except Exception:
             sorted_idx = None
-
         sort_cache[cache_key] = sorted_idx
 
     try:
@@ -3744,25 +3547,15 @@ if view.startswith("📝"):
     except Exception:
         reviews_df = filtered
 
-    # Now place download button using the sorted dataset (nice UX; same rows)
-    with topR:
-        if not reviews_df.empty:
-            csv_bytes = reviews_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Download reviews (filtered)",
-                csv_bytes,
-                file_name="filtered_reviews.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
     # ---- Pagination ----
     reviews_per_page = int(st.session_state.get("rpp", 10))
     total_reviews_count = len(reviews_df)
-    total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
+    total_pages = max(1, int(np.ceil(total_reviews_count / reviews_per_page))) if reviews_per_page > 0 else 1
 
-    st.session_state["review_page"] = min(st.session_state.get("review_page", 0), max(total_pages - 1, 0))
-    current_page = st.session_state["review_page"]
+    current_page = int(st.session_state.get("review_page", 0))
+    current_page = max(0, min(current_page, total_pages - 1))
+    st.session_state["review_page"] = current_page
+
     start_index = current_page * reviews_per_page
     end_index = start_index + reviews_per_page
     paginated = reviews_df.iloc[start_index:end_index]
@@ -3845,57 +3638,26 @@ if view.startswith("📝"):
             st.session_state["review_page"] = total_pages - 1
             st.rerun()
 
-
 # ============================================================
-# AI view — Product + Consumer Insights Chat (reliable RAG)
+# AI view — simplified, reliable chat + 1 executive summary button
 # ============================================================
 if view.startswith("🤖"):
-    st.markdown("## 🤖 AI")
-    st.caption(
-        "Ask anything about the **product** and what **consumers** are saying. "
-        "Answers are grounded in the **currently filtered** dataset (RAG over your uploaded reviews)."
-    )
+    st.markdown("## 🤖 AI — Product & Consumer Insights")
+    st.caption("Ask anything. The assistant is grounded in the **currently filtered** dataset.")
 
-    # ----------------------------
-    # Sidebar: minimal AI controls (kept out of the way)
-    # ----------------------------
+    # Sidebar: minimal settings (kept out of the main page)
     with st.sidebar.expander("🤖 AI Settings", expanded=False):
-        st.session_state.setdefault("llm_model", "gpt-4o-mini")
-        st.session_state.setdefault("llm_temp", 0.2)
-
-        _model_choices = [
-            ("Fast (recommended) – 4o-mini", "gpt-4o-mini"),
-            ("Balanced – 4o", "gpt-4o"),
-            ("Advanced – 4.1", "gpt-4.1"),
-        ]
-        model_ids = [m for _, m in _model_choices]
-        default_idx = model_ids.index(st.session_state["llm_model"]) if st.session_state["llm_model"] in model_ids else 0
-        st.session_state["llm_model"] = st.selectbox("Model", options=model_ids, index=default_idx)
-        st.session_state["llm_temp"] = st.slider("Creativity (temperature)", 0.0, 1.0, float(st.session_state.get("llm_temp", 0.2)), 0.1)
-
-    with st.sidebar.expander("🔒 Evidence & Privacy", expanded=False):
-        st.session_state.setdefault("ai_enabled", True)
+        st.session_state.setdefault("ai_model", "gpt-4o-mini")
+        st.session_state.setdefault("ai_temp", 0.2)
         st.session_state.setdefault("ai_send_quotes", True)
-        st.session_state.setdefault("ai_cap", 1500)
         st.session_state.setdefault("ai_quote_k", 10)
+        st.session_state.setdefault("ai_cap", 1500)
 
-        ai_enabled = st.toggle("Enable remote AI", value=bool(st.session_state.get("ai_enabled", True)), key="ai_enabled")
-        send_quotes = st.toggle(
-            "Send evidence quotes (masked) to AI",
-            value=bool(st.session_state.get("ai_send_quotes", True)),
-            key="ai_send_quotes",
-            help="If disabled, only aggregated stats + themes are sent (no verbatim text).",
-        )
-        ai_cap = st.number_input(
-            "Max reviews in retrieval corpus",
-            min_value=200,
-            max_value=8000,
-            value=int(st.session_state.get("ai_cap", 1500)),
-            step=100,
-            key="ai_cap",
-            help="Higher = better recall but slower. Retrieval is local; only top quotes are sent (if enabled).",
-        )
-        quote_k = st.slider("Quotes to send (top-k)", 4, 18, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
+        st.selectbox("Model", options=["gpt-4o-mini", "gpt-4o", "gpt-4.1"], key="ai_model")
+        st.slider("Creativity (temperature)", 0.0, 1.0, float(st.session_state.get("ai_temp", 0.2)), 0.1, key="ai_temp")
+        st.toggle("Include evidence quotes (masked)", value=bool(st.session_state.get("ai_send_quotes", True)), key="ai_send_quotes")
+        st.slider("Quotes to retrieve", 4, 18, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
+        st.number_input("Max reviews in retrieval corpus", 200, 8000, int(st.session_state.get("ai_cap", 1500)), 100, key="ai_cap")
 
     with st.sidebar.expander("🔑 OpenAI API Key", expanded=False):
         st.text_input("OPENAI_API_KEY override", value="", type="password", key="api_key_override")
@@ -3909,480 +3671,262 @@ if view.startswith("🤖"):
         except Exception:
             api_key = os.getenv("OPENAI_API_KEY")
 
-    remote_ready = bool(ai_enabled and api_key)
-    sel_model = st.session_state.get("llm_model", "gpt-4o-mini")
-    status_txt = "🟢 Remote AI ready" if remote_ready else "🟡 Remote AI disabled (local insights only)"
+    remote_ready = bool(api_key)
+    model = str(st.session_state.get("ai_model") or "gpt-4o-mini")
+    temp = float(st.session_state.get("ai_temp") or 0.2)
+    send_quotes = bool(st.session_state.get("ai_send_quotes", True))
+    quote_k = int(st.session_state.get("ai_quote_k", 10))
+    cap = int(st.session_state.get("ai_cap", 1500))
+
     st.markdown(
         f"""
 <div class="soft-panel" style="margin-top: 8px;">
   <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
-    <div style="font-weight:850;">{_html.escape(status_txt)}</div>
-    <div class="small-muted">Model: <b>{_html.escape(str(sel_model))}</b></div>
+    <div style="font-weight:850;">{"🟢 Remote AI ready" if remote_ready else "🟡 Add API key to enable remote AI (local insights still work)"}</div>
+    <div class="small-muted">Model: <b>{_html.escape(model)}</b></div>
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    # ----------------------------
-    # Remote call helper (HTTP, retries, no SDK dependency)
-    # ----------------------------
+    # ---- Local retrieval index (TF-IDF) cached per filter-hash ----
+    def _filter_hash_for_ai() -> str:
+        try:
+            payload = {
+                "dataset": st.session_state.get("_dataset_sig"),
+                "filters": {
+                    "tf": tf,
+                    "tf_range": st.session_state.get("tf_range"),
+                    "sr": sr_sel,
+                    "kw": keyword,
+                    "delight": sel_del,
+                    "detract": sel_det,
+                    "std": {c: st.session_state.get(f"f_{c}") for c in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]},
+                    "extra_cols": extra_cols,
+                    "extra": {c: st.session_state.get(f"f_{c}") or st.session_state.get(f"f_{c}_range") for c in extra_cols},
+                },
+                "n": int(len(filtered)),
+            }
+            return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        except Exception:
+            return str(len(filtered))
+
+    def _mask_pii(s: str) -> str:
+        if not s:
+            return s
+        return PII_PAT.sub("[REDACTED]", s)
+
+    def _build_ai_corpus(df_in: pd.DataFrame, max_rows: int) -> tuple[list[str], list[dict]]:
+        if df_in.empty:
+            return [], []
+        df_use = df_in
+        if len(df_use) > max_rows:
+            df_use = df_use.sample(max_rows, random_state=42)
+        texts = []
+        meta = []
+        for _, r in df_use.iterrows():
+            verb = r.get("Verbatim", "")
+            verb = "" if pd.isna(verb) else str(verb)
+            verb = _mask_pii(verb)
+            # Light metadata prefix helps retrieval
+            star = r.get("Star Rating", "")
+            country = r.get("Country", "")
+            source = r.get("Source", "")
+            dtv = r.get("Review Date", "")
+            try:
+                dtv = pd.to_datetime(dtv).strftime("%Y-%m-%d") if pd.notna(dtv) else ""
+            except Exception:
+                dtv = ""
+            prefix = f"[★{star}] [{country}] [{source}] [{dtv}] "
+            txt = (prefix + verb).strip()
+            texts.append(txt)
+            meta.append({"star": star, "country": country, "source": source, "date": dtv, "text": verb})
+        return texts, meta
+
+    def _get_local_index(df_in: pd.DataFrame) -> tuple[Optional[TfidfVectorizer], Any, list[str], list[dict]]:
+        cache = st.session_state.setdefault("_ai_local_index", {})
+        h = _filter_hash_for_ai()
+        if h in cache:
+            return cache[h]["vec"], cache[h]["mat"], cache[h]["texts"], cache[h]["meta"]
+
+        texts, meta = _build_ai_corpus(df_in, cap)
+        if not texts:
+            cache[h] = {"vec": None, "mat": None, "texts": [], "meta": []}
+            return None, None, [], []
+
+        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=35000)
+        mat = vec.fit_transform(texts)
+        cache[h] = {"vec": vec, "mat": mat, "texts": texts, "meta": meta}
+        return vec, mat, texts, meta
+
+    def _retrieve_quotes(query: str, df_in: pd.DataFrame, k: int) -> list[dict]:
+        vec, mat, texts, meta = _get_local_index(df_in)
+        if vec is None or mat is None or not texts:
+            return []
+        qv = vec.transform([query])
+        sims = linear_kernel(qv, mat).flatten()
+        if sims.size == 0:
+            return []
+        top = np.argsort(-sims)[: max(1, k)]
+        out = []
+        for rank, idx in enumerate(top, start=1):
+            m = meta[int(idx)]
+            out.append({"id": f"Q{rank}", "score": float(sims[int(idx)]), **m})
+        return out
+
+    def _build_knowledge_pack(df_in: pd.DataFrame) -> dict:
+        # Product profile
+        prof = infer_product_profile(df_in, source_label)
+        # Key CSAT metrics
+        cnt, avg, low = section_stats(df_in)
+        seeded_mask_local = df_in["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in df_in.columns else pd.Series(False, index=df_in.index)
+        org_local = df_in[~seeded_mask_local]
+        seed_local = df_in[seeded_mask_local]
+        org_cnt2, org_avg2, org_low2 = section_stats(org_local)
+        seed_cnt2, seed_avg2, seed_low2 = section_stats(seed_local)
+
+        det_tbl2 = analyze_symptoms_fast(df_in, existing_detractor_columns).head(12).to_dict("records") if existing_detractor_columns else []
+        del_tbl2 = analyze_symptoms_fast(df_in, existing_delighter_columns).head(12).to_dict("records") if existing_delighter_columns else []
+
+        return {
+            "product_profile": prof,
+            "csat": {
+                "count": cnt,
+                "avg_star": round(avg, 3),
+                "pct_1_2": round(low, 2),
+                "organic": {"count": org_cnt2, "avg_star": round(org_avg2, 3), "pct_1_2": round(org_low2, 2)},
+                "seeded": {"count": seed_cnt2, "avg_star": round(seed_avg2, 3), "pct_1_2": round(seed_low2, 2)},
+            },
+            "top_detractors": det_tbl2,
+            "top_delighters": del_tbl2,
+        }
+
     def _openai_chat_http(api_key: str, model: str, messages: list[dict], temperature: float | None = None, max_tokens: int = 900, timeout_s: int = 60) -> str:
         import requests
-
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-        base_payload = {"model": model, "messages": messages}
-        variants = []
-        variants.append({**base_payload, **({"temperature": float(temperature)} if temperature is not None else {}), "max_tokens": int(max_tokens)})
-        variants.append({**base_payload, "max_tokens": int(max_tokens)})
-        variants.append({**base_payload})
+        payload = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
+        if temperature is not None and model_supports_temperature(model):
+            payload["temperature"] = float(temperature)
 
         last_err = None
-        for payload in variants:
-            for attempt in range(5):
-                try:
-                    r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
-                    if r.status_code in (429, 500, 502, 503, 504):
-                        time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
-                        continue
-                    if r.status_code >= 400:
-                        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:600]}")
-                    data = r.json()
-                    return str(data["choices"][0]["message"]["content"])
-                except Exception as e:
-                    last_err = e
-                    # On model-not-found/access, stop retrying this variant
-                    if isinstance(e, RuntimeError) and ("model" in str(e).lower() or "not found" in str(e).lower() or "does not exist" in str(e).lower()):
-                        break
-                    time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
+        for attempt in range(5):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
+                    continue
+                if r.status_code >= 400:
+                    raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:600]}")
+                data = r.json()
+                return str(data["choices"][0]["message"]["content"])
+            except Exception as e:
+                last_err = e
+                time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
         raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI error")
 
-    def _call_openai_with_fallback(api_key: str, model: str, messages: list[dict], temperature: float | None) -> str:
-        try:
-            return _openai_chat_http(api_key, model, messages, temperature=temperature)
-        except Exception as e:
-            msg = str(e).lower()
-            if "does not exist" in msg or "not found" in msg or ("model" in msg and "access" in msg):
-                # fallback to safe model
-                st.warning(f"Selected model `{model}` is unavailable for this key. Falling back to `gpt-4o-mini`.")
-                return _openai_chat_http(api_key, "gpt-4o-mini", messages, temperature=temperature)
-            raise
-
-    with st.sidebar.expander("🔌 Test Remote AI", expanded=False):
-        if st.button("Run test prompt", use_container_width=True, key="ai_test_prompt_btn"):
-            if not api_key:
-                st.warning("No API key found (override, secrets, or env).")
-            else:
-                try:
-                    test_messages = [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": "Reply with OK and nothing else."},
-                    ]
-                    out = _call_openai_with_fallback(
-                        api_key=api_key,
-                        model=st.session_state.get("llm_model", "gpt-4o-mini"),
-                        messages=test_messages,
-                        temperature=0.0,
-                    )
-                    st.success(f"Remote AI OK ✅  Response: {str(out).strip()[:60]}")
-                except Exception as e:
-                    st.session_state["ai_last_error"] = repr(e)
-                    st.error("Remote AI test failed.")
-                    st.code(repr(e))
-
-    if st.session_state.get("ai_last_error"):
-        with st.expander("⚠️ Last AI error (debug)", expanded=False):
-            st.code(st.session_state.get("ai_last_error"))
-
-    # ----------------------------
-    # Chat UI (no presets; one executive summary button)
-    # ----------------------------
-    st.session_state.setdefault("ai_chat_messages", [])  # list of {role, content}
-    st.session_state.setdefault("_ai_last_search_results", [])
-
-    EXEC_SUMMARY_PROMPT = (
-        "Create an executive summary of the product using ONLY the current filtered consumer reviews. "
-        "Include: (1) what the product is (based on the dataset), (2) what consumers LOVE (top delighters + evidence), "
-        "(3) biggest improvement opportunities (top detractors ranked by impact + evidence), "
-        "(4) where DSAT concentrates (hotspots by country/source/SKU), and "
-        "(5) the top 5 actions a SharkNinja quality engineer should take next with a validation plan. "
-        "Cite evidence quote IDs like [Q3]."
-    )
-
-    exec_clicked = st.button("🪄 Executive Summary", use_container_width=True)
-
-    # Render conversation
-    for msg in st.session_state["ai_chat_messages"]:
-        with st.chat_message("user" if msg.get("role") == "user" else "assistant"):
-            st.markdown(msg.get("content", ""))
-
-    typed_q = st.chat_input("Ask anything (e.g., biggest improvement opportunities, what consumers love, defect hypotheses, hotspots)…")
-    q = EXEC_SUMMARY_PROMPT if exec_clicked else typed_q
-
-    # ----------------------------
-    # Build CSAT + consumer insight context (cached per filter state)
-    # ----------------------------
-    def _ensure_ai_context() -> dict:
-        # hash current applied filters (stable across reruns)
-        try:
-            _filters_hash = hashlib.sha1(json.dumps(active_filters, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-        except Exception:
-            _filters_hash = str(len(filtered))
-
-        cache = st.session_state.setdefault("_ai_csat_cache", {})
-        required = {"driver_det", "driver_del", "hotspots", "product_profile", "text_themes", "csat"}
-        cached = cache.get(_filters_hash)
-        if isinstance(cached, dict) and required.issubset(set(cached.keys())):
-            return {**cached, "_filters_hash": _filters_hash}
-
-        # baseline CSAT metrics
-        stars_all = pd.to_numeric(filtered.get("Star Rating"), errors="coerce") if "Star Rating" in filtered.columns else pd.Series(dtype=float)
-        stars_all = stars_all.dropna()
-        baseline_avg = float(stars_all.mean()) if not stars_all.empty else 0.0
-        baseline_median = float(stars_all.median()) if not stars_all.empty else 0.0
-        baseline_pct_low = float((stars_all <= 2).mean() * 100) if not stars_all.empty else 0.0
-        baseline_pct_high = float((stars_all >= 4).mean() * 100) if not stars_all.empty else 0.0
-        star_counts = (
-            stars_all.value_counts().reindex([1, 2, 3, 4, 5]).fillna(0).astype(int).to_dict()
-            if not stars_all.empty
-            else {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-        )
-
-        def _symptom_driver_stats(df_in: pd.DataFrame, symptom_cols: list[str]) -> pd.DataFrame:
-            cols = [c for c in symptom_cols if c in df_in.columns]
-            if not cols or df_in.empty or "Star Rating" not in df_in.columns:
-                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
-
-            stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
-            long = df_in[cols].copy()
-            long["__rid__"] = np.arange(len(df_in))
-            long = long.melt(id_vars="__rid__", value_vars=cols, value_name="symptom").dropna(subset=["symptom"])
-            long["symptom"] = long["symptom"].astype("string").str.strip()
-            long = long[long["symptom"].ne("")]
-            if long.empty:
-                return pd.DataFrame(columns=["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★"])
-
-            g = long.groupby("symptom")["__rid__"].nunique().rename("Reviews").reset_index()
-            g["Mention %"] = (g["Reviews"] / max(1, len(df_in)) * 100).round(2)
-
-            sym_to_rids = long.groupby("symptom")["__rid__"].apply(lambda x: set(x.tolist())).to_dict()
-            avgs = {}
-            lows = {}
-            for sym, rids in sym_to_rids.items():
-                s = stars.iloc[list(rids)].dropna()
-                avgs[sym] = float(s.mean()) if not s.empty else np.nan
-                lows[sym] = float((s <= 2).mean() * 100) if not s.empty else np.nan
-
-            g["Avg ★"] = g["symptom"].map(avgs).round(2)
-            g["% 1–2★"] = g["symptom"].map(lows).round(1)
-            g = g.rename(columns={"symptom": "Symptom"}).sort_values(["Reviews", "Mention %"], ascending=[False, False])
-            return g.reset_index(drop=True)
-
-        def _driver_table(stats: pd.DataFrame, kind: str) -> pd.DataFrame:
-            if stats.empty:
-                return stats
-            df = stats.copy()
-            df["Δ Avg ★"] = (df["Avg ★"] - baseline_avg).round(2)
-            df["Δ % 1–2★"] = (df["% 1–2★"] - baseline_pct_low).round(1)
-            if kind == "detractors":
-                df["Impact"] = (df["Reviews"] * (baseline_avg - df["Avg ★"])).round(2)
-                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
-            else:
-                df["Impact"] = (df["Reviews"] * (df["Avg ★"] - baseline_avg)).round(2)
-                df = df.sort_values(["Impact", "Reviews"], ascending=[False, False])
-            return df[["Symptom", "Reviews", "Mention %", "Avg ★", "% 1–2★", "Δ Avg ★", "Δ % 1–2★", "Impact"]].reset_index(drop=True)
-
-        def _segment_hotspots(df_in: pd.DataFrame, field: str, k: int = 10, min_n: int = 15) -> pd.DataFrame:
-            if field not in df_in.columns or df_in.empty or "Star Rating" not in df_in.columns:
-                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
-            d = df_in[[field, "Star Rating"]].copy()
-            d[field] = d[field].astype("string").fillna("(blank)").str.strip().replace("", "(blank)")
-            d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-            d = d.dropna(subset=["star"])
-            if d.empty:
-                return pd.DataFrame(columns=[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"])
-            d["low"] = d["star"] <= 2
-            d["high"] = d["star"] >= 4
-            g = d.groupby(field).agg(Reviews=("star", "size"), Avg=("star", "mean"), PctLow=("low", "mean"), PctHigh=("high", "mean")).reset_index()
-            g["Avg ★"] = g["Avg"].round(2)
-            g["% 1–2★"] = (g["PctLow"] * 100).round(1)
-            g["% 4–5★"] = (g["PctHigh"] * 100).round(1)
-            g = g[g["Reviews"] >= int(min_n)]
-            g = g.sort_values(["% 1–2★", "Reviews"], ascending=[False, False]).head(int(k))
-            return g[[field, "Reviews", "Avg ★", "% 1–2★", "% 4–5★"]]
-
-        with st.spinner("Building insight context…"):
-            det_stats = _symptom_driver_stats(filtered, existing_detractor_columns)
-            del_stats = _symptom_driver_stats(filtered, existing_delighter_columns)
-            driver_det = _driver_table(det_stats, "detractors")
-            driver_del = _driver_table(del_stats, "delighters")
-
-            hotspots = {}
-            for f in ["Country", "Source", "Model (SKU)", "Seeded"]:
-                hotspots[f] = _segment_hotspots(filtered, f, k=10, min_n=15)
-
-            product_profile = infer_product_profile(filtered, source_label)
-            text_themes = compute_text_theme_diffs(filtered, max_reviews=5000, top_n=18)
-
-        csat = {
-            "reviews": int(len(filtered)),
-            "avg_star": round(baseline_avg, 3),
-            "median_star": round(baseline_median, 3),
-            "pct_1_2": round(baseline_pct_low, 2),
-            "pct_4_5": round(baseline_pct_high, 2),
-            "star_counts": star_counts,
-        }
-
-        cache[_filters_hash] = {
-            "driver_det": driver_det,
-            "driver_del": driver_del,
-            "hotspots": hotspots,
-            "product_profile": product_profile,
-            "text_themes": text_themes,
-            "csat": csat,
-        }
-        return {**cache[_filters_hash], "_filters_hash": _filters_hash}
-
-    # ----------------------------
-    # Local helpers for fallback + evidence display
-    # ----------------------------
-    def _row_symptoms_list(row: pd.Series, cols: list[str]) -> list[str]:
-        out = []
-        for c in cols:
-            if c not in row.index:
-                continue
-            v = row.get(c, pd.NA)
-            if pd.isna(v):
-                continue
-            s = str(v).strip()
-            if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}:
-                continue
-            out.append(s)
-        seen = set()
-        out2 = []
-        for x in out:
-            xl = x.lower()
-            if xl in seen:
-                continue
-            seen.add(xl)
-            out2.append(x)
-        return out2
-
-    def _local_fallback_answer(knowledge: dict, evidence_quotes: list[dict], question: str) -> str:
-        prof = knowledge.get("product_profile") or {}
-        csat = knowledge.get("csat") or {}
-        det = knowledge.get("top_detractors") or []
-        deli = knowledge.get("top_delighters") or []
+    def _local_answer(question: str, knowledge: dict, quotes: list[dict]) -> str:
+        # A simple deterministic fallback using aggregates
+        csat = knowledge.get("csat", {})
+        prof = knowledge.get("product_profile", {})
+        det = knowledge.get("top_detractors", [])[:6]
+        deli = knowledge.get("top_delighters", [])[:6]
 
         lines = []
-        lines.append(f"**Product (dataset-based):** {prof.get('product_guess','(unknown)')}")
-        fam = prof.get("product_family_guess")
-        if fam:
-            lines.append(f"**Likely family:** {fam}")
-
-        lines.append("")
-        lines.append(
-            f"**CSAT snapshot (filtered):** {csat.get('reviews',0):,} reviews • Avg ★ **{csat.get('avg_star',0):.2f}** • "
-            f"% 1–2★ **{csat.get('pct_1_2',0):.1f}%** • % 4–5★ **{csat.get('pct_4_5',0):.1f}%**"
-        )
-
+        lines.append(f"**Local CSAT Brief (remote AI unavailable)**")
+        lines.append(f"- Reviews in filter: **{csat.get('count', 0):,}**")
+        lines.append(f"- Avg ★: **{csat.get('avg_star', 0)}** • % 1–2★: **{csat.get('pct_1_2', 0)}%**")
+        if prof:
+            guess = prof.get("product_guess") or prof.get("name_guess") or prof.get("model_guess") or "Unknown"
+            lines.append(f"- Product guess: **{guess}**")
         if det:
-            lines.append("")
-            lines.append("### Biggest improvement opportunities (top detractors)")
-            for r in det[:6]:
-                lines.append(
-                    f"- **{r.get('Symptom')}** — {int(r.get('Reviews',0)):,} reviews ({float(r.get('Mention %',0)):.1f}%), "
-                    f"Avg ★ {float(r.get('Avg ★',0)):.2f}, %1–2★ {float(r.get('% 1–2★',0)):.1f}% (Impact {float(r.get('Impact',0)):.2f})"
-                )
-
+            lines.append("\n**Biggest improvement opportunities (top detractors by mentions):**")
+            for r in det:
+                lines.append(f"- {r.get('Item')}: {r.get('Mentions')} mentions • Avg ★ {r.get('Avg Star')}")
         if deli:
-            lines.append("")
-            lines.append("### What consumers love (top delighters)")
-            for r in deli[:6]:
-                lines.append(
-                    f"- **{r.get('Symptom')}** — {int(r.get('Reviews',0)):,} reviews ({float(r.get('Mention %',0)):.1f}%), Avg ★ {float(r.get('Avg ★',0)):.2f}"
-                )
-
-        if evidence_quotes:
-            lines.append("")
-            lines.append("### Evidence (retrieved from filtered reviews)")
-            for r in evidence_quotes[:6]:
-                lines.append(f"- [{r.get('id','Q')}] “{r.get('quote','')}” — {r.get('meta','')}")
-
-        lines.append("")
-        lines.append("*Note: Remote AI was unavailable; this answer was generated locally from aggregates + retrieved evidence.*")
+            lines.append("\n**What consumers love (top delighters by mentions):**")
+            for r in deli:
+                lines.append(f"- {r.get('Item')}: {r.get('Mentions')} mentions • Avg ★ {r.get('Avg Star')}")
+        if quotes:
+            lines.append("\n**Most relevant quotes (masked):**")
+            for q in quotes[:5]:
+                lines.append(f"- [{q['id']}] ★{q.get('star')} {q.get('country')} {q.get('source')} {q.get('date')}: {q.get('text','')[:240]}")
         return "\n".join(lines)
 
-    # ----------------------------
-    # Handle a question
-    # ----------------------------
-    if q and str(q).strip():
-        q = str(q).strip()
+    # ---- Main AI interaction ----
+    st.session_state.setdefault("_ai_last_q", "")
+    st.session_state.setdefault("_ai_last_answer", "")
 
-        # Show the user's message immediately
-        with st.chat_message("user"):
-            st.markdown(q)
-        st.session_state["ai_chat_messages"].append({"role": "user", "content": q})
+    colA, colB = st.columns([1, 0.28])
+    with colA:
+        st.markdown("### Ask a question")
+    with colB:
+        if st.button("🧾 Executive summary", use_container_width=True):
+            st.session_state["ai_user_q"] = "Provide an executive summary of what consumers love, biggest improvement opportunities, and concrete next steps for engineering. Use the filtered dataset."
 
-        ctx = _ensure_ai_context()
-        _filters_hash = ctx.get("_filters_hash", str(len(filtered)))
-        driver_det = ctx.get("driver_det", pd.DataFrame())
-        driver_del = ctx.get("driver_del", pd.DataFrame())
+    # Show latest answer (ONLY)
+    last_q = (st.session_state.get("_ai_last_q") or "").strip()
+    last_a = (st.session_state.get("_ai_last_answer") or "").strip()
+    if last_a:
+        st.markdown("### Latest answer")
+        if last_q:
+            st.markdown(f"**Q:** {esc(last_q)}")
+        st.markdown(last_a)
 
-        # Build enriched retrieval corpus (deterministic sampling)
-        df_for_retrieval = filtered
-        if len(df_for_retrieval) > int(ai_cap):
-            try:
-                rs = int(_filters_hash[:8], 16) % (2**32 - 1)
-            except Exception:
-                rs = 42
-            df_for_retrieval = df_for_retrieval.sample(n=int(ai_cap), random_state=rs)
-
-        _enriched_cache = st.session_state.setdefault("_ai_enriched_texts", {})
-        _ekey = f"{_filters_hash}|cap={int(ai_cap)}"
-        if _ekey not in _enriched_cache:
-            rows = []
-            for _, r in df_for_retrieval.iterrows():
-                verb = clean_text(r.get("Verbatim", ""))
-                verb = _mask_pii(str(verb))
-                meta = []
-                for f in ["Country", "Source", "Model (SKU)", "Seeded", "New Review", "Review Date"]:
-                    if f in df_for_retrieval.columns:
-                        vv = r.get(f, pd.NA)
-                        if pd.notna(vv) and str(vv).strip():
-                            meta.append(f"{f}={str(vv).strip()}")
-                sr = r.get("Star Rating", pd.NA)
-                if pd.notna(sr):
-                    meta.append(f"Star={sr}")
-
-                dets = _row_symptoms_list(r, existing_detractor_columns)
-                dels = _row_symptoms_list(r, existing_delighter_columns)
-                if dets:
-                    meta.append("Detractors=" + ", ".join(dets[:6]) + ("…" if len(dets) > 6 else ""))
-                if dels:
-                    meta.append("Delighters=" + ", ".join(dels[:6]) + ("…" if len(dels) > 6 else ""))
-
-                prefix = " | ".join(meta)
-                txt = (prefix + " || " if prefix else "") + verb
-                rows.append(txt[:2500])
-            _enriched_cache[_ekey] = rows
-
-        local_texts = _enriched_cache[_ekey]
-        content_hash_local = _hash_texts(local_texts)
-        local_index = _get_or_build_local_text_index(local_texts, content_hash_local)
-
-        hits = _local_search(q, local_index, top_k=max(14, int(quote_k) + 4))
-
-        evidence = []
-        for i, (raw, score) in enumerate(hits[: int(quote_k)], start=1):
-            meta = ""
-            verb = raw or ""
-            if "||" in verb:
-                prefix, verb2 = verb.split("||", 1)
-                meta = prefix.strip().replace("|", " • ").strip()
-                verb = verb2.strip()
-
-            verb = _mask_pii(str(verb))
-            if len(verb) > 360:
-                verb = verb[:357] + "…"
-            evidence.append({"id": f"Q{i}", "quote": verb, "meta": meta, "score": float(score)})
-
-        # Add a few symptom-anchored quotes for top drivers (helps product understanding)
-        symptom_evidence = []
-        top_det_syms = driver_det["Symptom"].head(2).tolist() if isinstance(driver_det, pd.DataFrame) and not driver_det.empty else []
-        top_del_syms = driver_del["Symptom"].head(2).tolist() if isinstance(driver_del, pd.DataFrame) and not driver_del.empty else []
-        for sym in top_det_syms:
-            for s in _pick_quotes_for_symptom(filtered, sym, existing_detractor_columns, k=2, prefer="low"):
-                symptom_evidence.append({"id": f"S-{sym}", "quote": _mask_pii(s), "meta": f"Symptom={sym} (detractor)", "score": 0.0})
-        for sym in top_del_syms:
-            for s in _pick_quotes_for_symptom(filtered, sym, existing_delighter_columns, k=2, prefer="high"):
-                symptom_evidence.append({"id": f"S+{sym}", "quote": _mask_pii(s), "meta": f"Symptom={sym} (delighter)", "score": 0.0})
-
-        st.session_state["_ai_last_search_results"] = (evidence + symptom_evidence)[:40]
-
-        # Compact filter summary
-        try:
-            filters_summary = _summarize_active_filters(filtered)
-        except Exception:
-            filters_summary = []
-
-        knowledge = {
-            "product_profile": ctx.get("product_profile"),
-            "filters": [{"name": k, "value": v} for (k, v) in (filters_summary or [])],
-            "csat": ctx.get("csat"),
-            "top_detractors": ctx.get("driver_det", pd.DataFrame()).head(12).to_dict(orient="records") if isinstance(ctx.get("driver_det"), pd.DataFrame) else [],
-            "top_delighters": ctx.get("driver_del", pd.DataFrame()).head(12).to_dict(orient="records") if isinstance(ctx.get("driver_del"), pd.DataFrame) else [],
-            "hotspots": {k: (v.head(10).to_dict(orient="records") if isinstance(v, pd.DataFrame) else []) for k, v in (ctx.get("hotspots") or {}).items()},
-            "themes": ctx.get("text_themes") or {},
-        }
-
-        # Local fallback always available
-        local_answer = _local_fallback_answer(knowledge, evidence_quotes=evidence, question=q)
-
-        final_answer = local_answer
-        used_remote = False
-
-        if remote_ready:
-            try:
-                evidence_to_send = (evidence + symptom_evidence) if send_quotes else []
-                evidence_to_send = evidence_to_send[: int(quote_k)]
-
-                system_prompt = (
-                    "You are a SharkNinja Consumer Insights + Product Quality copilot. "
-                    "Your job is to help a quality engineer improve CSAT using the uploaded consumer review dataset. "
-                    "You MUST ground all metrics and claims in the provided DATA_JSON. "
-                    "If you use general product knowledge, label it clearly as a hypothesis. "
-                    "Be concise but insightful; use headings and bullets. "
-                    "When using evidence, cite quote IDs like [Q3] or [S-...]. "
-                    "Never invent quotes or numbers."
-                )
-
-                user_payload = {"question": q, "knowledge": knowledge, "evidence_quotes": evidence_to_send}
-                user_prompt = (
-                    "Answer the question using the dataset context below.\n"
-                    "Provide: TL;DR, Insights (what consumers love + improvement opportunities), Hotspots, and Next actions + validation plan.\n\n"
-                    "DATA_JSON:\n" + json.dumps(user_payload, ensure_ascii=False)
-                )
-
-                messages = [{"role": "system", "content": system_prompt}]
-
-                # Provide a small amount of chat memory (keeps it ChatGPT-like but bounded)
-                hist = st.session_state.get("ai_chat_messages", [])
-                for msg in hist[-6:]:
-                    if msg.get("role") in ("user", "assistant"):
-                        messages.append({"role": msg["role"], "content": str(msg.get("content", ""))[:2500]})
-                messages.append({"role": "user", "content": user_prompt})
-
-                ans = _call_openai_with_fallback(
-                    api_key=api_key,
-                    model=st.session_state.get("llm_model", "gpt-4o-mini"),
-                    messages=messages,
-                    temperature=float(st.session_state.get("llm_temp", 0.2)),
-                )
-                if ans and isinstance(ans, str):
-                    final_answer = ans
-                    used_remote = True
-                    st.session_state.pop("ai_last_error", None)
-            except Exception as e:
-                st.session_state["ai_last_error"] = repr(e)
-                # silent fallback to local (still show debug if user opens it)
-
-        # Show assistant answer
-        with st.chat_message("assistant"):
-            st.markdown(final_answer)
-
-        st.session_state["ai_chat_messages"].append({"role": "assistant", "content": final_answer})
-        st.session_state["ai_last_used_remote"] = used_remote
-
-    # ----------------------------
-    # Evidence panel (optional)
-    # ----------------------------
-    with st.expander("🔎 Evidence (retrieved from your filtered reviews)", expanded=False):
-        rows = st.session_state.get("_ai_last_search_results", []) or []
-        if not rows:
-            st.caption("Ask a question to retrieve evidence quotes.")
+    # Chat box
+    user_q = st.text_area("Your question", value=st.session_state.get("ai_user_q", ""), height=120, key="ai_user_q", placeholder="E.g., What are the biggest improvement opportunities? What are consumers loving about the product?")
+    send = st.button("➡️ Send", type="primary")
+    if send:
+        q = (user_q or "").strip()
+        if not q:
+            st.warning("Type a question first.")
         else:
-            for r in rows[:24]:
-                st.write(f"[{r.get('id','Q')}] “{r.get('quote','')}” — {r.get('meta','')}")
+            knowledge = _build_knowledge_pack(filtered)
+            quotes = _retrieve_quotes(q, filtered, quote_k) if send_quotes else []
+            # Build prompt
+            sys_prompt = (
+                "You are a SharkNinja Consumer Insights + Quality Engineering copilot.\n"
+                "You MUST ground your answers in the provided dataset context and retrieved evidence.\n"
+                "Be practical, concise, and insight-driven. Quantify (counts, avg★, %1–2★) when possible.\n"
+                "When you make a claim supported by evidence quotes, cite the quote IDs like [Q3].\n"
+                "If the question is about 'what is this product', infer from model/retailer/source strings and the review text.\n"
+                "Never invent data that isn't in the context.\n"
+            )
+            user_payload = {
+                "question": q,
+                "dataset_context": knowledge,
+                "retrieved_evidence": [
+                    {
+                        "id": it["id"],
+                        "star": it.get("star"),
+                        "country": it.get("country"),
+                        "source": it.get("source"),
+                        "date": it.get("date"),
+                        "text": it.get("text"),
+                    }
+                    for it in quotes[:quote_k]
+                ],
+            }
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ]
+
+            with st.spinner("Thinking…"):
+                if remote_ready:
+                    try:
+                        ans = _openai_chat_http(api_key, model, messages, temperature=temp)
+                    except Exception as e:
+                        st.warning("Remote AI failed; falling back to local insights.")
+                        st.sidebar.caption(f"Last AI error: {str(e)[:200]}")
+                        ans = _local_answer(q, knowledge, quotes)
+                else:
+                    ans = _local_answer(q, knowledge, quotes)
+
+            # Requested: replace previous response; newest stays on top
+            st.session_state["_ai_last_q"] = q
+            st.session_state["_ai_last_answer"] = ans
+            # Clear input (optional)
+            # st.session_state["ai_user_q"] = ""
+            st.rerun()
