@@ -407,6 +407,71 @@ GLOBAL_CSS = """
   .pill .muted{ color:var(--muted); font-weight:650; }
 
   .section-title{ margin-top: 10px; font-weight: 900; font-size: 1.1rem; }
+
+/* --- DataFrame readability fixes (prevents white-on-white) --- */
+div[data-testid="stDataFrame"] *{
+  color: var(--text) !important;
+}
+div[data-testid="stDataFrame"] [role="grid"],
+div[data-testid="stDataFrame"] [role="table"]{
+  background: var(--bg-card) !important;
+}
+div[data-testid="stDataFrame"] [role="columnheader"]{
+  background: var(--bg-tile) !important;
+  color: var(--muted) !important;
+  font-weight: 900 !important;
+}
+div[data-testid="stDataFrame"] [role="gridcell"]{
+  background: var(--bg-card) !important;
+}
+
+/* --- Symptom tables (custom HTML) --- */
+.sw-table-wrap{
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: auto;
+  background: var(--bg-card);
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.06);
+}
+table.sw-table{
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 560px;
+}
+table.sw-table thead th{
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-tile);
+  color: var(--muted);
+  text-align: left;
+  font-size: 13px;
+  font-weight: 900;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(148,163,184,0.28);
+}
+table.sw-table tbody td{
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(148,163,184,0.18);
+  font-size: 14px;
+  color: var(--text);
+  vertical-align: top;
+}
+table.sw-table tbody tr:hover{
+  background: rgba(148,163,184,0.10);
+}
+.sw-td-right{
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.sw-pos{
+  color: #16a34a !important;
+  font-weight: 900;
+}
+.sw-neg{
+  color: #dc2626 !important;
+  font-weight: 900;
+}
 </style>
 """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
@@ -466,6 +531,122 @@ def _mask_pii(s: str) -> str:
 def esc(x) -> str:
     return _html.escape("" if pd.isna(x) else str(x))
 
+
+
+def series_matches_any(series: pd.Series, selected: List[str], *, delim: str = " | ") -> pd.Series:
+    """Boolean mask for filtering with multi-select values.
+
+    - If "ALL" is in selected (or selected is empty) -> returns all True.
+    - If cells contain delimited multi-values (e.g., "A | B"), this matches if ANY
+      selected token is present as a full token.
+    """
+    if not selected or ("ALL" in selected):
+        return pd.Series(True, index=series.index)
+
+    sel = [str(x) for x in selected if str(x).strip() and str(x) != "ALL"]
+    if not sel:
+        return pd.Series(True, index=series.index)
+
+    s = series.astype("string")
+    # Multi-value detection (delimited)
+    try:
+        has_delim = s.str.contains(re.escape(delim), regex=True, na=False).any()
+    except Exception:
+        has_delim = False
+
+    if has_delim:
+        # Token boundary match on the delimiter
+        pat = r"(?:^|%s)(?:%s)(?:%s|$)" % (
+            re.escape(delim),
+            "|".join(re.escape(x) for x in sel),
+            re.escape(delim),
+        )
+        return s.fillna("").str.contains(pat, regex=True)
+
+    return s.isin(sel)
+
+
+def pct_12(stars: pd.Series) -> float:
+    """Percent of reviews with 1–2 star ratings."""
+    s = pd.to_numeric(stars, errors="coerce")
+    denom = int(s.notna().sum())
+    if denom == 0:
+        return 0.0
+    return float((s <= 2).sum() / denom * 100.0)
+
+
+def section_stats(df_in: pd.DataFrame) -> Tuple[int, float, float]:
+    """Return (count, avg, pct_1_2) for a dataframe with 'Star Rating'."""
+    s = pd.to_numeric(df_in.get("Star Rating"), errors="coerce")
+    cnt = int(s.notna().sum())
+    avg = float(s.mean()) if cnt else float("nan")
+    low = pct_12(s) if cnt else float("nan")
+    return cnt, avg, low
+
+
+def symptom_table_html(df_in: pd.DataFrame, *, max_height_px: int = 420) -> str:
+    """Render a delighters/detractors table as HTML with consistent formatting & colors."""
+    if df_in is None or df_in.empty:
+        return "<div class='sw-table-wrap' style='max-height:%dpx; padding:12px;'>No data.</div>" % max_height_px
+
+    cols = [c for c in ["Item", "Mentions", "% Total", "Avg Star", "Net Hit"] if c in df_in.columns]
+    d = df_in[cols].copy()
+
+    # Formatting (keep raw values elsewhere; only format for display)
+    if "Mentions" in d.columns:
+        d["Mentions"] = pd.to_numeric(d["Mentions"], errors="coerce").fillna(0).astype(int)
+
+    if "Avg Star" in d.columns:
+        d["Avg Star"] = pd.to_numeric(d["Avg Star"], errors="coerce").round(1)
+
+    if "Net Hit" in d.columns:
+        d["Net Hit"] = pd.to_numeric(d["Net Hit"], errors="coerce").round(3)
+
+    # Build HTML
+    th = "".join(f"<th>{esc(c)}</th>" for c in cols)
+    rows_html = []
+    for _, row in d.iterrows():
+        tds = []
+        for c in cols:
+            v = row.get(c, "")
+            cls = ""
+            if c in ("Mentions", "% Total", "Avg Star", "Net Hit"):
+                cls = "sw-td-right"
+
+            if c == "Avg Star":
+                try:
+                    f = float(v)
+                    cls += (" sw-pos" if f >= 4.5 else " sw-neg")
+                    v_str = f"{f:.1f}"
+                except Exception:
+                    v_str = esc(str(v))
+                tds.append(f"<td class='{cls.strip()}'>{v_str}</td>")
+                continue
+
+            if c == "Net Hit":
+                try:
+                    f = float(v)
+                    v_str = f"{f:.3f}"
+                except Exception:
+                    v_str = esc(str(v))
+                tds.append(f"<td class='{cls.strip()}'>{v_str}</td>")
+                continue
+
+            if isinstance(v, (float, int)) and c not in ("Item", "% Total"):
+                v_str = esc(str(v))
+            else:
+                v_str = esc(str(v))
+
+            tds.append(f"<td class='{cls.strip()}'>{v_str}</td>")
+
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+
+    body = "".join(rows_html)
+    return (
+        f"<div class='sw-table-wrap' style='max-height:{max_height_px}px;'>"
+        f"<table class='sw-table'><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+        f"</div>"
+    )
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).lower())
@@ -2403,7 +2584,7 @@ def _reset_all_filters():
 
 
 # Home (requested): quick way back to main dashboard from anywhere
-if st.sidebar.button("🏠 Home", use_container_width=True):
+if st.sidebar.button("🏠 Dashboard", use_container_width=True):
     st.session_state["main_view"] = "📊 Dashboard"
     st.rerun()
 
@@ -2622,7 +2803,7 @@ for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
     sel_list = sel_raw if isinstance(sel_raw, list) else [sel_raw]
     sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
     if col in d0.columns and sel_clean:
-        mask &= d0[col].astype("string").isin([str(x) for x in sel_clean])
+        mask &= series_matches_any(d0[col], [str(x) for x in sel_clean])
 
 # extra filters
 for col in extra_cols:
@@ -3088,48 +3269,44 @@ if view.startswith("📊"):
             sty = sty.applymap(style_avg, subset=["Avg Star"])
         return sty
 
-    def _full_table_actions(label: str, full_df: pd.DataFrame):
+    # Render symptom tables with HTML so:
+    # 1) Avg Star is always 1-decimal (no 3.700000)
+    # 2) Colors are readable (no white-on-white)
+    # 3) Only ONE table shows at a time (no stacked duplicates)
+    def _render_symptom_table(label: str, preview_df: pd.DataFrame, full_df: pd.DataFrame, *, preview_height: int = 360):
         if full_df is None or full_df.empty:
             st.info("No data.")
             return
-        if len(full_df) > int(table_limit):
-            if st.button(f"View full {label} table", key=f"view_full_{label}"):
-                st.dataframe(_styled_table(full_df), use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(_styled_table(full_df), use_container_width=True, hide_index=True)
+
+        total_rows = len(full_df)
+        show_full = False
+        if total_rows > int(table_limit):
+            show_full = st.toggle(
+                f"Show full table ({total_rows:,} rows)",
+                key=f"show_full_{label}",
+                value=False,
+            )
+
+        df_show = full_df if show_full else preview_df
+        max_h = 520 if show_full else preview_height
+        st.markdown(symptom_table_html(df_show, max_height_px=max_h), unsafe_allow_html=True)
 
     if view_mode == "Split":
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### All Detractors")
-            if detractors_preview is None or detractors_preview.empty:
-                st.info("No detractor symptoms available.")
-            else:
-                st.dataframe(_styled_table(detractors_preview), use_container_width=True, hide_index=True)
-                _full_table_actions("detractors", detractors_full)
+            _render_symptom_table("detractors", detractors_preview, detractors_full)
         with c2:
             st.markdown("### All Delighters")
-            if delighters_preview is None or delighters_preview.empty:
-                st.info("No delighter symptoms available.")
-            else:
-                st.dataframe(_styled_table(delighters_preview), use_container_width=True, hide_index=True)
-                _full_table_actions("delighters", delighters_full)
+            _render_symptom_table("delighters", delighters_preview, delighters_full)
     else:
         tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
         with tab1:
-            if detractors_preview is None or detractors_preview.empty:
-                st.info("No detractor symptoms available.")
-            else:
-                st.dataframe(_styled_table(detractors_preview), use_container_width=True, hide_index=True)
-                _full_table_actions("detractors", detractors_full)
+            _render_symptom_table("detractors_tab", detractors_preview, detractors_full, preview_height=420)
         with tab2:
-            if delighters_preview is None or delighters_preview.empty:
-                st.info("No delighter symptoms available.")
-            else:
-                st.dataframe(_styled_table(delighters_preview), use_container_width=True, hide_index=True)
-                _full_table_actions("delighters", delighters_full)
+            _render_symptom_table("delighters_tab", delighters_preview, delighters_full, preview_height=420)
 
-    # Combined download (requested: one button, two tabs) — placed BELOW view full buttons
+# Combined download (requested: one button, two tabs) — placed BELOW view full buttons
     if detractors_full is not None and delighters_full is not None and (not detractors_full.empty or not delighters_full.empty):
         out_xlsx = BytesIO()
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
