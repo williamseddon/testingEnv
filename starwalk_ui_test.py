@@ -80,7 +80,7 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-02-master-v23"
+APP_VERSION = "2026-03-02-master-v28"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
@@ -1923,7 +1923,7 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: list[str]) -> pd
     out = pd.DataFrame(
         {
             "Item": [str(x).title() for x in counts.index.tolist()],
-            "Avg Star": [None if pd.isna(avg_map.get(x, pd.NA)) else round(float(avg_map.get(x)), 1) for x in counts.index.tolist()],
+            "Avg Star": [np.nan if pd.isna(avg_map.get(x, pd.NA)) else round(float(avg_map.get(x)), 1) for x in counts.index.tolist()],
             "Mentions": counts.values.astype(int),
             "% Total": (counts.values / total_rows * 100).round(1).astype(str) + "%",
         }
@@ -3086,7 +3086,7 @@ This is a prioritization heuristic, not a causal model — use it to rank themes
             return tbl
         d = tbl.copy()
         d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0).astype(int)
-        d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
+        d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce").round(1)
 
         total_mentions = float(d["Mentions"].sum())
         if total_mentions <= 0:
