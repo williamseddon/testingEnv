@@ -3278,18 +3278,18 @@ if view.startswith("📊"):
             st.info("No data.")
             return
 
-        total_rows = len(full_df)
-        show_full = False
-        if total_rows > int(table_limit):
-            show_full = st.toggle(
-                f"Show full table ({total_rows:,} rows)",
-                key=f"show_full_{label}",
-                value=False,
-            )
+        total_rows = int(len(full_df))
+        show_key = f"show_full_{label}"
+        show_full = bool(st.session_state.get(show_key, False))
 
+        # Decide which table to render based on the *current* toggle state.
         df_show = full_df if show_full else preview_df
         max_h = 520 if show_full else preview_height
         st.markdown(symptom_table_html(df_show, max_height_px=max_h), unsafe_allow_html=True)
+
+        # Put the control below the table so Split-view tables stay aligned at the top.
+        if total_rows > int(table_limit):
+            st.toggle(f"Show full table ({total_rows:,} rows)", key=show_key, value=show_full)
 
     if view_mode == "Split":
         c1, c2 = st.columns(2)
