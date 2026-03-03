@@ -1188,12 +1188,19 @@ def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) 
 
 
 # Flexible JSON parsing (from aXreviewsConverter.py)
+_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", flags=re.DOTALL | re.IGNORECASE)
+
 def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    m = re.search(r"```(?:json)?\s*(.*?)```", s, flags=re.DOTALL | re.IGNORECASE)
+    """If the *entire* input is wrapped in a Markdown code fence, strip it.
+
+    IMPORTANT: Some review text can legitimately contain ``` inside JSON strings.
+    We must NOT treat those as code fences (otherwise valid JSON files break).
+    """
+    s0 = "" if s is None else str(s)
+    m = _CODE_FENCE_RE.match(s0)
     if m:
-        return m.group(1).strip()
-    return s
+        return (m.group(1) or "").strip()
+    return s0.strip()
 
 
 def _extract_json_substring(s: str) -> str:
