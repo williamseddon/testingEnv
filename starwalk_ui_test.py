@@ -3519,7 +3519,7 @@ if view.startswith("📊"):
                 top_regions = data[region_col].astype("string").value_counts().head(8).index.tolist()
                 data = data[data[region_col].astype("string").isin(top_regions)]
 
-                c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.1, 1.0])
+                c1, c2, c3, c4, c5 = st.columns([1.05, 1.05, 1.1, 1.0, 1.25])
                 with c1:
                     smooth = st.selectbox("Smoothing", options=["None", "7-day", "14-day"], index=1, key="cum_smooth")
                 with c2:
@@ -3528,6 +3528,17 @@ if view.startswith("📊"):
                     show_volume = st.toggle("Show volume bars", value=True, key="cum_show_volume")
                 with c4:
                     organic_only_cum = st.toggle("Organic only", value=False, help="Exclude seeded / incentivized reviews (Seeded == YES) from this chart.", key="cum_organic_only")
+                with c5:
+                    # Requested: default to a zoomed-in view so subtle rating movement is readable.
+                    # "Zoomed-in" also shows a small axis break indicator on the left y-axis.
+                    zoom_mode = st.radio(
+                        "Y-axis view",
+                        options=["🔍 Zoomed-in", "📏 Full scale"],
+                        horizontal=True,
+                        index=0,
+                        key="cum_zoom_mode",
+                    )
+                zoomed_in = str(zoom_mode).startswith("🔍")
 
 
                 if organic_only_cum and "Seeded" in data.columns:
@@ -3541,6 +3552,9 @@ if view.startswith("📊"):
                 vol["cum_cnt"] = vol["cnt"].cumsum()
 
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Collect y-values so we can auto-zoom the rating axis.
+                y_vals_for_range: List[float] = []
                 # volume bars (subtle)
                 if show_volume:
                     fig.add_trace(
@@ -3567,6 +3581,12 @@ if view.startswith("📊"):
                     if smooth != "None" and len(y) > 2:
                         win = 7 if smooth == "7-day" else 14
                         y = pd.Series(y).rolling(window=win, min_periods=1).mean().to_numpy()
+
+                    # Keep a running pool of y-values (post-smoothing) for range calculations.
+                    try:
+                        y_vals_for_range.extend([float(v) for v in y if np.isfinite(v)])
+                    except Exception:
+                        pass
 
                     fig.add_trace(
                         go.Scatter(
@@ -3596,6 +3616,11 @@ if view.startswith("📊"):
                         win = 7 if smooth == "7-day" else 14
                         y = pd.Series(y).rolling(window=win, min_periods=1).mean().to_numpy()
 
+                    try:
+                        y_vals_for_range.extend([float(v) for v in y if np.isfinite(v)])
+                    except Exception:
+                        pass
+
                     fig.add_trace(
                         go.Scatter(
                             x=overall["date"],
@@ -3622,7 +3647,86 @@ if view.startswith("📊"):
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                     barmode="overlay",
                 )
-                fig.update_yaxes(title_text="Cumulative Avg ★", range=[1.0, 5.2], showgrid=True, gridcolor=PLOTLY_GRIDCOLOR, secondary_y=False)
+
+                # --------- Auto y-axis zoom (requested) ---------
+                # Full scale = classic 1–5★ axis.
+                # Zoomed-in = auto range based on the chart's (smoothed) cumulative averages,
+                # plus a subtle "axis break" mark so it doesn't look misleading.
+                full_y_range = [1.0, 5.2]
+                y_range = list(full_y_range)
+                show_axis_break = False
+
+                if zoomed_in and y_vals_for_range:
+                    arr = np.asarray(y_vals_for_range, dtype=float)
+                    arr = arr[np.isfinite(arr)]
+                    if arr.size > 0:
+                        # Use robust percentiles so 1-off early cumulative points don't blow out the range.
+                        lo_p = float(np.nanpercentile(arr, 3))
+                        hi_p = float(np.nanpercentile(arr, 97))
+                        span = float(hi_p - lo_p)
+
+                        # If the series is nearly flat, still give it breathing room.
+                        span = max(span, 0.12)
+                        pad = max(0.05, span * 0.18)
+
+                        zoom_lo = max(1.0, lo_p - pad)
+                        zoom_hi = min(5.2, hi_p + pad)
+
+                        # Snap to a nice step so ticks look clean.
+                        step = 0.05
+                        try:
+                            zoom_lo = float(np.floor(zoom_lo / step) * step)
+                            zoom_hi = float(np.ceil(zoom_hi / step) * step)
+                        except Exception:
+                            zoom_lo, zoom_hi = float(zoom_lo), float(zoom_hi)
+
+                        # Guarantee a minimum visible span.
+                        if (zoom_hi - zoom_lo) < 0.2:
+                            zoom_hi = min(5.2, zoom_lo + 0.2)
+
+                        # Only show the axis break mark if we're not near the full 1★ baseline.
+                        show_axis_break = zoom_lo > 1.05
+                        y_range = [zoom_lo, zoom_hi]
+
+                fig.update_yaxes(
+                    title_text="Cumulative Avg ★",
+                    range=y_range,
+                    showgrid=True,
+                    gridcolor=PLOTLY_GRIDCOLOR,
+                    secondary_y=False,
+                )
+
+                # When zoomed-in, use 0.1★ ticks so the axis matches the desired view.
+                if zoomed_in and (y_range[1] - y_range[0]) <= 1.2:
+                    fig.update_yaxes(dtick=0.1, tickformat=".1f", secondary_y=False)
+
+                # Add a subtle axis-break mark on the left y-axis to indicate truncation.
+                if zoomed_in and show_axis_break:
+                    brk = "rgba(100,116,139,0.85)"
+                    # Two small diagonal slashes near the bottom-left of the plotting area.
+                    fig.add_shape(
+                        type="line",
+                        xref="paper",
+                        yref="paper",
+                        x0=0.0,
+                        x1=0.03,
+                        y0=0.06,
+                        y1=0.04,
+                        line=dict(color=brk, width=2),
+                        layer="above",
+                    )
+                    fig.add_shape(
+                        type="line",
+                        xref="paper",
+                        yref="paper",
+                        x0=0.0,
+                        x1=0.03,
+                        y0=0.035,
+                        y1=0.015,
+                        line=dict(color=brk, width=2),
+                        layer="above",
+                    )
+
                 fig.update_yaxes(title_text="Reviews/day", showgrid=False, secondary_y=True, rangemode="tozero", showticklabels=False)
 
                 style_plotly(fig)
