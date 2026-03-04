@@ -2205,13 +2205,94 @@ THEME_PATCH_CSS = ""
 # ============================================================
 # Improved flexible JSON parsing (more forgiving for copy/paste)
 # ============================================================
+# ============================================================
+# Improved flexible JSON parsing (SAFE for real exports)
+#   - Does NOT replace curly quotes inside string values (that breaks valid JSON)
+#   - Still supports: code fences, BOM, JSON Lines, trailing commas, raw_decode,
+#     comma-separated objects, Python literal fallback.
+#   - Optional last-resort: repairs curly-quote *delimited* strings if someone
+#     pasted non-JSON with “ ” as delimiters.
+# ============================================================
+
+def _convert_curly_delimited_strings_to_json(s: str) -> str:
+    """
+    Last-resort repair:
+    Convert strings delimited by curly quotes “ ... ” into standard JSON " ... ".
+
+    IMPORTANT:
+    - We do NOT touch curly quotes inside already-valid JSON strings.
+    - We only call this after json.loads() fails.
+    """
+    out: list[str] = []
+    in_str = False
+    delim = "standard"  # "standard" or "curly"
+    escape = False
+
+    for ch in s:
+        if in_str:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+
+            if delim == "standard":
+                if ch == '"':
+                    out.append('"')
+                    in_str = False
+                    delim = "standard"
+                    continue
+                out.append(ch)
+                continue
+
+            # delim == "curly"
+            if ch == "”":
+                out.append('"')
+                in_str = False
+                delim = "standard"
+                continue
+
+            # If a raw " appears inside a curly-delimited string, escape it
+            if ch == '"':
+                out.append('\\"')
+                continue
+
+            out.append(ch)
+            continue
+
+        # not in_str
+        if ch == '"':
+            out.append('"')
+            in_str = True
+            delim = "standard"
+            continue
+
+        if ch in ("“", "”"):
+            out.append('"')
+            in_str = True
+            delim = "curly"
+            continue
+
+        out.append(ch)
+
+    return "".join(out)
+
+
 def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
     """
     Parses:
     - Normal JSON object/array
     - JSON Lines (one object per line)
-    - Common copy/paste variants: code fences, BOM, smart quotes, trailing commas
+    - Common copy/paste variants: code fences, BOM, trailing commas
+    - Extra trailing text after JSON (raw_decode fallback)
     - Python-literal dict/list (best-effort via ast.literal_eval)
+
+    CRITICAL:
+    - We DO NOT replace curly quotes “ ” inside text. That breaks valid JSON exports.
     """
     warnings: List[str] = []
 
@@ -2220,25 +2301,25 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
 
     s = str(text_in)
 
-    # Remove BOM / zero-width / non-breaking spaces
-    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+    # Remove BOM / zero-width / NBSP
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\u2060", "").replace("\xa0", " ")
+
+    # Strip full-input code fences only (safe)
     s = _strip_code_fences(s)
+
+    # If there's leading/trailing commentary, extract first balanced JSON object/array
     s = _extract_json_substring(s).strip()
 
-    # Remove ASCII control characters that sometimes sneak into copy/paste and break json.loads.
-    # (JSON strings cannot contain raw control characters.)
+    # Remove ASCII control characters that break JSON (keep \t \n \r)
     s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
 
-    # Normalize smart quotes
-    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-
-    # Fast path: standard JSON
+    # 1) Strict JSON parse (do NOT mutate quotes)
     try:
         return json.loads(s), warnings
     except Exception as e1:
-        last_err = e1
+        last_err: Exception = e1
 
-    # Attempt: remove trailing commas
+    # 2) Remove trailing commas
     s2 = re.sub(r",\s*([}\]])", r"\1", s)
     if s2 != s:
         try:
@@ -2248,59 +2329,75 @@ def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
             last_err = e2
             warnings = [w for w in warnings if "trailing commas" not in w.lower()]
 
-    # Attempt: JSON Lines
+    # 3) JSON Lines
     jl = _try_parse_json_lines(s)
     if jl is not None:
-        warnings.append("Detected JSON Lines and parsed each line as a record.")
+        warnings.append("Detected JSON Lines and parsed each line as a record list.")
         return jl, warnings
 
-    # Attempt: common copy/paste fragment — multiple JSON objects separated by commas
-    # (e.g., "{...},\n{...},\n{...}" without the surrounding "[ ... ]").
-    # Heuristic: if we see the pattern "}{" with a comma in between at the top level,
-    # try wrapping the whole thing as a JSON array.
-    s_strip2 = s.strip()
-    if s_strip2.startswith("{") and ("\n{" in s_strip2 or re.search(r"\}\s*,\s*\{", s_strip2)):
-        candidate = s_strip2
-        # Remove a trailing comma (if present)
-        candidate = re.sub(r",\s*$", "", candidate)
+    # 4) JSONDecoder raw_decode (ignores trailing junk)
+    dec = json.JSONDecoder()
+    for start in [s.find("{"), s.find("[")]:
+        if start == -1:
+            continue
+        try:
+            obj, end = dec.raw_decode(s[start:])
+            tail = s[start + end :].strip()
+            if tail:
+                warnings.append("Ignored trailing text after JSON payload.")
+            return obj, warnings
+        except Exception as e3:
+            last_err = e3
+
+    # 5) LAST-RESORT: repair curly-quote delimited strings (only if we see curly quotes)
+    if ("“" in s) or ("”" in s):
+        s3 = _convert_curly_delimited_strings_to_json(s)
+        if s3 != s:
+            try:
+                obj = json.loads(s3)
+                warnings.append("Repaired curly-quote delimited strings (converted “ ” to standard JSON quotes).")
+                return obj, warnings
+            except Exception as e4:
+                last_err = e4
+
+    # 6) Comma-separated objects pasted without surrounding [ ... ]
+    ss = s.strip()
+    if ss.startswith("{") and re.search(r"\}\s*,\s*\{", ss):
+        candidate = re.sub(r",\s*$", "", ss)
         try:
             arr = json.loads("[" + candidate + "]")
             if isinstance(arr, list):
                 warnings.append("Wrapped comma-separated JSON objects into a JSON array (best-effort).")
                 return arr, warnings
-        except Exception as e_wrap:
-            last_err = e_wrap
+        except Exception as e5:
+            last_err = e5
 
-    # Attempt: Python-literal (dict/list with single quotes, None/True/False)
+    # 7) Python literal fallback (single quotes / None / True / False)
     try:
-        obj = ast.literal_eval(s)
+        obj = ast.literal_eval(ss)
         if isinstance(obj, (dict, list)):
             warnings.append("Parsed as a Python literal (best-effort). Consider exporting valid JSON for reliability.")
             return obj, warnings
-    except Exception as e3:
-        last_err = e3
+    except Exception as e6:
+        last_err = e6
 
-    # Attempt: if content is wrapped in quotes (rare copy/paste)
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+    # 8) Outer quotes around whole JSON
+    if (ss.startswith('"') and ss.endswith('"')) or (ss.startswith("'") and ss.endswith("'")):
         try:
-            inner = s[1:-1]
+            inner = ss[1:-1]
             return json.loads(inner), warnings + ["Removed outer quotes around pasted JSON text."]
-        except Exception as e4:
-            last_err = e4
+        except Exception as e7:
+            last_err = e7
 
-    s_strip = s.strip()
     hint = ""
-    if s_strip.startswith("{") and not s_strip.endswith("}"):
-        hint = "\nHint: your paste starts with '{' but does not end with '}'. It may be truncated. Try uploading the full .json file instead of pasting."
-    elif s_strip.startswith("[") and not s_strip.endswith("]"):
-        hint = "\nHint: your paste starts with '[' but does not end with ']'. It may be truncated. Try uploading the full .json file instead of pasting."
+    if isinstance(last_err, json.JSONDecodeError):
+        hint = f"\nDetails: JSONDecodeError at line {last_err.lineno}, col {last_err.colno}: {last_err.msg}"
 
     raise ValueError(
         "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines.\n"
         "Tips: remove any leading/trailing commentary, ensure quotes are standard \" characters, and avoid trailing commas."
         + hint
     ) from last_err
-
 
 # ============================================================
 # Main UI
