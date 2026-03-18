@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,15 +31,18 @@ from apify_client.errors import ApifyApiError
 # ----------------------------
 APP_TITLE = "Amazon Reviews Scraper (Apify)"
 DEFAULT_ACTOR_ID = "8vhDnIX6dStLlGVr7"
+
+# User-entered hard cap in UI / queue
 MAX_PER_ASIN_HARD_CAP = 20000
-BATCH_REVIEW_CAP = 100  # suspected per-run ceiling / safe chunk size
+
+# Safe chunk size for single actor call
+BATCH_REVIEW_CAP = 100
 
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$", re.IGNORECASE)
 
 SORT_LABEL_TO_KEY = {"Recent": "recent", "Helpful": "helpful"}
 SORT_OVERRIDE_OPTIONS = ["Default", "Recent", "Helpful"]
 
-# Keep these aligned to what your actor expects.
 COUNTRY_VALUES = [
     "France",
     "United States",
@@ -52,8 +54,6 @@ COUNTRY_VALUES = [
     "Japan",
 ]
 
-# Rating UI -> actor values
-# Preferred: All stars => ["all_stars"]. If the actor rejects it, we fallback to 1..5 buckets.
 RATING_UI_OPTIONS = ["All stars", "1-star", "2-star", "3-star", "4-star", "5-star"]
 RATING_UI_TO_ACTOR = {
     "All stars": ["all_stars"],
@@ -65,17 +65,16 @@ RATING_UI_TO_ACTOR = {
 }
 RATING_FALLBACK_ALL = ["one_star", "two_star", "three_star", "four_star", "five_star"]
 
-# Video-widget “junk” signature captured in ReviewContent
 VIDEO_MARKER = "This is a modal window."
 
-# Internal table columns (we still accept/import the older "Delete" column)
 COL_ENABLED = "Enabled"
 COL_COUNTRY = "Country"
 COL_ASIN = "ASIN or URL"
 COL_REVIEWS = "Reviews to pull"
+COL_PULL_MAX = "Pull Max"
 COL_RATING = "Rating"
 COL_SORT = "Sort"
-COL_SELECTED = "Selected"   # checkbox used for remove/disable/enable actions
+COL_SELECTED = "Selected"
 
 
 # ----------------------------
@@ -84,9 +83,11 @@ COL_SELECTED = "Selected"   # checkbox used for remove/disable/enable actions
 @dataclass(frozen=True)
 class JobSpec:
     row_id: int
+    raw_input: str
     asin: str
     country: str
     max_reviews: int
+    pull_max: bool
     rating_ui: str
     sort_override: str
 
@@ -128,15 +129,30 @@ def format_seconds(sec: Optional[float]) -> str:
     return f"{h}h {m:02d}m"
 
 
-def normalize_asin(raw: str) -> str:
+def extract_asin_from_text(raw: str) -> str:
     raw = (raw or "").strip()
     m = re.search(r"/dp/([A-Z0-9]{10})", raw, re.IGNORECASE)
     if m:
         return m.group(1).upper()
+
+    m = re.search(r"/gp/product/([A-Z0-9]{10})", raw, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
     m = re.search(r"\b([A-Z0-9]{10})\b", raw, re.IGNORECASE)
     if m:
         return m.group(1).upper()
+
     return raw.upper()
+
+
+def normalize_asin(raw: str) -> str:
+    return extract_asin_from_text(raw)
+
+
+def looks_like_url(raw: str) -> bool:
+    raw = (raw or "").strip().lower()
+    return raw.startswith("http://") or raw.startswith("https://")
 
 
 def is_valid_asin(asin: str) -> bool:
@@ -170,10 +186,6 @@ def extract_filter_by_star_from_pageurl(url: Any) -> Optional[str]:
 
 
 def review_dedupe_key(item: dict) -> str:
-    """
-    Build a stable key for the same review across multiple runs.
-    Prefer explicit IDs/URLs; otherwise fall back to a content fingerprint.
-    """
     for k in ["reviewId", "ReviewId", "id", "Id"]:
         v = item.get(k)
         if v:
@@ -208,16 +220,9 @@ def dedupe_review_items(items: List[dict]) -> List[dict]:
 
 
 # ----------------------------
-# Streamlit secrets / token helper
+# Secrets helper
 # ----------------------------
 def get_apify_token_from_secrets() -> str:
-    """
-    Supports either:
-      APIFY_TOKEN="..."
-    or:
-      [apify]
-      token="..."
-    """
     try:
         if "APIFY_TOKEN" in st.secrets:
             return str(st.secrets["APIFY_TOKEN"]).strip()
@@ -229,13 +234,9 @@ def get_apify_token_from_secrets() -> str:
 
 
 # ----------------------------
-# ReviewContent cleaning (video widget blob)
+# ReviewContent cleaning
 # ----------------------------
 def split_leading_json(s: str) -> Tuple[Optional[str], str]:
-    """
-    If s starts with a JSON object, return (json_str, remainder_after_json).
-    Otherwise (None, s).
-    """
     s = "" if s is None else str(s)
     if not s.startswith("{"):
         return None, s
@@ -284,12 +285,8 @@ def parse_video_meta(json_str: Optional[str]) -> Dict[str, Any]:
 
 
 def clean_review_content(raw: Any) -> Tuple[str, Dict[str, Any], bool]:
-    """
-    Returns (clean_text, video_meta, had_video_widget)
-    """
     s = "" if raw is None else str(raw)
 
-    # Signature: JSON starts the field + contains videoUrl + modal marker text
     if s.startswith("{") and '"videoUrl"' in s and VIDEO_MARKER in s:
         json_str, rem = split_leading_json(s)
         vmeta = parse_video_meta(json_str)
@@ -318,8 +315,7 @@ def export_csv_bytes(master: pd.DataFrame) -> bytes:
 
 
 def export_config_csv_bytes(df: pd.DataFrame) -> bytes:
-    # Backwards compatible config columns
-    cols = [COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_RATING, COL_SORT]
+    cols = [COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT]
     out = ensure_table_columns(df).copy()
     out = out[cols]
     return out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -329,14 +325,8 @@ def export_config_csv_bytes(df: pd.DataFrame) -> bytes:
 # Queue table helpers
 # ----------------------------
 def ensure_table_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensures required columns exist.
-
-    Also accepts legacy exports that have a "Delete" column, mapping it to "Selected".
-    """
     df = df.copy()
 
-    # Legacy support
     if "Delete" in df.columns and COL_SELECTED not in df.columns:
         df = df.rename(columns={"Delete": COL_SELECTED})
 
@@ -348,6 +338,8 @@ def ensure_table_columns(df: pd.DataFrame) -> pd.DataFrame:
         df[COL_ASIN] = ""
     if COL_REVIEWS not in df.columns:
         df[COL_REVIEWS] = 100
+    if COL_PULL_MAX not in df.columns:
+        df[COL_PULL_MAX] = False
     if COL_RATING not in df.columns:
         df[COL_RATING] = "All stars"
     if COL_SORT not in df.columns:
@@ -355,15 +347,14 @@ def ensure_table_columns(df: pd.DataFrame) -> pd.DataFrame:
     if COL_SELECTED not in df.columns:
         df[COL_SELECTED] = False
 
-    # Clean types
     df[COL_ENABLED] = df[COL_ENABLED].fillna(True).astype(bool)
+    df[COL_PULL_MAX] = df[COL_PULL_MAX].fillna(False).astype(bool)
     df[COL_SELECTED] = df[COL_SELECTED].fillna(False).astype(bool)
     df[COL_COUNTRY] = df[COL_COUNTRY].fillna("France").astype(str)
     df[COL_ASIN] = df[COL_ASIN].fillna("").astype(str)
     df[COL_RATING] = df[COL_RATING].fillna("All stars").astype(str)
     df[COL_SORT] = df[COL_SORT].fillna("Default").astype(str)
 
-    # Reviews column can contain floats/strings after CSV import; keep as-is and validate later
     return df
 
 
@@ -375,20 +366,12 @@ def normalize_table_asins(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dedupe_table(df: pd.DataFrame, key_cols: Optional[List[str]] = None) -> pd.DataFrame:
-    """
-    De-duplicate rows (keeping first) by a reasonable key.
-
-    Default key preserves the ability to run same ASIN in multiple countries or rating/sort.
-    """
     df = ensure_table_columns(df)
-    key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT]
+    key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT, COL_PULL_MAX]
     return df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
 
 
 def parse_asins_from_text(text: str) -> List[str]:
-    """
-    Extract ASINs (or /dp/ URLs) from pasted text. One per line.
-    """
     out: List[str] = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -406,16 +389,10 @@ def smart_parse_bulk_add(
     text: str,
     default_country: str,
     default_reviews: int,
+    default_pull_max: bool,
     default_rating: str,
     default_sort: str,
 ) -> Tuple[List[dict], List[str]]:
-    """
-    Accepts:
-      - One ASIN/URL per line
-      - Or CSV-ish lines: ASIN, Country, Reviews, Rating, Sort
-
-    Returns: (rows, invalid_lines)
-    """
     rows: List[dict] = []
     invalid: List[str] = []
 
@@ -432,18 +409,26 @@ def smart_parse_bulk_add(
         rating = parts[3] if len(parts) > 3 else default_rating
         sort = parts[4] if len(parts) > 4 else default_sort
 
-        asin = normalize_asin(raw_asin)
-        if not is_valid_asin(asin):
+        asin_or_url = raw_asin.strip()
+        asin = extract_asin_from_text(asin_or_url)
+
+        if not (looks_like_url(asin_or_url) or is_valid_asin(asin)):
             invalid.append(raw_line)
             continue
 
         if country not in COUNTRY_VALUES:
             country = default_country
-        try:
-            n = int(float(reviews))
-        except Exception:
-            n = int(default_reviews)
-        n = max(1, min(n, MAX_PER_ASIN_HARD_CAP))
+
+        pull_max = default_pull_max
+        if isinstance(reviews, str) and reviews.strip().upper() == "MAX":
+            pull_max = True
+            n = MAX_PER_ASIN_HARD_CAP
+        else:
+            try:
+                n = int(float(reviews))
+            except Exception:
+                n = int(default_reviews)
+            n = max(1, min(n, MAX_PER_ASIN_HARD_CAP))
 
         if rating not in RATING_UI_OPTIONS:
             rating = default_rating
@@ -454,8 +439,9 @@ def smart_parse_bulk_add(
             {
                 COL_ENABLED: True,
                 COL_COUNTRY: country,
-                COL_ASIN: asin,
+                COL_ASIN: asin_or_url,
                 COL_REVIEWS: n,
+                COL_PULL_MAX: pull_max,
                 COL_RATING: rating,
                 COL_SORT: sort,
                 COL_SELECTED: False,
@@ -471,13 +457,8 @@ def upsert_rows(
     update_existing: bool,
     key_cols: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """
-    Add rows, skipping duplicates (default) or updating existing rows in-place.
-
-    Duplicate key defaults to (ASIN, Country, Rating, Sort).
-    """
     df = ensure_table_columns(df)
-    key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT]
+    key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT, COL_PULL_MAX]
 
     if not new_rows:
         return df, {"added": 0, "updated": 0, "skipped": 0}
@@ -515,9 +496,6 @@ def upsert_rows(
 
 
 def apply_action_to_selected(df: pd.DataFrame, action: str) -> Tuple[pd.DataFrame, int]:
-    """
-    action ∈ {"remove", "disable", "enable", "select_all", "clear_selection"}
-    """
     df = ensure_table_columns(df)
     sel = df[COL_SELECTED] == True
     n = int(sel.sum())
@@ -542,6 +520,17 @@ def apply_action_to_selected(df: pd.DataFrame, action: str) -> Tuple[pd.DataFram
         return df, len(df)
 
     if action == "clear_selection":
+        df[COL_SELECTED] = False
+        return df, n
+
+    if action == "set_max":
+        df.loc[sel, COL_PULL_MAX] = True
+        df.loc[sel, COL_REVIEWS] = MAX_PER_ASIN_HARD_CAP
+        df[COL_SELECTED] = False
+        return df, n
+
+    if action == "unset_max":
+        df.loc[sel, COL_PULL_MAX] = False
         df[COL_SELECTED] = False
         return df, n
 
@@ -573,12 +562,14 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
         country = str(r.get(COL_COUNTRY, "")).strip()
         rating = str(r.get(COL_RATING, "All stars")).strip() or "All stars"
         sort = str(r.get(COL_SORT, "Default")).strip() or "Default"
+        pull_max = bool(r.get(COL_PULL_MAX, False))
         n = r.get(COL_REVIEWS, 0)
 
         if not enabled or not raw:
             continue
 
         asin = normalize_asin(raw)
+
         try:
             n_int = int(float(n))
         except Exception:
@@ -593,19 +584,21 @@ def validate_and_build_jobs(df: pd.DataFrame) -> Tuple[List[JobSpec], pd.DataFra
         if sort not in SORT_OVERRIDE_OPTIONS:
             issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": "Invalid sort."})
             continue
-        if not is_valid_asin(asin):
-            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": f"Invalid ASIN parsed: '{asin}'"})
+        if not (looks_like_url(raw) or is_valid_asin(asin)):
+            issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": f"Invalid ASIN/URL parsed: '{asin}'"})
             continue
-        if not (1 <= n_int <= MAX_PER_ASIN_HARD_CAP):
+        if not pull_max and not (1 <= n_int <= MAX_PER_ASIN_HARD_CAP):
             issues.append({"Row": i + 1, COL_ASIN: raw, "Problem": f"Reviews must be 1..{MAX_PER_ASIN_HARD_CAP}."})
             continue
 
         jobs.append(
             JobSpec(
                 row_id=i + 1,
+                raw_input=raw,
                 asin=asin,
                 country=country,
-                max_reviews=n_int,
+                max_reviews=MAX_PER_ASIN_HARD_CAP if pull_max else n_int,
+                pull_max=pull_max,
                 rating_ui=rating,
                 sort_override=sort,
             )
@@ -625,13 +618,14 @@ def build_actor_input(
     unique_only: bool,
     get_customers_say: bool,
     rating_filters: List[str],
+    max_reviews_override: Optional[int] = None,
 ) -> dict:
     sort_key = resolve_sort_key(global_sort_key, spec.sort_override)
     return {
-        "ASIN_or_URL": [spec.asin],
+        "ASIN_or_URL": [spec.raw_input],
         "country": spec.country,
-        "max_reviews": int(spec.max_reviews),
-        "sort_reviews_by": [sort_key],  # actor expects array
+        "max_reviews": int(max_reviews_override if max_reviews_override is not None else spec.max_reviews),
+        "sort_reviews_by": [sort_key],
         "filter_by_verified_purchase_only": [verified_filter],
         "filter_by_mediaType": [media_filter],
         "filter_by_ratings": rating_filters,
@@ -650,10 +644,8 @@ def run_actor_once(
     unique_only: bool,
     get_customers_say: bool,
     rating_filters: List[str],
+    max_reviews_override: Optional[int] = None,
 ) -> Tuple[dict, List[dict]]:
-    """
-    Single actor call. Falls back from ['all_stars'] to 1..5 star buckets if needed.
-    """
     run_input = build_actor_input(
         spec=spec,
         global_sort_key=global_sort_key,
@@ -662,15 +654,14 @@ def run_actor_once(
         unique_only=unique_only,
         get_customers_say=get_customers_say,
         rating_filters=rating_filters,
+        max_reviews_override=max_reviews_override,
     )
 
     try:
         run_obj = client.actor(actor_id).call(run_input=run_input)
     except ApifyApiError as e:
         msg = str(e)
-        if rating_filters == ["all_stars"] and (
-            "all_stars" in msg or "filter_by_ratings" in msg or "ratings" in msg
-        ):
+        if rating_filters == ["all_stars"] and ("all_stars" in msg or "filter_by_ratings" in msg or "ratings" in msg):
             run_input["filter_by_ratings"] = RATING_FALLBACK_ALL
             run_obj = client.actor(actor_id).call(run_input=run_input)
         else:
@@ -699,11 +690,13 @@ def postprocess_items(
     for it in items:
         it = dict(it)
 
+        it["_meta_raw_input"] = spec.raw_input
         it["_meta_asin"] = spec.asin
         it["_meta_country"] = spec.country
         it["_meta_rating"] = meta_rating_label or spec.rating_ui
         it["_meta_sort"] = effective_sort
         it["_meta_requested"] = meta_requested
+        it["_meta_pull_max"] = spec.pull_max
         it["_meta_run_id"] = run_id
         it["_meta_dataset_id"] = dataset_id
 
@@ -726,26 +719,58 @@ def postprocess_items(
     return out
 
 
-def pick_final_items(items: List[dict], target_n: int, preferred_sort: str) -> List[dict]:
+def choose_target_n(spec: JobSpec) -> int:
+    return MAX_PER_ASIN_HARD_CAP if spec.pull_max else spec.max_reviews
+
+
+def build_retrieval_plan(spec: JobSpec, global_sort_key: str) -> List[Tuple[str, List[str], int, str]]:
     """
-    Dedupe and keep up to target_n.
-    Prefer higher score first, then recent-ish order based on appearance.
+    Returns list of:
+      (effective_sort_key, rating_filters, max_reviews_for_run, rating_label_for_meta)
     """
-    deduped = dedupe_review_items(items)
+    target_n = choose_target_n(spec)
+    requested_sort = resolve_sort_key(global_sort_key, spec.sort_override)
 
-    if len(deduped) <= target_n:
-        return deduped
+    if spec.pull_max:
+        sort_keys = ["recent", "helpful"]
+    else:
+        sort_keys = [requested_sort]
+        if target_n > BATCH_REVIEW_CAP:
+            if "recent" not in sort_keys:
+                sort_keys.append("recent")
+            if "helpful" not in sort_keys:
+                sort_keys.append("helpful")
 
-    if preferred_sort == "helpful":
-        return deduped[:target_n]
+    plan: List[Tuple[str, List[str], int, str]] = []
 
-    def sort_key(it: dict):
-        score = parse_score_value(it.get("ReviewScore"))
-        score_num = score if score is not None else -1.0
-        return (-score_num,)
+    if spec.rating_ui == "All stars":
+        bucket_plan = [
+            ("1-star", ["one_star"]),
+            ("2-star", ["two_star"]),
+            ("3-star", ["three_star"]),
+            ("4-star", ["four_star"]),
+            ("5-star", ["five_star"]),
+        ]
 
-    ranked = sorted(deduped, key=sort_key)
-    return ranked[:target_n]
+        if spec.pull_max:
+            per_run_n = BATCH_REVIEW_CAP
+        else:
+            per_run_n = min(BATCH_REVIEW_CAP, max(1, (target_n + 4) // 5))
+
+        for sort_key in sort_keys:
+            for bucket_label, bucket_filters in bucket_plan:
+                plan.append((sort_key, bucket_filters, per_run_n, bucket_label))
+    else:
+        rating_filters = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
+        if spec.pull_max:
+            per_run_n = BATCH_REVIEW_CAP
+        else:
+            per_run_n = min(BATCH_REVIEW_CAP, target_n)
+
+        for sort_key in sort_keys:
+            plan.append((sort_key, rating_filters, per_run_n, spec.rating_ui))
+
+    return plan
 
 
 def run_one_job(
@@ -763,12 +788,6 @@ def run_one_job(
     add_score_value: bool,
     add_effective_filter: bool,
 ) -> JobResult:
-    """
-    Batched runner:
-    - <=100: one normal run
-    - All stars >100: fan out across 1..5 star buckets, up to 100 each
-    - Specific rating >100: try two retrieval paths (recent/helpful), then dedupe
-    """
     t0 = time.time()
     client = ApifyClient(token)
 
@@ -781,6 +800,7 @@ def run_one_job(
 
     def record_usage(run_obj: dict) -> Tuple[Optional[str], Optional[str]]:
         nonlocal usage_total_usd, compute_units, pricing_model
+
         run_id_local = run_obj.get("id")
         dataset_id_local = run_obj.get("defaultDatasetId")
 
@@ -810,147 +830,64 @@ def run_one_job(
         return run_id_local, dataset_id_local
 
     try:
-        effective_global_sort = resolve_sort_key(global_sort_key, spec.sort_override)
+        target_n = choose_target_n(spec)
+        plan = build_retrieval_plan(spec, global_sort_key)
 
-        # Case 1: normal single request
-        if spec.max_reviews <= BATCH_REVIEW_CAP:
-            rating_filters = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
+        for sort_key, rating_filters, run_n, rating_label in plan:
+            if sort_key == "recent":
+                sort_override = "Recent"
+            elif sort_key == "helpful":
+                sort_override = "Helpful"
+            else:
+                sort_override = spec.sort_override
+
+            sub_spec = JobSpec(
+                row_id=spec.row_id,
+                raw_input=spec.raw_input,
+                asin=spec.asin,
+                country=spec.country,
+                max_reviews=run_n,
+                pull_max=spec.pull_max,
+                rating_ui=rating_label,
+                sort_override=sort_override,
+            )
+
             run_obj, items = run_actor_once(
                 client=client,
                 actor_id=actor_id,
-                spec=spec,
-                global_sort_key=global_sort_key,
+                spec=sub_spec,
+                global_sort_key=sort_key,
                 verified_filter=verified_filter,
                 media_filter=media_filter,
                 unique_only=unique_only,
                 get_customers_say=get_customers_say,
                 rating_filters=rating_filters,
+                max_reviews_override=run_n,
             )
+
             run_id_local, dataset_id_local = record_usage(run_obj)
+
             all_items.extend(
                 postprocess_items(
                     items=items,
-                    spec=spec,
+                    spec=sub_spec,
                     run_id=run_id_local,
                     dataset_id=dataset_id_local,
-                    effective_sort=effective_global_sort,
+                    effective_sort=sort_key,
                     clean_content=clean_content,
                     keep_raw_content=keep_raw_content,
                     extract_video_meta=extract_video_meta,
                     add_score_value=add_score_value,
                     add_effective_filter=add_effective_filter,
-                    meta_requested=spec.max_reviews,
+                    meta_requested=target_n,
+                    meta_rating_label=rating_label,
                 )
             )
 
-        # Case 2: All stars over 100 -> split by stars
-        elif spec.rating_ui == "All stars":
-            bucket_plan = [
-                ("1-star", ["one_star"]),
-                ("2-star", ["two_star"]),
-                ("3-star", ["three_star"]),
-                ("4-star", ["four_star"]),
-                ("5-star", ["five_star"]),
-            ]
+        final_items = dedupe_review_items(all_items)
 
-            per_bucket_target = min(BATCH_REVIEW_CAP, max(1, math.ceil(spec.max_reviews / 5)))
-
-            for bucket_label, bucket_filters in bucket_plan:
-                sub_spec = JobSpec(
-                    row_id=spec.row_id,
-                    asin=spec.asin,
-                    country=spec.country,
-                    max_reviews=per_bucket_target,
-                    rating_ui=bucket_label,
-                    sort_override=spec.sort_override,
-                )
-
-                run_obj, items = run_actor_once(
-                    client=client,
-                    actor_id=actor_id,
-                    spec=sub_spec,
-                    global_sort_key=global_sort_key,
-                    verified_filter=verified_filter,
-                    media_filter=media_filter,
-                    unique_only=unique_only,
-                    get_customers_say=get_customers_say,
-                    rating_filters=bucket_filters,
-                )
-                run_id_local, dataset_id_local = record_usage(run_obj)
-
-                all_items.extend(
-                    postprocess_items(
-                        items=items,
-                        spec=sub_spec,
-                        run_id=run_id_local,
-                        dataset_id=dataset_id_local,
-                        effective_sort=effective_global_sort,
-                        clean_content=clean_content,
-                        keep_raw_content=keep_raw_content,
-                        extract_video_meta=extract_video_meta,
-                        add_score_value=add_score_value,
-                        add_effective_filter=add_effective_filter,
-                        meta_requested=spec.max_reviews,
-                        meta_rating_label=bucket_label,
-                    )
-                )
-
-        # Case 3: specific rating over 100 -> try multiple sort paths
-        else:
-            requested_sort = resolve_sort_key(global_sort_key, spec.sort_override)
-            sort_candidates = [requested_sort]
-            if "recent" not in sort_candidates:
-                sort_candidates.append("recent")
-            if "helpful" not in sort_candidates:
-                sort_candidates.append("helpful")
-
-            rating_filters = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
-
-            for sort_key in sort_candidates[:2]:
-                sort_override = "Recent" if sort_key == "recent" else "Helpful"
-                sub_spec = JobSpec(
-                    row_id=spec.row_id,
-                    asin=spec.asin,
-                    country=spec.country,
-                    max_reviews=BATCH_REVIEW_CAP,
-                    rating_ui=spec.rating_ui,
-                    sort_override=sort_override,
-                )
-
-                run_obj, items = run_actor_once(
-                    client=client,
-                    actor_id=actor_id,
-                    spec=sub_spec,
-                    global_sort_key=sort_key,
-                    verified_filter=verified_filter,
-                    media_filter=media_filter,
-                    unique_only=unique_only,
-                    get_customers_say=get_customers_say,
-                    rating_filters=rating_filters,
-                )
-                run_id_local, dataset_id_local = record_usage(run_obj)
-
-                all_items.extend(
-                    postprocess_items(
-                        items=items,
-                        spec=sub_spec,
-                        run_id=run_id_local,
-                        dataset_id=dataset_id_local,
-                        effective_sort=sort_key,
-                        clean_content=clean_content,
-                        keep_raw_content=keep_raw_content,
-                        extract_video_meta=extract_video_meta,
-                        add_score_value=add_score_value,
-                        add_effective_filter=add_effective_filter,
-                        meta_requested=spec.max_reviews,
-                    )
-                )
-
-        final_items = pick_final_items(
-            items=all_items,
-            target_n=spec.max_reviews,
-            preferred_sort=effective_global_sort,
-        )
+        if not spec.pull_max:
+            final_items = final_items[:target_n]
 
         runtime_s = time.time() - t0
         return JobResult(
@@ -994,7 +931,7 @@ def compute_eta_seconds(done: List[JobResult], pending: List[JobSpec]) -> Option
         avg_job = total_runtime / max(len(ok_done), 1)
         return avg_job * len(pending)
     sec_per_review = total_runtime / total_collected
-    remaining_requested = sum(s.max_reviews for s in pending)
+    remaining_requested = sum(choose_target_n(s) for s in pending)
     return sec_per_review * remaining_requested
 
 
@@ -1007,7 +944,7 @@ def compute_cost_projection(done: List[JobResult], pending: List[JobSpec]) -> Tu
     if reviews_so_far <= 0:
         return cost_so_far, None, None
     usd_per_review = cost_so_far / reviews_so_far
-    remaining_requested = sum(s.max_reviews for s in pending)
+    remaining_requested = sum(choose_target_n(s) for s in pending)
     projected_total = cost_so_far + usd_per_review * remaining_requested
     return cost_so_far, projected_total, usd_per_review
 
@@ -1017,7 +954,7 @@ def compute_cost_projection(done: List[JobResult], pending: List[JobSpec]) -> Tu
 # ----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Streamlined queue UI: one paste box to add, one paste box to remove, and action buttons right under the table.")
+st.caption("Streamlined queue UI with variant URL support, review batching, and pull-max mode.")
 
 
 # Session state init
@@ -1025,9 +962,36 @@ if "asin_table" not in st.session_state:
     st.session_state.asin_table = ensure_table_columns(
         pd.DataFrame(
             [
-                {COL_ENABLED: True, COL_COUNTRY: "France", COL_ASIN: "B0DGV9F4X3", COL_REVIEWS: 100, COL_RATING: "All stars", COL_SORT: "Default", COL_SELECTED: False},
-                {COL_ENABLED: True, COL_COUNTRY: "France", COL_ASIN: "B0DHHG7P99", COL_REVIEWS: 100, COL_RATING: "All stars", COL_SORT: "Default", COL_SELECTED: False},
-                {COL_ENABLED: True, COL_COUNTRY: "France", COL_ASIN: "B0915C748N", COL_REVIEWS: 100, COL_RATING: "All stars", COL_SORT: "Default", COL_SELECTED: False},
+                {
+                    COL_ENABLED: True,
+                    COL_COUNTRY: "France",
+                    COL_ASIN: "B0DGV9F4X3",
+                    COL_REVIEWS: 100,
+                    COL_PULL_MAX: False,
+                    COL_RATING: "All stars",
+                    COL_SORT: "Default",
+                    COL_SELECTED: False,
+                },
+                {
+                    COL_ENABLED: True,
+                    COL_COUNTRY: "France",
+                    COL_ASIN: "B0DHHG7P99",
+                    COL_REVIEWS: 100,
+                    COL_PULL_MAX: False,
+                    COL_RATING: "All stars",
+                    COL_SORT: "Default",
+                    COL_SELECTED: False,
+                },
+                {
+                    COL_ENABLED: True,
+                    COL_COUNTRY: "France",
+                    COL_ASIN: "B0915C748N",
+                    COL_REVIEWS: 100,
+                    COL_PULL_MAX: False,
+                    COL_RATING: "All stars",
+                    COL_SORT: "Default",
+                    COL_SELECTED: False,
+                },
             ]
         )
     )
@@ -1041,7 +1005,7 @@ if "last_per_sheet" not in st.session_state:
 
 
 # ----------------------------
-# Sidebar: token + run settings
+# Sidebar
 # ----------------------------
 with st.sidebar:
     st.subheader("Token")
@@ -1094,16 +1058,28 @@ tabs = st.tabs(["Queue & Run", "Results", "Help"])
 # ----------------------------
 with tabs[0]:
     st.subheader("Queue")
-
     st.session_state.asin_table = ensure_table_columns(st.session_state.asin_table)
 
     qa, qr = st.columns([1.25, 1.0], vertical_alignment="top")
 
     with qa:
         st.markdown("### Quick add (paste once)")
-        st.caption("Paste **one per line**. Optional CSV format per line: `ASIN, Country, Reviews, Rating, Sort`.")
-        default_country = st.selectbox("Defaults: Country", options=COUNTRY_VALUES, index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0, key="qa_country")
-        default_reviews = st.number_input("Defaults: Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, value=100, step=25, key="qa_reviews")
+        st.caption("Paste one per line. Optional CSV format per line: `ASIN_or_URL, Country, Reviews_or_MAX, Rating, Sort`.")
+        default_country = st.selectbox(
+            "Defaults: Country",
+            options=COUNTRY_VALUES,
+            index=COUNTRY_VALUES.index("France") if "France" in COUNTRY_VALUES else 0,
+            key="qa_country",
+        )
+        default_reviews = st.number_input(
+            "Defaults: Reviews to pull",
+            min_value=1,
+            max_value=MAX_PER_ASIN_HARD_CAP,
+            value=100,
+            step=25,
+            key="qa_reviews",
+        )
+        default_pull_max = st.checkbox("Defaults: Pull Max", value=False, key="qa_pull_max")
         default_rating = st.selectbox("Defaults: Rating", options=RATING_UI_OPTIONS, index=0, key="qa_rating")
         default_sort = st.selectbox("Defaults: Sort", options=SORT_OVERRIDE_OPTIONS, index=0, key="qa_sort")
         update_existing = st.checkbox("If duplicate exists: update settings instead of skipping", value=False, key="qa_upd")
@@ -1116,6 +1092,7 @@ with tabs[0]:
                 add_text,
                 default_country=default_country,
                 default_reviews=int(default_reviews),
+                default_pull_max=bool(default_pull_max),
                 default_rating=default_rating,
                 default_sort=default_sort,
             )
@@ -1172,7 +1149,7 @@ with tabs[0]:
     st.divider()
 
     st.markdown("### Edit queue")
-    st.caption("Tip: check **Selected** on rows, then use the action buttons right under the table (no scrolling).")
+    st.caption("Paste the full Amazon URL for an exact variant when possible. Checking Pull Max tells the app to try the broadest retrieval strategy available for that variant/product.")
 
     df_for_editor = ensure_table_columns(st.session_state.asin_table)
 
@@ -1181,12 +1158,13 @@ with tabs[0]:
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        column_order=[COL_ENABLED, COL_ASIN, COL_COUNTRY, COL_REVIEWS, COL_RATING, COL_SORT, COL_SELECTED],
+        column_order=[COL_ENABLED, COL_ASIN, COL_COUNTRY, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT, COL_SELECTED],
         column_config={
             COL_ENABLED: st.column_config.CheckboxColumn("Enabled", width="small"),
             COL_COUNTRY: st.column_config.SelectboxColumn("Country", options=COUNTRY_VALUES, width="medium"),
             COL_ASIN: st.column_config.TextColumn("ASIN or URL", width="large"),
             COL_REVIEWS: st.column_config.NumberColumn("Reviews to pull", min_value=1, max_value=MAX_PER_ASIN_HARD_CAP, step=25, width="small"),
+            COL_PULL_MAX: st.column_config.CheckboxColumn("Pull Max", width="small"),
             COL_RATING: st.column_config.SelectboxColumn("Rating", options=RATING_UI_OPTIONS, width="small"),
             COL_SORT: st.column_config.SelectboxColumn("Sort", options=SORT_OVERRIDE_OPTIONS, width="small"),
             COL_SELECTED: st.column_config.CheckboxColumn("Selected", width="small"),
@@ -1195,7 +1173,7 @@ with tabs[0]:
     )
     st.session_state.asin_table = ensure_table_columns(edited)
 
-    a1, a2, a3, a4, a5, a6 = st.columns([1, 1, 1, 1, 1, 1], vertical_alignment="center")
+    a1, a2, a3, a4, a5, a6, a7, a8 = st.columns([1, 1, 1, 1, 1, 1, 1, 1], vertical_alignment="center")
     with a1:
         if st.button("Remove selected", use_container_width=True):
             df0 = ensure_table_columns(st.session_state.asin_table)
@@ -1215,16 +1193,28 @@ with tabs[0]:
             st.session_state.asin_table = df1
             st.success(f"Enabled {n} row(s).")
     with a4:
+        if st.button("Set selected Max", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, n = apply_action_to_selected(df0, "set_max")
+            st.session_state.asin_table = df1
+            st.success(f"Set Pull Max on {n} row(s).")
+    with a5:
+        if st.button("Unset selected Max", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table)
+            df1, n = apply_action_to_selected(df0, "unset_max")
+            st.session_state.asin_table = df1
+            st.success(f"Unset Pull Max on {n} row(s).")
+    with a6:
         if st.button("Select all", use_container_width=True):
             df0 = ensure_table_columns(st.session_state.asin_table)
             df1, _ = apply_action_to_selected(df0, "select_all")
             st.session_state.asin_table = df1
-    with a5:
+    with a7:
         if st.button("Clear selection", use_container_width=True):
             df0 = ensure_table_columns(st.session_state.asin_table)
             df1, _ = apply_action_to_selected(df0, "clear_selection")
             st.session_state.asin_table = df1
-    with a6:
+    with a8:
         if st.button("Dedupe", use_container_width=True):
             df0 = ensure_table_columns(st.session_state.asin_table)
             before = len(df0)
@@ -1240,7 +1230,9 @@ with tabs[0]:
             st.success("Normalized ASIN/URL column (URLs → ASIN when possible).")
     with b2:
         if st.button("Clear queue", use_container_width=True):
-            st.session_state.asin_table = ensure_table_columns(pd.DataFrame(columns=[COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_RATING, COL_SORT, COL_SELECTED]))
+            st.session_state.asin_table = ensure_table_columns(
+                pd.DataFrame(columns=[COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT, COL_SELECTED])
+            )
             st.success("Cleared queue.")
     with b3:
         df0 = ensure_table_columns(st.session_state.asin_table)
@@ -1254,8 +1246,8 @@ with tabs[0]:
     st.divider()
     st.subheader("Run")
     st.caption(
-        f"For requests above {BATCH_REVIEW_CAP} reviews, the app automatically fans out across rating buckets "
-        "or alternate retrieval paths, then merges and deduplicates results."
+        "For requests above 100 reviews, the app fans out into multiple retrieval paths and deduplicates the merged results. "
+        "For Pull Max, it tries the broadest retrieval plan supported here."
     )
 
     can_run = bool(token) and bool(actor_id.strip()) and len(jobs) > 0 and issues_df.empty
@@ -1370,7 +1362,7 @@ with tabs[0]:
                     with log_box:
                         st.success(
                             f"[{now_ts()}] Row {spec.row_id} OK · {spec.asin} · {spec.country} · "
-                            f"{spec.rating_ui} · Collected {res.collected} · {format_seconds(res.runtime_s)}"
+                            f"{'PULL MAX' if spec.pull_max else spec.rating_ui} · Collected {res.collected} · {format_seconds(res.runtime_s)}"
                         )
                 else:
                     with log_box:
@@ -1382,10 +1374,12 @@ with tabs[0]:
                         {
                             "Row": r.spec.row_id,
                             "ASIN": r.spec.asin,
+                            "Raw Input": r.spec.raw_input,
                             "Country": r.spec.country,
+                            "Pull Max": r.spec.pull_max,
                             "Rating": r.spec.rating_ui,
                             "Sort": r.spec.sort_override,
-                            "Requested": r.spec.max_reviews,
+                            "Requested": choose_target_n(r.spec),
                             "Collected": r.collected,
                             "Runtime": format_seconds(r.runtime_s),
                             "Cost USD": r.usage_total_usd,
@@ -1407,7 +1401,8 @@ with tabs[0]:
         all_items: List[dict] = []
 
         for r in results:
-            sheet_key = f"{r.spec.asin}-{r.spec.country[:2].upper()}-{r.spec.rating_ui.split()[0]}-{r.spec.sort_override[0]}"
+            mode_tag = "MAX" if r.spec.pull_max else r.spec.rating_ui.split()[0]
+            sheet_key = f"{r.spec.asin}-{r.spec.country[:2].upper()}-{mode_tag}-{r.spec.sort_override[0]}"
             if r.ok and r.items:
                 df_sheet = pd.json_normalize(r.items)
                 per_sheet[sheet_key] = df_sheet
@@ -1416,9 +1411,11 @@ with tabs[0]:
                 per_sheet[sheet_key] = pd.DataFrame(
                     [{
                         "_meta_row": r.spec.row_id,
+                        "_meta_raw_input": r.spec.raw_input,
                         "_meta_asin": r.spec.asin,
                         "_meta_country": r.spec.country,
                         "_meta_rating": r.spec.rating_ui,
+                        "_meta_pull_max": r.spec.pull_max,
                         "_error": r.error or "",
                     }]
                 )
@@ -1433,7 +1430,7 @@ with tabs[0]:
 
 
 # ----------------------------
-# Results tab
+# Results
 # ----------------------------
 with tabs[1]:
     st.subheader("Results")
@@ -1499,44 +1496,34 @@ with tabs[1]:
 
 
 # ----------------------------
-# Help tab
+# Help
 # ----------------------------
 with tabs[2]:
     st.subheader("Help")
 
-    st.markdown("### Queue UX changes (what’s different vs your previous UI)")
+    st.markdown("### Variant-specific scraping")
     st.markdown(
-        "- **One paste box to add**, instead of separate “single add” + multiple bulk modes.\n"
-        "- **One paste box to remove** (remove by ASIN list), plus **Selected** checkboxes + action buttons **right under the table**.\n"
-        "- “Delete” column was renamed to **Selected** (legacy CSVs that have `Delete` still import correctly).\n"
-        "- Optional buttons: **Dedupe** and **Normalize ASINs**."
+        "Paste the **full Amazon URL for the exact variant** when possible. "
+        "The app now preserves and sends the full URL to the actor instead of collapsing it to only the ASIN."
     )
 
-    st.markdown("### Streamlit secrets")
-    st.markdown("Create `.streamlit/secrets.toml` locally, or paste the same TOML in Streamlit Cloud → App → Settings → Secrets.")
-    st.code('APIFY_TOKEN = "apify_api_your_token_here"', language="toml")
-    st.markdown("Or namespaced:")
-    st.code('[apify]\ntoken = "apify_api_your_token_here"', language="toml")
-
-    st.markdown("### Why ReviewContent sometimes contains a huge JSON blob")
+    st.markdown("### Pull Max")
     st.markdown(
-        "Some reviews include inline video. Amazon embeds a VSE player config JSON and UI text in the same container as "
-        "the review body. Enable **Clean ReviewContent** to strip it and optionally extract `VideoUrl` and poster image URL."
+        "When **Pull Max** is checked, the app tries the broadest retrieval strategy supported here:\n"
+        "- For **All stars**: tries 1★, 2★, 3★, 4★, 5★ across **Recent** and **Helpful**\n"
+        "- For a **single rating**: tries that rating across **Recent** and **Helpful**\n"
+        "- Merges everything and removes duplicates"
     )
 
-    st.markdown("### “All stars” sometimes looks like only 5★")
-    st.markdown(
-        "This app tries `filter_by_ratings=['all_stars']` for **All stars**. If your actor rejects `all_stars`, it falls "
-        "back to requesting all five star buckets. If you still see only 5★, turn on the debug column "
-        "`EffectiveFilterByStar` and check the generated filter."
-    )
-
-    st.markdown("### Why requests above 100 reviews now work better")
+    st.markdown("### Why requests above 100 reviews work better")
     st.markdown(
         f"If you request more than **{BATCH_REVIEW_CAP}** reviews, the app no longer relies on a single actor run. "
-        "Instead it:\n"
-        "- Splits **All stars** requests into separate 1★/2★/3★/4★/5★ runs\n"
-        "- Tries multiple retrieval paths for single-star requests above the cap\n"
-        "- Merges results and removes duplicates before export"
+        "It fans out into multiple retrieval paths, then merges and deduplicates results."
     )
 
+    st.markdown("### Optional quick-add format")
+    st.code(
+        "B0XXXXXXXX, France, 100, All stars, Default\n"
+        "https://www.amazon.com/dp/B0XXXXXXXX?th=1&psc=1, United States, MAX, All stars, Default",
+        language="text",
+    )
