@@ -1,4 +1,3 @@
-
 # amazonReviewScraper_streamlined.py
 # Streamlit: Amazon Reviews Scraper (Apify) — streamlined queue UI
 #
@@ -10,8 +9,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +33,7 @@ from apify_client.errors import ApifyApiError
 APP_TITLE = "Amazon Reviews Scraper (Apify)"
 DEFAULT_ACTOR_ID = "8vhDnIX6dStLlGVr7"
 MAX_PER_ASIN_HARD_CAP = 20000
+BATCH_REVIEW_CAP = 100  # suspected per-run ceiling / safe chunk size
 
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$", re.IGNORECASE)
 
@@ -165,6 +167,44 @@ def extract_filter_by_star_from_pageurl(url: Any) -> Optional[str]:
     q = parse_qs(urlparse(url).query)
     v = q.get("filterByStar")
     return v[0] if v else None
+
+
+def review_dedupe_key(item: dict) -> str:
+    """
+    Build a stable key for the same review across multiple runs.
+    Prefer explicit IDs/URLs; otherwise fall back to a content fingerprint.
+    """
+    for k in ["reviewId", "ReviewId", "id", "Id"]:
+        v = item.get(k)
+        if v:
+            return f"id::{str(v).strip()}"
+
+    for k in ["reviewUrl", "ReviewUrl", "url", "Url"]:
+        v = item.get(k)
+        if v:
+            return f"url::{str(v).strip()}"
+
+    parts = [
+        str(item.get("AuthorName") or item.get("authorName") or "").strip(),
+        str(item.get("ReviewTitle") or item.get("reviewTitle") or "").strip(),
+        str(item.get("ReviewDate") or item.get("reviewDate") or "").strip(),
+        str(item.get("ReviewScore") or item.get("reviewScore") or "").strip(),
+        str(item.get("ReviewContent") or item.get("reviewContent") or "").strip(),
+    ]
+    raw = " | ".join(parts)
+    return "fp::" + hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def dedupe_review_items(items: List[dict]) -> List[dict]:
+    seen = set()
+    out = []
+    for it in items:
+        k = review_dedupe_key(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
 
 
 # ----------------------------
@@ -342,7 +382,6 @@ def dedupe_table(df: pd.DataFrame, key_cols: Optional[List[str]] = None) -> pd.D
     """
     df = ensure_table_columns(df)
     key_cols = key_cols or [COL_ASIN, COL_COUNTRY, COL_RATING, COL_SORT]
-    # Keep order stable, keep first
     return df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
 
 
@@ -443,7 +482,6 @@ def upsert_rows(
     if not new_rows:
         return df, {"added": 0, "updated": 0, "skipped": 0}
 
-    # Map first occurrence of key -> row index
     key_to_idx: Dict[Tuple[str, ...], int] = {}
     for idx, r in df.iterrows():
         key = tuple(str(r.get(c, "")).strip() for c in key_cols)
@@ -602,8 +640,8 @@ def build_actor_input(
     }
 
 
-def run_one_job(
-    token: str,
+def run_actor_once(
+    client: ApifyClient,
     actor_id: str,
     spec: JobSpec,
     global_sort_key: str,
@@ -611,77 +649,61 @@ def run_one_job(
     media_filter: str,
     unique_only: bool,
     get_customers_say: bool,
+    rating_filters: List[str],
+) -> Tuple[dict, List[dict]]:
+    """
+    Single actor call. Falls back from ['all_stars'] to 1..5 star buckets if needed.
+    """
+    run_input = build_actor_input(
+        spec=spec,
+        global_sort_key=global_sort_key,
+        verified_filter=verified_filter,
+        media_filter=media_filter,
+        unique_only=unique_only,
+        get_customers_say=get_customers_say,
+        rating_filters=rating_filters,
+    )
+
+    try:
+        run_obj = client.actor(actor_id).call(run_input=run_input)
+    except ApifyApiError as e:
+        msg = str(e)
+        if rating_filters == ["all_stars"] and (
+            "all_stars" in msg or "filter_by_ratings" in msg or "ratings" in msg
+        ):
+            run_input["filter_by_ratings"] = RATING_FALLBACK_ALL
+            run_obj = client.actor(actor_id).call(run_input=run_input)
+        else:
+            raise
+
+    ds_id = run_obj.get("defaultDatasetId")
+    items = list(client.dataset(ds_id).iterate_items()) if ds_id else []
+    return run_obj, items
+
+
+def postprocess_items(
+    items: List[dict],
+    spec: JobSpec,
+    run_id: Optional[str],
+    dataset_id: Optional[str],
+    effective_sort: str,
     clean_content: bool,
     keep_raw_content: bool,
     extract_video_meta: bool,
     add_score_value: bool,
     add_effective_filter: bool,
-) -> JobResult:
-    """
-    Thread-safe job runner. Creates its own ApifyClient per thread.
-    Includes fallback if actor rejects "all_stars".
-    """
-    t0 = time.time()
-    client = ApifyClient(token)
-
-    run_id = None
-    dataset_id = None
-    usage_total_usd = None
-    compute_units = None
-    pricing_model = None
-
-    rating_filters_primary = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
-    rating_filters_fallback = RATING_FALLBACK_ALL if spec.rating_ui == "All stars" else rating_filters_primary
-
-    def _call(filters: List[str]) -> Tuple[dict, List[dict]]:
-        run_input = build_actor_input(
-            spec=spec,
-            global_sort_key=global_sort_key,
-            verified_filter=verified_filter,
-            media_filter=media_filter,
-            unique_only=unique_only,
-            get_customers_say=get_customers_say,
-            rating_filters=filters,
-        )
-        run_obj = client.actor(actor_id).call(run_input=run_input)
-        ds_id = run_obj.get("defaultDatasetId")
-        items_local = list(client.dataset(ds_id).iterate_items()) if ds_id else []
-        return run_obj, items_local
-
-    try:
-        run_obj, items = _call(rating_filters_primary)
-        run_id = run_obj.get("id")
-        dataset_id = run_obj.get("defaultDatasetId")
-    except ApifyApiError as e:
-        msg = str(e)
-        # If the actor doesn't accept "all_stars", fallback to selecting all five buckets.
-        if spec.rating_ui == "All stars" and ("all_stars" in msg or "filter_by_ratings" in msg or "ratings" in msg):
-            run_obj, items = _call(rating_filters_fallback)
-            run_id = run_obj.get("id")
-            dataset_id = run_obj.get("defaultDatasetId")
-        else:
-            raise
-
-    # Best-effort run usage
-    try:
-        if run_id:
-            details = client.run(run_id).get() or {}
-            usage_total_usd = details.get("usageTotalUsd")
-            stats = details.get("stats") or {}
-            compute_units = stats.get("computeUnits")
-            pricing_info = details.get("pricingInfo") or {}
-            pricing_model = pricing_info.get("pricingModel")
-    except Exception:
-        pass
-
-    sort_effective = resolve_sort_key(global_sort_key, spec.sort_override)
-
+    meta_requested: int,
+    meta_rating_label: Optional[str] = None,
+) -> List[dict]:
+    out = []
     for it in items:
+        it = dict(it)
+
         it["_meta_asin"] = spec.asin
         it["_meta_country"] = spec.country
-        it["_meta_rating"] = spec.rating_ui
-        it["_meta_sort"] = sort_effective
-        it["_meta_requested"] = spec.max_reviews
+        it["_meta_rating"] = meta_rating_label or spec.rating_ui
+        it["_meta_sort"] = effective_sort
+        it["_meta_requested"] = meta_requested
         it["_meta_run_id"] = run_id
         it["_meta_dataset_id"] = dataset_id
 
@@ -700,20 +722,266 @@ def run_one_job(
             if extract_video_meta and vmeta:
                 it.update(vmeta)
 
-    runtime_s = time.time() - t0
-    return JobResult(
-        spec=spec,
-        ok=True,
-        collected=len(items),
-        runtime_s=runtime_s,
-        run_id=run_id,
-        dataset_id=dataset_id,
-        usage_total_usd=float(usage_total_usd) if isinstance(usage_total_usd, (int, float)) else None,
-        compute_units=float(compute_units) if isinstance(compute_units, (int, float)) else None,
-        pricing_model=str(pricing_model) if pricing_model else None,
-        error=None,
-        items=items,
-    )
+        out.append(it)
+    return out
+
+
+def pick_final_items(items: List[dict], target_n: int, preferred_sort: str) -> List[dict]:
+    """
+    Dedupe and keep up to target_n.
+    Prefer higher score first, then recent-ish order based on appearance.
+    """
+    deduped = dedupe_review_items(items)
+
+    if len(deduped) <= target_n:
+        return deduped
+
+    if preferred_sort == "helpful":
+        return deduped[:target_n]
+
+    def sort_key(it: dict):
+        score = parse_score_value(it.get("ReviewScore"))
+        score_num = score if score is not None else -1.0
+        return (-score_num,)
+
+    ranked = sorted(deduped, key=sort_key)
+    return ranked[:target_n]
+
+
+def run_one_job(
+    token: str,
+    actor_id: str,
+    spec: JobSpec,
+    global_sort_key: str,
+    verified_filter: str,
+    media_filter: str,
+    unique_only: bool,
+    get_customers_say: bool,
+    clean_content: bool,
+    keep_raw_content: bool,
+    extract_video_meta: bool,
+    add_score_value: bool,
+    add_effective_filter: bool,
+) -> JobResult:
+    """
+    Batched runner:
+    - <=100: one normal run
+    - All stars >100: fan out across 1..5 star buckets, up to 100 each
+    - Specific rating >100: try two retrieval paths (recent/helpful), then dedupe
+    """
+    t0 = time.time()
+    client = ApifyClient(token)
+
+    all_items: List[dict] = []
+    all_run_ids: List[str] = []
+    all_dataset_ids: List[str] = []
+    usage_total_usd = 0.0
+    compute_units = 0.0
+    pricing_model = None
+
+    def record_usage(run_obj: dict) -> Tuple[Optional[str], Optional[str]]:
+        nonlocal usage_total_usd, compute_units, pricing_model
+        run_id_local = run_obj.get("id")
+        dataset_id_local = run_obj.get("defaultDatasetId")
+
+        if run_id_local:
+            all_run_ids.append(str(run_id_local))
+        if dataset_id_local:
+            all_dataset_ids.append(str(dataset_id_local))
+
+        try:
+            if run_id_local:
+                details = client.run(run_id_local).get() or {}
+                u = details.get("usageTotalUsd")
+                if isinstance(u, (int, float)):
+                    usage_total_usd += float(u)
+
+                stats = details.get("stats") or {}
+                cu = stats.get("computeUnits")
+                if isinstance(cu, (int, float)):
+                    compute_units += float(cu)
+
+                p = (details.get("pricingInfo") or {}).get("pricingModel")
+                if p and not pricing_model:
+                    pricing_model = str(p)
+        except Exception:
+            pass
+
+        return run_id_local, dataset_id_local
+
+    try:
+        effective_global_sort = resolve_sort_key(global_sort_key, spec.sort_override)
+
+        # Case 1: normal single request
+        if spec.max_reviews <= BATCH_REVIEW_CAP:
+            rating_filters = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
+            run_obj, items = run_actor_once(
+                client=client,
+                actor_id=actor_id,
+                spec=spec,
+                global_sort_key=global_sort_key,
+                verified_filter=verified_filter,
+                media_filter=media_filter,
+                unique_only=unique_only,
+                get_customers_say=get_customers_say,
+                rating_filters=rating_filters,
+            )
+            run_id_local, dataset_id_local = record_usage(run_obj)
+            all_items.extend(
+                postprocess_items(
+                    items=items,
+                    spec=spec,
+                    run_id=run_id_local,
+                    dataset_id=dataset_id_local,
+                    effective_sort=effective_global_sort,
+                    clean_content=clean_content,
+                    keep_raw_content=keep_raw_content,
+                    extract_video_meta=extract_video_meta,
+                    add_score_value=add_score_value,
+                    add_effective_filter=add_effective_filter,
+                    meta_requested=spec.max_reviews,
+                )
+            )
+
+        # Case 2: All stars over 100 -> split by stars
+        elif spec.rating_ui == "All stars":
+            bucket_plan = [
+                ("1-star", ["one_star"]),
+                ("2-star", ["two_star"]),
+                ("3-star", ["three_star"]),
+                ("4-star", ["four_star"]),
+                ("5-star", ["five_star"]),
+            ]
+
+            per_bucket_target = min(BATCH_REVIEW_CAP, max(1, math.ceil(spec.max_reviews / 5)))
+
+            for bucket_label, bucket_filters in bucket_plan:
+                sub_spec = JobSpec(
+                    row_id=spec.row_id,
+                    asin=spec.asin,
+                    country=spec.country,
+                    max_reviews=per_bucket_target,
+                    rating_ui=bucket_label,
+                    sort_override=spec.sort_override,
+                )
+
+                run_obj, items = run_actor_once(
+                    client=client,
+                    actor_id=actor_id,
+                    spec=sub_spec,
+                    global_sort_key=global_sort_key,
+                    verified_filter=verified_filter,
+                    media_filter=media_filter,
+                    unique_only=unique_only,
+                    get_customers_say=get_customers_say,
+                    rating_filters=bucket_filters,
+                )
+                run_id_local, dataset_id_local = record_usage(run_obj)
+
+                all_items.extend(
+                    postprocess_items(
+                        items=items,
+                        spec=sub_spec,
+                        run_id=run_id_local,
+                        dataset_id=dataset_id_local,
+                        effective_sort=effective_global_sort,
+                        clean_content=clean_content,
+                        keep_raw_content=keep_raw_content,
+                        extract_video_meta=extract_video_meta,
+                        add_score_value=add_score_value,
+                        add_effective_filter=add_effective_filter,
+                        meta_requested=spec.max_reviews,
+                        meta_rating_label=bucket_label,
+                    )
+                )
+
+        # Case 3: specific rating over 100 -> try multiple sort paths
+        else:
+            requested_sort = resolve_sort_key(global_sort_key, spec.sort_override)
+            sort_candidates = [requested_sort]
+            if "recent" not in sort_candidates:
+                sort_candidates.append("recent")
+            if "helpful" not in sort_candidates:
+                sort_candidates.append("helpful")
+
+            rating_filters = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
+
+            for sort_key in sort_candidates[:2]:
+                sort_override = "Recent" if sort_key == "recent" else "Helpful"
+                sub_spec = JobSpec(
+                    row_id=spec.row_id,
+                    asin=spec.asin,
+                    country=spec.country,
+                    max_reviews=BATCH_REVIEW_CAP,
+                    rating_ui=spec.rating_ui,
+                    sort_override=sort_override,
+                )
+
+                run_obj, items = run_actor_once(
+                    client=client,
+                    actor_id=actor_id,
+                    spec=sub_spec,
+                    global_sort_key=sort_key,
+                    verified_filter=verified_filter,
+                    media_filter=media_filter,
+                    unique_only=unique_only,
+                    get_customers_say=get_customers_say,
+                    rating_filters=rating_filters,
+                )
+                run_id_local, dataset_id_local = record_usage(run_obj)
+
+                all_items.extend(
+                    postprocess_items(
+                        items=items,
+                        spec=sub_spec,
+                        run_id=run_id_local,
+                        dataset_id=dataset_id_local,
+                        effective_sort=sort_key,
+                        clean_content=clean_content,
+                        keep_raw_content=keep_raw_content,
+                        extract_video_meta=extract_video_meta,
+                        add_score_value=add_score_value,
+                        add_effective_filter=add_effective_filter,
+                        meta_requested=spec.max_reviews,
+                    )
+                )
+
+        final_items = pick_final_items(
+            items=all_items,
+            target_n=spec.max_reviews,
+            preferred_sort=effective_global_sort,
+        )
+
+        runtime_s = time.time() - t0
+        return JobResult(
+            spec=spec,
+            ok=True,
+            collected=len(final_items),
+            runtime_s=runtime_s,
+            run_id=",".join(all_run_ids) if all_run_ids else None,
+            dataset_id=",".join(all_dataset_ids) if all_dataset_ids else None,
+            usage_total_usd=usage_total_usd if usage_total_usd else None,
+            compute_units=compute_units if compute_units else None,
+            pricing_model=pricing_model,
+            error=None,
+            items=final_items,
+        )
+
+    except Exception as e:
+        runtime_s = time.time() - t0
+        return JobResult(
+            spec=spec,
+            ok=False,
+            collected=0,
+            runtime_s=runtime_s,
+            run_id=",".join(all_run_ids) if all_run_ids else None,
+            dataset_id=",".join(all_dataset_ids) if all_dataset_ids else None,
+            usage_total_usd=usage_total_usd if usage_total_usd else None,
+            compute_units=compute_units if compute_units else None,
+            pricing_model=pricing_model,
+            error=str(e),
+            items=[],
+        )
 
 
 def compute_eta_seconds(done: List[JobResult], pending: List[JobSpec]) -> Optional[float]:
@@ -827,10 +1095,8 @@ tabs = st.tabs(["Queue & Run", "Results", "Help"])
 with tabs[0]:
     st.subheader("Queue")
 
-    # Keep table normalized (but do NOT force normalize on every keystroke in editor)
     st.session_state.asin_table = ensure_table_columns(st.session_state.asin_table)
 
-    # Quick add / remove area
     qa, qr = st.columns([1.25, 1.0], vertical_alignment="top")
 
     with qa:
@@ -898,7 +1164,6 @@ with tabs[0]:
             try:
                 imported = pd.read_csv(up)
                 imported = ensure_table_columns(imported)
-                # Don't forcibly normalize URLs into ASINs; keep as user input (validation will parse).
                 st.session_state.asin_table = imported
                 st.success("Config loaded.")
             except Exception as e:
@@ -930,7 +1195,6 @@ with tabs[0]:
     )
     st.session_state.asin_table = ensure_table_columns(edited)
 
-    # Action bar directly under table
     a1, a2, a3, a4, a5, a6 = st.columns([1, 1, 1, 1, 1, 1], vertical_alignment="center")
     with a1:
         if st.button("Remove selected", use_container_width=True):
@@ -989,6 +1253,10 @@ with tabs[0]:
 
     st.divider()
     st.subheader("Run")
+    st.caption(
+        f"For requests above {BATCH_REVIEW_CAP} reviews, the app automatically fans out across rating buckets "
+        "or alternate retrieval paths, then merges and deduplicates results."
+    )
 
     can_run = bool(token) and bool(actor_id.strip()) and len(jobs) > 0 and issues_df.empty
 
@@ -1261,5 +1529,14 @@ with tabs[2]:
         "This app tries `filter_by_ratings=['all_stars']` for **All stars**. If your actor rejects `all_stars`, it falls "
         "back to requesting all five star buckets. If you still see only 5★, turn on the debug column "
         "`EffectiveFilterByStar` and check the generated filter."
+    )
+
+    st.markdown("### Why requests above 100 reviews now work better")
+    st.markdown(
+        f"If you request more than **{BATCH_REVIEW_CAP}** reviews, the app no longer relies on a single actor run. "
+        "Instead it:\n"
+        "- Splits **All stars** requests into separate 1★/2★/3★/4★/5★ runs\n"
+        "- Tries multiple retrieval paths for single-star requests above the cap\n"
+        "- Merges results and removes duplicates before export"
     )
 
