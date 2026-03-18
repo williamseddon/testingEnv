@@ -1,6 +1,13 @@
 # amazonReviewScraper_streamlined.py
 # Streamlit: Amazon Reviews Scraper (Apify) — streamlined queue UI
 #
+# Features added:
+# - Variant URL support (preserves and passes full URL when provided)
+# - >100 review workaround (fans out across multiple retrieval paths and dedupes)
+# - Pull Max mode
+# - Estimate Max button / preflight probe
+# - Predicted Max columns in queue/results
+#
 # Install:
 #   pip install streamlit apify-client pandas openpyxl
 #
@@ -12,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,11 +40,9 @@ from apify_client.errors import ApifyApiError
 APP_TITLE = "Amazon Reviews Scraper (Apify)"
 DEFAULT_ACTOR_ID = "8vhDnIX6dStLlGVr7"
 
-# User-entered hard cap in UI / queue
 MAX_PER_ASIN_HARD_CAP = 20000
-
-# Safe chunk size for single actor call
 BATCH_REVIEW_CAP = 100
+PROBE_REVIEWS_PER_PATH = 10
 
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$", re.IGNORECASE)
 
@@ -76,6 +82,14 @@ COL_RATING = "Rating"
 COL_SORT = "Sort"
 COL_SELECTED = "Selected"
 
+COL_EST_PROBE_DISTINCT = "Probe Distinct"
+COL_EST_PATHS = "Probe Paths"
+COL_EST_CLASS = "Predicted Max Class"
+COL_EST_PREDICTED = "Predicted Max Reviews"
+COL_EST_VARIANT = "Likely Variant Specific"
+COL_EST_POOLED = "Likely Pooled Reviews"
+COL_EST_STATUS = "Estimate Status"
+
 
 # ----------------------------
 # Data models
@@ -107,6 +121,21 @@ class JobResult:
     items: List[dict]
 
 
+@dataclass
+class EstimateResult:
+    spec: JobSpec
+    ok: bool
+    runtime_s: float
+    probe_distinct: int
+    probe_paths_with_results: int
+    predicted_max_class: str
+    predicted_max_reviews: Optional[int]
+    likely_variant_specific: Optional[bool]
+    likely_pooled_reviews: Optional[bool]
+    note: str
+    error: Optional[str]
+
+
 # ----------------------------
 # General helpers
 # ----------------------------
@@ -131,6 +160,7 @@ def format_seconds(sec: Optional[float]) -> str:
 
 def extract_asin_from_text(raw: str) -> str:
     raw = (raw or "").strip()
+
     m = re.search(r"/dp/([A-Z0-9]{10})", raw, re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -217,6 +247,33 @@ def dedupe_review_items(items: List[dict]) -> List[dict]:
         seen.add(k)
         out.append(it)
     return out
+
+
+def classify_probe_distinct(n: int) -> str:
+    if n <= 0:
+        return "None"
+    if n < 10:
+        return "Low"
+    if n < 40:
+        return "Medium"
+    if n < 80:
+        return "High"
+    return "Very High"
+
+
+def predict_max_from_probe(probe_distinct: int, paths_with_results: int, rating_ui: str, pull_max: bool) -> Optional[int]:
+    if probe_distinct <= 0 or paths_with_results <= 0:
+        return 0
+
+    if rating_ui == "All stars":
+        base_multiplier = 6 if not pull_max else 10
+    else:
+        base_multiplier = 4 if not pull_max else 7
+
+    spread_factor = max(1.0, min(2.5, paths_with_results / 2.0))
+    est = int(round(probe_distinct * base_multiplier * spread_factor))
+
+    return max(probe_distinct, min(est, MAX_PER_ASIN_HARD_CAP))
 
 
 # ----------------------------
@@ -315,7 +372,22 @@ def export_csv_bytes(master: pd.DataFrame) -> bytes:
 
 
 def export_config_csv_bytes(df: pd.DataFrame) -> bytes:
-    cols = [COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT]
+    cols = [
+        COL_ENABLED,
+        COL_COUNTRY,
+        COL_ASIN,
+        COL_REVIEWS,
+        COL_PULL_MAX,
+        COL_RATING,
+        COL_SORT,
+        COL_EST_PROBE_DISTINCT,
+        COL_EST_PATHS,
+        COL_EST_CLASS,
+        COL_EST_PREDICTED,
+        COL_EST_VARIANT,
+        COL_EST_POOLED,
+        COL_EST_STATUS,
+    ]
     out = ensure_table_columns(df).copy()
     out = out[cols]
     return out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -330,30 +402,34 @@ def ensure_table_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Delete" in df.columns and COL_SELECTED not in df.columns:
         df = df.rename(columns={"Delete": COL_SELECTED})
 
-    if COL_ENABLED not in df.columns:
-        df[COL_ENABLED] = True
-    if COL_COUNTRY not in df.columns:
-        df[COL_COUNTRY] = "France"
-    if COL_ASIN not in df.columns:
-        df[COL_ASIN] = ""
-    if COL_REVIEWS not in df.columns:
-        df[COL_REVIEWS] = 100
-    if COL_PULL_MAX not in df.columns:
-        df[COL_PULL_MAX] = False
-    if COL_RATING not in df.columns:
-        df[COL_RATING] = "All stars"
-    if COL_SORT not in df.columns:
-        df[COL_SORT] = "Default"
-    if COL_SELECTED not in df.columns:
-        df[COL_SELECTED] = False
+    defaults = {
+        COL_ENABLED: True,
+        COL_COUNTRY: "France",
+        COL_ASIN: "",
+        COL_REVIEWS: 100,
+        COL_PULL_MAX: False,
+        COL_RATING: "All stars",
+        COL_SORT: "Default",
+        COL_SELECTED: False,
+        COL_EST_PROBE_DISTINCT: None,
+        COL_EST_PATHS: None,
+        COL_EST_CLASS: "",
+        COL_EST_PREDICTED: None,
+        COL_EST_VARIANT: None,
+        COL_EST_POOLED: None,
+        COL_EST_STATUS: "",
+    }
 
-    df[COL_ENABLED] = df[COL_ENABLED].fillna(True).astype(bool)
-    df[COL_PULL_MAX] = df[COL_PULL_MAX].fillna(False).astype(bool)
-    df[COL_SELECTED] = df[COL_SELECTED].fillna(False).astype(bool)
-    df[COL_COUNTRY] = df[COL_COUNTRY].fillna("France").astype(str)
-    df[COL_ASIN] = df[COL_ASIN].fillna("").astype(str)
-    df[COL_RATING] = df[COL_RATING].fillna("All stars").astype(str)
-    df[COL_SORT] = df[COL_SORT].fillna("Default").astype(str)
+    for col, default_val in defaults.items():
+        if col not in df.columns:
+            df[col] = default_val
+
+    bool_cols = [COL_ENABLED, COL_PULL_MAX, COL_SELECTED]
+    for col in bool_cols:
+        df[col] = df[col].fillna(False if col != COL_ENABLED else True).astype(bool)
+
+    for col in [COL_COUNTRY, COL_ASIN, COL_RATING, COL_SORT, COL_EST_CLASS, COL_EST_STATUS]:
+        df[col] = df[col].fillna("").astype(str)
 
     return df
 
@@ -445,6 +521,13 @@ def smart_parse_bulk_add(
                 COL_RATING: rating,
                 COL_SORT: sort,
                 COL_SELECTED: False,
+                COL_EST_PROBE_DISTINCT: None,
+                COL_EST_PATHS: None,
+                COL_EST_CLASS: "",
+                COL_EST_PREDICTED: None,
+                COL_EST_VARIANT: None,
+                COL_EST_POOLED: None,
+                COL_EST_STATUS: "",
             }
         )
 
@@ -724,10 +807,6 @@ def choose_target_n(spec: JobSpec) -> int:
 
 
 def build_retrieval_plan(spec: JobSpec, global_sort_key: str) -> List[Tuple[str, List[str], int, str]]:
-    """
-    Returns list of:
-      (effective_sort_key, rating_filters, max_reviews_for_run, rating_label_for_meta)
-    """
     target_n = choose_target_n(spec)
     requested_sort = resolve_sort_key(global_sort_key, spec.sort_override)
 
@@ -755,7 +834,7 @@ def build_retrieval_plan(spec: JobSpec, global_sort_key: str) -> List[Tuple[str,
         if spec.pull_max:
             per_run_n = BATCH_REVIEW_CAP
         else:
-            per_run_n = min(BATCH_REVIEW_CAP, max(1, (target_n + 4) // 5))
+            per_run_n = min(BATCH_REVIEW_CAP, max(1, math.ceil(target_n / 5)))
 
         for sort_key in sort_keys:
             for bucket_label, bucket_filters in bucket_plan:
@@ -771,6 +850,146 @@ def build_retrieval_plan(spec: JobSpec, global_sort_key: str) -> List[Tuple[str,
             plan.append((sort_key, rating_filters, per_run_n, spec.rating_ui))
 
     return plan
+
+
+def build_probe_plan(spec: JobSpec) -> List[Tuple[str, List[str], int, str]]:
+    plan: List[Tuple[str, List[str], int, str]] = []
+
+    if spec.rating_ui == "All stars" or spec.pull_max:
+        bucket_plan = [
+            ("1-star", ["one_star"]),
+            ("2-star", ["two_star"]),
+            ("3-star", ["three_star"]),
+            ("4-star", ["four_star"]),
+            ("5-star", ["five_star"]),
+        ]
+        for sort_key in ["recent", "helpful"]:
+            for bucket_label, bucket_filters in bucket_plan:
+                plan.append((sort_key, bucket_filters, PROBE_REVIEWS_PER_PATH, bucket_label))
+    else:
+        rating_filters = RATING_UI_TO_ACTOR.get(spec.rating_ui, ["five_star"])
+        for sort_key in ["recent", "helpful"]:
+            plan.append((sort_key, rating_filters, PROBE_REVIEWS_PER_PATH, spec.rating_ui))
+
+    return plan
+
+
+def run_one_estimate(
+    token: str,
+    actor_id: str,
+    spec: JobSpec,
+    verified_filter: str,
+    media_filter: str,
+    unique_only: bool,
+    get_customers_say: bool,
+) -> EstimateResult:
+    t0 = time.time()
+    client = ApifyClient(token)
+
+    try:
+        probe_items: List[dict] = []
+        paths_with_results = 0
+
+        plan = build_probe_plan(spec)
+
+        sort_to_keys: Dict[str, set] = {"recent": set(), "helpful": set()}
+        rating_to_keys: Dict[str, set] = {}
+
+        for sort_key, rating_filters, run_n, rating_label in plan:
+            sub_spec = JobSpec(
+                row_id=spec.row_id,
+                raw_input=spec.raw_input,
+                asin=spec.asin,
+                country=spec.country,
+                max_reviews=run_n,
+                pull_max=spec.pull_max,
+                rating_ui=rating_label,
+                sort_override="Recent" if sort_key == "recent" else "Helpful",
+            )
+
+            try:
+                _, items = run_actor_once(
+                    client=client,
+                    actor_id=actor_id,
+                    spec=sub_spec,
+                    global_sort_key=sort_key,
+                    verified_filter=verified_filter,
+                    media_filter=media_filter,
+                    unique_only=unique_only,
+                    get_customers_say=get_customers_say,
+                    rating_filters=rating_filters,
+                    max_reviews_override=run_n,
+                )
+            except Exception:
+                items = []
+
+            if items:
+                paths_with_results += 1
+                dedupe_keys = {review_dedupe_key(it) for it in items}
+                sort_to_keys[sort_key].update(dedupe_keys)
+                rating_to_keys.setdefault(rating_label, set()).update(dedupe_keys)
+                probe_items.extend(items)
+
+        distinct_probe_items = dedupe_review_items(probe_items)
+        probe_distinct = len(distinct_probe_items)
+
+        recent_keys = sort_to_keys.get("recent", set())
+        helpful_keys = sort_to_keys.get("helpful", set())
+        overlap = len(recent_keys & helpful_keys)
+        union = len(recent_keys | helpful_keys)
+        overlap_ratio = (overlap / union) if union > 0 else 1.0
+
+        likely_variant_specific: Optional[bool] = None
+        likely_pooled_reviews: Optional[bool] = None
+
+        if looks_like_url(spec.raw_input):
+            likely_variant_specific = True
+            likely_pooled_reviews = overlap_ratio > 0.85 and probe_distinct > 0
+        else:
+            likely_variant_specific = False
+            likely_pooled_reviews = True if probe_distinct > 0 else None
+
+        predicted_class = classify_probe_distinct(probe_distinct)
+        predicted_max = predict_max_from_probe(
+            probe_distinct=probe_distinct,
+            paths_with_results=paths_with_results,
+            rating_ui=spec.rating_ui,
+            pull_max=spec.pull_max,
+        )
+
+        if probe_distinct == 0:
+            note = "No reviews found in probe paths."
+        else:
+            note = f"Probe found {probe_distinct} distinct reviews across {paths_with_results} path(s)."
+
+        return EstimateResult(
+            spec=spec,
+            ok=True,
+            runtime_s=time.time() - t0,
+            probe_distinct=probe_distinct,
+            probe_paths_with_results=paths_with_results,
+            predicted_max_class=predicted_class,
+            predicted_max_reviews=predicted_max,
+            likely_variant_specific=likely_variant_specific,
+            likely_pooled_reviews=likely_pooled_reviews,
+            note=note,
+            error=None,
+        )
+
+    except Exception as e:
+        return EstimateResult(
+            spec=spec,
+            ok=False,
+            runtime_s=time.time() - t0,
+            probe_distinct=0,
+            probe_paths_with_results=0,
+            predicted_max_class="Unknown",
+            predicted_max_reviews=None,
+            likely_variant_specific=None,
+            likely_pooled_reviews=None,
+            note="Estimate failed.",
+            error=str(e),
+        )
 
 
 def run_one_job(
@@ -834,12 +1053,7 @@ def run_one_job(
         plan = build_retrieval_plan(spec, global_sort_key)
 
         for sort_key, rating_filters, run_n, rating_label in plan:
-            if sort_key == "recent":
-                sort_override = "Recent"
-            elif sort_key == "helpful":
-                sort_override = "Helpful"
-            else:
-                sort_override = spec.sort_override
+            sort_override = "Recent" if sort_key == "recent" else "Helpful"
 
             sub_spec = JobSpec(
                 row_id=spec.row_id,
@@ -885,16 +1099,14 @@ def run_one_job(
             )
 
         final_items = dedupe_review_items(all_items)
-
         if not spec.pull_max:
             final_items = final_items[:target_n]
 
-        runtime_s = time.time() - t0
         return JobResult(
             spec=spec,
             ok=True,
             collected=len(final_items),
-            runtime_s=runtime_s,
+            runtime_s=time.time() - t0,
             run_id=",".join(all_run_ids) if all_run_ids else None,
             dataset_id=",".join(all_dataset_ids) if all_dataset_ids else None,
             usage_total_usd=usage_total_usd if usage_total_usd else None,
@@ -905,12 +1117,11 @@ def run_one_job(
         )
 
     except Exception as e:
-        runtime_s = time.time() - t0
         return JobResult(
             spec=spec,
             ok=False,
             collected=0,
-            runtime_s=runtime_s,
+            runtime_s=time.time() - t0,
             run_id=",".join(all_run_ids) if all_run_ids else None,
             dataset_id=",".join(all_dataset_ids) if all_dataset_ids else None,
             usage_total_usd=usage_total_usd if usage_total_usd else None,
@@ -954,7 +1165,7 @@ def compute_cost_projection(done: List[JobResult], pending: List[JobSpec]) -> Tu
 # ----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Streamlined queue UI with variant URL support, review batching, and pull-max mode.")
+st.caption("Variant URL support, review batching, pull-max mode, and estimate-max preflight.")
 
 
 # Session state init
@@ -1002,6 +1213,8 @@ if "last_master_df" not in st.session_state:
     st.session_state.last_master_df = None
 if "last_per_sheet" not in st.session_state:
     st.session_state.last_per_sheet = None
+if "last_estimates" not in st.session_state:
+    st.session_state.last_estimates = []
 
 
 # ----------------------------
@@ -1064,7 +1277,7 @@ with tabs[0]:
 
     with qa:
         st.markdown("### Quick add (paste once)")
-        st.caption("Paste one per line. Optional CSV format per line: `ASIN_or_URL, Country, Reviews_or_MAX, Rating, Sort`.")
+        st.caption("Optional CSV per line: `ASIN_or_URL, Country, Reviews_or_MAX, Rating, Sort`.")
         default_country = st.selectbox(
             "Defaults: Country",
             options=COUNTRY_VALUES,
@@ -1149,7 +1362,7 @@ with tabs[0]:
     st.divider()
 
     st.markdown("### Edit queue")
-    st.caption("Paste the full Amazon URL for an exact variant when possible. Checking Pull Max tells the app to try the broadest retrieval strategy available for that variant/product.")
+    st.caption("Use the full Amazon URL for an exact variant when possible. Estimate Max runs a lightweight probe to predict likely retrievable volume.")
 
     df_for_editor = ensure_table_columns(st.session_state.asin_table)
 
@@ -1158,7 +1371,21 @@ with tabs[0]:
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        column_order=[COL_ENABLED, COL_ASIN, COL_COUNTRY, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT, COL_SELECTED],
+        column_order=[
+            COL_ENABLED,
+            COL_ASIN,
+            COL_COUNTRY,
+            COL_REVIEWS,
+            COL_PULL_MAX,
+            COL_RATING,
+            COL_SORT,
+            COL_EST_CLASS,
+            COL_EST_PREDICTED,
+            COL_EST_PROBE_DISTINCT,
+            COL_EST_PATHS,
+            COL_EST_STATUS,
+            COL_SELECTED,
+        ],
         column_config={
             COL_ENABLED: st.column_config.CheckboxColumn("Enabled", width="small"),
             COL_COUNTRY: st.column_config.SelectboxColumn("Country", options=COUNTRY_VALUES, width="medium"),
@@ -1167,6 +1394,11 @@ with tabs[0]:
             COL_PULL_MAX: st.column_config.CheckboxColumn("Pull Max", width="small"),
             COL_RATING: st.column_config.SelectboxColumn("Rating", options=RATING_UI_OPTIONS, width="small"),
             COL_SORT: st.column_config.SelectboxColumn("Sort", options=SORT_OVERRIDE_OPTIONS, width="small"),
+            COL_EST_CLASS: st.column_config.TextColumn("Predicted Max Class", disabled=True, width="small"),
+            COL_EST_PREDICTED: st.column_config.NumberColumn("Predicted Max Reviews", disabled=True, width="small"),
+            COL_EST_PROBE_DISTINCT: st.column_config.NumberColumn("Probe Distinct", disabled=True, width="small"),
+            COL_EST_PATHS: st.column_config.NumberColumn("Probe Paths", disabled=True, width="small"),
+            COL_EST_STATUS: st.column_config.TextColumn("Estimate Status", disabled=True, width="medium"),
             COL_SELECTED: st.column_config.CheckboxColumn("Selected", width="small"),
         },
         key="queue_editor",
@@ -1222,19 +1454,31 @@ with tabs[0]:
             st.session_state.asin_table = df1
             st.success(f"Removed {before - len(df1)} duplicate row(s).")
 
-    b1, b2, b3 = st.columns([1, 1, 2], vertical_alignment="center")
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 2], vertical_alignment="center")
     with b1:
         if st.button("Normalize ASINs", use_container_width=True):
             df0 = ensure_table_columns(st.session_state.asin_table)
             st.session_state.asin_table = normalize_table_asins(df0)
             st.success("Normalized ASIN/URL column (URLs → ASIN when possible).")
     with b2:
+        if st.button("Clear estimates", use_container_width=True):
+            df0 = ensure_table_columns(st.session_state.asin_table).copy()
+            for col in [COL_EST_PROBE_DISTINCT, COL_EST_PATHS, COL_EST_CLASS, COL_EST_PREDICTED, COL_EST_VARIANT, COL_EST_POOLED, COL_EST_STATUS]:
+                df0[col] = None if col in [COL_EST_PROBE_DISTINCT, COL_EST_PATHS, COL_EST_PREDICTED, COL_EST_VARIANT, COL_EST_POOLED] else ""
+            st.session_state.asin_table = ensure_table_columns(df0)
+            st.session_state.last_estimates = []
+            st.success("Cleared estimates.")
+    with b3:
         if st.button("Clear queue", use_container_width=True):
             st.session_state.asin_table = ensure_table_columns(
-                pd.DataFrame(columns=[COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT, COL_SELECTED])
+                pd.DataFrame(columns=[
+                    COL_ENABLED, COL_COUNTRY, COL_ASIN, COL_REVIEWS, COL_PULL_MAX, COL_RATING, COL_SORT,
+                    COL_SELECTED, COL_EST_PROBE_DISTINCT, COL_EST_PATHS, COL_EST_CLASS, COL_EST_PREDICTED,
+                    COL_EST_VARIANT, COL_EST_POOLED, COL_EST_STATUS
+                ])
             )
             st.success("Cleared queue.")
-    with b3:
+    with b4:
         df0 = ensure_table_columns(st.session_state.asin_table)
         jobs, issues_df = validate_and_build_jobs(df0)
         st.caption(f"Enabled rows ready: **{len(jobs)}** · Table rows: **{len(df0)}**")
@@ -1245,31 +1489,110 @@ with tabs[0]:
 
     st.divider()
     st.subheader("Run")
-    st.caption(
-        "For requests above 100 reviews, the app fans out into multiple retrieval paths and deduplicates the merged results. "
-        "For Pull Max, it tries the broadest retrieval plan supported here."
-    )
+    st.caption("Estimate Max runs a lightweight probe. Start Scrape runs the full retrieval plan.")
 
     can_run = bool(token) and bool(actor_id.strip()) and len(jobs) > 0 and issues_df.empty
 
-    r1, r2, r3 = st.columns([1.2, 1.2, 2.6], vertical_alignment="center")
+    r1, r2, r3, r4 = st.columns([1.2, 1.2, 1.2, 2.4], vertical_alignment="center")
     with r1:
-        run_clicked = st.button("Start scrape", type="primary", use_container_width=True, disabled=not can_run)
+        estimate_clicked = st.button("Estimate Max", use_container_width=True, disabled=not can_run)
     with r2:
-        clear_clicked = st.button("Clear results", use_container_width=True)
+        run_clicked = st.button("Start scrape", type="primary", use_container_width=True, disabled=not can_run)
     with r3:
+        clear_clicked = st.button("Clear results", use_container_width=True)
+    with r4:
         st.caption(f"Rows: **{len(jobs)}** · Concurrency: **{max_workers}** · Default sort: **{global_sort_label}**")
 
     if not token:
-        st.info("Add your Apify token (sidebar). You can store it in Streamlit secrets.")
+        st.info("Add your Apify token in the sidebar.")
     if not issues_df.empty:
-        st.warning("Fix queue issues first (above).")
+        st.warning("Fix queue issues first.")
 
     if clear_clicked:
         st.session_state.last_results = []
         st.session_state.last_master_df = None
         st.session_state.last_per_sheet = None
-        st.success("Cleared.")
+        st.success("Cleared run results.")
+
+    if estimate_clicked:
+        status_ph = st.empty()
+        progress = st.progress(0)
+        log_box = st.container()
+
+        estimates: List[EstimateResult] = []
+        total = len(jobs)
+
+        status_ph.markdown(f"**[{now_ts()}]** Estimating max for {total} row(s)…")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    run_one_estimate,
+                    token,
+                    actor_id,
+                    spec,
+                    verified_filter,
+                    media_filter,
+                    unique_only,
+                    get_customers_say,
+                ): spec
+                for spec in jobs
+            }
+
+            done_so_far = 0
+            for fut in as_completed(futures):
+                spec = futures[fut]
+                try:
+                    est = fut.result()
+                except Exception as e:
+                    est = EstimateResult(
+                        spec=spec,
+                        ok=False,
+                        runtime_s=0.0,
+                        probe_distinct=0,
+                        probe_paths_with_results=0,
+                        predicted_max_class="Unknown",
+                        predicted_max_reviews=None,
+                        likely_variant_specific=None,
+                        likely_pooled_reviews=None,
+                        note="Estimate failed.",
+                        error=str(e),
+                    )
+
+                estimates.append(est)
+                done_so_far += 1
+                progress.progress(int(done_so_far / total * 100))
+
+                with log_box:
+                    if est.ok:
+                        st.success(
+                            f"[{now_ts()}] Estimate OK · Row {spec.row_id} · {spec.asin} · "
+                            f"Predicted {est.predicted_max_reviews} · {est.predicted_max_class}"
+                        )
+                    else:
+                        st.error(f"[{now_ts()}] Estimate ERROR · Row {spec.row_id} · {spec.asin} · {est.error}")
+
+                if throttle_s > 0:
+                    time.sleep(throttle_s)
+
+        df_est = ensure_table_columns(st.session_state.asin_table).copy()
+        rowid_to_index = {i + 1: i for i in range(len(df_est))}
+
+        for est in estimates:
+            idx = rowid_to_index.get(est.spec.row_id)
+            if idx is None:
+                continue
+            df_est.at[idx, COL_EST_PROBE_DISTINCT] = est.probe_distinct
+            df_est.at[idx, COL_EST_PATHS] = est.probe_paths_with_results
+            df_est.at[idx, COL_EST_CLASS] = est.predicted_max_class
+            df_est.at[idx, COL_EST_PREDICTED] = est.predicted_max_reviews
+            df_est.at[idx, COL_EST_VARIANT] = est.likely_variant_specific
+            df_est.at[idx, COL_EST_POOLED] = est.likely_pooled_reviews
+            df_est.at[idx, COL_EST_STATUS] = est.note if est.ok else f"ERROR: {est.error}"
+
+        st.session_state.asin_table = ensure_table_columns(df_est)
+        st.session_state.last_estimates = estimates
+        status_ph.markdown(f"**[{now_ts()}]** Estimate complete ✅")
 
     if run_clicked:
         st.session_state.last_results = []
@@ -1310,7 +1633,7 @@ with tabs[0]:
                 c3.metric("$/review (observed)", f"{usd_per_review:.6f}" if usd_per_review is not None else "—")
 
         render_metrics()
-        status_ph.markdown(f"**[{now_ts()}]** Starting {total} runs… (parallelism={max_workers})")
+        status_ph.markdown(f"**[{now_ts()}]** Starting {total} scrape run(s)… (parallelism={max_workers})")
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
@@ -1426,6 +1749,19 @@ with tabs[0]:
         st.session_state.last_per_sheet = per_sheet
         st.session_state.last_master_df = master_df
 
+        # Push actual collected count back into predicted column as observed max for pull-max runs
+        df_after = ensure_table_columns(st.session_state.asin_table).copy()
+        rowid_to_index = {i + 1: i for i in range(len(df_after))}
+        for r in results:
+            idx = rowid_to_index.get(r.spec.row_id)
+            if idx is None:
+                continue
+            if r.spec.pull_max and r.ok:
+                df_after.at[idx, COL_EST_PREDICTED] = r.collected
+                df_after.at[idx, COL_EST_CLASS] = classify_probe_distinct(r.collected)
+                df_after.at[idx, COL_EST_STATUS] = f"Observed max from full run: {r.collected}"
+        st.session_state.asin_table = ensure_table_columns(df_after)
+
         status_ph.markdown(f"**[{now_ts()}]** Done ✅  (Switch to the Results tab to download.)")
 
 
@@ -1438,6 +1774,28 @@ with tabs[1]:
     results: List[JobResult] = st.session_state.last_results or []
     master_df: Optional[pd.DataFrame] = st.session_state.last_master_df
     per_sheet: Optional[Dict[str, pd.DataFrame]] = st.session_state.last_per_sheet
+    estimates: List[EstimateResult] = st.session_state.last_estimates or []
+
+    if estimates:
+        with st.expander("Latest estimates", expanded=False):
+            est_rows = []
+            for e in estimates:
+                est_rows.append(
+                    {
+                        "Row": e.spec.row_id,
+                        "ASIN": e.spec.asin,
+                        "Raw Input": e.spec.raw_input,
+                        "Probe Distinct": e.probe_distinct,
+                        "Probe Paths": e.probe_paths_with_results,
+                        "Predicted Max Class": e.predicted_max_class,
+                        "Predicted Max Reviews": e.predicted_max_reviews,
+                        "Likely Variant Specific": e.likely_variant_specific,
+                        "Likely Pooled Reviews": e.likely_pooled_reviews,
+                        "Status": "OK" if e.ok else "ERROR",
+                        "Note": e.note if e.ok else e.error,
+                    }
+                )
+            st.dataframe(pd.DataFrame(est_rows), use_container_width=True, hide_index=True)
 
     if not results:
         st.info("No run results yet.")
@@ -1504,21 +1862,31 @@ with tabs[2]:
     st.markdown("### Variant-specific scraping")
     st.markdown(
         "Paste the **full Amazon URL for the exact variant** when possible. "
-        "The app now preserves and sends the full URL to the actor instead of collapsing it to only the ASIN."
+        "The app preserves and sends the full URL to the actor instead of collapsing it to only the ASIN."
+    )
+
+    st.markdown("### Estimate Max")
+    st.markdown(
+        "Estimate Max runs a lightweight probe before scraping. It reports:\n"
+        "- distinct reviews found in the probe\n"
+        "- how many probe paths returned results\n"
+        "- a predicted max class\n"
+        "- an estimated retrievable review count\n"
+        "- whether the URL likely behaves like a specific variant or a pooled family review page"
     )
 
     st.markdown("### Pull Max")
     st.markdown(
         "When **Pull Max** is checked, the app tries the broadest retrieval strategy supported here:\n"
-        "- For **All stars**: tries 1★, 2★, 3★, 4★, 5★ across **Recent** and **Helpful**\n"
-        "- For a **single rating**: tries that rating across **Recent** and **Helpful**\n"
-        "- Merges everything and removes duplicates"
+        "- For **All stars**: 1★ through 5★ across **Recent** and **Helpful**\n"
+        "- For a **single rating**: that rating across **Recent** and **Helpful**\n"
+        "- Results are merged and duplicates are removed"
     )
 
-    st.markdown("### Why requests above 100 reviews work better")
+    st.markdown("### Important limitation")
     st.markdown(
-        f"If you request more than **{BATCH_REVIEW_CAP}** reviews, the app no longer relies on a single actor run. "
-        "It fans out into multiple retrieval paths, then merges and deduplicates results."
+        "The predicted max is an estimate, not a guaranteed exact total. "
+        "Amazon review pooling, redirects, pagination behavior, and actor limits can all affect what is actually retrievable."
     )
 
     st.markdown("### Optional quick-add format")
