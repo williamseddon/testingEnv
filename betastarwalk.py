@@ -1,66 +1,208 @@
-# starwalk_ui.py
-# Streamlit 1.38+
-"""
-Star Walk Analysis Dashboard
+from __future__ import annotations
 
-Update (Jan 2026):
-- AI Assistant now relies ONLY on OpenAI + the information shown on the current page
-  (current filters, on-page aggregates, and an explicit, user-previewable evidence pack).
-- Removed local semantic search / TF-IDF / BM25 / reranker / embeddings-based retrieval.
-- Improved AI grounding: strict "use only provided context" rules + evidence ID citations.
-"""
+import ast
+import base64
+import hashlib
+import html as _html
+import io
+import json
+import os
+import random
+import re
+import textwrap
+import time
+import zlib
+from collections import Counter
+from datetime import date, datetime, timedelta
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-import streamlit as st
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-from wordcloud import STOPWORDS  # keep for stopword set; not rendering WC
-import re
-import html as _html
-import os
-import json
-import textwrap
-import warnings
-import smtplib
-from email.message import EmailMessage
-from streamlit.components.v1 import html as st_html  # for custom HTML blocks
-from urllib.parse import quote
-from io import BytesIO
-import hashlib
-from typing import Optional, Dict, Any, List, Tuple
-from collections import Counter
+import requests
+import streamlit as st
 
-# Timezone
 try:
-    from zoneinfo import ZoneInfo  # py3.9+
+    from ftfy import fix_text as _ftfy_fix  # type: ignore
+    _HAS_FTFY = True
+except Exception:
+    _HAS_FTFY = False
+    _ftfy_fix = None  # type: ignore
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import linear_kernel
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
+    TfidfVectorizer = None  # type: ignore
+    linear_kernel = None  # type: ignore
+
+APP_VERSION = "2026-03-18-summit-v22"
+STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
+NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
+
+DEFAULT_STARWALK_COLUMNS: List[str] = [
+    "Source",
+    "Model (SKU)",
+    "Seeded",
+    "Country",
+    "New Review",
+    "Review Date",
+    "Verbatim Id",
+    "Verbatim",
+    "Star Rating",
+    "Review count per detractor",
+] + [f"Symptom {i}" for i in range(1, 21)]
+
+DEFAULT_EXTRA_AFTER_SYMPTOM20: List[str] = [
+    "Key Review Sentiment_Reviews",
+    "Key Review Sentiment Type_Reviews",
+    "Trigger Point_Product",
+    "Dominant Customer Journey Step",
+    "L2 Delighter Component",
+    "L2 Delighter Mode",
+    "L3 Non Product Detractors",
+    "Product_Symptom Component",
+    "Signal Type",
+    "Signal File",
+]
+
+SUPPLEMENTAL_TEXT_CANDIDATES = [
+    "Verbatim", "Review", "Text", "Transcript", "Message", "Body", "Comment",
+    "Content", "Description", "Case Notes", "Conversation", "Post", "Feedback",
+]
+SUPPLEMENTAL_DATE_CANDIDATES = [
+    "Review Date", "Date", "Created Date", "Timestamp", "Opened Timestamp",
+    "Created", "Opened", "Published", "Message Date",
+]
+SUPPLEMENTAL_RATING_CANDIDATES = [
+    "Star Rating", "Rating", "CSAT", "Score", "NPS", "Sentiment Score",
+]
+SUPPLEMENTAL_COUNTRY_CANDIDATES = ["Country", "Market", "Geo", "Region", "Location"]
+SUPPLEMENTAL_SOURCE_CANDIDATES = ["Source", "Channel", "Retailer", "Platform", "Site"]
+SUPPLEMENTAL_MODEL_CANDIDATES = ["Model (SKU)", "Model", "Product", "SKU", "Product Name"]
+SUPPLEMENTAL_ID_CANDIDATES = ["Verbatim Id", "ID", "Record ID", "Ticket ID", "Case ID", "Message ID"]
+DEFAULT_TAG_SPLIT_RE = re.compile(r"[;\|\n,]+")
+_BAD_CHARS_REGEX = re.compile(r"[ÃÂâï€™]")
+PII_PAT = re.compile(r"[\w\.-]+@[\w\.-]+|\+?\d[\d\-\s]{6,}\d")
+_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", flags=re.DOTALL | re.IGNORECASE)
+
+_BASIC_STOP = {
+    "the", "and", "for", "with", "this", "that", "have", "has", "had", "was", "were", "are",
+    "but", "not", "you", "your", "i", "me", "my", "we", "our", "they", "them", "their", "it",
+    "its", "a", "an", "to", "of", "in", "on", "at", "as", "is", "be", "been", "so", "if",
+    "very", "really", "just", "from", "or", "by", "about", "after", "before", "when", "while",
+    "can", "could", "would", "should", "will", "did", "does", "do", "than", "then", "there", "here",
+    "also", "too", "more", "most", "less", "much", "many", "one", "two", "three", "into", "over",
+    "under", "still", "even", "because", "only", "such", "like", "get", "got", "getting", "gotten",
+}
+
+try:
+    from zoneinfo import ZoneInfo
     _NY_TZ = ZoneInfo("America/New_York")
 except Exception:
     _NY_TZ = None
 
-warnings.filterwarnings(
-    "ignore",
-    message="Data Validation extension is not supported and will be removed",
-    module="openpyxl",
-)
 
-# ---------- Optional text fixer ----------
-try:
-    from ftfy import fix_text as _ftfy_fix
-    _HAS_FTFY = True
-except Exception:
-    _HAS_FTFY = False
-    _ftfy_fix = None
+# -----------------------------------------------------------------------------
+# App config + CSS
+# -----------------------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Star Walk — Summit Dashboard")
 
-# ---------- OpenAI SDK ----------
-try:
-    from openai import OpenAI
-    _HAS_OPENAI = True
-except Exception:
-    _HAS_OPENAI = False
-    OpenAI = None  # type: ignore
+GLOBAL_CSS = """
+<style>
+  :root { scroll-behavior: smooth; }
+  .stApp {
+    --bg-card: color-mix(in srgb, var(--background-color, #ffffff) 86%, var(--secondary-background-color, #f5f7fb) 14%);
+    --bg-soft: color-mix(in srgb, var(--secondary-background-color, #f5f7fb) 75%, var(--background-color, #ffffff) 25%);
+    --border-soft: color-mix(in srgb, var(--text-color, #111827) 12%, transparent);
+    --border-strong: color-mix(in srgb, var(--text-color, #111827) 18%, transparent);
+    --muted: color-mix(in srgb, var(--text-color, #111827) 72%, transparent);
+  }
+  .soft-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border-soft);
+    border-radius: 16px;
+    padding: 14px 16px;
+    box-shadow: 0 8px 20px rgba(2,6,23,.05);
+    margin: 10px 0 16px;
+  }
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+    margin: 10px 0 16px;
+  }
+  .metric-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-soft);
+    border-radius: 16px;
+    padding: 16px;
+    box-shadow: 0 8px 20px rgba(2,6,23,.05);
+  }
+  .metric-title { font-size: .9rem; color: var(--muted); font-weight: 700; }
+  .metric-value { font-size: 1.95rem; font-weight: 900; line-height: 1.08; margin-top: 4px; }
+  .metric-sub { font-size: .86rem; color: var(--muted); margin-top: 6px; }
+  .pill-row { display:flex; flex-wrap:wrap; gap:8px; }
+  .pill {
+    display:inline-flex; align-items:center; gap:8px; padding:6px 10px;
+    border-radius:999px; background: var(--bg-soft); border:1px solid var(--border-soft);
+    font-size:.86rem; font-weight:700;
+  }
+  .small-muted { color: var(--muted); font-size: .9rem; }
+  .quote-card {
+    background: var(--bg-card);
+    border-left: 4px solid rgba(59,130,246,.65);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 8px 0;
+    border-top: 1px solid var(--border-soft);
+    border-right: 1px solid var(--border-soft);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .action-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
+    padding: 12px 14px;
+    margin-top: 10px;
+  }
+</style>
+"""
+st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
-NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
+PLOTLY_TEMPLATE = "plotly"
+PLOTLY_GRIDCOLOR = "rgba(148,163,184,0.24)"
+
+
+def style_plotly(fig: go.Figure) -> go.Figure:
+    try:
+        fig.update_layout(
+            template=PLOTLY_TEMPLATE,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="currentColor"),
+            title=dict(font=dict(color="currentColor")),
+        )
+        fig.update_xaxes(
+            gridcolor=PLOTLY_GRIDCOLOR,
+            zerolinecolor=PLOTLY_GRIDCOLOR,
+            tickfont=dict(color="currentColor"),
+            titlefont=dict(color="currentColor"),
+        )
+        fig.update_yaxes(
+            gridcolor=PLOTLY_GRIDCOLOR,
+            zerolinecolor=PLOTLY_GRIDCOLOR,
+            tickfont=dict(color="currentColor"),
+            titlefont=dict(color="currentColor"),
+        )
+    except Exception:
+        pass
+    return fig
 
 
 def model_supports_temperature(model_id: str) -> bool:
@@ -71,104 +213,14 @@ def model_supports_temperature(model_id: str) -> bool:
     return not model_id.startswith("gpt-5")
 
 
-# ---------- Page config ----------
-st.set_page_config(layout="wide", page_title="Star Walk Analysis Dashboard")
-
-# ---------- Force Light Mode ----------
-st_html(
-    """
-<script>
-(function () {
-  function setLight() {
-    try {
-      document.documentElement.setAttribute('data-theme','light');
-      document.body && document.body.setAttribute('data-theme','light');
-      window.localStorage.setItem('theme','light');
-    } catch (e) {}
-  }
-  setLight();
-  new MutationObserver(setLight).observe(
-    document.documentElement,
-    { attributes: true, attributeFilter: ['data-theme'] }
-  );
-})();
-</script>
-""",
-    height=0,
-)
-
-# ---------- Global CSS ----------
-GLOBAL_CSS = """
-<style>
-  :root { scroll-behavior: smooth; scroll-padding-top: 96px; }
-  *, ::before, ::after { box-sizing: border-box; }
-  @supports (scrollbar-color: transparent transparent){ * { scrollbar-width: thin; scrollbar-color: transparent transparent; } }
-
-  :root{
-    --text:#0f172a; --muted:#475569; --muted-2:#64748b;
-    --border-strong:#90a7c1; --border:#cbd5e1; --border-soft:#e2e8f0;
-    --bg-app:#f6f8fc; --bg-card:#ffffff; --bg-tile:#f8fafc;
-    --ring:#3b82f6; --ok:#16a34a; --bad:#dc2626;
-    --gap-sm:12px; --gap-md:20px; --gap-lg:32px;
-  }
-  html[data-theme="dark"], body[data-theme="dark"]{
-    --text:rgba(255,255,255,.92); --muted:rgba(255,255,255,.72); --muted-2:rgba(255,255,255,.64);
-    --border-strong:rgba(255,255,255,.22); --border:rgba(255,255,255,.16); --border-soft:rgba(255,255,255,.10);
-    --bg-app:#0b0e14; --bg-card:rgba(255,255,255,.06); --bg-tile:rgba(255,255,255,.04);
-    --ring:#60a5fa; --ok:#34d399; --bad:#f87171;
-  }
-
-  html, body, .stApp {
-    background: var(--bg-app);
-    font-family: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", sans-serif;
-    color: var(--text);
-  }
-  .block-container { padding-top:.9rem; padding-bottom:1.2rem; }
-  section[data-testid="stSidebar"] .block-container { padding-top:.6rem; }
-  mark{ background:#fff2a8; padding:0 .2em; border-radius:3px; }
-
-  .metrics-grid { display:grid; grid-template-columns:repeat(3,minmax(260px,1fr)); gap:17px; }
-  @media (max-width:1100px){ .metrics-grid { grid-template-columns:1fr; } }
-  .metric-card{ background:var(--bg-card); border-radius:14px; padding:16px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
-  .metric-card h4{ margin:.2rem 0 .7rem 0; font-size:1.05rem; color:var(--text); }
-  .metric-row{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-  .metric-box{ background:var(--bg-tile); border:1.6px solid var(--border); border-radius:12px; padding:12px; text-align:center; color:var(--text); }
-  .metric-label{ color:var(--muted); font-size:.85rem; }
-  .metric-kpi{ font-weight:800; font-size:1.8rem; letter-spacing:-0.01em; margin-top:2px; color:var(--text); }
-
-  .review-card{ background:var(--bg-card); border-radius:12px; padding:16px; margin:16px 0 24px; box-shadow:0 0 0 1.5px var(--border-strong), 0 8px 14px rgba(15,23,42,0.06); color:var(--text); }
-  .review-card p{ margin:.25rem 0; line-height:1.5; }
-  .badges{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-  .badge{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:600; font-size:.85rem; border:1.5px solid transparent; }
-  .badge.pos{ background:#ecfdf5; border-color:#86efac; color:#065f46; }
-  .badge.neg{ background:#fef2f2; border-color:#fca5a5; color:#7f1d1d; }
-
-  [data-testid="stPlotlyChart"]{ margin-top:18px !important; margin-bottom:30px !important; }
-
-  .soft-panel{
-    background:var(--bg-card);
-    border-radius:14px;
-    padding:14px 16px;
-    box-shadow:0 0 0 1.2px var(--border-strong), 0 6px 12px rgba(15,23,42,0.05);
-    margin:10px 0 14px;
-  }
-  .small-muted{ color:var(--muted); font-size:.9rem; }
-  .kpi-pill{
-    display:inline-block; padding:4px 10px; border-radius:999px;
-    border:1.3px solid var(--border);
-    background:var(--bg-tile);
-    font-weight:650; margin-right:8px;
-  }
-</style>
-"""
-st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
-
-# ---------- Utilities ----------
-_BAD_CHARS_REGEX = re.compile(r"[ÃÂâï€™]")
-PII_PAT = re.compile(r"[\w\.-]+@[\w\.-]+|\+?\d[\d\-\s]{6,}\d")
+# -----------------------------------------------------------------------------
+# Small utilities
+# -----------------------------------------------------------------------------
+def esc(x: Any) -> str:
+    return _html.escape("" if pd.isna(x) else str(x))
 
 
-def clean_text(x: str, keep_na: bool = False) -> str:
+def clean_text(x: Any, keep_na: bool = False) -> Any:
     if pd.isna(x):
         return pd.NA if keep_na else ""
     s = str(x)
@@ -205,42 +257,136 @@ def clean_text(x: str, keep_na: bool = False) -> str:
     return s
 
 
-def _mask_pii(s: str) -> str:
+def mask_pii(s: str) -> str:
     try:
         return PII_PAT.sub("[redacted]", s or "")
     except Exception:
         return s or ""
 
 
-def esc(x) -> str:
-    return _html.escape("" if pd.isna(x) else str(x))
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
 
-def apply_filter(df: pd.DataFrame, column_name: str, label: str, key: str | None = None):
-    options = ["ALL"]
-    if column_name in df.columns:
-        col = df[column_name].astype("string")
-        options += sorted([x for x in col.dropna().unique().tolist() if str(x).strip() != ""])
-    selected = st.multiselect(f"Select {label}", options=options, default=["ALL"], key=key)
-    if "ALL" not in selected and column_name in df.columns:
-        return df[df[column_name].astype("string").isin(selected)], selected
-    return df, ["ALL"]
+def dedupe_preserve(items: Iterable[Any]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        s = str(item).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
-def collect_unique_symptoms(df: pd.DataFrame, cols: list[str]) -> list[str]:
-    vals, seen = [], set()
-    for c in cols:
-        if c in df.columns:
-            s = df[c].astype("string").str.strip().dropna()
-            for v in pd.unique(s.to_numpy()):
-                v = str(v).strip()
-                if v and v not in seen:
-                    seen.add(v)
-                    vals.append(v)
-    return vals
+def parse_tags(value: Any, split_re: re.Pattern) -> List[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return dedupe_preserve([str(v).strip() for v in value if str(v).strip()])
+    s = str(value).strip()
+    if not s:
+        return []
+    if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, (list, tuple, set)):
+                return dedupe_preserve([str(v).strip().strip("'\"") for v in parsed if str(v).strip()])
+        except Exception:
+            pass
+    parts = [p.strip() for p in split_re.split(s) if p and p.strip()]
+    return dedupe_preserve(parts)
 
 
-def is_valid_symptom_value(x) -> bool:
+def clean_seeded_value(v: Any) -> Any:
+    if v is None:
+        return "NO"
+    try:
+        if pd.isna(v):
+            return "NO"
+    except Exception:
+        pass
+    if isinstance(v, (bool, np.bool_)):
+        return "YES" if bool(v) else "NO"
+    s = str(v).strip().lower()
+    if s in {"1", "1.0", "true", "yes", "y", "seeded"}:
+        return "YES"
+    if s in {"0", "0.0", "false", "no", "n", "unseeded", "not seeded", "notseeded"}:
+        return "NO"
+    toks = parse_tags(v, DEFAULT_TAG_SPLIT_RE)
+    for tok in toks:
+        nt = _norm(tok)
+        if nt in {"seeded", "yes", "true", "1"}:
+            return "YES"
+    return "NO"
+
+
+def clean_star_rating_value(v: Any) -> Any:
+    if v is None:
+        return pd.NA
+    try:
+        if pd.isna(v):
+            return pd.NA
+    except Exception:
+        pass
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        try:
+            if np.isnan(v):
+                return pd.NA
+        except Exception:
+            pass
+        fv = float(v)
+        return int(fv) if fv.is_integer() else fv
+    s = str(v).strip()
+    if not s:
+        return pd.NA
+    m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+    if not m:
+        return pd.NA
+    fv = float(m.group(1))
+    return int(fv) if fv.is_integer() else fv
+
+
+def pct_12(stars: pd.Series) -> float:
+    s = pd.to_numeric(stars, errors="coerce").dropna()
+    if s.empty:
+        return 0.0
+    return float((s <= 2).mean() * 100.0)
+
+
+def section_stats(df_in: pd.DataFrame) -> Tuple[int, float, float]:
+    s = pd.to_numeric(df_in.get("Star Rating"), errors="coerce")
+    cnt = int(s.notna().sum())
+    avg = float(s.mean()) if cnt else float("nan")
+    low = pct_12(s) if cnt else float("nan")
+    return cnt, avg, low
+
+
+def series_matches_any(series: pd.Series, selected: List[str], *, delim: str = " | ") -> pd.Series:
+    if not selected or ("ALL" in selected) or ("All" in selected):
+        return pd.Series(True, index=series.index)
+    sel = [str(x) for x in selected if str(x).strip() and str(x) not in {"ALL", "All"}]
+    if not sel:
+        return pd.Series(True, index=series.index)
+    s = series.astype("string").fillna("")
+    try:
+        has_delim = s.str.contains(re.escape(delim), regex=True, na=False).any()
+    except Exception:
+        has_delim = False
+    if has_delim:
+        pat = r"(?:^|%s)(?:%s)(?:%s|$)" % (
+            re.escape(delim),
+            "|".join(re.escape(x) for x in sel),
+            re.escape(delim),
+        )
+        return s.str.contains(pat, regex=True, case=False, na=False)
+    return s.isin(sel)
+
+
+def is_valid_symptom_value(x: Any) -> bool:
     if pd.isna(x):
         return False
     s = str(x).strip()
@@ -249,39 +395,23 @@ def is_valid_symptom_value(x) -> bool:
     return not bool(re.fullmatch(r"[\W_]+", s))
 
 
-def analyze_delighters_detractors(filtered_df: pd.DataFrame, symptom_columns: list[str]) -> pd.DataFrame:
-    cols = [c for c in symptom_columns if c in filtered_df.columns]
-    if not cols:
-        return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
-    m = filtered_df[cols].melt(value_name="symptom", var_name="col").drop(columns=["col"])
-    m["symptom"] = m["symptom"].map(lambda v: clean_text(v, keep_na=True)).astype("string").str.strip()
-    m = m[m["symptom"].map(is_valid_symptom_value)]
-    if m.empty:
-        return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total"])
-    counts = m["symptom"].value_counts()
-
-    if "Star Rating" in filtered_df.columns:
-        stars = pd.to_numeric(filtered_df["Star Rating"], errors="coerce")
-        avg_map = {}
-        for s_val in counts.index:
-            rows = filtered_df[cols].isin([s_val]).any(axis=1)
-            avg_map[s_val] = round(float(stars[rows].mean()), 1) if rows.any() else None
-    else:
-        avg_map = {s_val: None for s_val in counts.index}
-
-    total_rows = len(filtered_df) or 1
-    out = pd.DataFrame(
-        {
-            "Item": counts.index.str.title(),
-            "Avg Star": [avg_map[s_val] for s_val in counts.index],
-            "Mentions": counts.values,
-            "% Total": (counts.values / total_rows * 100).round(1).astype(str) + "%",
-        }
-    )
-    return out.sort_values("Mentions", ascending=False, ignore_index=True)
+def collect_unique_symptoms(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    vals: List[str] = []
+    seen: Set[str] = set()
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = df[c].astype("string").str.strip()
+        s = s[s.map(is_valid_symptom_value)]
+        for v in pd.unique(s.to_numpy()):
+            vv = str(v).strip().title()
+            if vv and vv not in seen:
+                seen.add(vv)
+                vals.append(vv)
+    return vals
 
 
-def highlight_html(text: str, keyword: str | None) -> str:
+def highlight_html(text: str, keyword: Optional[str]) -> str:
     safe = _html.escape(text or "")
     if keyword:
         try:
@@ -290,6 +420,16 @@ def highlight_html(text: str, keyword: str | None) -> str:
         except re.error:
             pass
     return safe
+
+
+def metric_card_html(title: str, value: str, sub: str = "") -> str:
+    return f"""
+    <div class='metric-card'>
+      <div class='metric-title'>{esc(title)}</div>
+      <div class='metric-value'>{esc(value)}</div>
+      <div class='metric-sub'>{esc(sub)}</div>
+    </div>
+    """
 
 
 def _infer_product_label(df_in: pd.DataFrame, fallback_filename: str) -> str:
@@ -301,117 +441,721 @@ def _infer_product_label(df_in: pd.DataFrame, fallback_filename: str) -> str:
             if len(top) == 1:
                 return str(top[0])
             return " / ".join([str(x) for x in top])
+    if "Product Name" in df_in.columns:
+        s = df_in["Product Name"].astype("string").str.strip().replace({"": pd.NA}).dropna()
+        if not s.empty:
+            return str(s.value_counts().idxmax())
     return base
 
 
-def _trim_snippet(s: str, max_len: int = 420) -> str:
-    t = (s or "").strip()
+def infer_product_profile(df_in: pd.DataFrame, fallback_filename: str) -> Dict[str, Any]:
+    prof: Dict[str, Any] = {"product_guess": _infer_product_label(df_in, fallback_filename)}
+
+    def _top_vals(col: str, k: int = 5) -> List[str]:
+        if col not in df_in.columns:
+            return []
+        s = df_in[col].astype("string").str.strip().replace({"": pd.NA}).dropna()
+        if s.empty:
+            return []
+        return [str(x) for x in s.value_counts().head(k).index.tolist()]
+
+    for c in ["Product Name", "Product Category", "Brand", "Company", "Model (SKU)"]:
+        vals = _top_vals(c)
+        if vals:
+            prof[f"top_{c.lower().replace(' ', '_').replace('(', '').replace(')', '')}"] = vals
+
+    if "Verbatim" in df_in.columns:
+        uni = Counter()
+        bi = Counter()
+        for text in df_in["Verbatim"].astype("string").fillna("").head(min(len(df_in), 5000)).tolist():
+            t = clean_text(text)
+            words = re.findall(r"[a-zA-Z]{3,}", str(t).lower())
+            words = [w for w in words if w not in _BASIC_STOP]
+            if not words:
+                continue
+            uni.update(set(words))
+            if len(words) >= 2:
+                bi.update(set(" ".join(p) for p in zip(words, words[1:])))
+        prof["top_keywords"] = [w for w, _ in uni.most_common(15)]
+        prof["top_bigrams"] = [w for w, _ in bi.most_common(15)]
+
+    return prof
+
+
+def symptom_long_df(df_in: pd.DataFrame, symptom_columns: List[str]) -> pd.DataFrame:
+    cols = [c for c in symptom_columns if c in df_in.columns]
+    if not cols:
+        return pd.DataFrame(columns=["__idx", "symptom"])
+    block = df_in[cols]
+    long = block.stack(dropna=False).reset_index()
+    long.columns = ["__idx", "__col", "symptom"]
+    s = long["symptom"].astype("string").str.strip()
+    mask = s.map(is_valid_symptom_value)
+    out = long.loc[mask, ["__idx"]].copy()
+    out["symptom"] = s[mask].astype("string").str.title()
+    return out
+
+
+def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_columns: List[str]) -> pd.DataFrame:
+    long = symptom_long_df(df_in, symptom_columns)
+    if long.empty:
+        return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Total", "Review Mentions", "Review Rate %"])
+    counts = long["symptom"].value_counts()
+    review_mentions = long.drop_duplicates(subset=["__idx", "symptom"])["symptom"].value_counts()
+
+    avg_map: Dict[str, float] = {}
+    if "Star Rating" in df_in.columns:
+        tmp = long.drop_duplicates(subset=["__idx", "symptom"]).copy()
+        tmp = tmp.join(pd.to_numeric(df_in["Star Rating"], errors="coerce").rename("star"), on="__idx")
+        avg_map = tmp.groupby("symptom")["star"].mean().to_dict()
+
+    total_rows = max(1, len(df_in))
+    rows = []
+    for sym, cnt in counts.items():
+        review_cnt = int(review_mentions.get(sym, 0))
+        rows.append(
+            {
+                "Item": str(sym).title(),
+                "Avg Star": round(float(avg_map.get(sym)), 2) if sym in avg_map and pd.notna(avg_map.get(sym)) else np.nan,
+                "Mentions": int(cnt),
+                "% Total": round(cnt / total_rows * 100.0, 1),
+                "Review Mentions": review_cnt,
+                "Review Rate %": round(review_cnt / total_rows * 100.0, 1),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["Mentions", "Review Mentions"], ascending=False, ignore_index=True)
+
+
+def token_presence_counts(texts: Iterable[str], max_reviews: int = 4000) -> Tuple[Counter, int]:
+    counter = Counter()
+    n = 0
+    for t in list(texts)[: int(max_reviews)]:
+        n += 1
+        t2 = clean_text(t)
+        words = re.findall(r"[a-zA-Z]{3,}", str(t2).lower())
+        words = [w for w in words if w not in _BASIC_STOP]
+        if not words:
+            continue
+        counter.update(set(words))
+        if len(words) >= 2:
+            counter.update(set(" ".join(p) for p in zip(words, words[1:])))
+    return counter, n
+
+
+def compute_group_text_diff(df_a: pd.DataFrame, df_b: pd.DataFrame, top_n: int = 15, max_reviews: int = 3000) -> Dict[str, Any]:
+    texts_a = df_a.get("Verbatim", pd.Series(dtype="string")).astype("string").fillna("").tolist()
+    texts_b = df_b.get("Verbatim", pd.Series(dtype="string")).astype("string").fillna("").tolist()
+    c_a, n_a = token_presence_counts(texts_a, max_reviews=max_reviews)
+    c_b, n_b = token_presence_counts(texts_b, max_reviews=max_reviews)
+    out = {"a_count": n_a, "b_count": n_b, "a_vs_b": [], "b_vs_a": []}
+    if n_a == 0 or n_b == 0:
+        return out
+    terms = set(list(c_a.keys())[:3000]) | set(list(c_b.keys())[:3000])
+    diffs = []
+    for term in terms:
+        ra = c_a.get(term, 0) / max(1, n_a)
+        rb = c_b.get(term, 0) / max(1, n_b)
+        diffs.append((term, ra - rb, ra, rb))
+    diffs.sort(key=lambda x: x[1], reverse=True)
+    out["a_vs_b"] = [
+        {"term": t, "delta_pp": round(delta * 100.0, 1), "a_rate_pct": round(ra * 100.0, 1), "b_rate_pct": round(rb * 100.0, 1)}
+        for t, delta, ra, rb in diffs[: int(top_n)] if delta > 0
+    ]
+    diffs.sort(key=lambda x: x[1])
+    out["b_vs_a"] = [
+        {"term": t, "delta_pp": round((-delta) * 100.0, 1), "b_rate_pct": round(rb * 100.0, 1), "a_rate_pct": round(ra * 100.0, 1)}
+        for t, delta, ra, rb in diffs[: int(top_n)] if delta < 0
+    ]
+    return out
+
+
+def compute_text_theme_diffs(df_in: pd.DataFrame, max_reviews: int = 4000, top_n: int = 15) -> Dict[str, Any]:
+    if df_in is None or df_in.empty or "Verbatim" not in df_in.columns or "Star Rating" not in df_in.columns:
+        return {"n_low_reviews": 0, "n_high_reviews": 0, "low_vs_high": [], "high_vs_low": [], "low_terms": [], "high_terms": []}
+    d = df_in[["Verbatim", "Star Rating"]].copy()
+    d["star"] = pd.to_numeric(d["Star Rating"], errors="coerce")
+    d = d.dropna(subset=["star"])
+    low = d.loc[d["star"] <= 2]
+    high = d.loc[d["star"] >= 4]
+    diff = compute_group_text_diff(low, high, top_n=top_n, max_reviews=max_reviews)
+    low_c, low_n = token_presence_counts(low["Verbatim"].astype("string").fillna("").tolist(), max_reviews=max_reviews)
+    high_c, high_n = token_presence_counts(high["Verbatim"].astype("string").fillna("").tolist(), max_reviews=max_reviews)
+    return {
+        "n_low_reviews": low_n,
+        "n_high_reviews": high_n,
+        "low_terms": [{"term": t, "reviews": int(c), "rate_pct": round(c / max(1, low_n) * 100.0, 1)} for t, c in low_c.most_common(top_n)],
+        "high_terms": [{"term": t, "reviews": int(c), "rate_pct": round(c / max(1, high_n) * 100.0, 1)} for t, c in high_c.most_common(top_n)],
+        "low_vs_high": diff.get("a_vs_b", []),
+        "high_vs_low": diff.get("b_vs_a", []),
+    }
+
+
+def _extract_sentence(text: str, keyword: Optional[str] = None, prefer_tail: bool = False) -> str:
+    t = (text or "").strip()
     if not t:
         return ""
-    if len(t) <= max_len:
-        return t
-    return t[: max_len - 1] + "…"
+    parts = re.split(r"(?<=[.!?\n])\s+", t)
+    if keyword:
+        k = keyword.lower()
+        for p in parts:
+            if k in p.lower():
+                return p.strip()
+    if parts:
+        return (parts[-1] if prefer_tail else parts[0]).strip()
+    return t[:260]
 
 
-def _detect_trends(df_in: pd.DataFrame, symptom_cols: list[str], min_mentions: int = 3):
-    # Note: this is an on-page analytic derived from the current filtered dataset.
-    if "Review Date" not in df_in.columns or "Star Rating" not in df_in.columns:
+def pick_quotes_for_symptom(df_in: pd.DataFrame, symptom: str, cols: List[str], k: int = 3, prefer: str = "low") -> List[Dict[str, str]]:
+    if not symptom or not cols or "Star Rating" not in df_in.columns:
         return []
-    d = df_in.copy()
-    d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
-    d = d.dropna(subset=["Review Date"])
-    if d.empty:
+    sym = str(symptom).strip().lower()
+    mask = pd.Series(False, index=df_in.index)
+    for c in cols:
+        if c not in df_in.columns:
+            continue
+        s = df_in[c].astype("string").fillna("").str.strip().str.lower()
+        mask |= s.eq(sym)
+    sub = df_in.loc[mask].copy()
+    if sub.empty:
         return []
-
-    last_date = d["Review Date"].max()
-    last_m = pd.Period(last_date, freq="M")
-    prev_m = last_m - 1
-
-    last = d[d["Review Date"].dt.to_period("M") == last_m]
-    prev = d[d["Review Date"].dt.to_period("M") == prev_m]
-
+    sub["Star Rating"] = pd.to_numeric(sub["Star Rating"], errors="coerce")
+    sub = sub.dropna(subset=["Star Rating"])
+    if sub.empty:
+        return []
+    sub = sub.sort_values("Star Rating", ascending=(prefer == "low"))
     out = []
-    if len(prev) > 0:
-        pct = ((len(last) - len(prev)) / max(1, len(prev))) * 100
-        if (len(last) - len(prev)) >= 5 and pct >= 50:
-            out.append(f"Review volume increased from {len(prev)} → {len(last)} in {last_m.strftime('%b %Y')} (↑{pct:.0f}%).")
-    elif len(last) >= 5:
-        out.append(f"Review volume jumped to {len(last)} in {last_m.strftime('%b %Y')} (from 0 in prior month).")
+    for _, row in sub.head(k).iterrows():
+        txt = mask_pii(clean_text(row.get("Verbatim", "")))
+        sent = _extract_sentence(txt, keyword=symptom, prefer_tail=(prefer == "low"))
+        if len(sent) > 280:
+            sent = sent[:277] + "…"
+        meta = []
+        try:
+            meta.append(f"{int(float(row.get('Star Rating')))}★")
+        except Exception:
+            pass
+        for col in ["Source", "Country", "Model (SKU)", "Signal Type"]:
+            if col in row.index:
+                v = row.get(col, pd.NA)
+                if pd.notna(v) and str(v).strip():
+                    meta.append(str(v).strip())
+        if "Review Date" in row.index:
+            v = row.get("Review Date", pd.NaT)
+            if pd.notna(v):
+                try:
+                    meta.append(pd.to_datetime(v).strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
+        out.append({"text": sent, "meta": " • ".join(meta) if meta else ""})
+    return out
 
-    cols = [c for c in symptom_cols if c in d.columns]
-    if cols and (not last.empty):
-        def _sym_counts(frame: pd.DataFrame):
-            vals = []
-            for c in cols:
-                s = frame[c].astype("string").map(lambda v: clean_text(v, keep_na=True)).astype("string").str.strip()
-                s = s[s.map(is_valid_symptom_value)]
-                vals.extend([str(x) for x in s.tolist()])
-            return Counter(vals)
-
-        c_last = _sym_counts(last)
-        c_prev = _sym_counts(prev) if not prev.empty else Counter()
-
-        for sym, cnt in c_last.most_common(12):
-            prev_cnt = c_prev.get(sym, 0)
-            if prev_cnt == 0 and cnt >= min_mentions:
-                out.append(f"New/returning theme: **{str(sym).title()}** with {cnt} mentions in {last_m.strftime('%b %Y')} (0 prior month).")
-            elif prev_cnt > 0:
-                inc = cnt - prev_cnt
-                inc_pct = (inc / prev_cnt) * 100.0
-                if inc >= min_mentions and inc_pct >= 50:
-                    out.append(f"Spike: **{str(sym).title()}** mentions {prev_cnt} → {cnt} in {last_m.strftime('%b %Y')} (↑{inc_pct:.0f}%).")
-
-    return out[:8]
+# -----------------------------------------------------------------------------
+# JSON parsing + conversion helpers
+# -----------------------------------------------------------------------------
+def safe_get(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
+    cur: Any = d
+    for key in path:
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return default
+    return cur
 
 
-# ---------- Anchors ----------
-def anchor(id_: str):
-    st.markdown(f"<div id='{id_}'></div>", unsafe_allow_html=True)
+def join_list(x: Any, sep: str = " | ") -> Any:
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        try:
+            return json.dumps(x, ensure_ascii=False)
+        except Exception:
+            return str(x)
+    if isinstance(x, list):
+        vals = [str(v).strip() for v in x if v is not None and str(v).strip()]
+        return sep.join(vals) if vals else None
+    return x
 
 
-def scroll_to(id_: str):
-    st.markdown(
-        f"""
-        <script>
-        (function(id){{
-          function jump(){{
-            const el = document.getElementById(id);
-            if(el) {{
-              el.scrollIntoView({{behavior:'smooth', block:'start'}});
-              window.location.hash = id;
-            }}
-          }}
-          setTimeout(jump, 0); setTimeout(jump, 150); setTimeout(jump, 300); setTimeout(jump, 600);
-        }})('{id_}');
-        </script>
-        """,
-        unsafe_allow_html=True,
+def parse_iso_date(x: Any) -> Optional[date]:
+    if not x:
+        return None
+    ts = pd.to_datetime(x, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+
+def _collect_attribute_keys(records: List[Dict[str, Any]]) -> Tuple[List[str], List[str], List[str], List[str]]:
+    def _clean_keys(keys: Iterable[Any]) -> List[str]:
+        out = []
+        for k in keys:
+            s = str(k).strip()
+            if not s or s.lower() in {"unnamed: 0"}:
+                continue
+            out.append(s)
+        return sorted(list(dict.fromkeys(out)))
+
+    client: Set[str] = set()
+    custom: Set[str] = set()
+    tax: Set[str] = set()
+    ax: Set[str] = set()
+
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        ca = r.get("clientAttributes")
+        if isinstance(ca, dict):
+            client.update([str(k) for k in ca.keys()])
+        cu = r.get("customAttributes")
+        if isinstance(cu, dict):
+            for k, v in cu.items():
+                if str(k) == "taxonomies" and isinstance(v, dict):
+                    tax.update([str(tk) for tk in v.keys()])
+                else:
+                    custom.add(str(k))
+        aa = r.get("axionAttributes")
+        if isinstance(aa, dict):
+            ax.update([str(k) for k in aa.keys()])
+
+    return _clean_keys(client), _clean_keys(custom), _clean_keys(tax), _clean_keys(ax)
+
+
+def build_reviews_df(records: List[Dict[str, Any]], include_extra: bool = True) -> pd.DataFrame:
+    client_keys: List[str] = []
+    custom_keys: List[str] = []
+    tax_keys: List[str] = []
+    ax_keys: List[str] = []
+    if include_extra:
+        client_keys, custom_keys, tax_keys, ax_keys = _collect_attribute_keys(records)
+
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        row: Dict[str, Any] = {
+            "Record ID": r.get("_id"),
+            "Opened Timestamp": parse_iso_date(r.get("openedTimestamp")),
+            "Rating (num)": safe_get(r, ["clientAttributes", "Rating (num)"]),
+            "Retailer": safe_get(r, ["clientAttributes", "Retailer"]),
+            "Model": safe_get(r, ["clientAttributes", "Model"]),
+            "Seeded Reviews": safe_get(r, ["clientAttributes", "Seeded Reviews"]),
+            "Syndicated/Seeded Reviews": safe_get(r, ["clientAttributes", "Syndicated/Seeded Reviews"]),
+            "Location": safe_get(r, ["clientAttributes", "Location"]),
+            "Title": safe_get(r, ["freeText", "Title"]),
+            "Review": safe_get(r, ["freeText", "Review"]),
+        }
+        if include_extra:
+            ca = r.get("clientAttributes") if isinstance(r.get("clientAttributes"), dict) else {}
+            cu = r.get("customAttributes") if isinstance(r.get("customAttributes"), dict) else {}
+            tax = cu.get("taxonomies") if isinstance(cu.get("taxonomies"), dict) else {}
+            aa = r.get("axionAttributes") if isinstance(r.get("axionAttributes"), dict) else {}
+            for k in client_keys:
+                row[k] = join_list(ca.get(k))
+            for k in custom_keys:
+                row[k] = join_list(cu.get(k))
+            for k in tax_keys:
+                row[k] = join_list(tax.get(k))
+            for k in ax_keys:
+                row[k] = join_list(aa.get(k))
+            if "eventType" in r:
+                row["eventType"] = r.get("eventType")
+            if "eventId" in r:
+                row["eventId"] = r.get("eventId")
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if "Rating (num)" in df.columns:
+        df["Rating (num)"] = pd.to_numeric(df["Rating (num)"], errors="coerce")
+    return df
+
+
+def _strip_code_fences(s: str) -> str:
+    s0 = "" if s is None else str(s)
+    m = _CODE_FENCE_RE.match(s0)
+    if m:
+        return (m.group(1) or "").strip()
+    return s0.strip()
+
+
+def _extract_json_substring(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
+    if not starts:
+        return s
+    start = min(starts)
+    sub = s[start:]
+    stack: List[str] = []
+    in_str = False
+    quote = ""
+    escape = False
+    for i, ch in enumerate(sub):
+        if in_str:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == quote:
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            quote = ch
+            continue
+        if ch in "[{":
+            stack.append(ch)
+            continue
+        if ch in "]}":
+            if not stack:
+                continue
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                stack = []
+                continue
+            if not stack:
+                return sub[: i + 1].strip()
+    return sub.strip()
+
+
+def _try_parse_json_lines(s: str) -> Optional[List[Dict[str, Any]]]:
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    objs: List[Dict[str, Any]] = []
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+            if isinstance(obj, dict):
+                objs.append(obj)
+            else:
+                return None
+        except Exception:
+            return None
+    return objs
+
+
+def _convert_curly_delimited_strings_to_json(s: str) -> str:
+    out: List[str] = []
+    in_str = False
+    delim = "standard"
+    escape = False
+    for ch in s:
+        if in_str:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if delim == "standard":
+                if ch == '"':
+                    out.append('"')
+                    in_str = False
+                    delim = "standard"
+                    continue
+                out.append(ch)
+                continue
+            if ch == "”":
+                out.append('"')
+                in_str = False
+                delim = "standard"
+                continue
+            if ch == '"':
+                out.append('\\"')
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            out.append('"')
+            in_str = True
+            delim = "standard"
+            continue
+        if ch in ("“", "”"):
+            out.append('"')
+            in_str = True
+            delim = "curly"
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def loads_flexible_json(text_in: str) -> Tuple[Any, List[str]]:
+    warnings: List[str] = []
+    if text_in is None:
+        raise ValueError("No JSON provided.")
+    s = str(text_in)
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\u2060", "").replace("\xa0", " ")
+    s = _strip_code_fences(s)
+    s = _extract_json_substring(s).strip()
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+    try:
+        return json.loads(s), warnings
+    except Exception as e1:
+        last_err: Exception = e1
+
+    s2 = re.sub(r",\s*([}\]])", r"\1", s)
+    if s2 != s:
+        try:
+            warnings.append("Removed trailing commas to make JSON valid.")
+            return json.loads(s2), warnings
+        except Exception as e2:
+            last_err = e2
+            warnings = [w for w in warnings if "trailing commas" not in w.lower()]
+
+    jl = _try_parse_json_lines(s)
+    if jl is not None:
+        warnings.append("Detected JSON Lines and parsed each line as a record list.")
+        return jl, warnings
+
+    dec = json.JSONDecoder()
+    for start in [s.find("{"), s.find("[")]:
+        if start == -1:
+            continue
+        try:
+            obj, end = dec.raw_decode(s[start:])
+            tail = s[start + end :].strip()
+            if tail:
+                warnings.append("Ignored trailing text after JSON payload.")
+            return obj, warnings
+        except Exception as e3:
+            last_err = e3
+
+    if ("“" in s) or ("”" in s):
+        s3 = _convert_curly_delimited_strings_to_json(s)
+        if s3 != s:
+            try:
+                obj = json.loads(s3)
+                warnings.append("Repaired curly-quote delimited strings.")
+                return obj, warnings
+            except Exception as e4:
+                last_err = e4
+
+    ss = s.strip()
+    if ss.startswith("{") and re.search(r"\}\s*,\s*\{", ss):
+        candidate = re.sub(r",\s*$", "", ss)
+        try:
+            arr = json.loads("[" + candidate + "]")
+            if isinstance(arr, list):
+                warnings.append("Wrapped comma-separated JSON objects into an array.")
+                return arr, warnings
+        except Exception as e5:
+            last_err = e5
+
+    try:
+        obj = ast.literal_eval(ss)
+        if isinstance(obj, (dict, list)):
+            warnings.append("Parsed as a Python literal (best-effort).")
+            return obj, warnings
+    except Exception as e6:
+        last_err = e6
+
+    if (ss.startswith('"') and ss.endswith('"')) or (ss.startswith("'") and ss.endswith("'")):
+        try:
+            inner = ss[1:-1]
+            return json.loads(inner), warnings + ["Removed outer quotes around pasted JSON text."]
+        except Exception as e7:
+            last_err = e7
+
+    hint = ""
+    if isinstance(last_err, json.JSONDecodeError):
+        hint = f" Details: line {last_err.lineno}, col {last_err.colno}: {last_err.msg}"
+    raise ValueError(
+        "Could not parse input as JSON. Paste valid JSON (object/array) or JSON Lines."
+        + hint
+    ) from last_err
+
+
+def extract_records(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, dict) and isinstance(raw.get("results"), list):
+        return [r for r in raw.get("results") if isinstance(r, dict)]
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, dict)]
+    if isinstance(raw, dict):
+        if ("freeText" in raw) and ("clientAttributes" in raw or "customAttributes" in raw):
+            return [raw]
+
+    def _search(obj: Any, depth: int = 0) -> Optional[List[Dict[str, Any]]]:
+        if depth > 6:
+            return None
+        if isinstance(obj, list):
+            if obj and all(isinstance(x, dict) for x in obj[: min(len(obj), 5)]):
+                return [x for x in obj if isinstance(x, dict)]
+            for x in obj:
+                found = _search(x, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(obj, dict):
+            for _, v in obj.items():
+                found = _search(v, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    found = _search(raw)
+    if found is not None:
+        return found
+    raise ValueError(
+        "Unrecognized JSON shape. Expected a dict with `results: []`, a list of records, or a wrapper containing a list of records."
     )
 
 
-# ---------- File Upload ----------
-st.markdown("### 📁 File Upload")
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx", "csv"])
+def insert_after_symptom20(out_cols: List[str], extra_cols: List[str]) -> List[str]:
+    base = list(out_cols)
+    extras = [c for c in extra_cols if c and str(c).strip()]
+    if not extras:
+        return base
+    base_no_extras = [c for c in base if c not in extras]
+    try:
+        idx = base_no_extras.index("Symptom 20")
+        return base_no_extras[: idx + 1] + extras + base_no_extras[idx + 1 :]
+    except ValueError:
+        return base_no_extras + extras
 
-if uploaded_file and st.session_state.get("last_uploaded_name") != uploaded_file.name:
-    st.session_state["last_uploaded_name"] = uploaded_file.name
-    st.session_state["force_scroll_top_once"] = True
 
-if not uploaded_file:
-    st.info("Please upload an Excel file to get started.")
-    st.stop()
+def collect_from_row_tuple(row_tup: tuple, col_idx: Dict[str, int], cols: List[str], split_re: re.Pattern) -> List[str]:
+    tags: List[str] = []
+    for c in cols:
+        i = col_idx.get(c)
+        if i is None:
+            continue
+        tags.extend(parse_tags(row_tup[i], split_re))
+    return dedupe_preserve(tags)
 
 
-# ---------- Load & clean (cached) ----------
+def convert_to_starwalk_from_reviews_df(
+    reviews_df: pd.DataFrame,
+    include_extra_cols_after_symptom20: bool = True,
+    weight_mode: str = "Leave blank",
+    split_regex: str = r"[;\|\n,]+",
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    src_df = reviews_df.reset_index(drop=True)
+    out_cols = list(DEFAULT_STARWALK_COLUMNS)
+    extra_cols_dynamic: List[str] = []
+    extra_cols_final: List[str] = []
+
+    if include_extra_cols_after_symptom20:
+        base_extras = [c for c in DEFAULT_EXTRA_AFTER_SYMPTOM20 if c in src_df.columns]
+        _used_inputs = {
+            "Retailer", "Model", "Seeded Reviews", "Syndicated/Seeded Reviews", "Location",
+            "Opened Timestamp", "Record ID", "Review", "Rating (num)",
+        }
+        for c in list(src_df.columns):
+            sc = str(c).strip()
+            if not sc or sc.lower() in {"unnamed: 0"}:
+                continue
+            if sc in _used_inputs or sc in base_extras or sc in out_cols or sc.startswith("Symptom "):
+                continue
+            try:
+                if src_df[sc].isna().all():
+                    continue
+            except Exception:
+                pass
+            extra_cols_dynamic.append(sc)
+        extra_cols_dynamic = sorted(list(dict.fromkeys(extra_cols_dynamic)))
+        extra_cols_final = base_extras + [c for c in extra_cols_dynamic if c not in base_extras]
+        out_cols = insert_after_symptom20(out_cols, extra_cols_final)
+
+    field_map = {
+        "Source": "Retailer",
+        "Model (SKU)": "Model",
+        "Seeded": "Seeded Reviews",
+        "Country": "Location",
+        "New Review": "Syndicated/Seeded Reviews",
+        "Review Date": "Opened Timestamp",
+        "Verbatim Id": "Record ID",
+        "Verbatim": "Review",
+        "Star Rating": "Rating (num)",
+        **{c: c for c in extra_cols_final if c in src_df.columns},
+    }
+
+    l2_det_cols = [c for c in ["Product_Symptom Conditions", "Product Symptom Conditions"] if c in src_df.columns]
+    l2_del_cols = [c for c in ["L2 Delighter Condition", "L2 Delighter Conditions"] if c in src_df.columns]
+    if not l2_det_cols:
+        l2_det_cols = [c for c in src_df.columns if "productsymptom" in _norm(c) and "condition" in _norm(c)][:1]
+    if not l2_del_cols:
+        l2_del_cols = [c for c in src_df.columns if "delighter" in _norm(c) and "condition" in _norm(c)][:1]
+
+    split_re = re.compile(split_regex)
+    src_cols = list(src_df.columns)
+    col_idx = {c: i for i, c in enumerate(src_cols)}
+    n = len(src_df)
+    base_cols = list(out_cols)
+    out = pd.DataFrame(index=range(n), columns=base_cols, dtype="object")
+
+    for out_field, in_field in field_map.items():
+        if out_field not in out.columns:
+            continue
+        if in_field and in_field in src_df.columns:
+            series = src_df[in_field]
+            if out_field == "Seeded":
+                out[out_field] = series.apply(clean_seeded_value).astype("object")
+            elif out_field == "Star Rating":
+                out[out_field] = series.apply(clean_star_rating_value).astype("object")
+            else:
+                out[out_field] = series.values
+        else:
+            out[out_field] = pd.NA
+
+    detr_matrix = [[pd.NA] * 10 for _ in range(n)]
+    deli_matrix = [[pd.NA] * 10 for _ in range(n)]
+    detr_count = np.zeros(n, dtype=int)
+    deli_count = np.zeros(n, dtype=int)
+    rows_trunc_det = 0
+    rows_trunc_del = 0
+
+    for r_i, row in enumerate(src_df.itertuples(index=False, name=None)):
+        d_tags = collect_from_row_tuple(row, col_idx, l2_det_cols, split_re)
+        l_tags = collect_from_row_tuple(row, col_idx, l2_del_cols, split_re)
+        if len(d_tags) > 10:
+            rows_trunc_det += 1
+        if len(l_tags) > 10:
+            rows_trunc_del += 1
+        d_tags = d_tags[:10]
+        l_tags = l_tags[:10]
+        detr_count[r_i] = len(d_tags)
+        deli_count[r_i] = len(l_tags)
+        for j, t in enumerate(d_tags):
+            detr_matrix[r_i][j] = t
+        for j, t in enumerate(l_tags):
+            deli_matrix[r_i][j] = t
+
+    out[[f"Symptom {i}" for i in range(1, 11)]] = pd.DataFrame(detr_matrix, columns=[f"Symptom {i}" for i in range(1, 11)]).values
+    out[[f"Symptom {i}" for i in range(11, 21)]] = pd.DataFrame(deli_matrix, columns=[f"Symptom {i}" for i in range(11, 21)]).values
+
+    if "Review count per detractor" in out.columns:
+        if weight_mode == "Leave blank":
+            out["Review count per detractor"] = pd.NA
+        elif weight_mode == "Always 1":
+            out["Review count per detractor"] = 1.0
+        elif weight_mode == "1 / # detractor symptoms (if any)":
+            out["Review count per detractor"] = np.where(detr_count > 0, 1.0 / detr_count, pd.NA)
+        elif weight_mode == "1 / # delighter symptoms (if any)":
+            out["Review count per detractor"] = np.where(deli_count > 0, 1.0 / deli_count, pd.NA)
+        else:
+            total = detr_count + deli_count
+            out["Review count per detractor"] = np.where(total > 0, 1.0 / total, pd.NA)
+
+    stats = {
+        "rows": n,
+        "rows_truncated_detractors_gt10": rows_trunc_det,
+        "rows_truncated_delighters_gt10": rows_trunc_del,
+    }
+    return out, stats
+
+
 @st.cache_data(show_spinner=False)
-def _load_clean_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+def _load_starwalk_table(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     try:
         if file_name.lower().endswith(".csv"):
             df_local = pd.read_csv(BytesIO(file_bytes))
         else:
             bio = BytesIO(file_bytes)
             try:
-                df_local = pd.read_excel(bio, sheet_name="Star Walk scrubbed verbatims")
+                df_local = pd.read_excel(bio, sheet_name=STARWALK_SHEET_NAME)
             except ValueError:
                 bio2 = BytesIO(file_bytes)
                 xls = pd.ExcelFile(bio2)
@@ -428,1396 +1172,1880 @@ def _load_clean_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
                 if candidate:
                     df_local = pd.read_excel(xls, sheet_name=candidate)
                 else:
-                    bio3 = BytesIO(file_bytes)
-                    df_local = pd.read_excel(bio3)
+                    df_local = pd.read_excel(BytesIO(file_bytes))
     except Exception as e:
         raise RuntimeError(f"Could not read file: {e}")
 
-    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review", "Signal Type"]:
         if col in df_local.columns:
             df_local[col] = df_local[col].astype("string").str.upper()
-
     if "Star Rating" in df_local.columns:
         df_local["Star Rating"] = pd.to_numeric(df_local["Star Rating"], errors="coerce")
-
-    all_symptom_cols = [c for c in df_local.columns if str(c).startswith("Symptom")]
-    for c in all_symptom_cols:
-        df_local[c] = df_local[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
-
-    if "Verbatim" in df_local.columns:
-        df_local["Verbatim"] = df_local["Verbatim"].astype("string").map(clean_text)
-
     if "Review Date" in df_local.columns:
         df_local["Review Date"] = pd.to_datetime(df_local["Review Date"], errors="coerce")
-
+    for c in [col for col in df_local.columns if str(col).startswith("Symptom")]:
+        df_local[c] = df_local[c].apply(lambda v: clean_text(v, keep_na=True)).astype("string")
+    if "Verbatim" in df_local.columns:
+        df_local["Verbatim"] = df_local["Verbatim"].astype("string").map(clean_text)
     return df_local
 
 
-try:
-    df = _load_clean_excel(uploaded_file.getvalue(), uploaded_file.name)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-
-# ---------- Sidebar filters ----------
-st.sidebar.header("🔍 Filters")
-
-with st.sidebar.expander("🗓️ Timeframe", expanded=False):
-    tz_today = datetime.now(_NY_TZ).date() if _NY_TZ else datetime.today().date()
-    timeframe = st.selectbox(
-        "Select Timeframe",
-        options=["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"],
-        key="tf",
+@st.cache_data(show_spinner=False)
+def _json_text_to_starwalk(json_text: str, source_name: str, include_extra_cols: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    raw_obj, warnings = loads_flexible_json(json_text)
+    records = extract_records(raw_obj)
+    if not records:
+        raise ValueError("Parsed input, but found 0 record objects to convert.")
+    reviews_df = build_reviews_df(records, include_extra=include_extra_cols)
+    out_df, stats = convert_to_starwalk_from_reviews_df(
+        reviews_df,
+        include_extra_cols_after_symptom20=include_extra_cols,
+        weight_mode="Leave blank",
     )
-    today = tz_today
-    start_date, end_date = None, None
-    if timeframe == "Custom Range":
-        sel = st.date_input(
-            label="Date Range",
-            value=(today - timedelta(days=30), today),
-            min_value=datetime(2000, 1, 1).date(),
-            max_value=today,
-            label_visibility="collapsed",
-        )
-        if isinstance(sel, tuple) and len(sel) == 2:
-            start_date, end_date = sel
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review", "Signal Type"]:
+        if col in out_df.columns:
+            out_df[col] = out_df[col].astype("string").str.upper()
+    if "Star Rating" in out_df.columns:
+        out_df["Star Rating"] = pd.to_numeric(out_df["Star Rating"], errors="coerce")
+    if "Review Date" in out_df.columns:
+        out_df["Review Date"] = pd.to_datetime(out_df["Review Date"], errors="coerce")
+    for c in [col for col in out_df.columns if str(col).startswith("Symptom")]:
+        out_df[c] = out_df[c].astype("string").map(lambda v: clean_text(v, keep_na=True)).astype("string")
+    if "Verbatim" in out_df.columns:
+        out_df["Verbatim"] = out_df["Verbatim"].astype("string").map(clean_text)
+    meta = {"source": source_name, "warnings": warnings, "stats": stats, "records": len(records)}
+    return out_df, meta
+
+
+@st.cache_data(show_spinner=False)
+def _load_supplemental_signal_file(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    try:
+        if file_name.lower().endswith(".csv"):
+            raw = pd.read_csv(BytesIO(file_bytes))
         else:
-            start_date = end_date = sel
-    elif timeframe == "Last Week":
-        start_date, end_date = today - timedelta(days=7), today
-    elif timeframe == "Last Month":
-        start_date, end_date = today - timedelta(days=30), today
-    elif timeframe == "Last Year":
-        start_date, end_date = today - timedelta(days=365), today
+            raw = pd.read_excel(BytesIO(file_bytes))
+    except Exception as e:
+        raise RuntimeError(f"Could not read supplemental file {file_name}: {e}")
+    if raw.empty:
+        raise ValueError(f"Supplemental file {file_name} is empty.")
 
-filtered = df.copy()
-if start_date and end_date and "Review Date" in filtered.columns:
-    dt = pd.to_datetime(filtered["Review Date"], errors="coerce")
-    end_inclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-    filtered = filtered[(dt >= pd.Timestamp(start_date)) & (dt <= end_inclusive)]
+    norm_map = {_norm(c): c for c in raw.columns}
 
-with st.sidebar.expander("🌟 Star Rating", expanded=False):
-    selected_ratings = st.multiselect("Select Star Ratings", options=["All"] + [1, 2, 3, 4, 5], default=["All"], key="sr")
-if "All" not in selected_ratings and "Star Rating" in filtered.columns:
-    filtered = filtered[filtered["Star Rating"].isin(selected_ratings)]
+    def _pick(candidates: List[str]) -> Optional[str]:
+        for cand in candidates:
+            if cand in raw.columns:
+                return cand
+        for cand in candidates:
+            nc = _norm(cand)
+            if nc in norm_map:
+                return norm_map[nc]
+        return None
 
-with st.sidebar.expander("🌍 Standard Filters", expanded=False):
-    filtered, _ = apply_filter(filtered, "Country", "Country", key="f_Country")
-    filtered, _ = apply_filter(filtered, "Source", "Source", key="f_Source")
-    filtered, _ = apply_filter(filtered, "Model (SKU)", "Model (SKU)", key="f_Model (SKU)")
-    filtered, _ = apply_filter(filtered, "Seeded", "Seeded", key="f_Seeded")
-    filtered, _ = apply_filter(filtered, "New Review", "New Review", key="f_New Review")
+    text_col = _pick(SUPPLEMENTAL_TEXT_CANDIDATES)
+    if text_col is None:
+        for c in raw.columns:
+            s = raw[c].astype("string")
+            if s.dropna().astype(str).str.len().median() > 25:
+                text_col = c
+                break
+    if text_col is None:
+        raise ValueError(
+            f"Could not find a text column in {file_name}. Expected one of: {', '.join(SUPPLEMENTAL_TEXT_CANDIDATES)}"
+        )
 
-detractor_columns = [f"Symptom {i}" for i in range(1, 11)]
-delighter_columns = [f"Symptom {i}" for i in range(11, 21)]
-existing_detractor_columns = [c for c in detractor_columns if c in filtered.columns]
-existing_delighter_columns = [c for c in delighter_columns if c in filtered.columns]
-detractor_symptoms = collect_unique_symptoms(filtered, existing_detractor_columns)
-delighter_symptoms = collect_unique_symptoms(filtered, existing_delighter_columns)
+    date_col = _pick(SUPPLEMENTAL_DATE_CANDIDATES)
+    rating_col = _pick(SUPPLEMENTAL_RATING_CANDIDATES)
+    country_col = _pick(SUPPLEMENTAL_COUNTRY_CANDIDATES)
+    source_col = _pick(SUPPLEMENTAL_SOURCE_CANDIDATES)
+    model_col = _pick(SUPPLEMENTAL_MODEL_CANDIDATES)
+    id_col = _pick(SUPPLEMENTAL_ID_CANDIDATES)
 
-with st.sidebar.expander("🩺 Review Symptoms", expanded=False):
-    selected_delighter = st.multiselect(
-        "Select Delighter Symptoms",
-        options=["All"] + sorted(delighter_symptoms),
-        default=["All"],
-        key="delight",
-    )
-    selected_detractor = st.multiselect(
-        "Select Detractor Symptoms",
-        options=["All"] + sorted(detractor_symptoms),
-        default=["All"],
-        key="detract",
-    )
-if "All" not in selected_delighter and existing_delighter_columns:
-    filtered = filtered[filtered[existing_delighter_columns].isin(selected_delighter).any(axis=1)]
-if "All" not in selected_detractor and existing_detractor_columns:
-    filtered = filtered[filtered[existing_detractor_columns].isin(selected_detractor).any(axis=1)]
+    out = pd.DataFrame(index=raw.index)
+    out["Verbatim"] = raw[text_col].astype("string").map(clean_text)
+    out["Verbatim Id"] = raw[id_col].astype("string") if id_col else [f"{Path(file_name).stem}-{i+1}" for i in range(len(raw))]
+    out["Review Date"] = pd.to_datetime(raw[date_col], errors="coerce") if date_col else pd.NaT
+    out["Star Rating"] = pd.to_numeric(raw[rating_col], errors="coerce") if rating_col else pd.NA
+    out["Country"] = raw[country_col].astype("string") if country_col else pd.NA
+    out["Source"] = raw[source_col].astype("string") if source_col else Path(file_name).stem.upper()
+    out["Model (SKU)"] = raw[model_col].astype("string") if model_col else pd.NA
+    out["Seeded"] = "NO"
+    out["New Review"] = "NO"
+    out["Review count per detractor"] = pd.NA
+    out["Signal Type"] = Path(file_name).stem.upper()
+    out["Signal File"] = file_name
+    for i in range(1, 21):
+        out[f"Symptom {i}"] = pd.NA
 
-with st.sidebar.expander("🔎 Keyword", expanded=False):
-    keyword = st.text_input(
-        "Keyword to search (in review text)",
-        value="",
-        key="kw",
-        help="Case-insensitive match in review text. Cleans â€™ → '",
-    )
-    if keyword and "Verbatim" in filtered.columns:
-        mask_kw = filtered["Verbatim"].astype("string").fillna("").str.contains(keyword.strip(), case=False, na=False)
-        filtered = filtered[mask_kw]
+    mapped = {text_col, date_col, rating_col, country_col, source_col, model_col, id_col}
+    mapped = {m for m in mapped if m is not None}
+    for c in raw.columns:
+        if c in mapped or c in out.columns:
+            continue
+        out[c] = raw[c]
 
-core_cols = {"Country", "Source", "Model (SKU)", "Seeded", "New Review", "Star Rating", "Review Date", "Verbatim"}
-symptom_cols = set([f"Symptom {i}" for i in range(1, 21)])
-with st.sidebar.expander("📋 Additional Filters", expanded=False):
-    additional_columns = [c for c in df.columns if c not in (core_cols | symptom_cols)]
-    if additional_columns:
-        for column in additional_columns:
-            filtered, _ = apply_filter(filtered, column, column, key=f"f_{column}")
-    else:
-        st.info("No additional filters available.")
-
-with st.sidebar.expander("📄 Review List", expanded=False):
-    rpp_options = [10, 20, 50, 100]
-    default_rpp = st.session_state.get("reviews_per_page", 10)
-    rpp_index = rpp_options.index(default_rpp) if default_rpp in rpp_options else 0
-    rpp = st.selectbox("Reviews per page", options=rpp_options, index=rpp_index, key="rpp")
-    if rpp != default_rpp:
-        st.session_state["reviews_per_page"] = rpp
-        st.session_state["review_page"] = 0
-
-# Clear filters
-if st.sidebar.button("🧹 Clear all filters"):
-    for k in [
-        "tf",
-        "sr",
-        "kw",
-        "delight",
-        "detract",
-        "rpp",
-        "review_page",
-        "llm_model",
-        "llm_model_label",
-        "llm_temp",
-        "ai_enabled",
-        "ai_snippet_cap",
-        "ai_evidence_scope",
-        "ask_q",
-        "product_summary_text",
-        "chat_history",
-    ] + [k for k in list(st.session_state.keys()) if k.startswith("f_")]:
-        if k in st.session_state:
-            del st.session_state[k]
-    st.rerun()
-
-# ---------- AI Assistant ----------
-with st.sidebar.expander("🤖 AI Assistant (LLM)", expanded=False):
-    _model_choices = [
-        ("Fast & economical – 4o-mini", "gpt-4o-mini"),
-        ("Balanced – 4o", "gpt-4o"),
-        ("Advanced – 4.1", "gpt-4.1"),
-        ("Most advanced – GPT-5", "gpt-5"),
-        ("GPT-5 (Chat latest)", "gpt-5-chat-latest"),
-    ]
-    _default_model = st.session_state.get("llm_model", "gpt-4o-mini")
-    _default_idx = next((i for i, (_, mid) in enumerate(_model_choices) if mid == _default_model), 0)
-    _label = st.selectbox("Model", options=[l for (l, _) in _model_choices], index=_default_idx, key="llm_model_label")
-    st.session_state["llm_model"] = dict(_model_choices)[_label]
-
-    temp_supported = model_supports_temperature(st.session_state["llm_model"])
-    st.session_state["llm_temp"] = st.slider(
-        "Creativity (temperature)",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.get("llm_temp", 0.2)),
-        step=0.1,
-        disabled=not temp_supported,
-        help=("Lower = more deterministic, higher = more creative. Some models ignore this."),
-    )
-    if not temp_supported:
-        st.caption("ℹ️ This model uses a fixed temperature; the slider is disabled.")
-
-with st.sidebar.expander("🔒 Privacy & AI", expanded=True):
-    ai_enabled = st.toggle(
-        "Enable AI (send page context to OpenAI)",
-        value=True,
-        key="ai_enabled",
-        help="When on and you press Send/Generate, the app sends ONLY the page context pack (filters + on-page aggregates + a previewable evidence sample) to OpenAI.",
-    )
-    st.session_state["ai_evidence_scope"] = st.radio(
-        "Evidence scope",
-        options=["Current page only", "Sample from filtered set (previewed below)"],
-        index=1,
-        key="ai_evidence_scope",
-        help="Controls which review snippets are included in the evidence pack.",
-    )
-    st.session_state["ai_snippet_cap"] = st.number_input(
-        "Max review snippets to send",
-        min_value=10,
-        max_value=200,
-        value=int(st.session_state.get("ai_snippet_cap", 60)),
-        step=10,
-        key="ai_snippet_cap",
-    )
-    st.caption("Emails/phone numbers are masked before sending. No remote calls happen until you press Send / Generate.")
-
-with st.sidebar.expander("🔑 OpenAI Key (optional override)", expanded=False):
-    st.text_input("OPENAI_API_KEY override", value="", type="password", key="api_key_override")
-    st.caption("Leave blank to use .streamlit/secrets.toml or environment variable.")
-
-api_key_override = (st.session_state.get("api_key_override") or "").strip()
-api_key = api_key_override or st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-
-if not _HAS_OPENAI:
-    st.info("To enable the AI assistant, add `openai` to requirements and set `OPENAI_API_KEY`.")
-elif not api_key:
-    st.info("Set `OPENAI_API_KEY` (env or .streamlit/secrets.toml) to use the AI assistant.")
-
-# ---------- Dataset Overview ----------
-product_label = _infer_product_label(filtered, uploaded_file.name)
-st.markdown("## 🧾 Dataset Overview")
-st.markdown(
-    f"""
-<div class="soft-panel">
-  <div><span class="kpi-pill">File</span> <b>{esc(uploaded_file.name)}</b></div>
-  <div style="margin-top:6px;"><span class="kpi-pill">Product guess</span> <b>{esc(product_label)}</b></div>
-  <div class="small-muted" style="margin-top:8px;">
-    Overview is based on the <b>current filtered</b> dataset.
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# Precompute symptom summaries once for reuse (charts + tables + AI context)
-detractors_results_full = analyze_delighters_detractors(filtered, existing_detractor_columns)
-delighters_results_full = analyze_delighters_detractors(filtered, existing_delighter_columns)
-
-# Watchouts derived from filtered dataset
-_all_sym_cols = [c for c in [f"Symptom {i}" for i in range(1, 21)] if c in filtered.columns]
-trend_watchouts = _detect_trends(filtered, symptom_cols=_all_sym_cols, min_mentions=3)
-
-if trend_watchouts:
-    with st.expander("⚠️ Watchouts & Recent Movement", expanded=False):
-        st.markdown("\n".join([f"- {t}" for t in trend_watchouts]))
-
-# ---------- Helpers: AI context pack (ONLY on-page information) ----------
-def _metrics_snapshot(df_in: pd.DataFrame) -> dict:
-    s = pd.to_numeric(df_in.get("Star Rating"), errors="coerce")
-    total = int(len(df_in))
-    out = {
-        "product_guess": product_label,
-        "total_reviews": total,
-        "avg_star": float(s.mean()) if total and "Star Rating" in df_in.columns else 0.0,
-        "median_star": float(s.median()) if total and "Star Rating" in df_in.columns else 0.0,
-        "pct_1_2": float((s <= 2).mean() * 100) if total and "Star Rating" in df_in.columns else 0.0,
-        "star_counts": s.value_counts().sort_index().to_dict() if "Star Rating" in df_in.columns else {},
-    }
-    if "Review Date" in df_in.columns:
-        dmin = pd.to_datetime(df_in["Review Date"], errors="coerce").min()
-        dmax = pd.to_datetime(df_in["Review Date"], errors="coerce").max()
-        out["date_min"] = None if pd.isna(dmin) else pd.to_datetime(dmin).strftime("%Y-%m-%d")
-        out["date_max"] = None if pd.isna(dmax) else pd.to_datetime(dmax).strftime("%Y-%m-%d")
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review", "Signal Type"]:
+        if col in out.columns:
+            out[col] = out[col].astype("string").str.upper()
     return out
 
 
-def _top_table(df_tbl: pd.DataFrame, k: int = 8) -> list[dict]:
-    if df_tbl is None or df_tbl.empty:
-        return []
-    out = []
-    for _, r in df_tbl.head(k).iterrows():
-        out.append(
+def append_supplemental_signals(base_df: pd.DataFrame, supp_dfs: List[pd.DataFrame]) -> pd.DataFrame:
+    if not supp_dfs:
+        return base_df
+    frames = [base_df] + supp_dfs
+    all_cols = []
+    seen: Set[str] = set()
+    for df in frames:
+        for c in df.columns:
+            if c not in seen:
+                seen.add(c)
+                all_cols.append(c)
+    aligned = []
+    for df in frames:
+        temp = df.copy()
+        for c in all_cols:
+            if c not in temp.columns:
+                temp[c] = pd.NA
+        aligned.append(temp[all_cols])
+    out = pd.concat(aligned, ignore_index=True)
+    if "Review Date" in out.columns:
+        out["Review Date"] = pd.to_datetime(out["Review Date"], errors="coerce")
+    if "Star Rating" in out.columns:
+        out["Star Rating"] = pd.to_numeric(out["Star Rating"], errors="coerce")
+    if "Verbatim" in out.columns:
+        out["Verbatim"] = out["Verbatim"].astype("string").map(clean_text)
+    return out
+
+# -----------------------------------------------------------------------------
+# Preset helpers
+# -----------------------------------------------------------------------------
+PRESET_SCHEMA_VERSION = 2
+
+
+def _now_iso() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def collect_filter_state(additional_columns: List[str]) -> Dict[str, Any]:
+    state = {"schema_version": PRESET_SCHEMA_VERSION, "created_at": _now_iso(), "filters": {}, "ui": {}}
+    state["filters"]["tf"] = st.session_state.get("tf", "All Time")
+    state["filters"]["tf_range"] = st.session_state.get("tf_range", None)
+    state["filters"]["sr"] = st.session_state.get("sr", ["All"])
+    state["filters"]["kw"] = st.session_state.get("kw", "")
+    state["filters"]["delight"] = st.session_state.get("delight", ["All"])
+    state["filters"]["detract"] = st.session_state.get("detract", ["All"])
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + list(additional_columns):
+        for suffix in ["", "_range", "_contains"]:
+            key = f"f_{col}{suffix}"
+            if key in st.session_state:
+                state["filters"][key] = st.session_state.get(key)
+    state["ui"]["extra_filter_cols"] = st.session_state.get("extra_filter_cols", [])
+    state["ui"]["rpp"] = st.session_state.get("rpp", 10)
+    return state
+
+
+def apply_filter_state(state: Dict[str, Any], additional_columns: List[str]) -> None:
+    filters = state.get("filters", {})
+    for key in ["tf", "tf_range", "sr", "kw", "delight", "detract"]:
+        if key in filters:
+            st.session_state[key] = filters.get(key)
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + list(additional_columns):
+        for suffix in ["", "_range", "_contains"]:
+            key = f"f_{col}{suffix}"
+            if key in filters:
+                st.session_state[key] = filters.get(key)
+    ui = state.get("ui", {})
+    st.session_state["extra_filter_cols"] = ui.get("extra_filter_cols", [])
+    st.session_state["rpp"] = int(ui.get("rpp", 10) or 10)
+    st.session_state["review_page"] = 0
+
+
+# -----------------------------------------------------------------------------
+# Radar, compare, root cause, simulation, actions
+# -----------------------------------------------------------------------------
+def detect_issue_radar(
+    df_in: pd.DataFrame,
+    detractor_cols: List[str],
+    delighter_cols: List[str],
+    lookback_days: int = 30,
+    min_mentions: int = 3,
+) -> pd.DataFrame:
+    if df_in.empty or "Review Date" not in df_in.columns:
+        return pd.DataFrame(columns=["Type", "Issue", "Narrative", "Severity", "Current", "Previous", "Delta pp", "Window"])
+    d = df_in.copy()
+    d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
+    d = d.dropna(subset=["Review Date"])
+    if d.empty:
+        return pd.DataFrame(columns=["Type", "Issue", "Narrative", "Severity", "Current", "Previous", "Delta pp", "Window"])
+
+    last_day = d["Review Date"].max().normalize()
+    current_start = last_day - pd.Timedelta(days=int(lookback_days) - 1)
+    prev_end = current_start - pd.Timedelta(days=1)
+    prev_start = prev_end - pd.Timedelta(days=int(lookback_days) - 1)
+    cur = d[(d["Review Date"] >= current_start) & (d["Review Date"] <= last_day)]
+    prev = d[(d["Review Date"] >= prev_start) & (d["Review Date"] <= prev_end)]
+    rows: List[Dict[str, Any]] = []
+    if cur.empty:
+        return pd.DataFrame(columns=["Type", "Issue", "Narrative", "Severity", "Current", "Previous", "Delta pp", "Window"])
+
+    if "Star Rating" in cur.columns:
+        cur_avg = pd.to_numeric(cur["Star Rating"], errors="coerce").mean()
+        prev_avg = pd.to_numeric(prev["Star Rating"], errors="coerce").mean() if not prev.empty else np.nan
+        if pd.notna(cur_avg) and pd.notna(prev_avg):
+            drop = float(cur_avg - prev_avg)
+            if drop <= -0.20:
+                rows.append(
+                    {
+                        "Type": "Rating drop",
+                        "Issue": "Overall Avg ★",
+                        "Narrative": f"Avg ★ moved from {prev_avg:.2f} to {cur_avg:.2f} in the last {lookback_days} days.",
+                        "Severity": round(abs(drop) * 100, 1),
+                        "Current": round(cur_avg, 2),
+                        "Previous": round(prev_avg, 2),
+                        "Delta pp": round(drop, 2),
+                        "Window": f"{current_start.date()} → {last_day.date()}",
+                    }
+                )
+        cur_low = pct_12(cur["Star Rating"]) if "Star Rating" in cur.columns else np.nan
+        prev_low = pct_12(prev["Star Rating"]) if (not prev.empty and "Star Rating" in prev.columns) else np.nan
+        if pd.notna(cur_low) and pd.notna(prev_low):
+            delta_low = float(cur_low - prev_low)
+            if delta_low >= 4.0:
+                rows.append(
+                    {
+                        "Type": "Low-star spike",
+                        "Issue": "1–2★ reviews",
+                        "Narrative": f"Low-star share increased from {prev_low:.1f}% to {cur_low:.1f}% in the last {lookback_days} days.",
+                        "Severity": round(delta_low * 3.0, 1),
+                        "Current": round(cur_low, 1),
+                        "Previous": round(prev_low, 1),
+                        "Delta pp": round(delta_low, 1),
+                        "Window": f"{current_start.date()} → {last_day.date()}",
+                    }
+                )
+
+    all_sym_cols = detractor_cols + delighter_cols
+    long_cur = symptom_long_df(cur, all_sym_cols)
+    long_prev = symptom_long_df(prev, all_sym_cols)
+    cur_counts = long_cur["symptom"].value_counts()
+    prev_counts = long_prev["symptom"].value_counts()
+    detractor_set = {s.title() for s in collect_unique_symptoms(df_in, detractor_cols)}
+    denom_cur = max(1, len(cur))
+    denom_prev = max(1, len(prev))
+    candidate_terms = set(cur_counts.head(40).index.tolist()) | set(prev_counts.head(20).index.tolist())
+    for term in candidate_terms:
+        c = int(cur_counts.get(term, 0))
+        p = int(prev_counts.get(term, 0))
+        if c < min_mentions:
+            continue
+        rate_c = c / denom_cur * 100.0
+        rate_p = p / denom_prev * 100.0 if denom_prev else 0.0
+        delta_pp = rate_c - rate_p
+        ratio = (c + 1) / (p + 1)
+        if p == 0 and c >= min_mentions:
+            severity = c * 6.0
+            kind = "New theme"
+            narrative = f"{term} appeared {c} times in the latest window after 0 mentions in the previous window."
+        elif delta_pp >= 2.0 or ratio >= 1.8:
+            severity = c * max(delta_pp, 1.0)
+            kind = "Detractor spike" if term in detractor_set else "Theme spike"
+            narrative = f"{term} moved from {rate_p:.1f}% to {rate_c:.1f}% of reviews ({p} → {c} mentions)."
+        else:
+            continue
+        rows.append(
             {
-                "item": str(r.get("Item", "")),
-                "mentions": int(r.get("Mentions", 0)),
-                "avg_star": None if pd.isna(r.get("Avg Star")) else float(r.get("Avg Star")),
-                "pct_total": str(r.get("% Total", "")),
+                "Type": kind,
+                "Issue": term,
+                "Narrative": narrative,
+                "Severity": round(severity, 1),
+                "Current": round(rate_c, 1),
+                "Previous": round(rate_p, 1),
+                "Delta pp": round(delta_pp, 1),
+                "Window": f"{current_start.date()} → {last_day.date()}",
             }
         )
+
+    if {"Country", "Source", "Star Rating"}.issubset(d.columns):
+        cur2 = cur.copy()
+        cur2["Star Rating"] = pd.to_numeric(cur2["Star Rating"], errors="coerce")
+        grp = cur2.groupby(["Country", "Source"])["Star Rating"].agg(["count", "mean"]).reset_index()
+        grp = grp[(grp["count"] >= 5) & (grp["mean"] <= max(2.9, pd.to_numeric(cur2["Star Rating"], errors="coerce").mean() - 0.4))]
+        for _, row in grp.sort_values(["mean", "count"]).head(8).iterrows():
+            rows.append(
+                {
+                    "Type": "Pocket underperformance",
+                    "Issue": f"{row['Country']} × {row['Source']}",
+                    "Narrative": f"Recent Avg ★ is {row['mean']:.2f} across {int(row['count'])} reviews.",
+                    "Severity": round((5.0 - float(row["mean"])) * float(row["count"]), 1),
+                    "Current": round(float(row["mean"]), 2),
+                    "Previous": np.nan,
+                    "Delta pp": np.nan,
+                    "Window": f"{current_start.date()} → {last_day.date()}",
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["Type", "Issue", "Narrative", "Severity", "Current", "Previous", "Delta pp", "Window"])
+    out = out.sort_values("Severity", ascending=False, ignore_index=True)
+    return out.head(20)
+
+
+def build_symptom_delta_table(df_a: pd.DataFrame, df_b: pd.DataFrame, symptom_cols: List[str], label_a: str, label_b: str) -> pd.DataFrame:
+    ta = analyze_symptoms_fast(df_a, symptom_cols)
+    tb = analyze_symptoms_fast(df_b, symptom_cols)
+    if ta.empty and tb.empty:
+        return pd.DataFrame(columns=["Item", f"{label_a} Rate %", f"{label_b} Rate %", "Delta pp", "Direction"])
+    ma = ta[["Item", "Review Mentions", "Review Rate %", "Avg Star"]].rename(
+        columns={"Review Mentions": f"{label_a} Reviews", "Review Rate %": f"{label_a} Rate %", "Avg Star": f"{label_a} Avg ★"}
+    )
+    mb = tb[["Item", "Review Mentions", "Review Rate %", "Avg Star"]].rename(
+        columns={"Review Mentions": f"{label_b} Reviews", "Review Rate %": f"{label_b} Rate %", "Avg Star": f"{label_b} Avg ★"}
+    )
+    merged = ma.merge(mb, on="Item", how="outer")
+    for col in merged.columns:
+        if col != "Item":
+            merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
+    merged["Delta pp"] = merged[f"{label_a} Rate %"] - merged[f"{label_b} Rate %"]
+    merged["Direction"] = np.where(merged["Delta pp"] >= 0, label_a, label_b)
+    return merged.sort_values("Delta pp", key=lambda s: s.abs(), ascending=False, ignore_index=True)
+
+
+def issue_mask_from_mode(df_in: pd.DataFrame, mode: str, issue_name: Optional[str], detractor_cols: List[str], delighter_cols: List[str]) -> pd.Series:
+    if df_in.empty:
+        return pd.Series(dtype=bool)
+    if mode == "1–2★ reviews":
+        return pd.to_numeric(df_in.get("Star Rating"), errors="coerce") <= 2
+    target_cols = detractor_cols if mode == "Detractor symptom" else delighter_cols
+    if not issue_name:
+        return pd.Series(False, index=df_in.index)
+    sym = str(issue_name).strip().lower()
+    mask = pd.Series(False, index=df_in.index)
+    for c in target_cols:
+        if c not in df_in.columns:
+            continue
+        s = df_in[c].astype("string").fillna("").str.strip().str.lower()
+        mask |= s.eq(sym)
+    return mask
+
+
+def rank_drivers_for_issue(
+    df_in: pd.DataFrame,
+    issue_mask: pd.Series,
+    driver_cols: List[str],
+    mode: str,
+    min_group_n: int = 5,
+) -> pd.DataFrame:
+    if df_in.empty or issue_mask.empty or issue_mask.sum() == 0:
+        return pd.DataFrame(columns=["Driver", "Bucket", "Reviews", "Issue Reviews", "Issue Rate %", "Lift vs Baseline", "Avg Star", "Contribution %", "Impact Score"])
+    d = df_in.copy()
+    d["__issue"] = issue_mask.values
+    d["__star"] = pd.to_numeric(d.get("Star Rating"), errors="coerce")
+    baseline_rate = float(issue_mask.mean())
+    overall_avg = float(d["__star"].mean()) if d["__star"].notna().any() else np.nan
+    rows: List[Dict[str, Any]] = []
+
+    for col in driver_cols:
+        if col not in d.columns:
+            continue
+        s = d[col].astype("string").fillna("UNKNOWN").replace({"": "UNKNOWN"})
+        tokenize = bool(s.head(250).astype(str).str.contains(r"\s\|\s", regex=True).any())
+        if tokenize:
+            temp = pd.DataFrame({"bucket": s.str.split(r"\s*\|\s*", regex=True), "issue": d["__issue"], "star": d["__star"]})
+            temp = temp.explode("bucket")
+            temp["bucket"] = temp["bucket"].astype("string").fillna("UNKNOWN").replace({"": "UNKNOWN"})
+        else:
+            temp = pd.DataFrame({"bucket": s, "issue": d["__issue"], "star": d["__star"]})
+        grp = temp.groupby("bucket").agg(reviews=("issue", "size"), issue_reviews=("issue", "sum"), avg_star=("star", "mean")).reset_index()
+        grp = grp[grp["reviews"] >= int(min_group_n)]
+        if grp.empty:
+            continue
+        grp["issue_rate"] = grp["issue_reviews"] / grp["reviews"]
+        grp["lift"] = grp["issue_rate"] / max(baseline_rate, 1e-9)
+        grp["contribution"] = grp["issue_reviews"] / max(int(issue_mask.sum()), 1)
+        if mode in {"Detractor symptom", "1–2★ reviews"}:
+            grp["impact_score"] = grp["issue_reviews"] * np.maximum(grp["lift"] - 1.0, 0) * np.maximum(overall_avg - grp["avg_star"] + 0.15, 0.15)
+        else:
+            grp["impact_score"] = grp["issue_reviews"] * np.maximum(grp["lift"] - 1.0, 0) * np.maximum(grp["avg_star"] - overall_avg + 0.15, 0.15)
+        for _, row in grp.sort_values("impact_score", ascending=False).head(15).iterrows():
+            rows.append(
+                {
+                    "Driver": col,
+                    "Bucket": str(row["bucket"]),
+                    "Reviews": int(row["reviews"]),
+                    "Issue Reviews": int(row["issue_reviews"]),
+                    "Issue Rate %": round(float(row["issue_rate"]) * 100.0, 1),
+                    "Lift vs Baseline": round(float(row["lift"]), 2),
+                    "Avg Star": round(float(row["avg_star"]), 2) if pd.notna(row["avg_star"]) else np.nan,
+                    "Contribution %": round(float(row["contribution"]) * 100.0, 1),
+                    "Impact Score": round(float(row["impact_score"]), 2),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=["Driver", "Bucket", "Reviews", "Issue Reviews", "Issue Rate %", "Lift vs Baseline", "Avg Star", "Contribution %", "Impact Score"])
+    out = pd.DataFrame(rows)
+    return out.sort_values("Impact Score", ascending=False, ignore_index=True).head(30)
+
+
+def estimate_issue_lift(df_in: pd.DataFrame, issue_mask: pd.Series, mode: str, reduction_pct: float) -> Dict[str, float]:
+    total = len(df_in)
+    issue_reviews = int(issue_mask.sum())
+    if total == 0 or issue_reviews == 0 or "Star Rating" not in df_in.columns:
+        return {"estimated_lift": 0.0, "issue_share_pct": 0.0, "issue_avg": np.nan, "overall_avg": np.nan}
+    stars = pd.to_numeric(df_in["Star Rating"], errors="coerce")
+    overall_avg = float(stars.mean()) if stars.notna().any() else np.nan
+    issue_avg = float(stars[issue_mask].mean()) if stars[issue_mask].notna().any() else np.nan
+    share = issue_reviews / total
+    if mode in {"Detractor symptom", "1–2★ reviews"}:
+        local_gap = max(0.0, overall_avg - issue_avg)
+    else:
+        local_gap = max(0.0, issue_avg - overall_avg)
+    estimated_lift = share * local_gap * (float(reduction_pct) / 100.0)
+    return {
+        "estimated_lift": round(float(estimated_lift), 3),
+        "issue_share_pct": round(float(share) * 100.0, 1),
+        "issue_avg": round(float(issue_avg), 2) if pd.notna(issue_avg) else np.nan,
+        "overall_avg": round(float(overall_avg), 2) if pd.notna(overall_avg) else np.nan,
+    }
+
+
+def build_action_center(
+    df_in: pd.DataFrame,
+    issue_label: str,
+    mode: str,
+    issue_mask: pd.Series,
+    driver_df: pd.DataFrame,
+    quotes: List[Dict[str, str]],
+    product_label: str,
+) -> Dict[str, Any]:
+    total_reviews = len(df_in)
+    issue_reviews = int(issue_mask.sum())
+    stars = pd.to_numeric(df_in.get("Star Rating"), errors="coerce")
+    overall_avg = float(stars.mean()) if stars.notna().any() else np.nan
+    issue_avg = float(stars[issue_mask].mean()) if issue_reviews and stars[issue_mask].notna().any() else np.nan
+    top_drivers = driver_df.head(3).to_dict("records") if driver_df is not None and not driver_df.empty else []
+    top_driver_text = "; ".join(
+        [f"{r['Driver']}={r['Bucket']} ({r['Issue Rate %']}% issue rate, {r['Contribution %']}% contribution)" for r in top_drivers]
+    ) or "No strong concentration detected in the selected driver set."
+    quote_text = quotes[0]["text"] if quotes else "No direct quote available for this filtered slice."
+    quote_meta = quotes[0]["meta"] if quotes else ""
+
+    problem_line = f"{issue_label} shows up in {issue_reviews:,} of {total_reviews:,} filtered reviews ({issue_reviews / max(total_reviews, 1) * 100.0:.1f}%)."
+    rating_line = f"Overall Avg ★ is {overall_avg:.2f}; impacted reviews average {issue_avg:.2f}★." if pd.notna(overall_avg) and pd.notna(issue_avg) else "Star-rating context is limited in this slice."
+
+    exec_summary = textwrap.dedent(
+        f"""
+        • **Signal:** {problem_line}
+        • **Impact:** {rating_line}
+        • **Where it concentrates:** {top_driver_text}
+        • **Evidence:** “{quote_text}” ({quote_meta})
+        • **Recommendation:** Triage the top concentration buckets first, validate the specific failure mode in recent reviews, and track whether issue prevalence drops in the next 2–4 weeks.
+        """
+    ).strip()
+
+    eng_brief = textwrap.dedent(
+        f"""
+        # Engineering Brief — {issue_label}
+
+        ## Problem statement
+        {product_label}: {problem_line}
+        {rating_line}
+
+        ## Root-cause hypothesis
+        {top_driver_text}
+
+        ## Consumer evidence
+        > {quote_text}
+        > {quote_meta}
+
+        ## Recommended next actions
+        1. Pull recent defect or support cases for the top-ranked driver buckets.
+        2. Reproduce the issue on the most-concentrated model / channel combinations.
+        3. Check whether the failure is tied to a specific component, journey step, or onboarding moment.
+        4. Add a post-fix watchlist for issue prevalence, Avg ★, and low-star rate.
+
+        ## Success metric
+        Reduce {issue_label} mention rate by 20%+ in the affected slice without lowering delighter mentions.
+        """
+    ).strip()
+
+    jira_payload = {
+        "summary": f"Investigate consumer issue: {issue_label}",
+        "priority": "High" if mode in {"Detractor symptom", "1–2★ reviews"} else "Medium",
+        "labels": ["consumer-insights", "voice-of-customer", _norm(product_label)[:24], _norm(issue_label)[:24]],
+        "description": {
+            "product": product_label,
+            "mode": mode,
+            "problem": problem_line,
+            "impact": rating_line,
+            "top_drivers": top_drivers,
+            "consumer_evidence": [{"text": q["text"], "meta": q["meta"]} for q in quotes[:3]],
+            "next_steps": [
+                "Validate issue with QA and support logs",
+                "Reproduce with top-ranked cohort",
+                "Create fix / mitigation plan",
+                "Monitor issue prevalence weekly",
+            ],
+        },
+        "acceptance_criteria": [
+            "Issue driver validated or falsified",
+            "Action owner assigned",
+            "Monitoring slice defined",
+            "Success metric agreed",
+        ],
+    }
+
+    support_macro = textwrap.dedent(
+        f"""
+        Thanks for the feedback, and I’m sorry you ran into {issue_label.lower()}.
+        We’re reviewing this closely with the product team. To help us diagnose it faster, please share your model/SKU, where you purchased it, and when the issue started.
+        In the meantime, we can guide you through a few checks or next best steps based on your setup.
+        """
+    ).strip()
+
+    retailer_note = textwrap.dedent(
+        f"""
+        Subject: Consumer signal escalation — {issue_label}
+
+        We’re seeing a meaningful consumer signal around **{issue_label}** in the current filtered dataset for **{product_label}**.
+        {problem_line}
+        {rating_line}
+        Highest concentration: {top_driver_text}
+
+        Example verbatim: “{quote_text}” ({quote_meta})
+
+        We recommend flagging this for your category / quality contact and aligning on any recent returns, defect claims, or PDP / onboarding confusion patterns tied to this slice.
+        """
+    ).strip()
+
+    return {
+        "executive_summary": exec_summary,
+        "engineering_brief": eng_brief,
+        "jira": jira_payload,
+        "support_macro": support_macro,
+        "retailer_note": retailer_note,
+    }
+
+
+# -----------------------------------------------------------------------------
+# AI helpers
+# -----------------------------------------------------------------------------
+def _build_ai_corpus(df_in: pd.DataFrame, max_rows: int) -> Tuple[List[str], List[Dict[str, Any]]]:
+    if df_in.empty:
+        return [], []
+    df_use = df_in if len(df_in) <= max_rows else df_in.sample(max_rows, random_state=42)
+    texts: List[str] = []
+    meta: List[Dict[str, Any]] = []
+    for _, r in df_use.iterrows():
+        verb = mask_pii(str(r.get("Verbatim", "") or ""))
+        star = r.get("Star Rating", "")
+        country = r.get("Country", "")
+        source = r.get("Source", "")
+        signal_type = r.get("Signal Type", "")
+        dtv = r.get("Review Date", "")
+        try:
+            dtv = pd.to_datetime(dtv).strftime("%Y-%m-%d") if pd.notna(dtv) else ""
+        except Exception:
+            dtv = ""
+        prefix = f"[★{star}] [{country}] [{source}] [{signal_type}] [{dtv}] "
+        txt = (prefix + verb).strip()
+        texts.append(txt)
+        meta.append({"star": star, "country": country, "source": source, "signal_type": signal_type, "date": dtv, "text": verb})
+    return texts, meta
+
+
+def get_local_index(df_in: pd.DataFrame, corpus_cap: int = 1800) -> Tuple[Any, Any, List[str], List[Dict[str, Any]]]:
+    if not _HAS_SKLEARN:
+        return None, None, [], []
+    cache = st.session_state.setdefault("_ai_local_index", {})
+    try:
+        sig = hashlib.sha1((str(df_in.shape) + "|" + "|".join(df_in.columns.astype(str))).encode("utf-8")).hexdigest()
+    except Exception:
+        sig = str(df_in.shape)
+    if sig in cache:
+        return cache[sig]["vec"], cache[sig]["mat"], cache[sig]["texts"], cache[sig]["meta"]
+    texts, meta = _build_ai_corpus(df_in, max_rows=corpus_cap)
+    if not texts:
+        cache[sig] = {"vec": None, "mat": None, "texts": [], "meta": []}
+        return None, None, [], []
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=35000)
+    mat = vec.fit_transform(texts)
+    cache[sig] = {"vec": vec, "mat": mat, "texts": texts, "meta": meta}
+    return vec, mat, texts, meta
+
+
+def retrieve_quotes(query: str, df_in: pd.DataFrame, k: int = 8) -> List[Dict[str, Any]]:
+    if not _HAS_SKLEARN:
+        return []
+    vec, mat, texts, meta = get_local_index(df_in)
+    if vec is None or mat is None or not texts:
+        return []
+    qv = vec.transform([query])
+    sims = linear_kernel(qv, mat).flatten()
+    if sims.size == 0:
+        return []
+    top = np.argsort(-sims)[: max(1, k)]
+    out = []
+    for rank, idx in enumerate(top, start=1):
+        m = meta[int(idx)]
+        out.append({"id": f"Q{rank}", "score": float(sims[int(idx)]), **m})
     return out
 
 
-def _monthly_volume_and_mean(df_in: pd.DataFrame, bucket: str = "M", limit: int = 24) -> list[dict]:
-    if "Review Date" not in df_in.columns or "Star Rating" not in df_in.columns:
-        return []
-    d = df_in.copy()
-    d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
-    d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-    d = d.dropna(subset=["Review Date", "Star Rating"])
-    if d.empty:
-        return []
-    if bucket == "W":
-        d["bucket"] = d["Review Date"].dt.to_period("W-MON").dt.start_time
-    else:
-        d["bucket"] = d["Review Date"].dt.to_period("M").dt.to_timestamp()
-    g = d.groupby("bucket")["Star Rating"].agg(count="count", mean="mean").reset_index().sort_values("bucket")
-    if limit and len(g) > limit:
-        g = g.tail(int(limit))
-    rows = [{"bucket": r["bucket"].strftime("%Y-%m-%d"), "count": int(r["count"]), "mean": float(r["mean"])} for _, r in g.iterrows()]
-    return rows
-
-
-def _filters_snapshot(additional_cols: list[str]) -> dict:
-    # Pull directly from session_state (these are the "current filter criteria")
-    def _get(key, default=None):
-        v = st.session_state.get(key, default)
-        # normalize tuples from date_input etc.
-        if isinstance(v, tuple):
-            return [str(x) for x in v]
-        return v
-
-    snap = {
-        "timeframe": _get("tf"),
-        "custom_start_date": str(start_date) if start_date else None,
-        "custom_end_date": str(end_date) if end_date else None,
-        "star_ratings": _get("sr", ["All"]),
-        "keyword": (_get("kw") or "").strip(),
-        "country": _get("f_Country", ["ALL"]),
-        "source": _get("f_Source", ["ALL"]),
-        "model_sku": _get("f_Model (SKU)", ["ALL"]),
-        "seeded": _get("f_Seeded", ["ALL"]),
-        "new_review": _get("f_New Review", ["ALL"]),
-        "delighter_symptoms": _get("delight", ["All"]),
-        "detractor_symptoms": _get("detract", ["All"]),
-        "additional_filters": {},
-    }
-    for col in additional_cols or []:
-        snap["additional_filters"][col] = _get(f"f_{col}", ["ALL"])
-    return snap
-
-
-def _row_to_evidence_dict(row: pd.Series, eid: str, det_cols: list[str], del_cols: list[str]) -> dict:
-    txt = clean_text(row.get("Verbatim", ""))
-    txt = _mask_pii(txt)
-    txt = _trim_snippet(txt, 460)
-
-    def _sym_list(cols: list[str], limit: int = 8) -> list[str]:
-        vals = []
-        for c in cols:
-            v = row.get(c, pd.NA)
-            if pd.isna(v):
-                continue
-            s = str(v).strip()
-            if not s or s.upper() in {"<NA>", "NA", "N/A", "NULL", "NONE", "-"}:
-                continue
-            vals.append(s.title())
-        # de-dupe preserve order
-        out = []
-        seen = set()
-        for v in vals:
-            if v not in seen:
-                seen.add(v)
-                out.append(v)
-        return out[:limit]
-
-    date_val = row.get("Review Date", pd.NaT)
-    date_str = None
-    if pd.notna(date_val):
-        try:
-            date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
-        except Exception:
-            date_str = None
-
-    star_val = row.get("Star Rating", pd.NA)
-    try:
-        star_int = int(star_val) if pd.notna(star_val) else None
-    except Exception:
-        star_int = None
-
-    meta = {}
-    for c in ["Source", "Country", "Model (SKU)", "Seeded", "New Review"]:
-        if c in row.index:
-            v = row.get(c, pd.NA)
-            if pd.notna(v) and str(v).strip():
-                meta[c] = str(v).strip()
-
-    return {
-        "id": eid,
-        "star_rating": star_int,
-        "review_date": date_str,
-        "meta": meta,
-        "detractor_symptoms": _sym_list(det_cols, 8),
-        "delighter_symptoms": _sym_list(del_cols, 8),
-        "verbatim": txt,
-    }
-
-
-def _select_evidence_rows(
+def build_knowledge_pack(
     df_in: pd.DataFrame,
-    paginated_df: pd.DataFrame,
-    det_cols: list[str],
-    del_cols: list[str],
-    top_det_items: list[str],
-    top_del_items: list[str],
-    max_n: int,
-    scope: str,
-) -> pd.DataFrame:
-    if df_in.empty:
-        return df_in.head(0)
-
-    scope = (scope or "").lower()
-    max_n = int(max(1, max_n))
-
-    # Always start with what the user can already see (current page)
-    selected_idx = []
-    if not paginated_df.empty:
-        selected_idx.extend(list(paginated_df.index))
-
-    if scope.startswith("current page"):
-        return df_in.loc[selected_idx].head(max_n) if selected_idx else df_in.head(0)
-
-    # Otherwise, expand with a deterministic sample from the filtered dataset
-    remain = max_n - len(selected_idx)
-    if remain <= 0:
-        return df_in.loc[selected_idx].head(max_n)
-
-    d = df_in.copy()
-
-    # Prefer having Review Date ordering for "recent" coverage
-    if "Review Date" in d.columns:
-        d["__rd"] = pd.to_datetime(d["Review Date"], errors="coerce")
-    else:
-        d["__rd"] = pd.NaT
-
-    # Helper: deterministic rank key
-    def _rank_key(row_: pd.Series) -> str:
-        base = f"{row_.get('Verbatim','')}\n{row_.get('Star Rating','')}\n{row_.get('Review Date','')}"
-        return hashlib.md5(base.encode("utf-8", errors="ignore")).hexdigest()
-
-    d["__rk"] = d.apply(_rank_key, axis=1)
-
-    # 1) Ensure coverage across star ratings (up to 8 per star)
-    if "Star Rating" in d.columns:
-        for star in [1, 2, 3, 4, 5]:
-            if remain <= 0:
-                break
-            sub = d[pd.to_numeric(d["Star Rating"], errors="coerce") == star].copy()
-            if sub.empty:
-                continue
-            sub = sub.sort_values(["__rd", "__rk"], ascending=[False, True])
-            take = min(8, remain)
-            picks = [i for i in sub.head(take).index.tolist() if i not in selected_idx]
-            selected_idx.extend(picks)
-            remain = max_n - len(selected_idx)
-
-    # 2) Ensure coverage of top symptoms (1 review per item)
-    def _pick_by_symptom(items: list[str], cols: list[str]):
-        nonlocal remain, selected_idx
-        if remain <= 0 or not items or not cols:
-            return
-        # Build lower-case compare table once for speed
-        tmp = d[cols].astype("string").fillna("").apply(lambda s: s.str.strip().str.lower())
-        for it in items[:10]:
-            if remain <= 0:
-                break
-            it_l = str(it).strip().lower()
-            if not it_l:
-                continue
-            mask = tmp.eq(it_l).any(axis=1)
-            sub = d[mask].copy()
-            if sub.empty:
-                continue
-            sub = sub.sort_values(["__rd", "__rk"], ascending=[False, True])
-            for idx in sub.index.tolist():
-                if idx not in selected_idx:
-                    selected_idx.append(idx)
-                    remain = max_n - len(selected_idx)
-                    break
-
-    _pick_by_symptom(top_det_items, det_cols)
-    _pick_by_symptom(top_del_items, del_cols)
-
-    # 3) Fill remainder with most-recent deterministic
-    if remain > 0:
-        rest = d[~d.index.isin(selected_idx)].sort_values(["__rd", "__rk"], ascending=[False, True]).head(remain)
-        selected_idx.extend(rest.index.tolist())
-
-    return df_in.loc[selected_idx].head(max_n)
-
-
-def build_ai_context_pack(
-    df_filtered: pd.DataFrame,
-    df_paginated: pd.DataFrame,
-    additional_cols: list[str],
-    det_cols: list[str],
-    del_cols: list[str],
-    top_det_tbl: pd.DataFrame,
-    top_del_tbl: pd.DataFrame,
-    max_snippets: int,
-    evidence_scope: str,
-) -> dict:
-    metrics = _metrics_snapshot(df_filtered)
-    filters = _filters_snapshot(additional_cols)
-    top_det = _top_table(top_det_tbl, 10)
-    top_del = _top_table(top_del_tbl, 10)
-
-    top_det_items = [r["item"] for r in top_det if r.get("item")]
-    top_del_items = [r["item"] for r in top_del if r.get("item")]
-
-    chosen = _select_evidence_rows(
-        df_in=df_filtered,
-        paginated_df=df_paginated,
-        det_cols=det_cols,
-        del_cols=del_cols,
-        top_det_items=top_det_items,
-        top_del_items=top_del_items,
-        max_n=max_snippets,
-        scope=evidence_scope,
-    )
-
-    evidence = []
-    for i, (_, row) in enumerate(chosen.iterrows(), start=1):
-        evidence.append(_row_to_evidence_dict(row, f"E{i}", det_cols, del_cols))
-
-    monthly = _monthly_volume_and_mean(df_filtered, bucket="M", limit=24)
-
-    pack = {
-        "page_version": "2026-01",
-        "filters": filters,
-        "metrics": metrics,
-        "top_detractors": top_det,
-        "top_delighters": top_del,
-        "watchouts": trend_watchouts[:8],
-        "monthly_volume_and_mean": monthly,
-        "evidence_reviews": evidence,
-        "scope_notes": {
-            "analysis_scope": "All insights must reflect the CURRENT filtered dataset in this UI.",
-            "evidence_pack_note": (
-                "Only the evidence reviews listed here were shared as verbatim examples. "
-                "Use aggregate tables for quantification; cite evidence IDs (E#) for examples."
-            ),
+    source_label: str,
+    detractor_cols: List[str],
+    delighter_cols: List[str],
+) -> Dict[str, Any]:
+    cnt, avg, low = section_stats(df_in)
+    seeded_mask = df_in["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in df_in.columns else pd.Series(False, index=df_in.index)
+    organic = df_in[~seeded_mask]
+    seeded = df_in[seeded_mask]
+    org_cnt, org_avg, org_low = section_stats(organic)
+    seed_cnt, seed_avg, seed_low = section_stats(seeded)
+    radar = detect_issue_radar(df_in, detractor_cols, delighter_cols)
+    themes = compute_text_theme_diffs(df_in, top_n=10)
+    return {
+        "product_profile": infer_product_profile(df_in, source_label),
+        "csat": {
+            "count": cnt,
+            "avg_star": round(avg, 3) if pd.notna(avg) else np.nan,
+            "pct_1_2": round(low, 2) if pd.notna(low) else np.nan,
+            "organic": {"count": org_cnt, "avg_star": round(org_avg, 3) if pd.notna(org_avg) else np.nan, "pct_1_2": round(org_low, 2) if pd.notna(org_low) else np.nan},
+            "seeded": {"count": seed_cnt, "avg_star": round(seed_avg, 3) if pd.notna(seed_avg) else np.nan, "pct_1_2": round(seed_low, 2) if pd.notna(seed_low) else np.nan},
         },
+        "top_detractors": analyze_symptoms_fast(df_in, detractor_cols).head(12).to_dict("records") if detractor_cols else [],
+        "top_delighters": analyze_symptoms_fast(df_in, delighter_cols).head(12).to_dict("records") if delighter_cols else [],
+        "issue_radar": radar.head(8).to_dict("records") if radar is not None and not radar.empty else [],
+        "theme_diffs": themes,
     }
-    return pack
 
 
-def render_ai_context_preview(ctx: dict):
-    with st.expander("🔎 AI context (exactly what is sent to OpenAI)", expanded=False):
-        st.caption("This is the ONLY context the LLM receives. If it's not here, the assistant should not claim it.")
-        st.json(ctx)
-        if ctx.get("evidence_reviews"):
-            st.markdown("**Evidence reviews (verbatim snippets)**")
-            for r in ctx["evidence_reviews"][: min(25, len(ctx["evidence_reviews"]))]:
-                meta = r.get("meta", {})
-                meta_s = " • ".join([f"{k}:{v}" for k, v in meta.items()]) if meta else ""
-                st.markdown(
-                    f"- **{r.get('id')}** — {r.get('star_rating','?')}★ • {r.get('review_date') or '-'}"
-                    + (f" • {meta_s}" if meta_s else "")
-                    + f"\n  - “{esc(r.get('verbatim',''))}”"
-                )
-        if ctx.get("evidence_reviews") and len(ctx["evidence_reviews"]) > 25:
-            st.caption("Showing first 25 evidence snippets above; all evidence is in the JSON.")
-
-
-# ---------- Preset Questions ----------
-anchor("askdata-anchor")
-st.markdown("## 🤖 Ask your data")
-
-if "ask_q" not in st.session_state:
-    st.session_state["ask_q"] = ""
-
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []  # list of {role, content}
-
-st.markdown(
-    """
-<div class="soft-panel">
-  <div style="font-weight:800; font-size:1.05rem;">⚡ Preset Insight Questions</div>
-  <div class="small-muted" style="margin-top:4px;">
-    Click one to prefill the question box (then click <b>Send</b>). No remote calls until you press Send.
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-b1, b2, b3, b4, b5, b6 = st.columns([1, 1, 1, 1, 1, 1])
-if b1.button("Executive Summary", use_container_width=True):
-    st.session_state["ask_q"] = (
-        "Provide an executive summary of this product based on the CURRENT filtered reviews. "
-        "Quantify key points (counts/percentages), list top delighters and detractors, and include 4–6 evidence quotes."
-    )
-    scroll_to("askdata-anchor")
-if b2.button("Top Delighters", use_container_width=True):
-    st.session_state["ask_q"] = "What are the top delighters? Quantify mentions and include evidence quotes."
-    scroll_to("askdata-anchor")
-if b3.button("Top Detractors", use_container_width=True):
-    st.session_state["ask_q"] = "What are the top detractors? Quantify mentions and include evidence quotes."
-    scroll_to("askdata-anchor")
-if b4.button("Biggest Improvements", use_container_width=True):
-    st.session_state["ask_q"] = (
-        "What are the biggest improvement opportunities for this product? "
-        "Quantify how common each issue is, and recommend 3–6 actions prioritized by impact."
-    )
-    scroll_to("askdata-anchor")
-if b5.button("Trends / Watchouts", use_container_width=True):
-    st.session_state["ask_q"] = "Are there any emerging trends or watchouts? Quantify changes and include evidence."
-    scroll_to("askdata-anchor")
-if b6.button("Seeded vs Organic", use_container_width=True):
-    st.session_state["ask_q"] = "Compare Seeded vs Organic. Quantify the avg rating gap, volumes, and key theme differences."
-    scroll_to("askdata-anchor")
-
-st.markdown(
-    '<div class="callout warn">⚠️ AI can make mistakes. The assistant is required to ground all claims in the on-page context. '
-    "Double-check important conclusions.</div>",
-    unsafe_allow_html=True,
-)
-
-# ---------- AI Product Summary (button-triggered) ----------
-with st.expander("🪄 AI Product Summary (narrative, button-triggered)", expanded=False):
-    st.caption("Generates a concise narrative summary grounded ONLY in the current page context. No remote call until you click.")
-
-    if st.button("Generate / Refresh AI Product Summary", key="gen_product_summary"):
-        if not ai_enabled or (not _HAS_OPENAI) or (not api_key):
-            st.warning("AI is disabled or no API key available.")
-        else:
-            ctx = build_ai_context_pack(
-                df_filtered=filtered,
-                df_paginated=pd.DataFrame(),  # use sampling from filtered set
-                additional_cols=additional_columns,
-                det_cols=existing_detractor_columns,
-                del_cols=existing_delighter_columns,
-                top_det_tbl=detractors_results_full,
-                top_del_tbl=delighters_results_full,
-                max_snippets=min(int(st.session_state.get("ai_snippet_cap", 60)), 120),
-                evidence_scope="Sample from filtered set (previewed below)",
-            )
-            render_ai_context_preview(ctx)
-
-            selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
-            llm_temp = float(st.session_state.get("llm_temp", 0.2))
-
-            sys_ctx = (
-                "You are StarWalk, a senior consumer insights lead and product review expert.\n"
-                "You MUST follow these hard rules:\n"
-                "1) Use ONLY facts in CONTEXT_JSON.\n"
-                "2) If you mention a number, it must come from CONTEXT_JSON (metrics/top tables/monthly rows).\n"
-                "3) Use evidence snippets for examples: quote IDs like [E1], [E2].\n"
-                "4) If evidence is insufficient, say so and recommend adjusting filters/evidence scope.\n"
-                "5) Keep output exec-friendly, specific, and action-oriented.\n"
-            )
-
-            user_prompt = (
-                "Create a stakeholder-ready product review summary for the CURRENT filtered dataset.\n\n"
-                "Required sections:\n"
-                "1) Executive summary (2–4 bullets)\n"
-                "2) What customers love (top delighters; quantify)\n"
-                "3) What customers dislike (top detractors; quantify)\n"
-                "4) Watchouts / movement over time (if present)\n"
-                "5) Recommendations (prioritized; be specific)\n"
-                "6) Evidence (4–8 short quotes; cite IDs like [E3])\n\n"
-                f"CONTEXT_JSON:\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}"
-            )
-
-            try:
-                client = OpenAI(api_key=api_key, timeout=90, max_retries=2)
-                req = {
-                    "model": selected_model,
-                    "messages": [{"role": "system", "content": sys_ctx}, {"role": "user", "content": user_prompt}],
-                }
-                if model_supports_temperature(selected_model):
-                    req["temperature"] = llm_temp
-
-                with st.spinner("Generating summary…"):
-                    resp = client.chat.completions.create(**req)
-                st.session_state["product_summary_text"] = resp.choices[0].message.content
-            except Exception as e:
-                st.error(f"Could not generate summary: {e}")
-
-    if st.session_state.get("product_summary_text"):
-        st.markdown(st.session_state["product_summary_text"])
-
-# ---------- Conversation (optional) ----------
-if st.session_state.get("chat_history"):
-    with st.expander("🧠 Conversation (this session)", expanded=False):
-        for m in st.session_state["chat_history"][-12:]:
-            if m.get("role") == "user":
-                st.markdown(f"**You:** {esc(m.get('content',''))}")
-            else:
-                st.markdown(f"**Assistant:**\n\n{m.get('content','')}")
-
-cA, cB = st.columns([1, 1])
-with cA:
-    if st.button("🧹 Clear conversation", disabled=not bool(st.session_state.get("chat_history"))):
-        st.session_state["chat_history"] = []
-        st.rerun()
-with cB:
-    st.caption("Tip: If an answer feels under-evidenced, increase 'Max review snippets to send' or narrow filters.")
-
-# ---------- Ask form ----------
-with st.form("ask_ai_form", clear_on_submit=True):
-    q = st.text_area("Ask a question", key="ask_q", height=90)
-    send = st.form_submit_button("Send")
-
-if send and q.strip():
-    q = q.strip()
-
-    if not ai_enabled or (not _HAS_OPENAI) or (not api_key):
-        st.warning("AI is disabled or no API key available.")
-    else:
-        # Build on-page context pack (previewable)
-        # Note: paginated is defined later in the Reviews section; we compute it here too for AI.
-        if "review_page" not in st.session_state:
-            st.session_state["review_page"] = 0
-        reviews_per_page = st.session_state.get("reviews_per_page", 10)
-        total_reviews_count = len(filtered)
-        total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
-        st.session_state["review_page"] = min(st.session_state.get("review_page", 0), max(total_pages - 1, 0))
-        current_page = st.session_state["review_page"]
-        start_index = current_page * reviews_per_page
-        end_index = start_index + reviews_per_page
-        paginated_for_ai = filtered.iloc[start_index:end_index]
-
-        ctx = build_ai_context_pack(
-            df_filtered=filtered,
-            df_paginated=paginated_for_ai,
-            additional_cols=additional_columns,
-            det_cols=existing_detractor_columns,
-            del_cols=existing_delighter_columns,
-            top_det_tbl=detractors_results_full,
-            top_del_tbl=delighters_results_full,
-            max_snippets=int(st.session_state.get("ai_snippet_cap", 60)),
-            evidence_scope=str(st.session_state.get("ai_evidence_scope", "")),
-        )
-
-        render_ai_context_preview(ctx)
-
-        selected_model = st.session_state.get("llm_model", "gpt-4o-mini")
-        llm_temp = float(st.session_state.get("llm_temp", 0.2))
-
-        SYS_PROMPT = (
-            "You are StarWalk, a senior consumer insights lead and product review expert.\n\n"
-            "Hard rules (must follow):\n"
-            "- Use ONLY facts in CONTEXT_JSON. Do NOT use outside knowledge.\n"
-            "- If you mention a number, it must appear in CONTEXT_JSON.\n"
-            "- When giving examples, cite evidence snippet IDs like [E1], [E2].\n"
-            "- If evidence is limited or missing for a claim, say so explicitly.\n"
-            "- Keep answers grounded, structured, and action-oriented.\n"
-            "- Always assume the analysis scope is the CURRENT filtered dataset.\n\n"
-            "Style:\n"
-            "- Prefer bullets and short sections.\n"
-            "- Separate 'What we know' (quantified) from 'Hypotheses' (if any).\n"
-            "- End with 3–6 prioritized recommendations.\n"
-        )
-
-        # Keep a small rolling history; do NOT rely on old assistant numbers.
-        history = st.session_state.get("chat_history", [])[-6:]
-        messages = [{"role": "system", "content": SYS_PROMPT}]
-        for m in history:
-            if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str):
-                messages.append({"role": m["role"], "content": m["content"]})
-
-        user_msg = f"CONTEXT_JSON:\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}\n\nQUESTION:\n{q}"
-        messages.append({"role": "user", "content": user_msg})
-
+def openai_chat_http(api_key: str, model: str, messages: List[Dict[str, str]], temperature: Optional[float] = None, max_tokens: int = 900, timeout_s: int = 60) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload: Dict[str, Any] = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
+    if temperature is not None and model_supports_temperature(model):
+        payload["temperature"] = float(temperature)
+    last_err: Optional[Exception] = None
+    for attempt in range(5):
         try:
-            client = OpenAI(api_key=api_key, timeout=90, max_retries=2)
-            req = {"model": selected_model, "messages": messages}
-            if model_supports_temperature(selected_model):
-                req["temperature"] = llm_temp
-            with st.spinner("Thinking…"):
-                resp = client.chat.completions.create(**req)
-            final_text = resp.choices[0].message.content
-
-            # Persist chat
-            st.session_state["chat_history"] = st.session_state.get("chat_history", []) + [
-                {"role": "user", "content": q},
-                {"role": "assistant", "content": final_text},
-            ]
-
-            st.markdown(f"<div class='chat-q'><b>User:</b> {esc(q)}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='chat-a'><b>Assistant:</b> {final_text}</div>", unsafe_allow_html=True)
-
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:600]}")
+            data = r.json()
+            return str(data["choices"][0]["message"]["content"])
         except Exception as e:
-            st.error(f"AI request failed: {e}")
+            last_err = e
+            time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
+    raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI error")
 
-st.markdown("---")
 
-# ---------- Metrics ----------
-st.markdown("## ⭐ Star Rating Metrics")
-st.caption("All metrics below reflect the **currently filtered** dataset.")
+def transcribe_audio_http(api_key: str, uploaded_audio: Any, model: str = "gpt-4o-mini-transcribe", timeout_s: int = 90) -> str:
+    audio_name = getattr(uploaded_audio, "name", "voice_question.wav")
+    audio_type = getattr(uploaded_audio, "type", "audio/wav")
+    audio_bytes = uploaded_audio.getvalue()
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    files = {"file": (audio_name, audio_bytes, audio_type)}
+    data = {"model": model, "response_format": "json"}
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=timeout_s)
+    if r.status_code >= 400:
+        raise RuntimeError(f"OpenAI transcription error {r.status_code}: {r.text[:600]}")
+    payload = r.json()
+    text = payload.get("text") if isinstance(payload, dict) else None
+    return str(text or "").strip()
 
-def pct_12(series: pd.Series) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    return float((s <= 2).mean() * 100) if not s.empty else 0.0
 
-def section_stats(sub: pd.DataFrame) -> tuple[int, float, float]:
-    cnt = len(sub)
-    if cnt == 0 or "Star Rating" not in sub.columns:
-        return 0, 0.0, 0.0
-    avg = float(pd.to_numeric(sub["Star Rating"], errors="coerce").mean())
-    pct = pct_12(sub["Star Rating"])
-    return cnt, avg, pct
+def local_ai_answer(question: str, knowledge: Dict[str, Any], quotes: List[Dict[str, Any]]) -> str:
+    csat = knowledge.get("csat", {})
+    prof = knowledge.get("product_profile", {})
+    det = knowledge.get("top_detractors", [])[:6]
+    deli = knowledge.get("top_delighters", [])[:6]
+    radar = knowledge.get("issue_radar", [])[:5]
+    themes = knowledge.get("theme_diffs", {})
+    lines = []
+    lines.append("**Local insight brief**")
+    lines.append(f"- Reviews in filter: **{csat.get('count', 0):,}**")
+    lines.append(f"- Avg ★: **{csat.get('avg_star', 0)}** • % 1–2★: **{csat.get('pct_1_2', 0)}%**")
+    if prof:
+        lines.append(f"- Product guess: **{prof.get('product_guess', 'Unknown')}**")
+    if radar:
+        lines.append("\n**Top watchouts right now:**")
+        for r in radar:
+            lines.append(f"- {r.get('Type')}: {r.get('Issue')} — {r.get('Narrative')}")
+    if det:
+        lines.append("\n**Biggest detractors:**")
+        for r in det:
+            lines.append(f"- {r.get('Item')}: {r.get('Review Mentions')} reviews • Avg ★ {r.get('Avg Star')}")
+    if deli:
+        lines.append("\n**Strongest delighters:**")
+        for r in deli:
+            lines.append(f"- {r.get('Item')}: {r.get('Review Mentions')} reviews • Avg ★ {r.get('Avg Star')}")
+    low_vs_high = themes.get("low_vs_high", [])[:5]
+    if low_vs_high:
+        lines.append("\n**Language most associated with low-star reviews:**")
+        for r in low_vs_high:
+            lines.append(f"- {r.get('term')}: +{r.get('delta_pp')}pp vs high-star reviews")
+    if quotes:
+        lines.append("\n**Most relevant quotes:**")
+        for q in quotes[:5]:
+            lines.append(f"- [{q['id']}] ★{q.get('star')} {q.get('country')} {q.get('source')} {q.get('date')}: {q.get('text', '')[:240]}")
+    lines.append(f"\n**Question received:** {question}")
+    return "\n".join(lines)
 
-# Robust Seeded split
-if "Seeded" in filtered.columns:
-    seed_mask = filtered["Seeded"].astype("string").str.upper().eq("YES")
+# -----------------------------------------------------------------------------
+# Main UI
+# -----------------------------------------------------------------------------
+st.title("Star Walk — Consumer Insights Summit Dashboard")
+st.caption(f"Version: {APP_VERSION}")
+
+st.markdown("### 📁 Data input")
+mode = st.radio(
+    "Choose input",
+    options=[
+        "Star Walk scrubbed verbatims (Excel/CSV)",
+        "JSON export (auto-convert → dashboard)",
+    ],
+    horizontal=True,
+)
+
+df_base: Optional[pd.DataFrame] = None
+source_label: str = "Uploaded file"
+meta_info: Dict[str, Any] = {}
+
+if mode.startswith("Star Walk"):
+    uploaded_file = st.file_uploader("Upload Star Walk Excel/CSV", type=["xlsx", "csv"], key="upl_starwalk")
+    if not uploaded_file:
+        st.info("Upload a Star Walk scrubbed verbatims file to begin.")
+        st.stop()
+    t0 = time.perf_counter()
+    df_base = _load_starwalk_table(uploaded_file.getvalue(), uploaded_file.name)
+    meta_info = {"source": uploaded_file.name, "load_s": round(time.perf_counter() - t0, 3)}
+    source_label = uploaded_file.name
 else:
-    seed_mask = pd.Series(False, index=filtered.index)
+    left, right = st.columns(2)
+    with left:
+        json_file = st.file_uploader("Upload JSON export", type=["json"], key="upl_json")
+    with right:
+        pasted = st.text_area("…or paste JSON / JSON Lines", height=200, key="json_paste", placeholder="Paste JSON or JSON Lines here.")
 
-all_cnt, all_avg, all_low = section_stats(filtered)
-org = filtered[~seed_mask]
-seed = filtered[seed_mask]
-org_cnt, org_avg, org_low = section_stats(org)
-seed_cnt, seed_avg, seed_low = section_stats(seed)
+    raw_text: Optional[str] = None
+    source_label = "pasted_json"
+    if json_file is not None and getattr(json_file, "size", 0) > 0:
+        source_label = json_file.name
+        raw_text = json_file.getvalue().decode("utf-8-sig", errors="replace")
+    elif pasted and pasted.strip():
+        raw_text = pasted.strip()
 
-def card_html(title, count, avg, pct):
-    return textwrap.dedent(f"""
-    <div class="metric-card">
-      <h4>{_html.escape(title)}</h4>
-      <div class="metric-row">
-        <div class="metric-box">
-          <div class="metric-label">Count</div>
-          <div class="metric-kpi">{count:,}</div>
-        </div>
-        <div class="metric-box">
-          <div class="metric-label">Avg ★</div>
-          <div class="metric-kpi">{avg:.1f}</div>
-        </div>
-        <div class="metric-box">
-          <div class="metric-label">% 1–2★</div>
-          <div class="metric-kpi">{pct:.1f}%</div>
-        </div>
-      </div>
-    </div>
-    """).strip()
+    include_extra_cols = st.checkbox("Include extra columns after Symptom 20", value=True)
+    if not raw_text:
+        st.info("Upload JSON or paste JSON text to begin.")
+        st.stop()
+    with st.spinner("Parsing JSON and converting to Star Walk format…"):
+        t0 = time.perf_counter()
+        try:
+            df_base, meta_info = _json_text_to_starwalk(raw_text, source_label, include_extra_cols=include_extra_cols)
+            meta_info["convert_s"] = round(time.perf_counter() - t0, 3)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+    with st.expander("✅ JSON conversion details", expanded=False):
+        for w in meta_info.get("warnings", []):
+            st.info(w)
+        st.write("Records:", meta_info.get("records"))
+        st.write("Truncation stats:", meta_info.get("stats"))
+        out_bytes = df_base.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Download converted Star Walk CSV",
+            out_bytes,
+            file_name=f"{Path(source_label).stem}_starwalk.csv",
+            mime="text/csv",
+        )
+
+assert df_base is not None
+
+with st.expander("🔗 Optional Signal Hub — add support tickets, chats, call notes, or social exports", expanded=False):
+    st.caption("Upload extra CSV/XLSX files with at least one text column. The app will append them into the filtered insight layer and tag them with Signal Type.")
+    supplemental_files = st.file_uploader(
+        "Supplemental files",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+        key="supp_files",
+    )
+
+supp_dfs: List[pd.DataFrame] = []
+if supplemental_files:
+    load_notes: List[str] = []
+    for f in supplemental_files:
+        try:
+            sdf = _load_supplemental_signal_file(f.getvalue(), f.name)
+            supp_dfs.append(sdf)
+            load_notes.append(f"Loaded {f.name}: {len(sdf):,} rows")
+        except Exception as e:
+            load_notes.append(f"Skipped {f.name}: {e}")
+    if supp_dfs:
+        df_base = append_supplemental_signals(df_base, supp_dfs)
+    for note in load_notes:
+        st.caption(note)
+
+product_label = _infer_product_label(df_base, source_label)
+
+try:
+    dataset_sig = hashlib.sha1(
+        (str(source_label) + "|" + str(df_base.shape) + "|" + "|".join([str(c) for c in df_base.columns.tolist()[:100]])).encode("utf-8")
+    ).hexdigest()
+except Exception:
+    dataset_sig = str(getattr(df_base, "shape", ""))
+
+if st.session_state.get("_dataset_sig") != dataset_sig:
+    for key in ["_ai_local_index", "review_page", "saved_views", "_review_sort_prev"]:
+        st.session_state.pop(key, None)
+    st.session_state["_dataset_sig"] = dataset_sig
 
 st.markdown(
-    (
-        '<div class="metrics-grid">'
-        f'{card_html("All Reviews", all_cnt, all_avg, all_low)}'
-        f'{card_html("Organic (non-Seeded)", org_cnt, org_avg, org_low)}'
-        f'{card_html("Seeded", seed_cnt, seed_avg, seed_low)}'
-        "</div>"
-    ),
+    f"""
+    <div class='soft-panel'>
+      <div><b>Source:</b> {esc(source_label)}</div>
+      <div style='margin-top:6px;'><b>Product guess:</b> {esc(product_label)}</div>
+      <div class='small-muted' style='margin-top:8px;'>All insights below are based on the currently filtered slice of data.</div>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
-# ---------- Monthly Volume + Avg ★ chart ----------
-st.markdown("### 📊 Monthly Review Volume + Avg ★")
-if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
-    st.info("Need 'Review Date' and 'Star Rating' columns to compute this chart.")
-else:
-    cA, cB, cC = st.columns([1, 1, 1])
-    with cA:
-        show_seeded_split = st.toggle("Split Seeded vs Organic", value=False, key="month_split_seeded")
-    with cB:
-        show_volume_month = st.toggle("Show Volume Bars", value=True, key="month_show_volume")
-    with cC:
-        month_freq = st.selectbox("Bucket", ["Month", "Week"], index=0, key="month_bucket")
+# -----------------------------------------------------------------------------
+# Sidebar filters
+# -----------------------------------------------------------------------------
+core_cols = {"Country", "Source", "Model (SKU)", "Seeded", "New Review", "Star Rating", "Review Date", "Verbatim"}
+symptom_cols = {f"Symptom {i}" for i in range(1, 21)}
+extra_filter_candidates = [c for c in df_base.columns if c not in (core_cols | symptom_cols)]
+extra_filter_candidates = [c for c in extra_filter_candidates if str(c).strip() and str(c).strip().lower() not in {"unnamed: 0"}]
 
-    d = filtered.copy()
-    d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
-    d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-    d = d.dropna(subset=["Review Date", "Star Rating"])
-    if d.empty:
-        st.warning("No data after cleaning dates/ratings.")
-    else:
-        if month_freq == "Week":
-            d["bucket"] = d["Review Date"].dt.to_period("W-MON").dt.start_time
-        else:
-            d["bucket"] = d["Review Date"].dt.to_period("M").dt.to_timestamp()
+st.session_state.setdefault("extra_filter_cols", [])
+st.session_state.setdefault("saved_views", {})
 
-        overall = d.groupby("bucket")["Star Rating"].agg(count="count", mean="mean").reset_index().sort_values("bucket")
+tz_today = datetime.now(_NY_TZ).date() if _NY_TZ else datetime.today().date()
+st.session_state.setdefault("tf", "All Time")
+st.session_state.setdefault("tf_range", (tz_today - timedelta(days=30), tz_today))
+st.session_state.setdefault("sr", ["All"])
+st.session_state.setdefault("kw", "")
+st.session_state.setdefault("delight", ["All"])
+st.session_state.setdefault("detract", ["All"])
+st.session_state.setdefault("rpp", 10)
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        if show_volume_month:
-            fig.add_trace(
-                go.Bar(
-                    x=overall["bucket"],
-                    y=overall["count"],
-                    name="Review volume",
-                    opacity=0.30,
-                    marker=dict(color="rgba(15, 23, 42, 0.35)"),
-                ),
-                secondary_y=False,
-            )
-        fig.add_trace(
-            go.Scatter(
-                x=overall["bucket"],
-                y=overall["mean"],
-                name="Avg ★",
-                mode="lines+markers",
-                line=dict(width=3),
-                marker=dict(size=6),
-                hovertemplate="Bucket: %{x|%Y-%m-%d}<br>Avg ★: %{y:.2f}<extra></extra>",
-            ),
-            secondary_y=True,
+all_detractor_columns = [c for c in [f"Symptom {i}" for i in range(1, 11)] if c in df_base.columns]
+all_delighter_columns = [c for c in [f"Symptom {i}" for i in range(11, 21)] if c in df_base.columns]
+detractor_symptoms_all = collect_unique_symptoms(df_base, all_detractor_columns)
+delighter_symptoms_all = collect_unique_symptoms(df_base, all_delighter_columns)
+
+
+def _col_options(df_in: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -> List[str]:
+    if col not in df_in.columns:
+        return ["ALL"]
+    s0 = df_in[col].astype("string").replace({"": pd.NA}).dropna()
+    if s0.empty:
+        return ["ALL"]
+    tokenize_multi = bool(s0.head(300).astype(str).str.contains(r"\s\|\s", regex=True).any())
+    if tokenize_multi:
+        tok = (
+            s0.astype(str)
+            .str.split(r"\s*\|\s*", regex=True)
+            .explode()
+            .astype("string")
+            .str.strip()
+            .replace({"": pd.NA})
+            .dropna()
         )
-
-        if show_seeded_split and "Seeded" in d.columns:
-            d2 = d.copy()
-            d2["Seeded"] = d2["Seeded"].astype("string").str.upper().fillna("NO")
-            for label, mask in [("Organic", d2["Seeded"].ne("YES")), ("Seeded", d2["Seeded"].eq("YES"))]:
-                sub = d2[mask].groupby("bucket")["Star Rating"].agg(mean="mean").reset_index().sort_values("bucket")
-                if not sub.empty:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=sub["bucket"],
-                            y=sub["mean"],
-                            name=f"{label} Avg ★",
-                            mode="lines",
-                            line=dict(width=2, dash="dot"),
-                            hovertemplate=f"{label}<br>Bucket: %{{x|%Y-%m-%d}}<br>Avg ★: %{{y:.2f}}<extra></extra>",
-                        ),
-                        secondary_y=True,
-                    )
-
-        fig.update_yaxes(title_text="Review volume", secondary_y=False, rangemode="tozero")
-        fig.update_yaxes(title_text="Avg ★", secondary_y=True, range=[1.0, 5.2])
-        fig.update_layout(
-            template="plotly_white",
-            hovermode="x unified",
-            margin=dict(l=50, r=50, t=40, b=40),
-            legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# ---------- Top Delighters/Detractors bar charts ----------
-st.markdown("### 🧩 Top Delighters & Detractors (Bars)")
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("**Top Detractors (by mentions)**")
-    det = detractors_results_full.head(10)
-    if det.empty:
-        st.info("No detractor symptoms available.")
+        vc = tok.value_counts()
     else:
-        fig_det = go.Figure(
-            go.Bar(
-                x=det["Mentions"][::-1],
-                y=det["Item"][::-1],
-                orientation="h",
-                opacity=0.85,
-                hovertemplate="%{y}<br>Mentions: %{x}<extra></extra>",
-            )
-        )
-        fig_det.update_layout(template="plotly_white", margin=dict(l=140, r=20, t=20, b=20), height=420)
-        st.plotly_chart(fig_det, use_container_width=True)
-with c2:
-    st.markdown("**Top Delighters (by mentions)**")
-    deli = delighters_results_full.head(10)
-    if deli.empty:
-        st.info("No delighter symptoms available.")
-    else:
-        fig_del = go.Figure(
-            go.Bar(
-                x=deli["Mentions"][::-1],
-                y=deli["Item"][::-1],
-                orientation="h",
-                opacity=0.85,
-                hovertemplate="%{y}<br>Mentions: %{x}<extra></extra>",
-            )
-        )
-        fig_del.update_layout(template="plotly_white", margin=dict(l=140, r=20, t=20, b=20), height=420)
-        st.plotly_chart(fig_del, use_container_width=True)
+        vc = s0.value_counts()
+    if isinstance(max_vals, int) and max_vals > 0:
+        vc = vc.head(max_vals)
+    return ["ALL"] + vc.index.astype(str).tolist()
 
-# ---------- Avg ★ Over Time by Region — Cumulative (Weighted Over Time) ----------
-st.markdown("### 📈 Cumulative Avg ★ Over Time by Region (Weighted)")
 
-if "Review Date" not in filtered.columns or "Star Rating" not in filtered.columns:
-    st.info("Need 'Review Date' and 'Star Rating' columns to compute this chart.")
-else:
-    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 0.9, 0.9])
-    with c1:
-        bucket_label = st.selectbox("Bucket size", ["Day", "Week", "Month"], index=2, key="region_bucket")
-        _freq_map = {"Day": "D", "Week": "W", "Month": "M"}
-        freq = _freq_map[bucket_label]
-    with c2:
-        _candidates = [c for c in ["Country", "Source", "Model (SKU)"] if c in filtered.columns]
-        region_col = st.selectbox("Region field", options=_candidates or ["(none)"], key="region_col")
-    with c3:
-        top_n = st.number_input("Top regions by volume", 1, 15, value=5, step=1, key="region_topn")
-    with c4:
-        organic_only = st.toggle("Organic Only", value=False, help="Exclude reviews where Seeded == YES")
-    with c5:
-        show_volume = st.toggle(
-            "Show Volume",
-            value=True,
-            help="Adds subtle bars + a right axis showing review count per bucket.",
-        )
+def _sanitize_multiselect(key: str, options: List[Any], default: List[Any]) -> List[Any]:
+    cur = st.session_state.get(key, default)
+    if cur is None:
+        cur = list(default)
+    if not isinstance(cur, list):
+        cur = [cur]
+    cur = [v for v in cur if v in options]
+    if not cur:
+        cur = list(default)
+    if ("ALL" in cur or "All" in cur) and len(cur) > 1:
+        cur = [v for v in cur if v not in {"ALL", "All"}]
+    st.session_state[key] = cur
+    return cur
 
-    if region_col not in filtered.columns or region_col == "(none)":
-        st.info("No region column found for this chart.")
-    else:
-        d = filtered.copy()
-        if organic_only and "Seeded" in d.columns:
-            d = d[d["Seeded"].astype("string").str.upper().ne("YES")]
 
-        d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-        d["Review Date"] = pd.to_datetime(d["Review Date"], errors="coerce")
-        d = d.dropna(subset=["Review Date", "Star Rating"])
-
-        if d.empty:
-            st.warning("No data available for the current selections.")
-        else:
-            counts = d[region_col].astype("string").str.strip().replace({"": pd.NA}).dropna()
-            top_regions = counts.value_counts().head(int(top_n)).index.tolist()
-
-            regions_available = sorted(
-                r for r in d[region_col].astype("string").dropna().unique().tolist()
-                if str(r).strip() != ""
-            )
-            chosen_regions = st.multiselect(
-                "Regions to plot",
-                options=regions_available,
-                default=[r for r in top_regions if r in regions_available],
-                key="region_pick",
-            )
-
-            if chosen_regions:
-                d = d[d[region_col].astype("string").isin(chosen_regions)]
-
-            if d.empty:
-                st.warning("No data after region selection.")
-            else:
-                freq_eff = "W-MON" if freq == "W" else freq
-
-                tmp = (
-                    d.assign(_region=d[region_col].astype("string"))
-                    .groupby([pd.Grouper(key="Review Date", freq=freq_eff), "_region"])["Star Rating"]
-                    .agg(bucket_sum="sum", bucket_count="count")
-                    .reset_index()
-                    .sort_values(["_region", "Review Date"])
-                )
-                tmp["cum_sum"] = tmp.groupby("_region")["bucket_sum"].cumsum()
-                tmp["cum_cnt"] = tmp.groupby("_region")["bucket_count"].cumsum()
-                tmp["Cumulative Avg ★"] = tmp["cum_sum"] / tmp["cum_cnt"]
-
-                overall = (
-                    d.groupby(pd.Grouper(key="Review Date", freq=freq_eff))["Star Rating"]
-                    .agg(bucket_sum="sum", bucket_count="count")
-                    .reset_index()
-                    .sort_values("Review Date")
-                )
-                overall["cum_sum"] = overall["bucket_sum"].cumsum()
-                overall["cum_cnt"] = overall["bucket_count"].cumsum()
-                overall["Cumulative Avg ★"] = overall["cum_sum"] / overall["cum_cnt"]
-
-                fig = go.Figure()
-
-                if show_volume and not overall.empty:
-                    fig.add_trace(
-                        go.Bar(
-                            x=overall["Review Date"],
-                            y=overall["bucket_count"],
-                            name="Review volume",
-                            yaxis="y2",
-                            opacity=0.30,
-                            marker=dict(color="rgba(15, 23, 42, 0.35)", line=dict(width=0)),
-                            hovertemplate="Review volume<br>Bucket end: %{x|%Y-%m-%d}<br>Reviews: %{y}<extra></extra>",
-                            showlegend=False,
-                        )
-                    )
-
-                plot_regions = chosen_regions or tmp["_region"].unique().tolist()
-                for reg in plot_regions:
-                    sub = tmp[tmp["_region"] == reg]
-                    if sub.empty:
-                        continue
-                    fig.add_trace(
-                        go.Scatter(
-                            x=sub["Review Date"],
-                            y=sub["Cumulative Avg ★"],
-                            mode="lines+markers",
-                            name=str(reg),
-                            line=dict(width=2),
-                            marker=dict(size=5),
-                            hovertemplate=(
-                                f"{region_col}: {reg}<br>"
-                                "Bucket end: %{x|%Y-%m-%d}<br>"
-                                "Cumulative Avg ★: %{y:.3f}<br>"
-                                "Cum. Reviews: %{customdata}<extra></extra>"
-                            ),
-                            customdata=sub["cum_cnt"],
-                        )
-                    )
-
-                if not overall.empty:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=overall["Review Date"],
-                            y=overall["Cumulative Avg ★"],
-                            mode="lines",
-                            name="Overall",
-                            line=dict(width=3, dash="dash"),
-                            hovertemplate=(
-                                "Overall<br>"
-                                "Bucket end: %{x|%Y-%m-%d}<br>"
-                                "Cumulative Avg ★: %{y:.3f}<br>"
-                                "Cum. Reviews: %{customdata}<extra></extra>"
-                            ),
-                            customdata=overall["cum_cnt"],
-                        )
-                    )
-
-                _tickformat = {"D": "%b %d, %Y", "W": "%b %d, %Y", "M": "%b %Y"}[freq]
-                fig.update_xaxes(tickformat=_tickformat, automargin=True)
-                fig.update_yaxes(automargin=True)
-
-                title_bucket = {"D": "Daily", "W": "Weekly", "M": "Monthly"}[freq]
-                title_org = " • Organic Only" if organic_only else ""
-                fig.update_layout(
-                    title=f"<b>{title_bucket} Cumulative (Weighted) Avg ★ by {region_col}{title_org}</b>",
-                    xaxis=dict(title="Date", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                    yaxis=dict(title="Cumulative Avg ★", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                    yaxis2=dict(
-                        title="Review volume",
-                        overlaying="y",
-                        side="right",
-                        showgrid=False,
-                        rangemode="tozero",
-                        autorange=True,
-                        visible=bool(show_volume),
-                    ),
-                    barmode="overlay",
-                    hovermode="x unified",
-                    plot_bgcolor="white",
-                    template="plotly_white",
-                    margin=dict(l=60, r=(60 if show_volume else 40), t=70, b=100),
-                    legend=dict(orientation="h", yanchor="top", y=-0.28, xanchor="center", x=0.5, bgcolor="rgba(255,255,255,0)"),
-                )
-
-                ys = []
-                for tr in fig.data:
-                    if getattr(tr, "yaxis", "y") not in (None, "y"):
-                        continue
-                    if getattr(tr, "y", None) is not None:
-                        try:
-                            ys.extend([float(v) for v in tr.y if v is not None])
-                        except Exception:
-                            pass
-
-                if ys:
-                    y_min, y_max = min(ys), max(ys)
-                    pad = max(0.1, (y_max - y_min) * 0.08)
-                    lo = max(1.0, y_min - pad)
-                    hi = min(5.2, y_max + pad)
-                    fig.update_layout(yaxis_range=[lo, hi])
-
-                fig.update_traces(cliponaxis=False, selector=dict(type="scatter"))
-                st.plotly_chart(fig, use_container_width=True)
-
-# ---------- Country × Source breakdown ----------
-st.markdown("### 🧭 Country × Source Breakdown")
-if "Country" in filtered.columns and "Source" in filtered.columns and "Star Rating" in filtered.columns:
-    cA, cB, cC = st.columns([1, 1, 1])
-    with cA:
-        top_countries = st.number_input("Top Countries", 3, 30, value=10, step=1, key="cx_top_countries")
-    with cB:
-        top_sources = st.number_input("Top Sources", 3, 30, value=10, step=1, key="cx_top_sources")
-    with cC:
-        show_heatmap = st.toggle("Show Avg ★ Heatmap", value=False, key="cx_show_heatmap")
-
-    d = filtered.copy()
-    d["Star Rating"] = pd.to_numeric(d["Star Rating"], errors="coerce")
-    d = d.dropna(subset=["Star Rating"])
-    if not d.empty:
-        topC = d["Country"].astype("string").value_counts().head(int(top_countries)).index.tolist()
-        topS = d["Source"].astype("string").value_counts().head(int(top_sources)).index.tolist()
-        d = d[d["Country"].astype("string").isin(topC) & d["Source"].astype("string").isin(topS)]
-
-        pivot = d.groupby(["Country", "Source"])["Star Rating"].agg(count="count", mean="mean").reset_index()
-        pivot["mean"] = pivot["mean"].round(2)
-
-        wide_count = pivot.pivot(index="Country", columns="Source", values="count").fillna(0).astype(int)
-        wide_mean = pivot.pivot(index="Country", columns="Source", values="mean").round(2)
-
-        with st.expander("📋 Table (Count + Avg ★)", expanded=True):
-            st.caption("Count table shown first, Avg ★ table shown second.")
-            st.markdown("**Counts**")
-            st.dataframe(wide_count, use_container_width=True)
-            st.markdown("**Avg ★**")
-            st.dataframe(wide_mean, use_container_width=True)
-
-        if show_heatmap:
-            hm = wide_mean.copy()
-            fig_hm = go.Figure(
-                data=go.Heatmap(
-                    z=hm.values,
-                    x=list(hm.columns),
-                    y=list(hm.index),
-                    hovertemplate="Country=%{y}<br>Source=%{x}<br>Avg ★=%{z}<extra></extra>",
-                )
-            )
-            fig_hm.update_layout(template="plotly_white", margin=dict(l=80, r=20, t=30, b=40), height=520)
-            st.plotly_chart(fig_hm, use_container_width=True)
-    else:
-        st.info("No rating data available after filtering.")
-else:
-    st.info("Need Country, Source, and Star Rating columns to compute this breakdown.")
-
-# ---------- Symptom Tables ----------
-st.markdown("### 🩺 Symptom Tables")
-detractors_results = detractors_results_full.head(50)
-delighters_results = delighters_results_full.head(50)
-
-view_mode = st.radio("View mode", ["Split", "Tabs"], horizontal=True, index=0)
-
-def _styled_table(df_in: pd.DataFrame):
-    if df_in.empty:
-        return df_in
-    def colstyle(v):
-        if pd.isna(v):
-            return ""
-        try:
-            v = float(v)
-            if v >= 4.5:
-                return "color:#065F46;font-weight:600;"
-            if v < 4.5:
-                return "color:#7F1D1D;font-weight:600;"
-        except Exception:
-            pass
-        return ""
-    return df_in.style.applymap(colstyle, subset=["Avg Star"]).format({"Avg Star": "{:.1f}", "Mentions": "{:.0f}"})
-
-if view_mode == "Split":
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.subheader("All Detractors")
-        st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results, use_container_width=True, hide_index=True)
-    with c2:
-        st.subheader("All Delighters")
-        st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results, use_container_width=True, hide_index=True)
-else:
-    tab1, tab2 = st.tabs(["All Detractors", "All Delighters"])
-    with tab1:
-        st.dataframe(_styled_table(detractors_results) if not detractors_results.empty else detractors_results, use_container_width=True, hide_index=True)
-    with tab2:
-        st.dataframe(_styled_table(delighters_results) if not delighters_results.empty else delighters_results, use_container_width=True, hide_index=True)
-
-st.markdown("---")
-
-# ---------- Reviews ----------
-st.markdown("### 📝 All Reviews")
-
-if not filtered.empty:
-    csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Download ALL filtered reviews (CSV)", csv_bytes, file_name="filtered_reviews.csv", mime="text/csv")
-
-if "review_page" not in st.session_state:
+def _reset_all_filters() -> None:
+    st.session_state["tf"] = "All Time"
+    st.session_state["tf_range"] = (tz_today - timedelta(days=30), tz_today)
+    st.session_state["sr"] = ["All"]
+    st.session_state["kw"] = ""
+    st.session_state["delight"] = ["All"]
+    st.session_state["detract"] = ["All"]
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + list(st.session_state.get("extra_filter_cols", [])):
+        st.session_state[f"f_{col}"] = ["ALL"]
+        st.session_state.pop(f"f_{col}_range", None)
+        st.session_state.pop(f"f_{col}_contains", None)
+    st.session_state["extra_filter_cols"] = []
     st.session_state["review_page"] = 0
-reviews_per_page = st.session_state.get("reviews_per_page", 10)
-total_reviews_count = len(filtered)
-total_pages = max((total_reviews_count + reviews_per_page - 1) // reviews_per_page, 1)
 
-st.session_state["review_page"] = min(st.session_state.get("review_page", 0), max(total_pages - 1, 0))
 
-current_page = st.session_state["review_page"]
-start_index = current_page * reviews_per_page
-end_index = start_index + reviews_per_page
-paginated = filtered.iloc[start_index:end_index]
+if st.sidebar.button("🏠 Dashboard", use_container_width=True):
+    st.session_state["main_view"] = "📊 Dashboard"
+    st.rerun()
 
-if paginated.empty:
-    st.warning("No reviews match the selected criteria.")
-else:
-    for _, row in paginated.iterrows():
-        review_text = row.get("Verbatim", pd.NA)
-        review_text = "" if pd.isna(review_text) else clean_text(review_text)
-        display_review_html = highlight_html(review_text, st.session_state.get("kw", ""))
+st.sidebar.header("🔍 Filters")
+if st.sidebar.button("🧹 Clear all filters", use_container_width=True):
+    _reset_all_filters()
+    st.rerun()
 
-        date_val = row.get("Review Date", pd.NaT)
-        if pd.isna(date_val):
-            date_str = "-"
-        else:
+with st.sidebar.expander("🗓️ Timeframe", expanded=False):
+    tf_opts = ["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"]
+    if st.session_state.get("tf") not in tf_opts:
+        st.session_state["tf"] = "All Time"
+    st.selectbox("Select timeframe", options=tf_opts, key="tf")
+    if st.session_state["tf"] == "Custom Range":
+        st.date_input("Start / end", value=st.session_state.get("tf_range", (tz_today - timedelta(days=30), tz_today)), key="tf_range")
+
+with st.sidebar.expander("⭐ Star rating", expanded=False):
+    sr_opts = ["All", 5, 4, 3, 2, 1]
+    _sanitize_multiselect("sr", sr_opts, ["All"])
+    st.multiselect("Select stars", options=sr_opts, default=st.session_state["sr"], key="sr")
+
+with st.sidebar.expander("🌍 Country / Source / Model / Seeded", expanded=True):
+    for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+        opts = _col_options(df_base, col, max_vals=250)
+        _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
+        st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
+
+with st.sidebar.expander("🩺 Symptom filters", expanded=False):
+    det_opts = ["All"] + detractor_symptoms_all
+    del_opts = ["All"] + delighter_symptoms_all
+    _sanitize_multiselect("detract", det_opts, ["All"])
+    _sanitize_multiselect("delight", del_opts, ["All"])
+    st.multiselect("Detractors", options=det_opts, default=st.session_state["detract"], key="detract")
+    st.multiselect("Delighters", options=del_opts, default=st.session_state["delight"], key="delight")
+
+with st.sidebar.expander("🔎 Keyword", expanded=False):
+    st.text_input("Search in review text", value=st.session_state.get("kw", ""), key="kw")
+
+with st.sidebar.expander("➕ Add filters", expanded=False):
+    st.multiselect(
+        "Available extra columns",
+        options=extra_filter_candidates,
+        default=st.session_state.get("extra_filter_cols", []),
+        key="extra_filter_cols",
+    )
+
+extra_cols = st.session_state.get("extra_filter_cols", []) or []
+if extra_cols:
+    with st.sidebar.expander("🧩 Extra filters", expanded=True):
+        for col in extra_cols:
+            if col not in df_base.columns:
+                continue
+            s = df_base[col]
+            kind = "categorical"
             try:
-                date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d")
+                if pd.api.types.is_datetime64_any_dtype(s):
+                    kind = "date"
+                else:
+                    num = pd.to_numeric(s, errors="coerce")
+                    if num.notna().mean() >= 0.9 and num.nunique(dropna=True) > 6:
+                        kind = "numeric"
             except Exception:
-                date_str = "-"
-
-        def chips(row_i, columns, css_class):
-            items = []
-            for c in columns:
-                val = row_i.get(c, pd.NA)
-                if pd.isna(val):
+                kind = "categorical"
+            if kind == "numeric":
+                num = pd.to_numeric(s, errors="coerce").dropna()
+                if num.empty:
                     continue
-                s = str(val).strip()
-                if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}:
+                lo, hi = float(num.min()), float(num.max())
+                if lo == hi:
+                    st.caption(f"{col}: {lo:g} (constant)")
                     continue
-                items.append(f'<span class="badge {css_class}">{_html.escape(s)}</span>')
-            return f'<div class="badges">{"".join(items)}</div>' if items else "<i>None</i>"
+                key = f"f_{col}_range"
+                default = st.session_state.get(key, (lo, hi))
+                if not (isinstance(default, (tuple, list)) and len(default) == 2):
+                    default = (lo, hi)
+                st.slider(col, min_value=lo, max_value=hi, value=(float(default[0]), float(default[1])), key=key)
+            else:
+                try:
+                    nunique = int(s.astype("string").replace({"": pd.NA}).nunique(dropna=True))
+                except Exception:
+                    nunique = 0
+                if nunique > 600:
+                    st.text_input(f"{col} contains", value=str(st.session_state.get(f"f_{col}_contains") or ""), key=f"f_{col}_contains")
+                else:
+                    opts = _col_options(df_base, col, max_vals=None)
+                    _sanitize_multiselect(f"f_{col}", opts, ["ALL"])
+                    st.multiselect(col, options=opts, default=st.session_state[f"f_{col}"], key=f"f_{col}")
 
-        delighter_message = chips(row, existing_delighter_columns, "pos")
-        detractor_message = chips(row, existing_detractor_columns, "neg")
-
-        star_val = row.get("Star Rating", 0)
+with st.sidebar.expander("💾 Saved Views", expanded=False):
+    name = st.text_input("Preset name", value="", key="sv_name")
+    c_a, c_b = st.columns(2)
+    with c_a:
+        if st.button("💾 Save", use_container_width=True):
+            nm = (st.session_state.get("sv_name") or "").strip() or f"Preset {len(st.session_state['saved_views']) + 1}"
+            st.session_state["saved_views"][nm] = collect_filter_state(extra_cols)
+            st.success(f"Saved {nm}")
+    with c_b:
+        if st.button("🗑️ Clear", use_container_width=True):
+            st.session_state["saved_views"] = {}
+            st.success("Cleared saved presets.")
+    preset_names = sorted(st.session_state.get("saved_views", {}).keys())
+    if preset_names:
+        sel = st.selectbox("Load preset", options=["—"] + preset_names, index=0)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if sel != "—" and st.button("Load", use_container_width=True):
+                apply_filter_state(st.session_state["saved_views"].get(sel, {}), extra_filter_candidates)
+                st.rerun()
+        with cc2:
+            if sel != "—":
+                payload = json.dumps(st.session_state["saved_views"].get(sel, {}), ensure_ascii=False, indent=2).encode("utf-8")
+                st.download_button("Export", payload, file_name=f"{sel}.json", mime="application/json", use_container_width=True)
+    imported = st.file_uploader("Import preset JSON", type=["json"], key="preset_json")
+    if imported is not None:
         try:
-            star_int = int(star_val) if pd.notna(star_val) else 0
-        except Exception:
-            star_int = 0
+            preset_obj = json.loads(imported.getvalue().decode("utf-8"))
+            if isinstance(preset_obj, dict):
+                apply_filter_state(preset_obj, extra_filter_candidates)
+                st.success("Imported preset.")
+        except Exception as e:
+            st.warning(f"Could not import preset: {e}")
 
+# -----------------------------------------------------------------------------
+# Apply filters
+# -----------------------------------------------------------------------------
+d0 = df_base
+mask = pd.Series(True, index=d0.index)
+
+tf = st.session_state.get("tf", "All Time")
+start_date = end_date = None
+if tf == "Custom Range":
+    rng = st.session_state.get("tf_range", (tz_today - timedelta(days=30), tz_today))
+    if isinstance(rng, (tuple, list)) and len(rng) == 2:
+        start_date, end_date = rng
+elif tf == "Last Week":
+    start_date, end_date = tz_today - timedelta(days=7), tz_today
+elif tf == "Last Month":
+    start_date, end_date = tz_today - timedelta(days=30), tz_today
+elif tf == "Last Year":
+    start_date, end_date = tz_today - timedelta(days=365), tz_today
+
+if start_date and end_date and "Review Date" in d0.columns:
+    dt = pd.to_datetime(d0["Review Date"], errors="coerce")
+    end_inclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+    mask &= (dt >= pd.Timestamp(start_date)) & (dt <= end_inclusive)
+
+sr_sel = [x for x in st.session_state.get("sr", ["All"]) if str(x).strip() and str(x).lower() != "all"]
+if sr_sel and "Star Rating" in d0.columns:
+    sr_nums = [int(x) for x in sr_sel if str(x).isdigit()]
+    if sr_nums:
+        mask &= pd.to_numeric(d0["Star Rating"], errors="coerce").isin(sr_nums)
+
+for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"]:
+    sel_clean = [x for x in st.session_state.get(f"f_{col}", ["ALL"]) if str(x).strip() and str(x).upper() != "ALL"]
+    if col in d0.columns and sel_clean:
+        mask &= series_matches_any(d0[col], [str(x) for x in sel_clean])
+
+for col in extra_cols:
+    if col not in d0.columns:
+        continue
+    range_key = f"f_{col}_range"
+    if range_key in st.session_state and isinstance(st.session_state.get(range_key), (tuple, list)):
+        lo, hi = st.session_state.get(range_key)
+        num = pd.to_numeric(d0[col], errors="coerce")
+        mask &= num.between(float(lo), float(hi))
+    else:
+        contains_key = f"f_{col}_contains"
+        contains_val = (st.session_state.get(contains_key) or "").strip()
+        if contains_val:
+            mask &= d0[col].astype("string").fillna("").str.contains(contains_val, case=False, na=False)
+        else:
+            sel_clean = [x for x in st.session_state.get(f"f_{col}", ["ALL"]) if str(x).strip() and str(x).upper() != "ALL"]
+            if sel_clean:
+                mask &= series_matches_any(d0[col], [str(x) for x in sel_clean])
+
+sel_del = [x for x in st.session_state.get("delight", ["All"]) if str(x).strip() and str(x).lower() != "all"]
+sel_det = [x for x in st.session_state.get("detract", ["All"]) if str(x).strip() and str(x).lower() != "all"]
+if sel_del and all_delighter_columns:
+    mask &= d0[all_delighter_columns].isin(sel_del).any(axis=1)
+if sel_det and all_detractor_columns:
+    mask &= d0[all_detractor_columns].isin(sel_det).any(axis=1)
+
+keyword = (st.session_state.get("kw") or "").strip()
+if keyword and "Verbatim" in d0.columns:
+    mask &= d0["Verbatim"].astype("string").fillna("").str.contains(keyword, case=False, na=False)
+
+filtered = d0[mask].copy()
+
+active_pills: List[str] = []
+if tf != "All Time":
+    active_pills.append(f"<div class='pill'>Timeframe: {esc(tf if tf != 'Custom Range' else f'{start_date} → {end_date}')}</div>")
+if sr_sel:
+    active_pills.append(f"<div class='pill'>Stars: {esc(', '.join(map(str, sr_sel)))}</div>")
+for col in ["Country", "Source", "Model (SKU)", "Seeded", "New Review"] + extra_cols:
+    if f"f_{col}_range" in st.session_state and isinstance(st.session_state.get(f"f_{col}_range"), (tuple, list)):
+        lo, hi = st.session_state.get(f"f_{col}_range")
+        active_pills.append(f"<div class='pill'>{esc(col)}: {float(lo):g} → {float(hi):g}</div>")
+        continue
+    cv = (st.session_state.get(f"f_{col}_contains") or "").strip()
+    if cv:
+        active_pills.append(f"<div class='pill'>{esc(col)} contains: {esc(cv)}</div>")
+        continue
+    sel = st.session_state.get(f"f_{col}", ["ALL"])
+    if isinstance(sel, list) and sel and "ALL" not in sel:
+        pretty = ", ".join([str(x) for x in sel[:4]]) + ("" if len(sel) <= 4 else f" +{len(sel) - 4}")
+        active_pills.append(f"<div class='pill'>{esc(col)}: {esc(pretty)}</div>")
+if sel_del:
+    active_pills.append(f"<div class='pill'>Delighters: {esc(', '.join(map(str, sel_del[:3])) + ('' if len(sel_del) <= 3 else f' +{len(sel_del)-3}'))}</div>")
+if sel_det:
+    active_pills.append(f"<div class='pill'>Detractors: {esc(', '.join(map(str, sel_det[:3])) + ('' if len(sel_det) <= 3 else f' +{len(sel_det)-3}'))}</div>")
+if keyword:
+    active_pills.append(f"<div class='pill'>Keyword: {esc(keyword)}</div>")
+
+st.markdown(
+    f"""
+    <div class='soft-panel'>
+      <div><b>Active filters</b> • Showing <b>{len(filtered):,}</b> of <b>{len(df_base):,}</b> rows</div>
+      <div class='pill-row' style='margin-top:8px;'>{''.join(active_pills) if active_pills else '<span class="small-muted">None (All data)</span>'}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+view = st.radio(
+    "View",
+    options=["📊 Dashboard", "⚖️ Compare", "🧠 Root Cause", "📝 All Reviews", "🤖 AI"],
+    horizontal=True,
+    index=["📊 Dashboard", "⚖️ Compare", "🧠 Root Cause", "📝 All Reviews", "🤖 AI"].index(st.session_state.get("main_view", "📊 Dashboard")) if st.session_state.get("main_view") else 0,
+    key="main_view",
+)
+
+# -----------------------------------------------------------------------------
+# Dashboard view
+# -----------------------------------------------------------------------------
+if view.startswith("📊"):
+    st.markdown("## ⭐ Star Rating Metrics")
+    seeded_mask = filtered["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in filtered.columns else pd.Series(False, index=filtered.index)
+    all_cnt, all_avg, all_low = section_stats(filtered)
+    org_cnt, org_avg, org_low = section_stats(filtered[~seeded_mask])
+    seed_cnt, seed_avg, seed_low = section_stats(filtered[seeded_mask])
+
+    st.markdown(
+        "<div class='metric-grid'>"
+        + metric_card_html("All reviews", f"{all_cnt:,}", f"Avg ★ {all_avg:.2f} • 1–2★ {all_low:.1f}%" if all_cnt else "No ratings")
+        + metric_card_html("Organic", f"{org_cnt:,}", f"Avg ★ {org_avg:.2f} • 1–2★ {org_low:.1f}%" if org_cnt else "No ratings")
+        + metric_card_html("Seeded", f"{seed_cnt:,}", f"Avg ★ {seed_avg:.2f} • 1–2★ {seed_low:.1f}%" if seed_cnt else "No ratings")
+        + metric_card_html("Signals in slice", f"{filtered.get('Signal Type', pd.Series(dtype='string')).astype('string').replace({'': pd.NA}).nunique(dropna=True) if 'Signal Type' in filtered.columns else 1}", "Distinct signal types in current slice")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("## 🚨 Emerging Issue Radar")
+    radar = detect_issue_radar(filtered, all_detractor_columns, all_delighter_columns)
+    if radar.empty:
+        st.info("No material issues or spikes detected in the current filtered timeframe.")
+    else:
+        top_alerts = radar.head(4)
         st.markdown(
-            f"""
-            <div class="review-card">
-                <p><strong>Source:</strong> {esc(row.get('Source'))} | <strong>Model:</strong> {esc(row.get('Model (SKU)'))}</p>
-                <p><strong>Country:</strong> {esc(row.get('Country'))} | <strong>Date:</strong> {esc(date_str)}</p>
-                <p><strong>Rating:</strong> {'⭐' * star_int} ({esc(row.get('Star Rating'))}/5)</p>
-                <p><strong>Review:</strong> {display_review_html}</p>
-                <div><strong>Delighter Symptoms:</strong> {delighter_message}</div>
-                <div><strong>Detractor Symptoms:</strong> {detractor_message}</div>
-            </div>
-            """,
+            "<div class='metric-grid'>"
+            + "".join(
+                [metric_card_html(str(r["Type"]), str(r["Issue"]), str(r["Narrative"])) for _, r in top_alerts.iterrows()]
+            )
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        with st.expander("See full radar table", expanded=False):
+            st.dataframe(radar, use_container_width=True, hide_index=True)
+
+    st.markdown("## 🧠 Language that separates low-star vs high-star reviews")
+    theme_diff = compute_text_theme_diffs(filtered, top_n=12)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**More associated with 1–2★ reviews**")
+        if theme_diff.get("low_vs_high"):
+            st.dataframe(pd.DataFrame(theme_diff["low_vs_high"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough low-star language to compare.")
+    with c2:
+        st.markdown("**More associated with 4–5★ reviews**")
+        if theme_diff.get("high_vs_low"):
+            st.dataframe(pd.DataFrame(theme_diff["high_vs_low"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough high-star language to compare.")
+
+    st.markdown("## 🩺 Symptom Explorer")
+    detr_tbl = analyze_symptoms_fast(filtered, all_detractor_columns)
+    del_tbl = analyze_symptoms_fast(filtered, all_delighter_columns)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Top detractors**")
+        if detr_tbl.empty:
+            st.info("No detractor symptoms in this slice.")
+        else:
+            st.dataframe(detr_tbl[["Item", "Review Mentions", "Review Rate %", "Avg Star"]].head(25), use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("**Top delighters**")
+        if del_tbl.empty:
+            st.info("No delighter symptoms in this slice.")
+        else:
+            st.dataframe(del_tbl[["Item", "Review Mentions", "Review Rate %", "Avg Star"]].head(25), use_container_width=True, hide_index=True)
+
+    union_symptoms = detr_tbl["Item"].head(20).tolist() + [x for x in del_tbl["Item"].head(20).tolist() if x not in detr_tbl["Item"].head(20).tolist()]
+    st.markdown("### 🔍 Evidence drawer")
+    if union_symptoms:
+        inspect_symptom = st.selectbox("Choose a symptom to inspect", options=union_symptoms, key="inspect_symptom")
+        is_det = inspect_symptom in set(detr_tbl["Item"].tolist())
+        quote_cols = all_detractor_columns if is_det else all_delighter_columns
+        prefer = "low" if is_det else "high"
+        quotes = pick_quotes_for_symptom(filtered, inspect_symptom, quote_cols, k=4, prefer=prefer)
+        if quotes:
+            for q in quotes:
+                st.markdown(
+                    f"<div class='quote-card'><div>{esc(q['text'])}</div><div class='small-muted' style='margin-top:6px;'>{esc(q['meta'])}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No direct quotes found for that symptom in the current slice.")
+    else:
+        st.info("No symptoms available to inspect in the current slice.")
+
+    st.markdown("## 🎯 Opportunity Matrix")
+    baseline_avg = float(all_avg) if pd.notna(all_avg) else np.nan
+    tab_det, tab_del = st.tabs(["Detractors", "Delighters"])
+
+    def _opportunity_scatter(tbl: pd.DataFrame, kind: str, baseline: float):
+        if tbl.empty or pd.isna(baseline):
+            st.info("Not enough data to render this matrix.")
+            return
+        d = tbl.copy()
+        d["Mentions"] = pd.to_numeric(d["Review Mentions"], errors="coerce").fillna(0)
+        d["Avg Star"] = pd.to_numeric(d["Avg Star"], errors="coerce")
+        d = d.dropna(subset=["Avg Star"])
+        if d.empty:
+            st.info("Not enough data to render this matrix.")
+            return
+        x = d["Mentions"].astype(float).to_numpy()
+        y = d["Avg Star"].astype(float).to_numpy()
+        if kind == "detractors":
+            score = x * np.clip(baseline - y, 0, None)
+        else:
+            score = x * np.clip(y - baseline, 0, None)
+        labels = d["Item"].astype(str).to_numpy()
+        size = (np.sqrt(x) / (np.sqrt(np.nanmax(x)) + 1e-9)) * 30 + 10
+        fig = go.Figure(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="markers+text",
+                text=labels,
+                textposition="top center",
+                customdata=np.stack([labels], axis=1),
+                hovertemplate="%{customdata[0]}<br>Mentions=%{x:.0f}<br>Avg ★=%{y:.2f}<extra></extra>",
+                marker=dict(size=size, opacity=0.75, line=dict(width=1, color="rgba(148,163,184,.4)")),
+            )
+        )
+        fig.add_hline(y=baseline, line_dash="dash", opacity=0.5)
+        fig.update_layout(height=500, margin=dict(l=40, r=20, t=20, b=40), xaxis_title="Review mentions", yaxis_title="Avg ★")
+        style_plotly(fig)
+        st.plotly_chart(fig, use_container_width=True)
+        d2 = d.copy()
+        d2["Score"] = score
+        st.dataframe(d2[["Item", "Review Mentions", "Review Rate %", "Avg Star", "Score"]].sort_values("Score", ascending=False).head(15), use_container_width=True, hide_index=True)
+
+    with tab_det:
+        _opportunity_scatter(detr_tbl.head(30), "detractors", baseline_avg)
+    with tab_del:
+        _opportunity_scatter(del_tbl.head(30), "delighters", baseline_avg)
+
+    st.markdown("## 📈 Cumulative Avg ★ Over Time by Region")
+    if {"Review Date", "Star Rating", "Country"}.issubset(filtered.columns):
+        data = filtered.copy()
+        data["Review Date"] = pd.to_datetime(data["Review Date"], errors="coerce")
+        data["Star Rating"] = pd.to_numeric(data["Star Rating"], errors="coerce")
+        data = data.dropna(subset=["Review Date", "Star Rating"])
+        if data.empty:
+            st.info("No time-series data in the current slice.")
+        else:
+            top_regions = data["Country"].astype("string").value_counts().head(6).index.tolist()
+            data = data[data["Country"].astype("string").isin(top_regions)].copy()
+            data["date"] = data["Review Date"].dt.date
+            grp = data.groupby(["date", "Country"])["Star Rating"].agg(cnt="count", total="sum").reset_index()
+            fig = go.Figure()
+            y_vals: List[float] = []
+            for region in top_regions:
+                sub = grp[grp["Country"].astype("string") == str(region)].sort_values("date")
+                sub["cum_cnt"] = sub["cnt"].cumsum()
+                sub["cum_sum"] = sub["total"].cumsum()
+                sub["cum_avg"] = sub["cum_sum"] / sub["cum_cnt"]
+                y_vals.extend(sub["cum_avg"].tolist())
+                fig.add_trace(
+                    go.Scatter(
+                        x=sub["date"],
+                        y=sub["cum_avg"],
+                        mode="lines",
+                        name=str(region),
+                        hovertemplate=f"Country: {region}<br>Date: %{{x}}<br>Cumulative Avg ★: %{{y:.3f}}<extra></extra>",
+                    )
+                )
+            overall = grp.groupby("date").agg(cnt=("cnt", "sum"), total=("total", "sum")).reset_index().sort_values("date")
+            overall["cum_cnt"] = overall["cnt"].cumsum()
+            overall["cum_sum"] = overall["total"].cumsum()
+            overall["cum_avg"] = overall["cum_sum"] / overall["cum_cnt"]
+            y_vals.extend(overall["cum_avg"].tolist())
+            fig.add_trace(go.Scatter(x=overall["date"], y=overall["cum_avg"], mode="lines", name="Overall", line=dict(width=4)))
+            if y_vals:
+                lo = max(1.0, float(np.nanpercentile(y_vals, 3)) - 0.12)
+                hi = min(5.2, float(np.nanpercentile(y_vals, 97)) + 0.12)
+                if (hi - lo) < 0.2:
+                    hi = min(5.2, lo + 0.2)
+            else:
+                lo, hi = 1.0, 5.2
+            fig.update_layout(height=520, margin=dict(l=40, r=20, t=20, b=40), xaxis_title="Date", yaxis_title="Cumulative Avg ★")
+            fig.update_yaxes(range=[lo, hi], dtick=0.1 if (hi - lo) <= 1.2 else None)
+            style_plotly(fig)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Need Review Date, Star Rating, and Country to render this chart.")
+
+# -----------------------------------------------------------------------------
+# Compare view
+# -----------------------------------------------------------------------------
+if view.startswith("⚖️"):
+    st.markdown("## ⚖️ Compare any two cohorts")
+    st.caption("Compare countries, retailers, models, journey stages, channels, signal types, or any extra column in the current filtered slice.")
+
+    compare_fields = []
+    for c in ["Country", "Source", "Model (SKU)", "Seeded", "New Review", "Signal Type"] + extra_filter_candidates:
+        if c in filtered.columns:
+            try:
+                nuniq = int(filtered[c].astype("string").replace({"": pd.NA}).nunique(dropna=True))
+            except Exception:
+                nuniq = 0
+            if nuniq >= 2:
+                compare_fields.append(c)
+    compare_fields = list(dict.fromkeys(compare_fields))
+    if not compare_fields:
+        st.info("No columns in the current slice have enough variation to compare cohorts.")
+    else:
+        c1, c2, c3 = st.columns([1.2, 1, 1])
+        with c1:
+            compare_field = st.selectbox("Compare field", options=compare_fields, key="cmp_field")
+        options = _col_options(filtered, compare_field, max_vals=None)[1:]
+        if len(options) < 2:
+            st.info("Need at least two values in the selected field.")
+        else:
+            with c2:
+                cohort_a = st.selectbox("Cohort A", options=options, index=0, key="cmp_a")
+            with c3:
+                default_b_idx = 1 if len(options) > 1 else 0
+                cohort_b = st.selectbox("Cohort B", options=options, index=default_b_idx, key="cmp_b")
+            a_mask = series_matches_any(filtered[compare_field], [cohort_a])
+            b_mask = series_matches_any(filtered[compare_field], [cohort_b])
+            df_a = filtered[a_mask].copy()
+            df_b = filtered[b_mask].copy()
+            if df_a.empty or df_b.empty:
+                st.warning("One of the selected cohorts has no rows after filtering.")
+            else:
+                a_cnt, a_avg, a_low = section_stats(df_a)
+                b_cnt, b_avg, b_low = section_stats(df_b)
+                delta_avg = (a_avg - b_avg) if pd.notna(a_avg) and pd.notna(b_avg) else np.nan
+                delta_low = (a_low - b_low) if pd.notna(a_low) and pd.notna(b_low) else np.nan
+                st.markdown(
+                    "<div class='metric-grid'>"
+                    + metric_card_html(cohort_a, f"{a_cnt:,}", f"Avg ★ {a_avg:.2f} • 1–2★ {a_low:.1f}%")
+                    + metric_card_html(cohort_b, f"{b_cnt:,}", f"Avg ★ {b_avg:.2f} • 1–2★ {b_low:.1f}%")
+                    + metric_card_html("Delta Avg ★", f"{delta_avg:+.2f}" if pd.notna(delta_avg) else "n/a", f"{cohort_a} minus {cohort_b}")
+                    + metric_card_html("Delta low-star share", f"{delta_low:+.1f} pp" if pd.notna(delta_low) else "n/a", f"{cohort_a} minus {cohort_b}")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("### 🩺 Symptom deltas")
+                tab1, tab2 = st.tabs(["Detractors", "Delighters"])
+                with tab1:
+                    det_delta = build_symptom_delta_table(df_a, df_b, all_detractor_columns, cohort_a, cohort_b)
+                    if det_delta.empty:
+                        st.info("No detractor differences available.")
+                    else:
+                        st.dataframe(det_delta.head(20), use_container_width=True, hide_index=True)
+                with tab2:
+                    del_delta = build_symptom_delta_table(df_a, df_b, all_delighter_columns, cohort_a, cohort_b)
+                    if del_delta.empty:
+                        st.info("No delighter differences available.")
+                    else:
+                        st.dataframe(del_delta.head(20), use_container_width=True, hide_index=True)
+
+                st.markdown("### 🧠 Language unique to each cohort")
+                text_diff = compute_group_text_diff(df_a, df_b, top_n=12)
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    st.markdown(f"**More common in {cohort_a}**")
+                    if text_diff.get("a_vs_b"):
+                        st.dataframe(pd.DataFrame(text_diff["a_vs_b"]), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No clear differentiating language.")
+                with cc2:
+                    st.markdown(f"**More common in {cohort_b}**")
+                    if text_diff.get("b_vs_a"):
+                        st.dataframe(pd.DataFrame(text_diff["b_vs_a"]), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No clear differentiating language.")
+
+                st.markdown("### 🔍 Evidence by differentiator")
+                det_candidates = det_delta["Item"].head(15).tolist() if 'det_delta' in locals() and not det_delta.empty else []
+                del_candidates = del_delta["Item"].head(15).tolist() if 'del_delta' in locals() and not del_delta.empty else []
+                inspect_options = det_candidates + [x for x in del_candidates if x not in det_candidates]
+                if inspect_options:
+                    inspect_issue = st.selectbox("Inspect a differentiating symptom", options=inspect_options, key="cmp_issue")
+                    is_det_issue = inspect_issue in set(det_candidates)
+                    quote_cols = all_detractor_columns if is_det_issue else all_delighter_columns
+                    qa = pick_quotes_for_symptom(df_a, inspect_issue, quote_cols, k=2, prefer="low" if is_det_issue else "high")
+                    qb = pick_quotes_for_symptom(df_b, inspect_issue, quote_cols, k=2, prefer="low" if is_det_issue else "high")
+                    q1, q2 = st.columns(2)
+                    with q1:
+                        st.markdown(f"**{cohort_a}**")
+                        if qa:
+                            for q in qa:
+                                st.markdown(
+                                    f"<div class='quote-card'><div>{esc(q['text'])}</div><div class='small-muted' style='margin-top:6px;'>{esc(q['meta'])}</div></div>",
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.info("No direct quotes found.")
+                    with q2:
+                        st.markdown(f"**{cohort_b}**")
+                        if qb:
+                            for q in qb:
+                                st.markdown(
+                                    f"<div class='quote-card'><div>{esc(q['text'])}</div><div class='small-muted' style='margin-top:6px;'>{esc(q['meta'])}</div></div>",
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.info("No direct quotes found.")
+                else:
+                    st.info("No differentiating symptoms available to inspect.")
+
+                st.markdown("### 📦 Download compare pack")
+                out_xlsx = BytesIO()
+                with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+                    pd.DataFrame([{"Cohort A": cohort_a, "Count": a_cnt, "Avg ★": a_avg, "% 1–2★": a_low}, {"Cohort B": cohort_b, "Count": b_cnt, "Avg ★": b_avg, "% 1–2★": b_low}]).to_excel(writer, sheet_name="KPI Delta", index=False)
+                    if 'det_delta' in locals() and not det_delta.empty:
+                        det_delta.to_excel(writer, sheet_name="Detractor Delta", index=False)
+                    if 'del_delta' in locals() and not del_delta.empty:
+                        del_delta.to_excel(writer, sheet_name="Delighter Delta", index=False)
+                    if text_diff.get("a_vs_b"):
+                        pd.DataFrame(text_diff["a_vs_b"]).to_excel(writer, sheet_name="Language A vs B", index=False)
+                    if text_diff.get("b_vs_a"):
+                        pd.DataFrame(text_diff["b_vs_a"]).to_excel(writer, sheet_name="Language B vs A", index=False)
+                st.download_button(
+                    "⬇️ Download compare workbook",
+                    out_xlsx.getvalue(),
+                    file_name=f"compare_{_norm(compare_field)}_{_norm(str(cohort_a))}_vs_{_norm(str(cohort_b))}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+# -----------------------------------------------------------------------------
+# Root cause + action center view
+# -----------------------------------------------------------------------------
+if view.startswith("🧠"):
+    st.markdown("## 🧠 Root Cause Copilot + Action Center")
+    st.caption("Pick a symptom or low-star cohort, rank the most likely drivers, simulate impact, and export ready-to-use action artifacts.")
+
+    issue_mode = st.radio(
+        "Issue target",
+        options=["Detractor symptom", "1–2★ reviews", "Delighter symptom"],
+        horizontal=True,
+        key="rc_mode",
+    )
+
+    issue_name: Optional[str] = None
+    if issue_mode == "Detractor symptom":
+        if detractor_symptoms_all:
+            issue_name = st.selectbox("Detractor symptom", options=detractor_symptoms_all, key="rc_issue_det")
+        else:
+            st.info("No detractor symptoms are available in the current slice.")
+    elif issue_mode == "Delighter symptom":
+        if delighter_symptoms_all:
+            issue_name = st.selectbox("Delighter symptom", options=delighter_symptoms_all, key="rc_issue_del")
+        else:
+            st.info("No delighter symptoms are available in the current slice.")
+
+    suggested_driver_cols = [c for c in ["Country", "Source", "Model (SKU)", "Signal Type", "Product_Symptom Component", "Trigger Point_Product", "Dominant Customer Journey Step", "L2 Delighter Component", "L2 Delighter Mode", "Brand", "Company"] if c in filtered.columns]
+    driver_cols = st.multiselect(
+        "Driver dimensions to inspect",
+        options=[c for c in ["Country", "Source", "Model (SKU)", "Seeded", "New Review", "Signal Type"] + extra_filter_candidates if c in filtered.columns],
+        default=suggested_driver_cols[:6] if suggested_driver_cols else [c for c in ["Country", "Source", "Model (SKU)"] if c in filtered.columns],
+        key="rc_drivers",
+    )
+    min_group_n = st.slider("Minimum cohort size", 2, 30, 5, 1, key="rc_min_group")
+
+    issue_mask = issue_mask_from_mode(filtered, issue_mode, issue_name, all_detractor_columns, all_delighter_columns)
+    issue_label = issue_name if issue_name else issue_mode
+
+    if filtered.empty:
+        st.info("No rows in the current filtered slice.")
+    elif int(issue_mask.sum()) == 0:
+        st.info("The selected issue is not present in the current filtered slice.")
+    else:
+        driver_df = rank_drivers_for_issue(filtered, issue_mask, driver_cols, issue_mode, min_group_n=min_group_n)
+        sim = estimate_issue_lift(filtered, issue_mask, issue_mode, reduction_pct=25)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(metric_card_html("Issue reviews", f"{int(issue_mask.sum()):,}", issue_label), unsafe_allow_html=True)
+        with c2:
+            st.markdown(metric_card_html("Issue share", f"{sim['issue_share_pct']:.1f}%", "Of current slice"), unsafe_allow_html=True)
+        with c3:
+            st.markdown(metric_card_html("Issue Avg ★", f"{sim['issue_avg']:.2f}" if pd.notna(sim['issue_avg']) else "n/a", "Among impacted reviews"), unsafe_allow_html=True)
+        with c4:
+            st.markdown(metric_card_html("Overall Avg ★", f"{sim['overall_avg']:.2f}" if pd.notna(sim['overall_avg']) else "n/a", "Current slice baseline"), unsafe_allow_html=True)
+
+        st.markdown("### Ranked drivers")
+        if driver_df.empty:
+            st.info("No concentrated drivers detected with the selected settings.")
+        else:
+            fig = go.Figure(
+                go.Bar(
+                    x=driver_df.head(15)["Impact Score"][::-1],
+                    y=(driver_df.head(15)["Driver"] + " = " + driver_df.head(15)["Bucket"])[::-1],
+                    orientation="h",
+                    customdata=np.stack([driver_df.head(15)["Issue Rate %"][::-1], driver_df.head(15)["Contribution %"][::-1]], axis=1),
+                    hovertemplate="Impact Score=%{x:.2f}<br>Issue Rate=%{customdata[0]:.1f}%<br>Contribution=%{customdata[1]:.1f}%<extra></extra>",
+                )
+            )
+            fig.update_layout(height=520, margin=dict(l=190, r=20, t=20, b=40), xaxis_title="Impact score", yaxis_title="Driver bucket")
+            style_plotly(fig)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(driver_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### What-if simulator")
+        reduction_pct = st.slider(
+            "Assume you reduce this issue's prevalence by…",
+            0,
+            80,
+            25,
+            5,
+            key="rc_reduction",
+        )
+        sim = estimate_issue_lift(filtered, issue_mask, issue_mode, reduction_pct=reduction_pct)
+        direction = "rating lift" if issue_mode in {"Detractor symptom", "1–2★ reviews"} else "delighter amplification lift"
+        st.markdown(
+            f"<div class='soft-panel'><b>Directional estimate:</b> reducing <b>{esc(issue_label)}</b> by <b>{reduction_pct}%</b> is worth about <b>{sim['estimated_lift']:+.3f}★</b> of {direction} in this slice. <span class='small-muted'>Heuristic = issue share × rating gap × reduction rate.</span></div>",
             unsafe_allow_html=True,
         )
 
-# Pager
-p1, p2, p3, p4, p5 = st.columns([1, 1, 2, 1, 1])
-with p1:
-    if st.button("⏮ First", disabled=current_page == 0):
-        st.session_state["review_page"] = 0
-        st.rerun()
-with p2:
-    if st.button("⬅ Prev", disabled=current_page == 0):
-        st.session_state["review_page"] = max(current_page - 1, 0)
-        st.rerun()
-with p3:
-    showing_from = 0 if total_reviews_count == 0 else start_index + 1
-    showing_to = min(end_index, total_reviews_count)
-    st.markdown(
-        f"<div style='text-align:center;font-weight:700;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>",
-        unsafe_allow_html=True,
-    )
-with p4:
-    if st.button("Next ➡", disabled=current_page >= total_pages - 1):
-        st.session_state["review_page"] = min(current_page + 1, total_pages - 1)
-        st.rerun()
-with p5:
-    if st.button("Last ⏭", disabled=current_page >= total_pages - 1):
-        st.session_state["review_page"] = total_pages - 1
-        st.rerun()
-
-st.markdown("---")
-
-# ---------- Feedback ----------
-anchor("feedback-anchor")
-st.markdown("## 💬 Submit Feedback")
-st.caption("Tell us what to improve. We care about making this tool user-centric.")
-
-def send_feedback_via_email(subject: str, body: str) -> bool:
-    try:
-        host = st.secrets.get("SMTP_HOST")
-        port = int(st.secrets.get("SMTP_PORT", 587))
-        user = st.secrets.get("SMTP_USER")
-        pwd = st.secrets.get("SMTP_PASS")
-        sender = st.secrets.get("SMTP_FROM", user or "")
-        to = st.secrets.get("SMTP_TO", "wseddon@sharkninja.com")
-        if not (host and port and sender and to):
-            return False
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = to
-        msg.set_content(body)
-        with smtplib.SMTP(host, port, timeout=15) as s:
-            s.starttls()
-            if user and pwd:
-                s.login(user, pwd)
-            s.send_message(msg)
-        return True
-    except Exception as e:
-        st.info(f"Could not send via SMTP: {e}")
-        return False
-
-with st.form("feedback_form", clear_on_submit=True):
-    name = st.text_input("Your name (optional)")
-    email = st.text_input("Your email (optional)")
-    message = st.text_area("Feedback / feature request", placeholder="Type your feedback here…", height=140)
-    submitted = st.form_submit_button("Submit feedback")
-if submitted:
-    if not message.strip():
-        st.warning("Please enter some feedback before submitting.")
-    else:
-        body = f"Name: {name or '-'}\nEmail: {email or '-'}\n\nFeedback:\n{message}"
-        ok = send_feedback_via_email("Star Walk — Feedback", body)
-        if ok:
-            st.success("Thanks! Your feedback was sent.")
+        st.markdown("### Evidence")
+        quote_cols = all_detractor_columns if issue_mode == "Detractor symptom" else all_delighter_columns
+        prefer = "low" if issue_mode in {"Detractor symptom", "1–2★ reviews"} else "high"
+        quotes = []
+        if issue_mode == "1–2★ reviews":
+            sub = filtered.loc[issue_mask].copy()
+            sub["Star Rating"] = pd.to_numeric(sub["Star Rating"], errors="coerce")
+            sub = sub.sort_values("Star Rating", ascending=True)
+            for _, row in sub.head(4).iterrows():
+                text = mask_pii(clean_text(row.get("Verbatim", "")))
+                sent = _extract_sentence(text, prefer_tail=True)
+                meta = []
+                for col in ["Source", "Country", "Model (SKU)", "Signal Type"]:
+                    v = row.get(col, pd.NA)
+                    if pd.notna(v) and str(v).strip():
+                        meta.append(str(v).strip())
+                try:
+                    meta.insert(0, f"{int(float(row.get('Star Rating')))}★")
+                except Exception:
+                    pass
+                quotes.append({"text": sent[:280] + ("…" if len(sent) > 280 else ""), "meta": " • ".join(meta)})
         else:
-            quoted = quote(message or "", safe="")
-            st.link_button(
-                "Open email to wseddon@sharkninja.com",
-                url=f"mailto:wseddon@sharkninja.com?subject=Star%20Walk%20Feedback&body={quoted}",
+            quotes = pick_quotes_for_symptom(filtered, issue_label, quote_cols, k=4, prefer=prefer)
+        if quotes:
+            for q in quotes:
+                st.markdown(
+                    f"<div class='quote-card'><div>{esc(q['text'])}</div><div class='small-muted' style='margin-top:6px;'>{esc(q['meta'])}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No direct quotes found for the selected issue in the current slice.")
+
+        st.markdown("### Action Center")
+        action_pack = build_action_center(filtered, str(issue_label), issue_mode, issue_mask, driver_df, quotes, product_label)
+        at1, at2, at3, at4, at5 = st.tabs(["Executive summary", "Engineering brief", "Jira JSON", "Support macro", "Retailer note"])
+        with at1:
+            st.markdown(action_pack["executive_summary"])
+            st.download_button("Download executive summary", action_pack["executive_summary"].encode("utf-8"), file_name=f"{_norm(str(issue_label))}_exec_summary.md")
+        with at2:
+            st.markdown(action_pack["engineering_brief"])
+            st.download_button("Download engineering brief", action_pack["engineering_brief"].encode("utf-8"), file_name=f"{_norm(str(issue_label))}_engineering_brief.md")
+        with at3:
+            jira_text = json.dumps(action_pack["jira"], ensure_ascii=False, indent=2)
+            st.code(jira_text, language="json")
+            st.download_button("Download Jira payload", jira_text.encode("utf-8"), file_name=f"{_norm(str(issue_label))}_jira.json")
+        with at4:
+            st.text_area("Support macro", value=action_pack["support_macro"], height=180, key="rc_support_macro", label_visibility="collapsed")
+            st.download_button("Download support macro", action_pack["support_macro"].encode("utf-8"), file_name=f"{_norm(str(issue_label))}_support_macro.txt")
+        with at5:
+            st.text_area("Retailer note", value=action_pack["retailer_note"], height=220, key="rc_retailer_note", label_visibility="collapsed")
+            st.download_button("Download retailer note", action_pack["retailer_note"].encode("utf-8"), file_name=f"{_norm(str(issue_label))}_retailer_note.txt")
+
+# -----------------------------------------------------------------------------
+# Reviews view
+# -----------------------------------------------------------------------------
+if view.startswith("📝"):
+    st.markdown("## 📝 Reviews in current filter criteria")
+    st.caption("Change filters in the sidebar and this list updates automatically.")
+
+    sort_options: List[str] = []
+    has_date = "Review Date" in filtered.columns
+    has_star = "Star Rating" in filtered.columns
+    if has_date:
+        sort_options += ["Newest → Oldest", "Oldest → Newest"]
+    if has_star:
+        sort_options += ["Rating: High → Low", "Rating: Low → High"]
+    if not sort_options:
+        sort_options = ["Default order"]
+
+    c1, c2 = st.columns([1.2, 1])
+    with c1:
+        sort_choice = st.selectbox("Sort", options=sort_options, index=0, key="review_sort_choice")
+    with c2:
+        if not filtered.empty:
+            st.download_button(
+                "⬇️ Download current slice",
+                filtered.to_csv(index=False).encode("utf-8-sig"),
+                file_name="filtered_reviews.csv",
+                mime="text/csv",
+                use_container_width=True,
             )
 
-# one-time scroll on fresh upload
-if st.session_state.get("force_scroll_top_once"):
-    st.session_state["force_scroll_top_once"] = False
-    st.markdown("<script>window.scrollTo({top:0,behavior:'auto'});</script>", unsafe_allow_html=True)
+    st.session_state.setdefault("review_page", 0)
+    if st.session_state.get("_review_sort_prev") != sort_choice:
+        st.session_state["_review_sort_prev"] = sort_choice
+        st.session_state["review_page"] = 0
+
+    reviews_df = filtered.copy()
+    try:
+        if sort_choice == "Newest → Oldest" and has_date:
+            reviews_df = reviews_df.sort_values("Review Date", ascending=False, na_position="last")
+        elif sort_choice == "Oldest → Newest" and has_date:
+            reviews_df = reviews_df.sort_values("Review Date", ascending=True, na_position="last")
+        elif sort_choice == "Rating: High → Low" and has_star:
+            reviews_df = reviews_df.sort_values(["Star Rating", "Review Date"] if has_date else ["Star Rating"], ascending=[False, False] if has_date else [False], na_position="last")
+        elif sort_choice == "Rating: Low → High" and has_star:
+            reviews_df = reviews_df.sort_values(["Star Rating", "Review Date"] if has_date else ["Star Rating"], ascending=[True, False] if has_date else [True], na_position="last")
+    except Exception:
+        pass
+
+    reviews_per_page = int(st.session_state.get("rpp", 10))
+    total_reviews_count = len(reviews_df)
+    total_pages = max(1, int(np.ceil(total_reviews_count / reviews_per_page))) if reviews_per_page > 0 else 1
+    current_page = max(0, min(int(st.session_state.get("review_page", 0)), total_pages - 1))
+    st.session_state["review_page"] = current_page
+    start_index = current_page * reviews_per_page
+    end_index = start_index + reviews_per_page
+    paginated = reviews_df.iloc[start_index:end_index]
+
+    if paginated.empty:
+        st.warning("No reviews match the selected criteria.")
+    else:
+        for _, row in paginated.iterrows():
+            review_text = clean_text(row.get("Verbatim", ""))
+            display_review_html = highlight_html(review_text, keyword)
+            try:
+                star_int = int(float(row.get("Star Rating", 0))) if pd.notna(row.get("Star Rating")) else 0
+            except Exception:
+                star_int = 0
+            try:
+                date_str = pd.to_datetime(row.get("Review Date")).strftime("%Y-%m-%d") if pd.notna(row.get("Review Date")) else "-"
+            except Exception:
+                date_str = "-"
+
+            def chips(row_i: pd.Series, columns: List[str], css_class: str) -> str:
+                items = []
+                for c in columns:
+                    if c not in row_i.index:
+                        continue
+                    val = row_i.get(c, pd.NA)
+                    if pd.isna(val):
+                        continue
+                    s = str(val).strip()
+                    if not s or s.upper() in {"<NA>", "NA", "N/A", "-"}:
+                        continue
+                    items.append(f'<span class="pill" style="border-color:transparent;">{_html.escape(s)}</span>')
+                return " ".join(items) if items else "<span class='small-muted'>None</span>"
+
+            st.markdown(
+                f"""
+                <div class='soft-panel'>
+                  <div><b>Source:</b> {esc(row.get('Source'))} &nbsp;|&nbsp; <b>Model:</b> {esc(row.get('Model (SKU)'))} &nbsp;|&nbsp; <b>Country:</b> {esc(row.get('Country'))}</div>
+                  <div style='margin-top:6px;'><b>Date:</b> {esc(date_str)} &nbsp;|&nbsp; <b>Rating:</b> {'⭐' * star_int} ({esc(row.get('Star Rating'))}/5) &nbsp;|&nbsp; <b>Signal:</b> {esc(row.get('Signal Type'))}</div>
+                  <div style='margin-top:10px;'><b>Review:</b> {display_review_html}</div>
+                  <div style='margin-top:10px;'><b>Delighters:</b> {chips(row, all_delighter_columns, 'pos')}</div>
+                  <div style='margin-top:8px;'><b>Detractors:</b> {chips(row, all_detractor_columns, 'neg')}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    p1, p2, p3, p4, p5 = st.columns([1, 1, 2, 1, 1])
+    with p1:
+        if st.button("⏮ First", disabled=current_page == 0):
+            st.session_state["review_page"] = 0
+            st.rerun()
+    with p2:
+        if st.button("⬅ Prev", disabled=current_page == 0):
+            st.session_state["review_page"] = max(current_page - 1, 0)
+            st.rerun()
+    with p3:
+        showing_from = 0 if total_reviews_count == 0 else start_index + 1
+        showing_to = min(end_index, total_reviews_count)
+        st.markdown(f"<div style='text-align:center;font-weight:700;'>Page {current_page + 1} of {total_pages} • Showing {showing_from}–{showing_to} of {total_reviews_count}</div>", unsafe_allow_html=True)
+    with p4:
+        if st.button("Next ➡", disabled=current_page >= total_pages - 1):
+            st.session_state["review_page"] = min(current_page + 1, total_pages - 1)
+            st.rerun()
+    with p5:
+        if st.button("Last ⏭", disabled=current_page >= total_pages - 1):
+            st.session_state["review_page"] = total_pages - 1
+            st.rerun()
+
+
+# -----------------------------------------------------------------------------
+# AI view
+# -----------------------------------------------------------------------------
+if view.startswith("🤖"):
+    st.markdown("## 🤖 AI Analyst")
+    st.caption("Ask by text or voice. Answers are grounded in the currently filtered slice, including issue radar, top symptoms, and retrieved evidence.")
+
+    with st.sidebar.expander("🤖 AI Settings", expanded=False):
+        st.session_state.setdefault("ai_model", "gpt-4o-mini")
+        st.session_state.setdefault("ai_temp", 0.2)
+        st.session_state.setdefault("ai_quote_k", 8)
+        st.session_state.setdefault("ai_cap", 1800)
+        st.selectbox("Model", options=["gpt-4o-mini", "gpt-4o", "gpt-4.1"], key="ai_model")
+        st.slider("Creativity", 0.0, 1.0, float(st.session_state.get("ai_temp", 0.2)), 0.1, key="ai_temp")
+        st.slider("Retrieved quotes", 4, 18, int(st.session_state.get("ai_quote_k", 8)), 1, key="ai_quote_k")
+        st.number_input("Max reviews in retrieval corpus", 200, 8000, int(st.session_state.get("ai_cap", 1800)), 100, key="ai_cap")
+
+    with st.sidebar.expander("🔑 OpenAI API Key", expanded=False):
+        st.text_input("OPENAI_API_KEY override", value="", type="password", key="api_key_override")
+        st.caption("Uses override → secrets → env. Key is never displayed.")
+
+    api_key_override = (st.session_state.get("api_key_override") or "").strip()
+    api_key = api_key_override
+    if not api_key:
+        try:
+            api_key = st.secrets["OPENAI_API_KEY"]
+        except Exception:
+            api_key = os.getenv("OPENAI_API_KEY")
+    remote_ready = bool(api_key)
+    model = str(st.session_state.get("ai_model") or "gpt-4o-mini")
+    temp = float(st.session_state.get("ai_temp") or 0.2)
+    quote_k = int(st.session_state.get("ai_quote_k", 8))
+
+    st.markdown(
+        f"<div class='soft-panel'><b>{'🟢 Remote AI ready' if remote_ready else '🟡 Remote AI disabled — local grounded insights still available'}</b><div class='small-muted' style='margin-top:6px;'>Model: {esc(model)}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    st.session_state.setdefault("_ai_last_q", "")
+    st.session_state.setdefault("_ai_last_answer", "")
+    st.session_state.setdefault("ai_user_q", "")
+
+    q1, q2, q3, q4 = st.columns(4)
+    if q1.button("🧾 Executive summary", use_container_width=True):
+        st.session_state["ai_user_q"] = "Give me an executive summary of what consumers love, what is breaking, and what engineering should do next in this filtered slice."
+    if q2.button("🚨 What changed recently?", use_container_width=True):
+        st.session_state["ai_user_q"] = "What changed recently? Use the issue radar and recent review language to explain emerging issues in this filtered slice."
+    if q3.button("⚖️ Where are cohort differences?", use_container_width=True):
+        st.session_state["ai_user_q"] = "What are the biggest cohort differences I should investigate in this filtered slice?"
+    if q4.button("✉️ Draft an escalation", use_container_width=True):
+        st.session_state["ai_user_q"] = "Draft a retailer escalation note and an engineering brief based on the most important issue in this filtered slice."
+
+    voice_audio = st.audio_input("Optional voice question")
+    if voice_audio is not None:
+        cva, cvb = st.columns([0.22, 0.78])
+        with cva:
+            transcribe_clicked = st.button("🎙️ Transcribe")
+        with cvb:
+            st.caption("Use your mic to speak a question and transcribe it into the prompt box.")
+        if transcribe_clicked:
+            if not remote_ready:
+                st.warning("Add an OpenAI API key to transcribe voice questions.")
+            else:
+                with st.spinner("Transcribing voice question…"):
+                    try:
+                        transcript = transcribe_audio_http(api_key, voice_audio)
+                        if transcript:
+                            st.session_state["ai_user_q"] = transcript
+                            st.success("Voice question transcribed into the prompt box.")
+                        else:
+                            st.warning("The transcript came back empty.")
+                    except Exception as e:
+                        st.warning(f"Transcription failed: {e}")
+
+    user_q = st.text_area(
+        "Your question",
+        value=st.session_state.get("ai_user_q", ""),
+        height=140,
+        key="ai_user_q",
+        placeholder="E.g., Why is suction driving low ratings in Germany? What changed in the last month? Draft an engineering brief.",
+    )
+
+    if st.session_state.get("_ai_last_answer"):
+        st.markdown("### Latest answer")
+        if st.session_state.get("_ai_last_q"):
+            st.markdown(f"**Q:** {esc(st.session_state.get('_ai_last_q'))}")
+        st.markdown(st.session_state.get("_ai_last_answer"))
+
+    send = st.button("➡️ Send", type="primary")
+    if send:
+        q = (user_q or "").strip()
+        if not q:
+            st.warning("Type a question first.")
+        else:
+            knowledge = build_knowledge_pack(filtered, source_label, all_detractor_columns, all_delighter_columns)
+            quotes = retrieve_quotes(q, filtered, k=quote_k)
+            sys_prompt = (
+                "You are a SharkNinja consumer-insights copilot. Ground every answer in the dataset context and retrieved evidence. "
+                "Quantify with counts, Avg ★, low-star rates, and mention rates where possible. "
+                "When evidence supports a claim, cite quote IDs like [Q3]. Never invent data."
+            )
+            user_payload = {
+                "question": q,
+                "dataset_context": knowledge,
+                "retrieved_evidence": [
+                    {"id": it["id"], "star": it.get("star"), "country": it.get("country"), "source": it.get("source"), "signal_type": it.get("signal_type"), "date": it.get("date"), "text": it.get("text")}
+                    for it in quotes[:quote_k]
+                ],
+            }
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ]
+            with st.spinner("Thinking…"):
+                if remote_ready:
+                    try:
+                        ans = openai_chat_http(api_key, model, messages, temperature=temp)
+                    except Exception as e:
+                        st.warning("Remote AI failed; falling back to local grounded summary.")
+                        st.caption(f"Last AI error: {str(e)[:220]}")
+                        ans = local_ai_answer(q, knowledge, quotes)
+                else:
+                    ans = local_ai_answer(q, knowledge, quotes)
+            st.session_state["_ai_last_q"] = q
+            st.session_state["_ai_last_answer"] = ans
+            st.rerun()
+
 
 
