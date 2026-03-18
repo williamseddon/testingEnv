@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Ax Event Exporter", page_icon="📥", layout="wide")
+st.set_page_config(page_title="Axion Ray Event Exporter", page_icon="📥", layout="wide")
 
 DEFAULT_OFFSET_PARAM = "offset"
 DEFAULT_LIMIT_PARAM = "limit"
@@ -44,27 +44,24 @@ POSSIBLE_TOTAL_KEYS = ["count", "total", "totalCount", "total_count", "numFound"
 
 
 def parse_fetch_snippet(fetch_text: str):
-    """
-    Parses the browser fetch(...) snippet format the user pasted.
-    Expects:
-      fetch("URL", { ... })
-    """
     text = fetch_text.strip()
 
-    prefix = 'fetch("'
-    alt_prefix = "fetch('"
-    if text.startswith(prefix):
+    prefix_double = 'fetch("'
+    prefix_single = "fetch('"
+
+    if text.startswith(prefix_double):
         quote = '"'
-        start = len(prefix)
-    elif text.startswith(alt_prefix):
+        start = len(prefix_double)
+    elif text.startswith(prefix_single):
         quote = "'"
-        start = len(alt_prefix)
+        start = len(prefix_single)
     else:
         raise ValueError("Expected text starting with fetch(\"...\") or fetch('...').")
 
     end_url = text.find(f"{quote},", start)
     if end_url == -1:
         raise ValueError("Could not parse fetch URL.")
+
     url = text[start:end_url]
 
     obj_start = text.find("{", end_url)
@@ -74,7 +71,6 @@ def parse_fetch_snippet(fetch_text: str):
 
     obj_text = text[obj_start:obj_end + 1]
 
-    # This pasted object is already JSON-like, so json.loads usually works.
     try:
         opts = json.loads(obj_text)
     except json.JSONDecodeError as e:
@@ -133,7 +129,12 @@ def parse_curl(curl_text: str):
     if not url:
         raise ValueError("Could not find a URL in the cURL command.")
 
-    return {"method": method, "url": url, "headers": headers, "body": body}
+    return {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "body": body,
+    }
 
 
 def parse_request_text(text: str):
@@ -165,7 +166,7 @@ def redact_headers(headers: dict):
 
 
 def try_json_loads(text):
-    if not text:
+    if text is None or text == "":
         return None
     try:
         return json.loads(text)
@@ -176,6 +177,7 @@ def try_json_loads(text):
 def extract_nested(obj, path: str):
     if not path:
         return obj
+
     current = obj
     for part in path.split("."):
         if isinstance(current, dict) and part in current:
@@ -200,6 +202,7 @@ def auto_detect_list_path(payload):
             for nested_key in POSSIBLE_LIST_KEYS:
                 if nested_key in value and isinstance(value[nested_key], list):
                     return f"{key}.{nested_key}"
+
     return None
 
 
@@ -216,6 +219,7 @@ def auto_detect_total_path(payload):
             for nested_key in POSSIBLE_TOTAL_KEYS:
                 if nested_key in value and isinstance(value[nested_key], int):
                     return f"{key}.{nested_key}"
+
     return None
 
 
@@ -231,15 +235,29 @@ def update_url_query(url: str, updates: dict):
 def dedupe_records(records):
     seen = set()
     output = []
+
     for item in records:
         try:
             fingerprint = json.dumps(item, sort_keys=True, ensure_ascii=False)
         except Exception:
             fingerprint = str(item)
+
         if fingerprint not in seen:
             seen.add(fingerprint)
             output.append(item)
+
     return output
+
+
+def build_effective_headers(raw_headers: dict):
+    headers = clean_headers(raw_headers)
+
+    # Normalize common required Axion Ray headers if casing varies
+    normalized = {}
+    for k, v in headers.items():
+        normalized[k] = v
+
+    return normalized
 
 
 def fetch_page(
@@ -264,19 +282,40 @@ def fetch_page(
                 limit_param: limit_value,
             },
         )
+
         if method == "GET":
             response = session.get(request_url, headers=headers, timeout=60)
         else:
             if body_json is not None:
-                response = session.request(method, request_url, headers=headers, json=body_json, timeout=60)
+                response = session.request(
+                    method,
+                    request_url,
+                    headers=headers,
+                    json=body_json,
+                    timeout=60,
+                )
             else:
-                response = session.request(method, request_url, headers=headers, data=body_text, timeout=60)
+                response = session.request(
+                    method,
+                    request_url,
+                    headers=headers,
+                    data=body_text,
+                    timeout=60,
+                )
     else:
         if body_json is None:
             raise ValueError("Body pagination selected, but the request body is not valid JSON.")
+
         body_json[offset_param] = offset_value
         body_json[limit_param] = limit_value
-        response = session.request(method, url, headers=headers, json=body_json, timeout=60)
+
+        response = session.request(
+            method,
+            url,
+            headers=headers,
+            json=body_json,
+            timeout=60,
+        )
 
     response.raise_for_status()
     return response.json()
@@ -288,26 +327,24 @@ def flatten_for_csv(records):
     return pd.json_normalize(records, sep=".")
 
 
-st.title("Ax Event Exporter")
+st.title("Axion Ray Event Exporter")
 st.caption("Paste a fetch(...) snippet or cURL from DevTools, fetch all pages, and download JSON/CSV.")
 
 with st.expander("Security note", expanded=True):
-    st.write(
-        "Paste a fresh request each time. Do not store bearer tokens in source code or shared files."
-    )
+    st.write("Use a fresh pasted request at runtime. Do not store bearer tokens in source code or shared files.")
 
-st.subheader("Recommended defaults for your Ax request")
-a, b, c = st.columns(3)
-a.metric("Method", "POST")
-b.metric("Pagination", "query: offset + limit")
-c.metric("Default rows path", DEFAULT_ROWS_PATH)
+st.subheader("Recommended defaults for your Axion Ray request")
+c1, c2, c3 = st.columns(3)
+c1.metric("Method", "POST")
+c2.metric("Pagination", "query: offset + limit")
+c3.metric("Rows path", DEFAULT_ROWS_PATH)
 
 left, right = st.columns([1.35, 1])
 
 with left:
     request_text = st.text_area(
         "Paste fetch(...) or cURL",
-        height=300,
+        height=320,
         placeholder='fetch("https://sharkninja.axionray.com/api/events/query-paginated?...',
     )
 
@@ -320,15 +357,16 @@ with left:
 
     parsed = st.session_state.get("parsed_request")
     if parsed:
-        st.subheader("Parsed request preview")
-        cleaned = clean_headers(parsed["headers"])
+        effective_headers = build_effective_headers(parsed["headers"])
         body_preview = try_json_loads(parsed["body"])
+
+        st.subheader("Parsed request preview")
         st.code(
             json.dumps(
                 {
                     "method": parsed["method"],
                     "url": parsed["url"],
-                    "headers": redact_headers(cleaned),
+                    "headers": redact_headers(effective_headers),
                     "body": body_preview if body_preview is not None else parsed["body"],
                 },
                 indent=2,
@@ -361,11 +399,16 @@ with p1:
         else:
             try:
                 session = requests.Session()
+                headers = build_effective_headers(parsed["headers"])
+
+                st.write("Headers being sent:")
+                st.json(redact_headers(headers))
+
                 payload = fetch_page(
                     session=session,
                     method=parsed["method"],
                     url=parsed["url"],
-                    headers=clean_headers(parsed["headers"]),
+                    headers=headers,
                     body_text=parsed["body"],
                     offset_param=offset_param,
                     limit_param=limit_param,
@@ -373,9 +416,11 @@ with p1:
                     limit_value=int(page_size),
                     pagination_location=pagination_location,
                 )
+
                 st.write("Auto rows path:", auto_detect_list_path(payload) or "Not found")
                 st.write("Auto total path:", auto_detect_total_path(payload) or "Not found")
                 st.json(payload)
+
             except Exception as e:
                 st.error(str(e))
 
@@ -387,7 +432,11 @@ with p2:
         else:
             try:
                 session = requests.Session()
-                headers = clean_headers(parsed["headers"])
+                headers = build_effective_headers(parsed["headers"])
+
+                st.write("Headers being sent:")
+                st.json(redact_headers(headers))
+
                 combined_rows = []
                 current_offset = int(start_offset)
                 expected_total = None
@@ -465,6 +514,7 @@ with p2:
                 }
 
                 json_bytes = json.dumps(export_bundle, indent=2, ensure_ascii=False).encode("utf-8")
+
                 st.success(f"Export complete. Combined {len(combined_rows)} rows.")
 
                 st.download_button(
@@ -495,17 +545,12 @@ with p2:
 st.divider()
 st.markdown(
     """
-###  Ax-specific notes
-- Your request is `POST`.
-- Pagination appears to live in the URL query string using `offset` and `limit`.
-- The filter logic stays in the JSON request body.
-- Because your URL includes `includeCount=false`, the response may not include a total count.
-- In that case, the exporter stops when a page returns fewer than the requested limit.
-
-### Good next upgrades
-- Save named profiles for dashboards or event types.
-- Add a column picker before CSV export.
-- Add a "test auth" button.
-- Add retry logic for 401 or 429 responses.
+### Axion Ray-specific notes
+- Request method is `POST`.
+- Pagination is in the URL query string using `offset` and `limit`.
+- Filter logic stays in the JSON request body.
+- `x-tenant-id` and `x-workspace-id` must be preserved.
+- If `includeCount=false`, the response may not include a total count.
+- In that case, exporting stops when a page returns fewer than the requested limit.
 """
 )
