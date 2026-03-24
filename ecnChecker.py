@@ -3,10 +3,19 @@ import re
 import urllib.parse
 import requests
 from io import BytesIO
+from openai import OpenAI
+import zipfile
 
 st.set_page_config(page_title="ECN Risk Assessment Tool", layout="wide")
 
-st.title("📊 ECN Risk Assessment Tool")
+st.title("📊 ECN Risk Assessment Tool (AI Enhanced)")
+
+# -----------------------------
+# OpenAI Setup
+# -----------------------------
+
+api_key = st.text_input("Enter OpenAI API Key", type="password")
+client = OpenAI(api_key=api_key) if api_key else None
 
 # -----------------------------
 # Helpers
@@ -41,32 +50,41 @@ def download_file(url):
     try:
         r = requests.get(url)
         if r.status_code == 200:
-            return BytesIO(r.content)
+            return r.content
         else:
             return None
     except:
         return None
 
 
-def risk_checks(text):
-    risks = []
+def ai_risk_analysis(text, attachments, client):
+    if not client:
+        return "No API key provided"
 
-    if "Need DQTP" in text or "Proposed DQTP" in text:
-        risks.append("⚠️ DQTP not confirmed complete")
+    prompt = f"""
+    You are a senior Quality Engineer reviewing an Engineering Change Notice (ECN).
 
-    if "no design" in text.lower() and "supplier" in text.lower():
-        risks.append("⚠️ Supplier change with 'no design impact' → high hidden risk")
+    Analyze the ECN and identify:
+    1. Key risks
+    2. Missing due diligence
+    3. Contradictions in the ECN
+    4. Supplier / cost / compliance risks
+    5. Final recommendation (GO / CONDITIONAL GO / NO GO)
 
-    if "Need EE" in text or "Electrical Changes Required" in text:
-        risks.append("⚠️ Electrical impact not fully validated")
+    ECN TEXT:
+    {text}
 
-    if "No impact confirmed" in text:
-        risks.append("⚠️ Compliance marked 'no impact' → verify with evidence")
+    ATTACHMENTS:
+    {attachments}
+    """
 
-    if "Cost Reduction" in text or "VAVE" in text:
-        risks.append("⚠️ Cost reduction ECN → risk of performance degradation")
+    response = client.chat.completions.create(
+        model="gpt-5",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
 
-    return risks
+    return response.choices[0].message.content
 
 # -----------------------------
 # UI
@@ -89,48 +107,44 @@ if st.button("Run ECN Risk Assessment"):
         urls = []
         for f in attachments:
             url = convert_to_url(f, sp_id)
-            urls.append(url)
+            urls.append((f, url))
             st.write(url)
 
         st.subheader("⬇️ Download Status")
         downloaded_files = {}
-        for url in urls:
+        for filename, url in urls:
             file_data = download_file(url)
             if file_data:
-                st.success(f"Downloaded: {url.split('/')[-1]}")
-                downloaded_files[url] = file_data
+                st.success(f"Downloaded: {filename}")
+                downloaded_files[filename] = file_data
             else:
-                st.error(f"Failed: {url}")
+                st.error(f"Failed: {filename}")
 
-        st.subheader("🧠 Risk Assessment")
-        risks = risk_checks(user_input)
+        # -----------------------------
+        # ZIP DOWNLOAD BUTTON
+        # -----------------------------
+        if downloaded_files:
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+                for filename, data in downloaded_files.items():
+                    zip_file.writestr(filename, data)
 
-        if risks:
-            for r in risks:
-                st.warning(r)
-        else:
-            st.success("No major risks detected")
+            zip_buffer.seek(0)
 
-        st.subheader("📋 DD Completeness Check")
+            st.download_button(
+                label="📦 Download All Attachments",
+                data=zip_buffer,
+                file_name=f"ECN_{sp_id}_attachments.zip",
+                mime="application/zip"
+            )
 
-        checklist_items = [
-            "Explanation of Change",
-            "Redlined EBOM",
-            "Proposed DQTP",
-            "Compliance Plan",
-            "Electrical Changes Required",
-        ]
-
-        for item in checklist_items:
-            if item in user_input:
-                st.success(f"✔ {item} present")
-            else:
-                st.error(f"✖ Missing: {item}")
+        st.subheader("🤖 AI Risk Assessment")
+        ai_output = ai_risk_analysis(user_input, [u[0] for u in urls], client)
+        st.write(ai_output)
 
         st.subheader("📊 Summary")
-
         st.write({
             "SharePoint ID": sp_id,
-            "# Attachments": len(attachments),
-            "# Risks": len(risks)
+            "# Attachments": len(attachments)
         })
+
