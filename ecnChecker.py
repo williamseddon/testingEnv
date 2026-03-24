@@ -5,6 +5,7 @@ import requests
 from io import BytesIO
 from openai import OpenAI
 import zipfile
+import os
 
 st.set_page_config(page_title="ECN Risk Assessment Tool", layout="wide")
 
@@ -14,7 +15,32 @@ st.title("📊 ECN Risk Assessment Tool (AI Enhanced)")
 # OpenAI Setup
 # -----------------------------
 
-api_key = st.text_input("Enter OpenAI API Key", type="password")
+def get_api_key():
+    secrets_key = None
+    env_key = os.getenv("OPENAI_API_KEY")
+
+    try:
+        secrets_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        secrets_key = None
+
+    if secrets_key:
+        return secrets_key, "streamlit_secrets"
+    if env_key:
+        return env_key, "environment"
+    return None, "missing"
+
+stored_api_key, api_source = get_api_key()
+
+if api_source == "streamlit_secrets":
+    st.success("OpenAI API key loaded from Streamlit secrets.")
+elif api_source == "environment":
+    st.info("OpenAI API key loaded from environment variable.")
+else:
+    st.warning("No OpenAI API key found in Streamlit secrets or environment. Please paste your API key below.")
+
+manual_api_key = st.text_input("Enter OpenAI API Key", type="password") if not stored_api_key else ""
+api_key = stored_api_key or manual_api_key
 client = OpenAI(api_key=api_key) if api_key else None
 
 # -----------------------------
@@ -27,15 +53,20 @@ def extract_sharepoint_id(text):
 
 
 def extract_attachments(text):
-    if "Attachments" not in text:
+    match = re.search(
+        r"\\bAttachments\\b\\s*(.*?)\\s*(?:\\bPriority\\b|\\bDisposition of Stock\\b|\\bChecklist \(Initiator, Lead Engineer, Engineer Delegate\)\\b)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
         return []
-    section = text.split("Attachments", 1)[1]
-    lines = section.split("\n")
+
+    block = match.group(1)
     files = []
-    for line in lines:
+    for line in block.splitlines():
         line = line.strip()
-        if line == "" or line.startswith("Priority"):
-            break
+        if not line:
+            continue
         files.append(line)
     return files
 
@@ -138,13 +169,15 @@ if st.button("Run ECN Risk Assessment"):
                 mime="application/zip"
             )
 
-        st.subheader("🤖 AI Risk Assessment")
-        ai_output = ai_risk_analysis(user_input, [u[0] for u in urls], client)
-        st.write(ai_output)
+                st.subheader("🤖 AI Risk Assessment")
+        if client:
+            ai_output = ai_risk_analysis(user_input, [u[0] for u in urls], client)
+            st.write(ai_output)
+        else:
+            st.error("No OpenAI API key available. Add OPENAI_API_KEY to Streamlit secrets, set an environment variable, or paste your API key above.")
 
         st.subheader("📊 Summary")
         st.write({
             "SharePoint ID": sp_id,
             "# Attachments": len(attachments)
         })
-
