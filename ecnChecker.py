@@ -18,6 +18,7 @@ st.title("ECN Risk Assessment Tool")
 # Constants
 # =========================================================
 HIVE_BASE = "https://hive.sharkninja.com/quality/root/Lists/ECN%20Live/Attachments"
+FILE_EXT_PATTERN = r"\.(pdf|xlsx|xls|doc|docx|ppt|pptx|msg|zip|csv|txt)$"
 
 # =========================================================
 # Helpers: API key
@@ -44,7 +45,7 @@ def get_openai_api_key():
 def normalize_text(text: str) -> str:
     if not text:
         return ""
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00A0", " ")
 
 
 def extract_sharepoint_id(text: str):
@@ -53,24 +54,7 @@ def extract_sharepoint_id(text: str):
     return match.group(1) if match else None
 
 
-def extract_field(text: str, field_name: str):
-    """
-    Best-effort extractor for simple ECN fields.
-    """
-    text = normalize_text(text)
-    pattern = rf"{re.escape(field_name)}\s*\n(.+?)(?=\n[A-Z][^\n]*\n|\Z)"
-    match = re.search(pattern, text, flags=re.DOTALL)
-    if not match:
-        return None
-    value = match.group(1).strip()
-    return value if value else None
-
-
 def extract_attachments(text: str):
-    """
-    Extract lines between 'Attachments' and the next known section.
-    Handles blank lines robustly.
-    """
     text = normalize_text(text)
 
     match = re.search(
@@ -89,16 +73,9 @@ def extract_attachments(text: str):
         clean = line.strip()
         if not clean:
             continue
-
-        # Keep likely file lines only
-        if re.search(
-            r"\.(pdf|xlsx|xls|doc|docx|ppt|pptx|msg|zip|csv|txt)$",
-            clean,
-            flags=re.IGNORECASE,
-        ):
+        if re.search(FILE_EXT_PATTERN, clean, flags=re.IGNORECASE):
             files.append(clean)
 
-    # Remove duplicates while preserving order
     seen = set()
     deduped = []
     for f in files:
@@ -109,44 +86,92 @@ def extract_attachments(text: str):
     return deduped
 
 
-def convert_to_hive_url(filename: str, sharepoint_id: str):
-    """
-    Hive appears to use non-breaking spaces in attachment URLs.
-    """
-    filename_nbsp = filename.replace(" ", "\u00A0")
-    encoded_filename = urllib.parse.quote(filename_nbsp, safe="()-.")
+# =========================================================
+# Helpers: URL generation
+# =========================================================
+def convert_to_hive_url(filename: str, sharepoint_id: str, use_nbsp: bool = False):
+    name = filename.replace(" ", "\u00A0") if use_nbsp else filename
+    encoded_filename = urllib.parse.quote(name, safe="()-._")
     return f"{HIVE_BASE}/{sharepoint_id}/{encoded_filename}"
+
+
+def get_candidate_urls(filename: str, sharepoint_id: str):
+    return [
+        convert_to_hive_url(filename, sharepoint_id, use_nbsp=False),
+        convert_to_hive_url(filename, sharepoint_id, use_nbsp=True),
+    ]
+
+
+# =========================================================
+# Helpers: auth/session
+# =========================================================
+def make_session(auth_cookie: str = ""):
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+    )
+    if auth_cookie.strip():
+        session.headers.update({"Cookie": auth_cookie.strip()})
+    return session
+
+
+def detect_signin_or_html(response: requests.Response):
+    content_type = response.headers.get("content-type", "").lower()
+    text_snippet = response.text[:5000].lower() if "text" in content_type or "html" in content_type else ""
+
+    if "text/html" in content_type:
+        return True, "Received HTML instead of a file. Sign-in may be required."
+
+    signin_markers = [
+        "sign in",
+        "signin",
+        "microsoft",
+        "office 365",
+        "sharepoint",
+        "login",
+        "authentication",
+    ]
+    if any(marker in text_snippet for marker in signin_markers):
+        return True, "Authentication page detected instead of attachment content."
+
+    return False, ""
 
 
 # =========================================================
 # Helpers: download
 # =========================================================
-def download_file(url: str, timeout: int = 30):
-    """
-    Attempts to download a file.
-    Returns (success, content_bytes, error_message)
-    """
+def try_download(session: requests.Session, url: str, timeout: int = 30):
     try:
-        response = requests.get(url, timeout=timeout)
-        content_type = response.headers.get("content-type", "").lower()
-
-        if response.status_code != 200:
-            return False, None, f"HTTP {response.status_code}"
-
-        # Catch likely login / HTML pages
-        if "text/html" in content_type:
-            return False, None, "Received HTML instead of file (likely auth required)"
-
-        return True, response.content, None
-
+        response = session.get(url, timeout=timeout, allow_redirects=True)
     except requests.RequestException as exc:
-        return False, None, str(exc)
+        return False, None, f"Request failed: {exc}"
+
+    if response.status_code != 200:
+        return False, None, f"HTTP {response.status_code}"
+
+    signin_detected, signin_reason = detect_signin_or_html(response)
+    if signin_detected:
+        return False, None, signin_reason
+
+    return True, response.content, None
+
+
+def download_file_from_candidates(session: requests.Session, filename: str, sharepoint_id: str, timeout: int = 30):
+    candidates = get_candidate_urls(filename, sharepoint_id)
+    errors = []
+
+    for url in candidates:
+        success, data, error = try_download(session, url, timeout=timeout)
+        if success:
+            return True, data, None, url
+        errors.append(f"{url} -> {error}")
+
+    return False, None, " | ".join(errors), candidates[0]
 
 
 def build_zip(file_dict: dict):
-    """
-    file_dict = {filename: bytes}
-    """
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for filename, data in file_dict.items():
@@ -159,9 +184,7 @@ def build_zip(file_dict: dict):
 # Helpers: rule-based checks
 # =========================================================
 def rule_based_risk_checks(text: str):
-    t = normalize_text(text)
-    tl = t.lower()
-
+    tl = normalize_text(text).lower()
     risks = []
     score = 0
 
@@ -202,7 +225,6 @@ def rule_based_risk_checks(text: str):
 
 def dd_completeness_check(text: str):
     t = normalize_text(text)
-
     required_items = [
         "Explanation of Change",
         "Redlined EBOM",
@@ -210,13 +232,7 @@ def dd_completeness_check(text: str):
         "Compliance Plan",
         "Electrical Changes Required",
     ]
-
-    results = []
-    for item in required_items:
-        present = item.lower() in t.lower()
-        results.append({"item": item, "present": present})
-
-    return results
+    return [{"item": item, "present": item.lower() in t.lower()} for item in required_items]
 
 
 def score_to_rating(score: int):
@@ -237,7 +253,7 @@ def build_ai_prompt(ecn_text: str, attachments: list, download_results: dict):
     return f"""
 You are a senior SharkNinja quality engineer reviewing an Engineering Change Notice (ECN).
 
-Your task:
+Tasks:
 1. Summarize the ECN.
 2. Identify key technical, quality, compliance, supply chain, and implementation risks.
 3. Identify missing due diligence.
@@ -266,22 +282,16 @@ Respond in clear sections with concise bullets.
 
 def ai_risk_analysis(client: OpenAI, ecn_text: str, attachments: list, download_results: dict):
     prompt = build_ai_prompt(ecn_text, attachments, download_results)
-
     response = client.chat.completions.create(
         model="gpt-5",
         temperature=0.2,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        messages=[{"role": "user", "content": prompt}],
     )
     return response.choices[0].message.content
 
 
 # =========================================================
-# Sidebar: API key setup
+# Sidebar
 # =========================================================
 stored_api_key, api_source = get_openai_api_key()
 
@@ -300,9 +310,22 @@ with st.sidebar:
         manual_api_key = st.text_input("Paste OpenAI API key", type="password")
 
     use_ai = st.checkbox("Enable AI analysis", value=True)
+    try_nbsp = st.checkbox("Try NBSP attachment URL fallback", value=True)
+
+    st.markdown("### Hive authentication")
+    st.caption(
+        "Direct attachment downloads may fail if Hive requires Microsoft / SharePoint sign-in. "
+        "If that happens, either paste an authenticated Cookie header below or upload files manually in the main app."
+    )
+    auth_cookie = st.text_area(
+        "Optional Cookie header for authenticated Hive requests",
+        height=140,
+        placeholder="FedAuth=...; rtFa=...; other_cookie=...",
+    )
 
 api_key = stored_api_key or manual_api_key
 client = OpenAI(api_key=api_key) if (api_key and use_ai) else None
+session = make_session(auth_cookie=auth_cookie)
 
 # =========================================================
 # Main input
@@ -325,10 +348,6 @@ if run_clicked:
         st.stop()
 
     text = normalize_text(ecn_text)
-
-    # -------------------------
-    # Parse basics
-    # -------------------------
     sharepoint_id = extract_sharepoint_id(text)
     attachments = extract_attachments(text)
 
@@ -340,11 +359,7 @@ if run_clicked:
     with col3:
         st.metric("Manual uploads", len(uploaded_fallback_files) if uploaded_fallback_files else 0)
 
-    # -------------------------
-    # Attachment preview + URLs
-    # -------------------------
     st.subheader("Parsed Attachments")
-
     if attachments:
         for idx, name in enumerate(attachments, start=1):
             st.write(f"{idx}. {name}")
@@ -352,72 +367,69 @@ if run_clicked:
         st.warning("No attachments were parsed from the pasted ECN text.")
 
     st.subheader("Hive Attachment Links")
-    attachment_urls = []
-
     if sharepoint_id and attachments:
         for name in attachments:
-            url = convert_to_hive_url(name, sharepoint_id)
-            attachment_urls.append((name, url))
-            st.code(url)
+            st.code(convert_to_hive_url(name, sharepoint_id, use_nbsp=False))
+            if try_nbsp:
+                st.caption(f"Fallback: {convert_to_hive_url(name, sharepoint_id, use_nbsp=True)}")
     else:
         if not sharepoint_id:
             st.warning("SharePoint ID not found, so Hive links could not be built.")
         if not attachments:
             st.warning("No attachment names found, so Hive links could not be built.")
 
-    # -------------------------
-    # Download attachments from Hive
-    # -------------------------
     st.subheader("Attachment Download Status")
-
     download_results = {}
     downloaded_files = {}
 
-    if attachment_urls:
-        for filename, url in attachment_urls:
-            success, data, error = download_file(url)
+    if attachments and sharepoint_id:
+        for filename in attachments:
+            if try_nbsp:
+                success, data, error, working_url = download_file_from_candidates(session, filename, sharepoint_id)
+            else:
+                url = convert_to_hive_url(filename, sharepoint_id, use_nbsp=False)
+                success, data, error = try_download(session, url)
+                working_url = url
+
             download_results[filename] = {
                 "success": success,
-                "url": url,
+                "url": working_url,
                 "error": error,
             }
 
             if success:
                 downloaded_files[filename] = data
                 st.success(f"Downloaded: {filename}")
+                st.caption(working_url)
             else:
-                st.error(f"Failed: {filename} — {error}")
+                st.error(f"Failed: {filename}")
+                st.caption(error)
 
-    # -------------------------
-    # Manual upload fallback
-    # -------------------------
+        auth_needed = any(
+            (not meta["success"]) and meta["error"] and ("sign-in" in meta["error"].lower() or "authentication" in meta["error"].lower() or "html" in meta["error"].lower())
+            for meta in download_results.values()
+        )
+        if auth_needed:
+            st.warning(
+                "Hive appears to require authentication for one or more files. "
+                "Paste your authenticated Cookie header in the sidebar or upload the files manually below."
+            )
+
     fallback_files = {}
     if uploaded_fallback_files:
-        uploaded_names = {f.name: f for f in uploaded_fallback_files}
-
-        for expected_name in attachments:
-            if expected_name in uploaded_names:
-                fallback_files[expected_name] = uploaded_names[expected_name].read()
-
-        # Include any extra uploaded files too
         for uploaded in uploaded_fallback_files:
-            if uploaded.name not in fallback_files:
-                fallback_files[uploaded.name] = uploaded.read()
+            fallback_files[uploaded.name] = uploaded.read()
 
     if fallback_files:
         st.subheader("Manual Upload Fallback")
         for name in fallback_files:
             st.info(f"Available via upload: {name}")
 
-    # Combine downloaded + uploaded fallback for ZIP
     all_available_files = dict(downloaded_files)
     for name, data in fallback_files.items():
         if name not in all_available_files:
             all_available_files[name] = data
 
-    # -------------------------
-    # Download-all ZIP
-    # -------------------------
     if all_available_files:
         zip_buffer = build_zip(all_available_files)
         st.download_button(
@@ -429,16 +441,15 @@ if run_clicked:
     else:
         st.warning("No files are currently available to package into a ZIP.")
 
-    # -------------------------
-    # Rule-based risk review
-    # -------------------------
     st.subheader("Rule-Based Risk Review")
-
     risks, risk_score = rule_based_risk_checks(text)
     risk_rating = score_to_rating(risk_score)
 
-    st.metric("Rule-based risk rating", risk_rating)
-    st.metric("Rule-based risk score", risk_score)
+    risk_col1, risk_col2 = st.columns(2)
+    with risk_col1:
+        st.metric("Rule-based risk rating", risk_rating)
+    with risk_col2:
+        st.metric("Rule-based risk score", risk_score)
 
     if risks:
         for risk in risks:
@@ -446,11 +457,7 @@ if run_clicked:
     else:
         st.success("No obvious rule-based risks were detected.")
 
-    # -------------------------
-    # DD completeness
-    # -------------------------
     st.subheader("Due Diligence Completeness Check")
-
     dd_results = dd_completeness_check(text)
     for row in dd_results:
         if row["present"]:
@@ -458,11 +465,7 @@ if run_clicked:
         else:
             st.error(f"Missing: {row['item']}")
 
-    # -------------------------
-    # AI analysis
-    # -------------------------
     st.subheader("AI Risk Assessment")
-
     if use_ai:
         if client:
             with st.spinner("Running AI analysis..."):
@@ -484,11 +487,7 @@ if run_clicked:
     else:
         st.info("AI analysis is disabled in the sidebar.")
 
-    # -------------------------
-    # Summary
-    # -------------------------
     st.subheader("Summary")
-
     downloaded_count = sum(1 for v in download_results.values() if v["success"])
     failed_count = sum(1 for v in download_results.values() if not v["success"])
 
@@ -501,5 +500,4 @@ if run_clicked:
         "Rule-based risk score": risk_score,
         "Rule-based risk rating": risk_rating,
     }
-
     st.json(summary)
