@@ -54,7 +54,7 @@ def extract_sharepoint_id(text):
 
 def extract_attachments(text):
     match = re.search(
-        r"\\bAttachments\\b\\s*(.*?)\\s*(?:\\bPriority\\b|\\bDisposition of Stock\\b|\\bChecklist \(Initiator, Lead Engineer, Engineer Delegate\)\\b)",
+        r"\bAttachments\b\s*(.*?)\s*(?:\bPriority\b|\bDisposition of Stock\b|\bChecklist \(Initiator, Lead Engineer, Engineer Delegate\)\b)",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -181,3 +181,4 @@ if st.button("Run ECN Risk Assessment"):
             "SharePoint ID": sp_id,
             "# Attachments": len(attachments)
         })
+
