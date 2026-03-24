@@ -3,6 +3,7 @@ import re
 import zipfile
 import urllib.parse
 from io import BytesIO
+from pathlib import Path
 
 import requests
 import streamlit as st
@@ -19,9 +20,11 @@ st.title("ECN Risk Assessment Tool")
 # =========================================================
 HIVE_BASE = "https://hive.sharkninja.com/quality/root/Lists/ECN%20Live/Attachments"
 FILE_EXT_PATTERN = r"\.(pdf|xlsx|xls|doc|docx|ppt|pptx|msg|zip|csv|txt)$"
+PLAYWRIGHT_STATE = "playwright_hive_state.json"
+PLAYWRIGHT_DOWNLOAD_DIR = "hive_downloads"
 
 # =========================================================
-# Helpers: API key
+# Helpers: OpenAI API key
 # =========================================================
 def get_openai_api_key():
     secrets_key = None
@@ -40,7 +43,7 @@ def get_openai_api_key():
 
 
 # =========================================================
-# Helpers: parsing
+# Helpers: text parsing
 # =========================================================
 def normalize_text(text: str) -> str:
     if not text:
@@ -55,6 +58,9 @@ def extract_sharepoint_id(text: str):
 
 
 def extract_attachments(text: str):
+    """
+    Extract lines between Attachments and the next known section.
+    """
     text = normalize_text(text)
 
     match = re.search(
@@ -90,26 +96,34 @@ def extract_attachments(text: str):
 # Helpers: URL generation
 # =========================================================
 def convert_to_hive_url(filename: str, sharepoint_id: str, use_nbsp: bool = False):
+    """
+    Most ECNs use normal spaces => %20.
+    Some legacy cases may need NBSP => %C2%A0.
+    """
     name = filename.replace(" ", "\u00A0") if use_nbsp else filename
     encoded_filename = urllib.parse.quote(name, safe="()-._")
     return f"{HIVE_BASE}/{sharepoint_id}/{encoded_filename}"
 
 
-def get_candidate_urls(filename: str, sharepoint_id: str):
-    return [
-        convert_to_hive_url(filename, sharepoint_id, use_nbsp=False),
-        convert_to_hive_url(filename, sharepoint_id, use_nbsp=True),
-    ]
+def get_candidate_urls(filename: str, sharepoint_id: str, try_nbsp: bool = True):
+    urls = [convert_to_hive_url(filename, sharepoint_id, use_nbsp=False)]
+    if try_nbsp:
+        urls.append(convert_to_hive_url(filename, sharepoint_id, use_nbsp=True))
+    return urls
 
 
 # =========================================================
-# Helpers: auth/session
+# Helpers: requests session and auth detection
 # =========================================================
 def make_session(auth_cookie: str = ""):
     session = requests.Session()
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
         }
     )
     if auth_cookie.strip():
@@ -119,7 +133,11 @@ def make_session(auth_cookie: str = ""):
 
 def detect_signin_or_html(response: requests.Response):
     content_type = response.headers.get("content-type", "").lower()
-    text_snippet = response.text[:5000].lower() if "text" in content_type or "html" in content_type else ""
+
+    try:
+        text_snippet = response.text[:4000].lower() if ("html" in content_type or "text" in content_type) else ""
+    except Exception:
+        text_snippet = ""
 
     if "text/html" in content_type:
         return True, "Received HTML instead of a file. Sign-in may be required."
@@ -139,9 +157,6 @@ def detect_signin_or_html(response: requests.Response):
     return False, ""
 
 
-# =========================================================
-# Helpers: download
-# =========================================================
 def try_download(session: requests.Session, url: str, timeout: int = 30):
     try:
         response = session.get(url, timeout=timeout, allow_redirects=True)
@@ -158,12 +173,12 @@ def try_download(session: requests.Session, url: str, timeout: int = 30):
     return True, response.content, None
 
 
-def download_file_from_candidates(session: requests.Session, filename: str, sharepoint_id: str, timeout: int = 30):
-    candidates = get_candidate_urls(filename, sharepoint_id)
+def download_file_from_candidates(session: requests.Session, filename: str, sharepoint_id: str, try_nbsp: bool = True):
+    candidates = get_candidate_urls(filename, sharepoint_id, try_nbsp=try_nbsp)
     errors = []
 
     for url in candidates:
-        success, data, error = try_download(session, url, timeout=timeout)
+        success, data, error = try_download(session, url)
         if success:
             return True, data, None, url
         errors.append(f"{url} -> {error}")
@@ -181,7 +196,103 @@ def build_zip(file_dict: dict):
 
 
 # =========================================================
-# Helpers: rule-based checks
+# Helpers: Playwright browser-assisted mode
+# =========================================================
+def playwright_available():
+    try:
+        import playwright  # noqa: F401
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def save_uploaded_cookie_as_session_note(auth_cookie: str):
+    if auth_cookie.strip():
+        st.session_state["cookie_available"] = True
+    else:
+        st.session_state["cookie_available"] = False
+
+
+def launch_hive_login():
+    """
+    Opens a real browser so the user can sign into Hive manually.
+    Best for local Streamlit use.
+    """
+    from playwright.sync_api import sync_playwright
+
+    Path(PLAYWRIGHT_DOWNLOAD_DIR).mkdir(exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
+        page.goto("https://hive.sharkninja.com", wait_until="load")
+
+        st.info("A browser window opened. Sign into Hive / Microsoft there.")
+        st.info("When you can access Hive successfully, close the browser window.")
+        page.wait_for_timeout(90000)
+
+        context.storage_state(path=PLAYWRIGHT_STATE)
+        browser.close()
+
+
+def download_with_playwright(url_pairs):
+    """
+    url_pairs: [(filename, url), ...]
+    Returns downloaded bytes using saved authenticated browser session.
+    """
+    from playwright.sync_api import sync_playwright
+
+    if not os.path.exists(PLAYWRIGHT_STATE):
+        return {}, "No saved Playwright login session found. Launch Hive Login first."
+
+    Path(PLAYWRIGHT_DOWNLOAD_DIR).mkdir(exist_ok=True)
+    downloaded = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            storage_state=PLAYWRIGHT_STATE,
+            accept_downloads=True,
+        )
+        page = context.new_page()
+
+        for filename, url in url_pairs:
+            try:
+                with page.expect_download(timeout=20000) as download_info:
+                    page.goto(url, wait_until="load", timeout=30000)
+
+                download = download_info.value
+                save_path = os.path.join(PLAYWRIGHT_DOWNLOAD_DIR, filename)
+                download.save_as(save_path)
+
+                with open(save_path, "rb") as f:
+                    downloaded[filename] = f.read()
+
+            except Exception:
+                # Some SharePoint links render first then download on second hit
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    with page.expect_download(timeout=15000) as download_info:
+                        page.goto(url, wait_until="load", timeout=30000)
+
+                    download = download_info.value
+                    save_path = os.path.join(PLAYWRIGHT_DOWNLOAD_DIR, filename)
+                    download.save_as(save_path)
+
+                    with open(save_path, "rb") as f:
+                        downloaded[filename] = f.read()
+                except Exception:
+                    continue
+
+        browser.close()
+
+    return downloaded, None
+
+
+# =========================================================
+# Helpers: rule-based risk checks
 # =========================================================
 def rule_based_risk_checks(text: str):
     tl = normalize_text(text).lower()
@@ -244,7 +355,7 @@ def score_to_rating(score: int):
 
 
 # =========================================================
-# Helpers: AI
+# Helpers: AI prompt
 # =========================================================
 def build_ai_prompt(ecn_text: str, attachments: list, download_results: dict):
     downloaded = [name for name, meta in download_results.items() if meta["success"]]
@@ -314,18 +425,31 @@ with st.sidebar:
 
     st.markdown("### Hive authentication")
     st.caption(
-        "Direct attachment downloads may fail if Hive requires Microsoft / SharePoint sign-in. "
-        "If that happens, either paste an authenticated Cookie header below or upload files manually in the main app."
+        "Direct downloads may fail if Hive requires Microsoft / SharePoint sign-in. "
+        "You can either paste an authenticated Cookie header below, use local browser-assisted login, "
+        "or upload files manually."
     )
+
     auth_cookie = st.text_area(
-        "Optional Cookie header for authenticated Hive requests",
-        height=140,
+        "Optional Cookie header",
+        height=120,
         placeholder="FedAuth=...; rtFa=...; other_cookie=...",
     )
+
+    use_playwright = st.checkbox("Enable local browser-assisted Hive login", value=False)
+
+    if use_playwright:
+        if playwright_available():
+            st.success("Playwright is available.")
+            st.caption("Best for local Streamlit use, not cloud-hosted apps.")
+        else:
+            st.error("Playwright is not installed.")
+            st.code("pip install playwright\nplaywright install")
 
 api_key = stored_api_key or manual_api_key
 client = OpenAI(api_key=api_key) if (api_key and use_ai) else None
 session = make_session(auth_cookie=auth_cookie)
+save_uploaded_cookie_as_session_note(auth_cookie)
 
 # =========================================================
 # Main input
@@ -337,7 +461,25 @@ uploaded_fallback_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-run_clicked = st.button("Run ECN Review", type="primary")
+button_col1, button_col2 = st.columns([1, 1])
+
+with button_col1:
+    run_clicked = st.button("Run ECN Review", type="primary")
+
+with button_col2:
+    launch_browser_login = st.button("Launch Hive Login Browser")
+
+if launch_browser_login:
+    if not use_playwright:
+        st.warning("Enable 'local browser-assisted Hive login' in the sidebar first.")
+    elif not playwright_available():
+        st.error("Playwright is not installed. Run: pip install playwright && playwright install")
+    else:
+        try:
+            launch_hive_login()
+            st.success("Hive login session saved for browser-assisted downloads.")
+        except Exception as exc:
+            st.error(f"Playwright login failed: {exc}")
 
 # =========================================================
 # Main app logic
@@ -359,6 +501,9 @@ if run_clicked:
     with col3:
         st.metric("Manual uploads", len(uploaded_fallback_files) if uploaded_fallback_files else 0)
 
+    # -----------------------------------------------------
+    # Parsed attachments
+    # -----------------------------------------------------
     st.subheader("Parsed Attachments")
     if attachments:
         for idx, name in enumerate(attachments, start=1):
@@ -366,35 +511,46 @@ if run_clicked:
     else:
         st.warning("No attachments were parsed from the pasted ECN text.")
 
+    # -----------------------------------------------------
+    # Hive links
+    # -----------------------------------------------------
     st.subheader("Hive Attachment Links")
+    candidate_url_map = {}
+
     if sharepoint_id and attachments:
         for name in attachments:
-            st.code(convert_to_hive_url(name, sharepoint_id, use_nbsp=False))
-            if try_nbsp:
-                st.caption(f"Fallback: {convert_to_hive_url(name, sharepoint_id, use_nbsp=True)}")
+            urls = get_candidate_urls(name, sharepoint_id, try_nbsp=try_nbsp)
+            candidate_url_map[name] = urls
+            st.code(urls[0])
+            if len(urls) > 1:
+                st.caption(f"Fallback: {urls[1]}")
     else:
         if not sharepoint_id:
             st.warning("SharePoint ID not found, so Hive links could not be built.")
         if not attachments:
             st.warning("No attachment names found, so Hive links could not be built.")
 
+    # -----------------------------------------------------
+    # Direct download
+    # -----------------------------------------------------
     st.subheader("Attachment Download Status")
     download_results = {}
     downloaded_files = {}
 
     if attachments and sharepoint_id:
         for filename in attachments:
-            if try_nbsp:
-                success, data, error, working_url = download_file_from_candidates(session, filename, sharepoint_id)
-            else:
-                url = convert_to_hive_url(filename, sharepoint_id, use_nbsp=False)
-                success, data, error = try_download(session, url)
-                working_url = url
+            success, data, error, working_url = download_file_from_candidates(
+                session=session,
+                filename=filename,
+                sharepoint_id=sharepoint_id,
+                try_nbsp=try_nbsp,
+            )
 
             download_results[filename] = {
                 "success": success,
                 "url": working_url,
                 "error": error,
+                "method": "requests",
             }
 
             if success:
@@ -405,16 +561,64 @@ if run_clicked:
                 st.error(f"Failed: {filename}")
                 st.caption(error)
 
-        auth_needed = any(
-            (not meta["success"]) and meta["error"] and ("sign-in" in meta["error"].lower() or "authentication" in meta["error"].lower() or "html" in meta["error"].lower())
-            for meta in download_results.values()
+    # -----------------------------------------------------
+    # Auth detection / user guidance
+    # -----------------------------------------------------
+    auth_needed = any(
+        (not meta["success"])
+        and meta["error"]
+        and (
+            "sign-in" in meta["error"].lower()
+            or "authentication" in meta["error"].lower()
+            or "html" in meta["error"].lower()
         )
-        if auth_needed:
-            st.warning(
-                "Hive appears to require authentication for one or more files. "
-                "Paste your authenticated Cookie header in the sidebar or upload the files manually below."
-            )
+        for meta in download_results.values()
+    )
 
+    if auth_needed:
+        st.warning(
+            "Hive appears to require authentication for one or more files. "
+            "You can paste a Cookie header in the sidebar, use 'Launch Hive Login Browser' "
+            "for local browser-assisted access, or upload files manually."
+        )
+
+    # -----------------------------------------------------
+    # Browser-assisted retry
+    # -----------------------------------------------------
+    failed_for_browser = []
+
+    if use_playwright and attachments and sharepoint_id:
+        for filename in attachments:
+            if not download_results.get(filename, {}).get("success"):
+                failed_for_browser.append((filename, candidate_url_map[filename][0]))
+
+        if failed_for_browser:
+            st.subheader("Browser-Assisted Hive Download Retry")
+            if os.path.exists(PLAYWRIGHT_STATE):
+                with st.spinner("Trying authenticated browser download..."):
+                    browser_downloaded, browser_error = download_with_playwright(failed_for_browser)
+
+                if browser_error:
+                    st.error(browser_error)
+                else:
+                    if browser_downloaded:
+                        for filename, data in browser_downloaded.items():
+                            downloaded_files[filename] = data
+                            download_results[filename] = {
+                                "success": True,
+                                "url": "browser-assisted download",
+                                "error": None,
+                                "method": "playwright",
+                            }
+                            st.success(f"Downloaded via browser session: {filename}")
+                    else:
+                        st.info("No additional files were downloaded with the saved browser session.")
+            else:
+                st.info("No saved browser session found yet. Click 'Launch Hive Login Browser' first.")
+
+    # -----------------------------------------------------
+    # Manual upload fallback
+    # -----------------------------------------------------
     fallback_files = {}
     if uploaded_fallback_files:
         for uploaded in uploaded_fallback_files:
@@ -425,6 +629,9 @@ if run_clicked:
         for name in fallback_files:
             st.info(f"Available via upload: {name}")
 
+    # -----------------------------------------------------
+    # Build ZIP
+    # -----------------------------------------------------
     all_available_files = dict(downloaded_files)
     for name, data in fallback_files.items():
         if name not in all_available_files:
@@ -441,6 +648,9 @@ if run_clicked:
     else:
         st.warning("No files are currently available to package into a ZIP.")
 
+    # -----------------------------------------------------
+    # Rule-based review
+    # -----------------------------------------------------
     st.subheader("Rule-Based Risk Review")
     risks, risk_score = rule_based_risk_checks(text)
     risk_rating = score_to_rating(risk_score)
@@ -457,6 +667,9 @@ if run_clicked:
     else:
         st.success("No obvious rule-based risks were detected.")
 
+    # -----------------------------------------------------
+    # DD completeness
+    # -----------------------------------------------------
     st.subheader("Due Diligence Completeness Check")
     dd_results = dd_completeness_check(text)
     for row in dd_results:
@@ -465,6 +678,9 @@ if run_clicked:
         else:
             st.error(f"Missing: {row['item']}")
 
+    # -----------------------------------------------------
+    # AI analysis
+    # -----------------------------------------------------
     st.subheader("AI Risk Assessment")
     if use_ai:
         if client:
@@ -487,6 +703,9 @@ if run_clicked:
     else:
         st.info("AI analysis is disabled in the sidebar.")
 
+    # -----------------------------------------------------
+    # Summary
+    # -----------------------------------------------------
     st.subheader("Summary")
     downloaded_count = sum(1 for v in download_results.values() if v["success"])
     failed_count = sum(1 for v in download_results.values() if not v["success"])
