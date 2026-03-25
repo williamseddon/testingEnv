@@ -79,180 +79,67 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-18-master-v22a"
+APP_VERSION = "2026-03-25-master-v22"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
-AI_MODEL_CATALOG: List[Dict[str, Any]] = [
-    {
-        "id": "gpt-5.4",
-        "label": "GPT-5.4",
-        "best_for": "General-purpose work, including complex reasoning, broad world knowledge, and code-heavy or multi-step agentic tasks",
-        "ui_blurb": "Best overall for deep analysis",
-        "context_tokens": 1_050_000,
-        "transport": "responses",
-        "temperature": False,
-        "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"],
-        "default_reasoning_effort": "medium",
-    },
-    {
-        "id": "gpt-5.4-pro",
-        "label": "GPT-5.4 Pro",
-        "best_for": "Tough problems that may take longer to solve and need deeper reasoning",
-        "ui_blurb": "Deepest reasoning, slowest",
-        "context_tokens": 1_050_000,
-        "transport": "responses",
-        "temperature": False,
-        "reasoning_efforts": ["medium", "high", "xhigh"],
-        "default_reasoning_effort": "high",
-    },
-    {
-        "id": "gpt-5.4-mini",
-        "label": "GPT-5.4 mini",
-        "best_for": "High-volume coding, computer use, and agent workflows that still need strong reasoning",
-        "ui_blurb": "Fast, balanced upgrade",
-        "context_tokens": 400_000,
-        "transport": "responses",
-        "temperature": False,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
-    {
-        "id": "gpt-5.4-nano",
-        "label": "GPT-5.4 nano",
-        "best_for": "Simple high-throughput tasks where speed and cost matter most",
-        "ui_blurb": "Cheapest GPT-5.4 option",
-        "context_tokens": 400_000,
-        "transport": "responses",
-        "temperature": False,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
-    {
-        "id": "gpt-4.1",
-        "label": "GPT-4.1",
-        "best_for": "Long-context instruction following and structured analysis over very large datasets and documents",
-        "ui_blurb": "1M-context non-reasoning model",
-        "context_tokens": 1_047_576,
-        "transport": "chat",
-        "temperature": True,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
-    {
-        "id": "gpt-4.1-mini",
-        "label": "GPT-4.1 mini",
-        "best_for": "Lower-cost 1M-context analysis over large datasets, long documents, and structured review collections",
-        "ui_blurb": "Cheap 1M-context option",
-        "context_tokens": 1_047_576,
-        "transport": "chat",
-        "temperature": True,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
-    {
-        "id": "o3-pro",
-        "label": "o3-pro",
-        "best_for": "Hard multi-step reasoning when thoroughness matters more than speed",
-        "ui_blurb": "Deep reasoning fallback",
-        "context_tokens": 200_000,
-        "transport": "responses",
-        "temperature": False,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
-    {
-        "id": "gpt-4o",
-        "label": "GPT-4o",
-        "best_for": "Legacy general-purpose / multimodal compatibility",
-        "ui_blurb": "Legacy compatible",
-        "context_tokens": None,
-        "transport": "chat",
-        "temperature": True,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
-    {
-        "id": "gpt-4o-mini",
-        "label": "GPT-4o mini",
-        "best_for": "Budget-friendly legacy option",
-        "ui_blurb": "Legacy budget option",
-        "context_tokens": None,
-        "transport": "chat",
-        "temperature": True,
-        "reasoning_efforts": [],
-        "default_reasoning_effort": None,
-    },
+AI_MODEL_OPTIONS = [
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-nano",
+    "gpt-5-chat-latest",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
 ]
 
-AI_MODEL_META: Dict[str, Dict[str, Any]] = {m["id"]: m for m in AI_MODEL_CATALOG}
-AI_MODEL_IDS: List[str] = [m["id"] for m in AI_MODEL_CATALOG]
-AI_DEFAULT_MODEL = "gpt-5.4"
-AI_LARGE_CONTEXT_MODELS = {
-    m["id"]
-    for m in AI_MODEL_CATALOG
-    if int(m.get("context_tokens") or 0) >= 1_000_000
-}
-
-NO_TEMP_MODELS = {m["id"] for m in AI_MODEL_CATALOG if not bool(m.get("temperature", True))}
+GPT5_NO_TEMP_MODELS = {"gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-chat-latest"}
+GPT5_TEMP_IF_EFFORT_NONE_PREFIXES = ("gpt-5.4", "gpt-5.2")
 
 
-def get_ai_model_meta(model_id: str) -> Dict[str, Any]:
-    return AI_MODEL_META.get(
-        model_id,
-        {
-            "id": model_id or "unknown",
-            "label": model_id or "Unknown model",
-            "best_for": "",
-            "ui_blurb": "",
-            "context_tokens": None,
-            "transport": "chat",
-            "temperature": True,
-            "reasoning_efforts": [],
-            "default_reasoning_effort": None,
-        },
-    )
+def normalize_model_id(model_id: str) -> str:
+    return str(model_id or "").strip()
 
 
-def model_supports_temperature(model_id: str) -> bool:
-    return bool(get_ai_model_meta(model_id).get("temperature", True))
+def is_gpt5_family(model_id: str) -> bool:
+    return normalize_model_id(model_id).startswith("gpt-5")
 
 
-def model_supports_reasoning_effort(model_id: str) -> bool:
-    return len(get_ai_model_meta(model_id).get("reasoning_efforts") or []) > 0
-
-
-def model_reasoning_options(model_id: str) -> List[str]:
-    return list(get_ai_model_meta(model_id).get("reasoning_efforts") or [])
+def preferred_openai_api(model_id: str) -> str:
+    return "responses" if is_gpt5_family(model_id) else "chat.completions"
 
 
 def default_reasoning_effort(model_id: str) -> Optional[str]:
-    return get_ai_model_meta(model_id).get("default_reasoning_effort")
+    return "none" if is_gpt5_family(model_id) else None
 
 
-def model_transport(model_id: str) -> str:
-    return str(get_ai_model_meta(model_id).get("transport") or "chat").lower()
+def model_supports_temperature(model_id: str, reasoning_effort: Optional[str] = None) -> bool:
+    model = normalize_model_id(model_id)
+    effort = str(reasoning_effort or "").strip().lower() or None
+    if not model:
+        return True
+    if not is_gpt5_family(model):
+        return True
+    if model in GPT5_NO_TEMP_MODELS:
+        return False
+    if model.startswith(GPT5_TEMP_IF_EFFORT_NONE_PREFIXES):
+        return (effort or "none") == "none"
+    return False
 
 
-def model_context_text(model_id: str) -> str:
-    ctx = get_ai_model_meta(model_id).get("context_tokens")
-    if not ctx:
-        return "Context window not shown"
+def model_supports_verbosity(model_id: str) -> bool:
+    return is_gpt5_family(model_id)
+
+
+def clamp_temperature(value: Any, default: float = 0.2) -> float:
     try:
-        ctx_int = int(ctx)
-        if ctx_int >= 1_000_000:
-            return f"{ctx_int / 1_000_000:.2f}M token context"
-        if ctx_int >= 1_000:
-            return f"{ctx_int / 1_000:.0f}K token context"
-        return f"{ctx_int:,} token context"
+        return float(min(1.0, max(0.0, float(value))))
     except Exception:
-        return "Context window not shown"
-
-
-def model_display_label(model_id: str) -> str:
-    meta = get_ai_model_meta(model_id)
-    blurb = str(meta.get("ui_blurb") or "").strip()
-    return f"{model_id} — {blurb}" if blurb else model_id
+        return float(default)
 
 
 # Timezone
@@ -2357,88 +2244,6 @@ def vector_search(query: str, index, api_key: str, top_k: int = 8):
 
 
 
-def coverage_balanced_subset(df_in: pd.DataFrame, max_rows: int) -> pd.DataFrame:
-    """Deterministic sampling for AI retrieval on large datasets.
-
-    Instead of a pure random sample, keep better coverage across low/mid/high star
-    buckets and common source/country segments so important details are less likely
-    to be skipped when the filtered dataset is larger than the retrieval cap.
-    """
-    if df_in is None or df_in.empty or max_rows <= 0 or len(df_in) <= max_rows:
-        return df_in.copy()
-
-    d = df_in.copy()
-
-    if "Review Date" in d.columns:
-        d["__ai_sort_date"] = pd.to_datetime(d["Review Date"], errors="coerce")
-    else:
-        d["__ai_sort_date"] = pd.NaT
-    d["__ai_sort_date"] = d["__ai_sort_date"].fillna(pd.Timestamp("1970-01-01"))
-
-    if "Verbatim" in d.columns:
-        d["__ai_text_len"] = d["Verbatim"].astype("string").fillna("").str.len()
-    else:
-        d["__ai_text_len"] = 0
-
-    if "Star Rating" in d.columns:
-        stars = pd.to_numeric(d["Star Rating"], errors="coerce")
-        d["__ai_star_bucket"] = np.select(
-            [stars <= 2, stars == 3, stars >= 4],
-            ["low", "mid", "high"],
-            default="unknown",
-        )
-    else:
-        d["__ai_star_bucket"] = "all"
-
-    bucket_rank = {"low": 0, "mid": 1, "high": 2, "unknown": 3, "all": 0}
-    d["__ai_bucket_rank"] = d["__ai_star_bucket"].map(bucket_rank).fillna(9)
-
-    group_parts: List[pd.Series] = [d["__ai_star_bucket"].astype("string")]
-    if "Source" in d.columns:
-        source = d["Source"].astype("string").fillna("")
-        if int(source.nunique(dropna=True)) <= 25:
-            group_parts.append(source)
-    if "Country" in d.columns:
-        country = d["Country"].astype("string").fillna("")
-        if int(country.nunique(dropna=True)) <= 25:
-            group_parts.append(country)
-
-    if len(group_parts) == 1:
-        d["__ai_group"] = group_parts[0]
-    else:
-        d["__ai_group"] = pd.concat(group_parts, axis=1).astype("string").fillna("").agg(" | ".join, axis=1)
-
-    d = d.sort_values(
-        ["__ai_bucket_rank", "__ai_sort_date", "__ai_text_len"],
-        ascending=[True, False, False],
-        kind="mergesort",
-    )
-
-    groups: List[List[Any]] = []
-    for _, sub in d.groupby("__ai_group", sort=False):
-        groups.append(sub.index.tolist())
-
-    selected: List[Any] = []
-    cursor = 0
-    while len(selected) < max_rows:
-        picked_any = False
-        for idxs in groups:
-            if cursor < len(idxs):
-                selected.append(idxs[cursor])
-                picked_any = True
-                if len(selected) >= max_rows:
-                    break
-        if not picked_any:
-            break
-        cursor += 1
-
-    out = df_in.loc[selected].copy()
-    if "Review Date" in out.columns:
-        out = out.sort_values("Review Date", ascending=False, na_position="last", kind="mergesort")
-    return out
-
-
-
 # ============================================================
 # Theme bootstrap + extra CSS patch (fix mixed light/dark on fresh sessions)
 # ============================================================
@@ -4271,71 +4076,40 @@ if view.startswith("📝"):
 # ============================================================
 if view.startswith("🤖"):
     st.markdown("## 🤖 AI — Product & Consumer Insights")
-    st.caption(
-        "Ask anything. The assistant is grounded in the **currently filtered** dataset. "
-        "For very large datasets, start with gpt-5.4, gpt-4.1, or gpt-4.1-mini; use gpt-5.4-pro when you want the most thorough pass."
-    )
+    st.caption("Ask anything. The assistant is grounded in the **currently filtered** dataset.")
 
     # Sidebar: minimal settings (kept out of the main page)
     with st.sidebar.expander("🤖 AI Settings", expanded=False):
-        st.session_state.setdefault("ai_model", AI_DEFAULT_MODEL)
+        st.session_state.setdefault("ai_model", "gpt-4o-mini")
         st.session_state.setdefault("ai_temp", 0.2)
+        st.session_state.setdefault("ai_reasoning_effort", "none")
+        st.session_state.setdefault("ai_verbosity", "medium")
         st.session_state.setdefault("ai_send_quotes", True)
         st.session_state.setdefault("ai_quote_k", 10)
-        st.session_state.setdefault("ai_cap", 10000)
-        st.session_state.setdefault("ai_balanced_sampling", True)
+        st.session_state.setdefault("ai_cap", 1500)
 
-        if st.session_state.get("ai_model") not in AI_MODEL_IDS:
-            st.session_state["ai_model"] = AI_DEFAULT_MODEL
+        model_options = list(dict.fromkeys([normalize_model_id(st.session_state.get("ai_model") or "gpt-4o-mini")] + AI_MODEL_OPTIONS))
+        st.selectbox("Model", options=model_options, key="ai_model")
 
-        st.selectbox(
-            "Model",
-            options=AI_MODEL_IDS,
-            key="ai_model",
-            format_func=model_display_label,
-        )
+        _selected_ai_model = normalize_model_id(st.session_state.get("ai_model") or "gpt-4o-mini")
+        if is_gpt5_family(_selected_ai_model):
+            effort_options = ["none", "low", "medium", "high", "xhigh"]
+            if st.session_state.get("ai_reasoning_effort") not in effort_options:
+                st.session_state["ai_reasoning_effort"] = "none"
+            st.selectbox("Reasoning effort", options=effort_options, key="ai_reasoning_effort")
 
-        chosen_model = str(st.session_state.get("ai_model") or AI_DEFAULT_MODEL)
-        chosen_meta = get_ai_model_meta(chosen_model)
+            verbosity_options = ["low", "medium", "high"]
+            if st.session_state.get("ai_verbosity") not in verbosity_options:
+                st.session_state["ai_verbosity"] = "medium"
+            st.selectbox("Verbosity", options=verbosity_options, key="ai_verbosity")
 
-        if model_supports_reasoning_effort(chosen_model):
-            effort_opts = model_reasoning_options(chosen_model)
-            cur_effort = st.session_state.get("ai_reasoning_effort")
-            if cur_effort not in effort_opts:
-                cur_effort = default_reasoning_effort(chosen_model) or effort_opts[0]
-                st.session_state["ai_reasoning_effort"] = cur_effort
-            st.selectbox(
-                "Reasoning effort",
-                options=effort_opts,
-                key="ai_reasoning_effort",
-                help="Higher effort is slower and costlier, but can be more thorough.",
-            )
-        else:
-            st.session_state["ai_reasoning_effort"] = None
+            if not model_supports_temperature(_selected_ai_model, st.session_state.get("ai_reasoning_effort")):
+                st.caption("Temperature will be omitted automatically for this GPT-5 selection to avoid parameter errors.")
 
-        st.caption(
-            f"{chosen_meta.get('best_for', '')} • {model_context_text(chosen_model)} • "
-            f"{'Responses API' if model_transport(chosen_model) == 'responses' else 'Chat Completions'}"
-        )
-
-        st.slider(
-            "Creativity (temperature)",
-            0.0,
-            1.0,
-            float(st.session_state.get("ai_temp", 0.2)),
-            0.1,
-            key="ai_temp",
-            disabled=not model_supports_temperature(chosen_model),
-        )
+        st.slider("Creativity (temperature)", 0.0, 1.0, float(st.session_state.get("ai_temp", 0.2)), 0.1, key="ai_temp")
         st.toggle("Include evidence quotes (masked)", value=bool(st.session_state.get("ai_send_quotes", True)), key="ai_send_quotes")
-        st.slider("Quotes to retrieve", 4, 24, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
-        st.toggle(
-            "Coverage-balanced retrieval for large datasets",
-            value=bool(st.session_state.get("ai_balanced_sampling", True)),
-            key="ai_balanced_sampling",
-            help="Preserve better coverage across star levels and common segments instead of pure random sampling when the filtered dataset exceeds the retrieval cap.",
-        )
-        st.number_input("Max reviews in retrieval corpus", 200, 50000, int(st.session_state.get("ai_cap", 10000)), 250, key="ai_cap")
+        st.slider("Quotes to retrieve", 4, 18, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
+        st.number_input("Max reviews in retrieval corpus", 200, 8000, int(st.session_state.get("ai_cap", 1500)), 100, key="ai_cap")
 
     with st.sidebar.expander("🔑 OpenAI API Key", expanded=False):
         st.text_input("OPENAI_API_KEY override", value="", type="password", key="api_key_override")
@@ -4350,24 +4124,22 @@ if view.startswith("🤖"):
             api_key = os.getenv("OPENAI_API_KEY")
 
     remote_ready = bool(api_key)
-    model = str(st.session_state.get("ai_model") or AI_DEFAULT_MODEL)
-    temp = float(st.session_state.get("ai_temp") or 0.2)
+    model = normalize_model_id(st.session_state.get("ai_model") or "gpt-4o-mini")
+    temp = clamp_temperature(st.session_state.get("ai_temp", 0.2), default=0.2)
+    reasoning_effort = str(st.session_state.get("ai_reasoning_effort") or default_reasoning_effort(model) or "none")
+    verbosity = str(st.session_state.get("ai_verbosity") or "medium")
     send_quotes = bool(st.session_state.get("ai_send_quotes", True))
     quote_k = int(st.session_state.get("ai_quote_k", 10))
-    cap = int(st.session_state.get("ai_cap", 10000))
-
-    model_meta = get_ai_model_meta(model)
-    model_route_label = "Responses API" if model_transport(model) == "responses" else "Chat Completions"
-    model_long_context_note = " • Strong long-context fit" if model in AI_LARGE_CONTEXT_MODELS else ""
+    cap = int(st.session_state.get("ai_cap", 1500))
+    api_mode = preferred_openai_api(model)
 
     st.markdown(
         f"""
 <div class="soft-panel" style="margin-top: 8px;">
   <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
     <div style="font-weight:850;">{"🟢 Remote AI ready" if remote_ready else "🟡 Add API key to enable remote AI (local insights still work)"}</div>
-    <div class="small-muted">Model: <b>{_html.escape(model)}</b> • {esc(model_route_label)} • {esc(model_context_text(model))}{esc(model_long_context_note)}</div>
+    <div class="small-muted">Model: <b>{_html.escape(model)}</b> • API: <b>{_html.escape(api_mode)}</b></div>
   </div>
-  <div class="small-muted" style="margin-top:6px;">{esc(str(model_meta.get('best_for') or ''))}</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -4389,10 +4161,6 @@ if view.startswith("🤖"):
                     "extra_cols": extra_cols,
                     "extra": {c: st.session_state.get(f"f_{c}") or st.session_state.get(f"f_{c}_range") for c in extra_cols},
                 },
-                "ai": {
-                    "cap": int(st.session_state.get("ai_cap", 10000)),
-                    "balanced": bool(st.session_state.get("ai_balanced_sampling", True)),
-                },
                 "n": int(len(filtered)),
             }
             return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -4409,10 +4177,7 @@ if view.startswith("🤖"):
             return [], []
         df_use = df_in
         if len(df_use) > max_rows:
-            if bool(st.session_state.get("ai_balanced_sampling", True)):
-                df_use = coverage_balanced_subset(df_use, max_rows)
-            else:
-                df_use = df_use.sample(max_rows, random_state=42)
+            df_use = df_use.sample(max_rows, random_state=42)
         texts = []
         meta = []
         for _, r in df_use.iterrows():
@@ -4492,49 +4257,103 @@ if view.startswith("🤖"):
             "top_delighters": del_tbl2,
         }
 
-    def _openai_chat_http(api_key: str, model: str, messages: list[dict], temperature: float | None = None, max_tokens: int = 900, timeout_s: int = 60) -> str:
-        import requests
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
-        if temperature is not None and model_supports_temperature(model):
+    def _responses_input_from_messages(messages: list[dict]) -> list[dict]:
+        items: list[dict] = []
+        for msg in messages or []:
+            role = str((msg or {}).get("role") or "user").strip().lower()
+            if role not in {"system", "developer", "user", "assistant"}:
+                role = "user"
+            content = (msg or {}).get("content", "")
+            if isinstance(content, list):
+                text_bits = []
+                for part in content:
+                    if isinstance(part, dict):
+                        text_bits.append(str(part.get("text") or part.get("content") or ""))
+                    else:
+                        text_bits.append(str(part))
+                content = "\n".join([x for x in text_bits if x])
+            items.append({
+                "type": "message",
+                "role": role,
+                "content": str(content or ""),
+            })
+        return items
+
+    def _extract_responses_output_text(data: Any) -> str:
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data.strip()
+        if isinstance(data, dict):
+            top = data.get("output_text")
+            if isinstance(top, str) and top.strip():
+                return top.strip()
+            chunks: list[str] = []
+            for item in data.get("output", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "message":
+                    for part in item.get("content", []) or []:
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = part.get("type")
+                        if ptype in {"output_text", "text"}:
+                            txt = part.get("text")
+                            if txt:
+                                chunks.append(str(txt))
+                        elif ptype == "refusal":
+                            txt = part.get("refusal")
+                            if txt:
+                                chunks.append(str(txt))
+            return "\n".join([c for c in chunks if c]).strip()
+        return ""
+
+    def _maybe_model_to_dict(obj: Any) -> Any:
+        for attr in ("to_dict", "model_dump", "dict"):
+            fn = getattr(obj, attr, None)
+            if callable(fn):
+                try:
+                    return fn()
+                except Exception:
+                    continue
+        return None
+
+    def _openai_responses_sdk(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
+        if not _HAS_OPENAI or OpenAI is None:
+            raise RuntimeError("OpenAI SDK not available for Responses API")
+        client = OpenAI(api_key=api_key, timeout=timeout_s, max_retries=0)
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": _responses_input_from_messages(messages),
+            "max_output_tokens": int(max_tokens),
+        }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": str(reasoning_effort)}
+        if verbosity and model_supports_verbosity(model):
+            payload["text"] = {"verbosity": str(verbosity)}
+        if temperature is not None and model_supports_temperature(model, reasoning_effort):
             payload["temperature"] = float(temperature)
 
-        last_err = None
-        for attempt in range(5):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
-                if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
-                    continue
-                if r.status_code >= 400:
-                    raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:600]}")
-                data = r.json()
-                return str(data["choices"][0]["message"]["content"])
-            except Exception as e:
-                last_err = e
-                time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
-        raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI error")
-
-
-    def _extract_responses_text(data: dict) -> str:
-        if not isinstance(data, dict):
-            return ""
-        txt = data.get("output_text")
+        resp = client.responses.create(**payload)
+        txt = getattr(resp, "output_text", None)
         if isinstance(txt, str) and txt.strip():
             return txt.strip()
-        parts: List[str] = []
-        for item in data.get("output") or []:
-            if not isinstance(item, dict):
-                continue
-            for part in item.get("content") or []:
-                if not isinstance(part, dict):
-                    continue
-                if str(part.get("type") or "") in {"output_text", "text"}:
-                    val = part.get("text")
-                    if isinstance(val, str) and val.strip():
-                        parts.append(val.strip())
-        return "\n".join([p for p in parts if p]).strip()
+
+        data = _maybe_model_to_dict(resp)
+        txt = _extract_responses_output_text(data)
+        if txt:
+            return txt
+        raise RuntimeError("Responses API returned no text output.")
 
     def _openai_responses_http(
         api_key: str,
@@ -4542,67 +4361,138 @@ if view.startswith("🤖"):
         messages: list[dict],
         *,
         temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
         reasoning_effort: Optional[str] = None,
-        max_output_tokens: int = 1100,
-        timeout_s: int = 90,
+        verbosity: Optional[str] = None,
     ) -> str:
         import requests
 
         url = "https://api.openai.com/v1/responses"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-        instructions = None
-        input_items = []
-        for m in messages:
-            role = str(m.get("role") or "user")
-            content = "" if m.get("content") is None else str(m.get("content"))
-            if not content.strip():
-                continue
-            if role == "system" and instructions is None:
-                instructions = content
-                continue
-            input_items.append(
-                {
-                    "role": role,
-                    "content": [{"type": "input_text", "text": content}],
-                }
-            )
-
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model": model,
-            "input": input_items,
-            "max_output_tokens": int(max_output_tokens),
-            "text": {"format": {"type": "text"}},
-            "store": False,
+            "input": _responses_input_from_messages(messages),
+            "max_output_tokens": int(max_tokens),
         }
-        if instructions:
-            payload["instructions"] = instructions
-        if temperature is not None and model_supports_temperature(model):
-            payload["temperature"] = float(temperature)
-        if reasoning_effort and model_supports_reasoning_effort(model):
+        if reasoning_effort:
             payload["reasoning"] = {"effort": str(reasoning_effort)}
+        if verbosity and model_supports_verbosity(model):
+            payload["text"] = {"verbosity": str(verbosity)}
+        if temperature is not None and model_supports_temperature(model, reasoning_effort):
+            payload["temperature"] = float(temperature)
 
         last_err = None
+        stripped_optional_once = False
         for attempt in range(5):
             try:
                 r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
                 if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(min(12.0, (2 ** attempt) * 0.8 + 0.2))
+                    time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
+                    continue
+                if r.status_code == 400 and not stripped_optional_once:
+                    stripped_optional_once = True
+                    payload = {
+                        "model": model,
+                        "input": _responses_input_from_messages(messages),
+                        "max_output_tokens": int(max_tokens),
+                    }
                     continue
                 if r.status_code >= 400:
-                    raise RuntimeError(f"OpenAI Responses API error {r.status_code}: {r.text[:700]}")
+                    raise RuntimeError(f"OpenAI Responses API error {r.status_code}: {r.text[:600]}")
                 data = r.json()
-                text = _extract_responses_text(data)
-                if text:
-                    return text
-                status = str(data.get("status") or "")
-                if status and status != "completed":
-                    raise RuntimeError(f"Responses API returned status={status} without text.")
+                txt = _extract_responses_output_text(data)
+                if txt:
+                    return txt
                 raise RuntimeError("Responses API returned no text output.")
             except Exception as e:
                 last_err = e
-                time.sleep(min(8.0, (2 ** attempt) * 0.45 + 0.1))
+                time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
         raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI Responses API error")
+
+    def _openai_chat_http(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
+        import requests
+
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
+        if reasoning_effort and is_gpt5_family(model):
+            payload["reasoning_effort"] = str(reasoning_effort)
+        if verbosity and model_supports_verbosity(model):
+            payload["verbosity"] = str(verbosity)
+        if temperature is not None and model_supports_temperature(model, reasoning_effort):
+            payload["temperature"] = float(temperature)
+
+        last_err = None
+        stripped_optional_once = False
+        for attempt in range(5):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
+                    continue
+                if r.status_code == 400 and not stripped_optional_once:
+                    stripped_optional_once = True
+                    payload = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
+                    if temperature is not None and not is_gpt5_family(model):
+                        payload["temperature"] = float(temperature)
+                    continue
+                if r.status_code >= 400:
+                    raise RuntimeError(f"OpenAI Chat Completions API error {r.status_code}: {r.text[:600]}")
+                data = r.json()
+                txt = str(data["choices"][0]["message"]["content"] or "").strip()
+                if txt:
+                    return txt
+                raise RuntimeError("Chat Completions API returned no text output.")
+            except Exception as e:
+                last_err = e
+                time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
+        raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI Chat Completions API error")
+
+    def _openai_resilient_chat(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
+        attempts: list[tuple[str, Any]] = []
+
+        if preferred_openai_api(model) == "responses":
+            attempts.extend([
+                ("responses_sdk", lambda: _openai_responses_sdk(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("responses_http", lambda: _openai_responses_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("chat_http", lambda: _openai_chat_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+            ])
+        else:
+            attempts.extend([
+                ("chat_http", lambda: _openai_chat_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("responses_sdk", lambda: _openai_responses_sdk(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("responses_http", lambda: _openai_responses_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+            ])
+
+        errors: list[str] = []
+        for name, fn in attempts:
+            try:
+                return fn()
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+
+        raise RuntimeError(" | ".join(errors[-3:]) if errors else "Unknown OpenAI error")
 
     def _local_answer(question: str, knowledge: dict, quotes: list[dict]) -> str:
         # A simple deterministic fallback using aggregates
@@ -4694,25 +4584,7 @@ if view.startswith("🤖"):
             with st.spinner("Thinking…"):
                 if remote_ready:
                     try:
-                        if model_transport(model) == "responses":
-                            ans = _openai_responses_http(
-                                api_key,
-                                model,
-                                messages,
-                                temperature=temp,
-                                reasoning_effort=st.session_state.get("ai_reasoning_effort"),
-                                max_output_tokens=1100,
-                                timeout_s=180 if model in {"gpt-5.4-pro", "o3-pro"} else 90,
-                            )
-                        else:
-                            ans = _openai_chat_http(
-                                api_key,
-                                model,
-                                messages,
-                                temperature=temp,
-                                max_tokens=1100,
-                                timeout_s=90 if model == "gpt-4.1" else 60,
-                            )
+                        ans = _openai_resilient_chat(api_key, model, messages, temperature=temp, reasoning_effort=reasoning_effort, verbosity=verbosity)
                     except Exception as e:
                         st.warning("Remote AI failed; falling back to local insights.")
                         st.sidebar.caption(f"Last AI error: {str(e)[:200]}")
@@ -4726,3 +4598,4 @@ if view.startswith("🤖"):
             # Clear input (optional)
             # st.session_state["ai_user_q"] = ""
             st.rerun()
+
