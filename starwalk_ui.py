@@ -1,21 +1,33 @@
-# starwalk_ui_v7_7_knowledge_plus_stable_fast.py — v7.7
-# v7.6 (Stable) + FAST batching + Subset Filters + Optional Throttle
+# starwalk_ui_v8_0_knowledge_plus_amazing.py
+# v8.0 — rewritten for a smoother, safer, more accurate workflow
 #
-# Key upgrades:
-#   - ✅ Batch symptomization: multiple reviews per OpenAI request (big speedup, fewer 429s)
-#   - ✅ Subset selection filters: Source / Model (SKU) / Seeded / Country / New Review / Review Date / Star Rating
-#   - ✅ Optional RPM/TPM throttle (coarse) to reduce rate limit hits
-#   - ✅ Keeps evidence-locked labeling, canonical merging, inbox, lazy export, session persistence, retries, etc.
-#
-# Requirements: streamlit>=1.28, pandas, openpyxl, openai (optional)
-# Optional: numpy, scikit-learn (for better clustering), tiktoken (for better token counts)
+# Highlights:
+#   - Cleaner main UI with tabs and a single Run Center
+#   - Safer overwrite mode with explicit confirmation and exact row targeting
+#   - Correct overwrite semantics: selected rows are rebuilt from scratch
+#   - Batch symptomization, filters, inbox, prelearn, export, undo, throttling, cost tracking
+#   - Stronger summaries and reduced button clutter
 
-import streamlit as st
+import gc
+import hashlib
+import html
+import io
+import json
+import math
+import os
+import random
+import re
+import time
+import difflib
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
 import pandas as pd
-import io, os, json, difflib, time, re, html, math, random, hashlib, traceback, gc
-from typing import List, Dict, Tuple, Optional, Set, Any, Iterable
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
-# Optional: OpenAI
 try:
     from openai import OpenAI  # type: ignore
     _HAS_OPENAI = True
@@ -23,7 +35,6 @@ except Exception:
     OpenAI = None  # type: ignore
     _HAS_OPENAI = False
 
-# Optional: better token counting
 try:
     import tiktoken  # type: ignore
     _HAS_TIKTOKEN = True
@@ -31,102 +42,208 @@ except Exception:
     tiktoken = None  # type: ignore
     _HAS_TIKTOKEN = False
 
-# Optional: clustering helpers
-try:
-    import numpy as np  # type: ignore
-    _HAS_NUMPY = True
-except Exception:
-    np = None  # type: ignore
-    _HAS_NUMPY = False
 
-try:
-    from sklearn.cluster import KMeans  # type: ignore
-    _HAS_SKLEARN = True
-except Exception:
-    KMeans = None  # type: ignore
-    _HAS_SKLEARN = False
-
-# Excel handling
-from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
-from openpyxl.styles import PatternFill
-from openpyxl.utils import column_index_from_string, get_column_letter
-
-# ------------------- Page Setup -------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v7.7 (Fast+Stable)")
-st.title("✨ Review Symptomizer — v7.7 (Fast+Stable)")
+# ----------------------------- Page setup -----------------------------
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v8.0")
+st.title("✨ Review Symptomizer — v8.0")
 st.caption(
-    "Exact export (K–T dets, U–AD dels) • ETA + presets + overwrite • Undo (optional) • "
-    "Product Knowledge Prelearn (recommended) • Strong canonical merging • "
-    "Similarity/semantic guard • Evidence-locked labeling • In-session cache • "
-    "🟡 Inbox: New Symptoms + Alias Suggestions • ✅ Stability hardening • ⚡ Batch speedups • 🔎 Filters"
+    "Smoother run center • safer overwrite • exact K–T / U–AD export • inbox + aliases • batch speedups • filters • prelearn"
 )
 
-# ------------------- Global CSS -------------------
 st.markdown(
     """
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-      :root { --brand:#7c3aed; --brand2:#06b6d4; --ok:#16a34a; --bad:#dc2626; --muted:#6b7280; }
-      html, body, .stApp { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-      .stApp { background:
-        radial-gradient(1200px 500px at 10% -20%, rgba(124,58,237,.18), transparent 60%),
-        radial-gradient(1200px 500px at 100% 0%, rgba(6,182,212,.16), transparent 60%);
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+      :root {
+        --bg1: rgba(124, 58, 237, .12);
+        --bg2: rgba(6, 182, 212, .10);
+        --line: #e5e7eb;
+        --muted: #667085;
+        --text: #101828;
+        --brand: #7c3aed;
+        --brand-2: #06b6d4;
+        --good: #16a34a;
+        --bad: #dc2626;
+        --warn: #d97706;
       }
-      .hero { border-radius: 20px; padding: 18px 22px; color: #0b1020;
-        background: linear-gradient(180deg, rgba(255,255,255,.95), rgba(255,255,255,.86));
-        border: 1px solid rgba(226,232,240,.9);
-        box-shadow: 0 10px 30px rgba(16,24,40,.08), 0 2px 6px rgba(16,24,40,.06) inset; }
-      .hero-stats { display:flex; gap:14px; flex-wrap:wrap; margin-top: 6px; }
-      .stat { background:#fff; border:1px solid #e6eaf0; border-radius:16px; padding:12px 16px; min-width:160px;
-        box-shadow: 0 2px 8px rgba(16,24,40,.05); }
-      .stat.accent { border-color: rgba(124,58,237,.35); box-shadow: 0 4px 12px rgba(124,58,237,.15); }
-      .stat .label{ font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#64748b; }
-      .stat .value{ font-size:28px; font-weight:800; }
-      .chip-wrap {display:flex; flex-wrap:wrap; gap:8px;}
-      .chip { padding:6px 10px; border-radius:999px; font-size:12.5px; border:1px solid #e6eaf0; background:#fff; box-shadow: 0 1px 2px rgba(16,24,40,.06); }
-      .chip.red { background: #fff1f2; border-color:#fecdd3; }
-      .chip.green { background: #ecfdf3; border-color:#bbf7d0; }
-      .chip.blue { background: #e0f2fe; border-color:#bae6fd; }
-      .chip.yellow { background: #fff7ed; border-color:#fed7aa; }
-      .chip.purple { background: #f3e8ff; border-color:#e9d5ff; }
-      .muted{ color:#64748b; font-size:12px; }
-      .chips-block { margin-bottom: 16px; }
-      .stButton > button { height: 40px; border-radius: 10px; font-weight: 600;
-        background: linear-gradient(180deg, #ffffff, #f7f8fb);
-        border: 1px solid #e6eaf0; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
-      .stButton > button:hover { border-color: rgba(124,58,237,.35); box-shadow: 0 2px 6px rgba(124,58,237,.15); }
-      div.batch-row .stNumberInput input { height: 40px; font-weight: 700; }
-      div.batch-row .stButton > button { border-radius: 999px; height: 36px; font-weight: 700; min-width: 72px;
-        background: #fff; border: 1px solid rgba(6,182,212,.45); }
-      div.batch-row .stButton > button:hover { background: #f0fdff; border-color: var(--brand2); }
-      mark.hl { background: #fde68a; padding: 0 .15em; border-radius: .25em; }
-      .tiny { font-size: 12px; color: #64748b; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      html, body, .stApp {
+        font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        color: var(--text);
+      }
+      .stApp {
+        background:
+          radial-gradient(1000px 420px at 0% -10%, var(--bg1), transparent 60%),
+          radial-gradient(900px 420px at 100% 0%, var(--bg2), transparent 60%);
+      }
+      .hero-shell {
+        background: linear-gradient(180deg, rgba(255,255,255,.97), rgba(255,255,255,.90));
+        border: 1px solid rgba(226,232,240,.95);
+        border-radius: 22px;
+        padding: 18px 20px 16px 20px;
+        box-shadow: 0 10px 30px rgba(16,24,40,.07);
+      }
+      .hero-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .hero-title {
+        font-size: 22px;
+        font-weight: 800;
+        letter-spacing: -.02em;
+      }
+      .hero-sub {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 4px;
+      }
+      .badge-row, .chip-wrap {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .badge, .chip {
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12.5px;
+        line-height: 1;
+        border: 1px solid #e5e7eb;
+        background: #fff;
+        box-shadow: 0 1px 2px rgba(16,24,40,.04);
+      }
+      .chip.blue { background: #eff6ff; border-color: #bfdbfe; }
+      .chip.green { background: #ecfdf3; border-color: #bbf7d0; }
+      .chip.red { background: #fff1f2; border-color: #fecdd3; }
+      .chip.yellow { background: #fffbeb; border-color: #fde68a; }
+      .chip.purple { background: #f5f3ff; border-color: #ddd6fe; }
+      .chip.gray { background: #f8fafc; border-color: #e2e8f0; }
+      .hero-grid {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 14px;
+      }
+      .hero-stat {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 14px 16px;
+        box-shadow: 0 2px 8px rgba(16,24,40,.05);
+      }
+      .hero-stat.accent {
+        border-color: rgba(124,58,237,.35);
+        box-shadow: 0 6px 18px rgba(124,58,237,.14);
+      }
+      .hero-stat .label {
+        color: #64748b;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+      }
+      .hero-stat .value {
+        font-size: 28px;
+        font-weight: 800;
+        margin-top: 2px;
+      }
+      .section-title {
+        font-size: 18px;
+        font-weight: 800;
+        margin: 6px 0 10px 0;
+      }
+      .section-sub {
+        color: var(--muted);
+        font-size: 13px;
+        margin: -2px 0 12px 0;
+      }
+      .info-card {
+        background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(255,255,255,.93));
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 14px 16px;
+        box-shadow: 0 4px 14px rgba(16,24,40,.05);
+      }
+      .info-card.tight { padding: 12px 14px; }
+      .info-card .title { font-size: 13px; color: #475467; font-weight: 700; }
+      .info-card .big { font-size: 30px; font-weight: 800; line-height: 1.1; margin-top: 4px; }
+      .info-card .muted { color: #667085; font-size: 12.5px; margin-top: 4px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+      .run-plan {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0,1fr));
+        gap: 10px;
+      }
+      .kv {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 14px;
+        padding: 12px 14px;
+      }
+      .kv .k { color: #667085; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+      .kv .v { font-size: 20px; font-weight: 800; margin-top: 2px; }
+      .danger-box {
+        background: linear-gradient(180deg, rgba(254,242,242,.92), rgba(254,226,226,.72));
+        border: 1px solid #fecaca;
+        border-radius: 16px;
+        padding: 12px 14px;
+      }
+      .good-box {
+        background: linear-gradient(180deg, rgba(236,253,243,.92), rgba(220,252,231,.72));
+        border: 1px solid #bbf7d0;
+        border-radius: 16px;
+        padding: 12px 14px;
+      }
+      .tiny { font-size: 12px; color: #667085; }
+      mark.hl { background: #fde68a; padding: 0 .16em; border-radius: .25em; }
+      .stButton > button {
+        height: 42px;
+        border-radius: 12px;
+        font-weight: 700;
+        border: 1px solid #d0d5dd;
+        background: linear-gradient(180deg, #ffffff, #f8fafc);
+        box-shadow: 0 1px 2px rgba(16,24,40,.04);
+      }
+      .stButton > button:hover {
+        border-color: rgba(124,58,237,.35);
+        box-shadow: 0 4px 12px rgba(124,58,237,.14);
+      }
+      .stNumberInput input, .stTextInput input, .stDateInput input {
+        border-radius: 12px !important;
+      }
+      @media (max-width: 1100px) {
+        .hero-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+        .run-plan { grid-template-columns: 1fr; }
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ------------------- Utilities -------------------
+
+# ----------------------------- Utilities -----------------------------
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
-def clean_text(x):
+
+def clean_text(x: Any) -> str:
     if pd.isna(x):
         return ""
     return str(x).strip()
 
-def is_filled(val) -> bool:
+
+def is_filled(val: Any) -> bool:
     if pd.isna(val):
         return False
     s = str(val).strip()
     return (s != "") and (s.upper() not in NON_VALUES)
+
 
 def _fmt_money(x: float) -> str:
     try:
         return f"${x:,.4f}" if x < 1 else f"${x:,.2f}"
     except Exception:
         return "$0.00"
+
 
 def _fmt_secs(sec: float) -> str:
     sec = float(sec or 0.0)
@@ -136,9 +253,20 @@ def _fmt_secs(sec: float) -> str:
     s = int(round(sec - m * 60))
     return f"{m}:{s:02d}"
 
-# ------------------- Column helpers + filter normalization -------------------
+
+def _safe(s: Any) -> str:
+    return html.escape(str(s or ""))
+
+
+def _canon(s: str) -> str:
+    return " ".join(str(s).split()).lower().strip()
+
+
+def _canon_simple(s: str) -> str:
+    return "".join(ch for ch in _canon(s) if ch.isalnum())
+
+
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Best-effort resolver for column names (case-insensitive + partial match)."""
     if df is None or df.empty:
         return None
     low = {str(c).strip().lower(): c for c in df.columns}
@@ -153,8 +281,10 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
                 return orig
     return None
 
-_BOOL_TRUE = {"true","t","yes","y","1","seeded"}
-_BOOL_FALSE = {"false","f","no","n","0","non-seeded","nonseeded","not seeded","unseeded"}
+
+_BOOL_TRUE = {"true", "t", "yes", "y", "1", "seeded"}
+_BOOL_FALSE = {"false", "f", "no", "n", "0", "non-seeded", "nonseeded", "not seeded", "unseeded"}
+
 
 def _boolish(x: Any) -> Optional[bool]:
     if pd.isna(x):
@@ -166,6 +296,7 @@ def _boolish(x: Any) -> Optional[bool]:
         return False
     return None
 
+
 def _coerce_datetime_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
     if col and col in df_in.columns:
         try:
@@ -173,6 +304,7 @@ def _coerce_datetime_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
                 df_in[col] = pd.to_datetime(df_in[col], errors="coerce")
         except Exception:
             pass
+
 
 def _coerce_numeric_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
     if col and col in df_in.columns:
@@ -182,7 +314,8 @@ def _coerce_numeric_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
         except Exception:
             pass
 
-def _unique_sorted_str(series: pd.Series, limit: int = 5000) -> List[str]:
+
+def _unique_sorted_str(series: Optional[pd.Series], limit: int = 5000) -> List[str]:
     if series is None:
         return []
     try:
@@ -196,14 +329,32 @@ def _unique_sorted_str(series: pd.Series, limit: int = 5000) -> List[str]:
     except Exception:
         return []
 
-# ------------------- Simple throttle (RPM + estimated TPM) -------------------
+
+def _chip_html(items: List[Tuple[str, str]]) -> str:
+    if not items:
+        return "<span class='chip gray'>No active filters</span>"
+    out = ["<div class='chip-wrap'>"]
+    for text, color in items:
+        out.append(f"<span class='chip {color}'>{_safe(text)}</span>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def highlight_text(text: str, terms: List[str]) -> str:
+    safe = html.escape(str(text))
+    terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
+    if not terms:
+        return safe
+    uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
+    try:
+        pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
+    except Exception:
+        return safe
+    return pattern.sub(lambda m: f"<mark class='hl'>{html.escape(m.group(0))}</mark>", safe)
+
+
+# -------------------------- Throttling / costs --------------------------
 def _throttle(kind: str, est_in_tokens: int) -> None:
-    """
-    Coarse throttling to reduce rate-limit hits.
-    Uses session_state:
-      - throttle_rpm (0 disables)
-      - throttle_tpm (0 disables)
-    """
     rpm = int(st.session_state.get("throttle_rpm", 0) or 0)
     tpm = int(st.session_state.get("throttle_tpm", 0) or 0)
     if rpm <= 0 and tpm <= 0:
@@ -214,7 +365,7 @@ def _throttle(kind: str, est_in_tokens: int) -> None:
     bucket = st.session_state.get(key) or {"events": []}
     events = bucket.get("events") or []
 
-    pruned = []
+    pruned: List[Tuple[float, int]] = []
     for e in events:
         try:
             ts, tok = float(e[0]), int(e[1])
@@ -254,8 +405,7 @@ def _throttle(kind: str, est_in_tokens: int) -> None:
     bucket["events"] = pruned
     st.session_state[key] = bucket
 
-# ------------------- Pricing & Cost Tracking -------------------
-# Prices per 1M tokens (text). Update as needed.
+
 MODEL_PRICING_PER_1M = {
     "gpt-4o-mini": {"in": 0.15, "out": 0.60},
     "gpt-4o": {"in": 2.50, "out": 10.00},
@@ -265,6 +415,7 @@ MODEL_PRICING_PER_1M = {
 EMBEDDING_PRICING_PER_1M = {
     "text-embedding-3-small": 0.02,
 }
+
 
 def _price_for_model(model_id: str) -> Tuple[float, float]:
     try:
@@ -278,6 +429,7 @@ def _price_for_model(model_id: str) -> Tuple[float, float]:
         return (0.0, 0.0)
     return (float(p.get("in", 0.0)), float(p.get("out", 0.0)))
 
+
 def _price_for_embedding(model_id: str) -> float:
     try:
         ov = st.session_state.get("_pricing_overrides", {}).get("embeddings", {})
@@ -287,15 +439,18 @@ def _price_for_embedding(model_id: str) -> float:
         pass
     return float(EMBEDDING_PRICING_PER_1M.get(model_id, 0.0))
 
+
 def _cost_chat(model_id: str, input_tokens: int, output_tokens: int) -> float:
     pin, pout = _price_for_model(model_id)
     return (float(input_tokens) * pin + float(output_tokens) * pout) / 1_000_000.0
+
 
 def _cost_embed(model_id: str, input_tokens: int) -> float:
     p = _price_for_embedding(model_id)
     return float(input_tokens) * p / 1_000_000.0
 
-def _ensure_usage_tracker():
+
+def _ensure_usage_tracker() -> Dict[str, Any]:
     if "_usage" not in st.session_state:
         st.session_state["_usage"] = {
             "chat_in": 0,
@@ -307,7 +462,8 @@ def _ensure_usage_tracker():
         }
     return st.session_state["_usage"]
 
-def _track(component: str, model_id: str, in_tok: int = 0, out_tok: int = 0, embed: bool = False):
+
+def _track(component: str, model_id: str, in_tok: int = 0, out_tok: int = 0, embed: bool = False) -> None:
     tr = _ensure_usage_tracker()
     component = str(component or "unknown")
     comp = tr["by_component"].setdefault(component, {"chat_in": 0, "chat_out": 0, "embed_in": 0, "cost": 0.0})
@@ -326,8 +482,8 @@ def _track(component: str, model_id: str, in_tok: int = 0, out_tok: int = 0, emb
         comp["chat_out"] += int(out_tok)
         comp["cost"] += c
 
+
 def _extract_usage(resp: Any) -> Tuple[int, int]:
-    """Best-effort extraction of (prompt/input tokens, completion/output tokens) from OpenAI responses."""
     if resp is None:
         return (0, 0)
     usage = getattr(resp, "usage", None)
@@ -339,7 +495,7 @@ def _extract_usage(resp: Any) -> Tuple[int, int]:
     if usage is None:
         return (0, 0)
 
-    def _get(obj, k1, k2):
+    def _get(obj: Any, k1: str, k2: str) -> int:
         if isinstance(obj, dict):
             return obj.get(k1, obj.get(k2, 0)) or 0
         return getattr(obj, k1, getattr(obj, k2, 0)) or 0
@@ -350,21 +506,21 @@ def _extract_usage(resp: Any) -> Tuple[int, int]:
         pt = _get(usage, "total_tokens", "prompt_tokens")
     return (int(pt or 0), int(ct or 0))
 
+
 def _estimate_tokens(text: str, model_id: str = "gpt-4o-mini") -> int:
-    """Rough token estimate; uses tiktoken when available, else ~4 chars per token heuristic."""
     s = str(text or "")
     if not s:
         return 0
     if _HAS_TIKTOKEN:
         try:
-            enc_name = "cl100k_base"
-            enc = tiktoken.get_encoding(enc_name)
+            enc = tiktoken.get_encoding("cl100k_base")
             return int(len(enc.encode(s)))
         except Exception:
             pass
     return int(max(1, math.ceil(len(s) / 4)))
 
-# ------------------- Cached workbook loaders (stability) -------------------
+
+# ------------------------------ Loaders ------------------------------
 @st.cache_data(show_spinner=False)
 def _load_reviews_df(file_bytes: bytes) -> pd.DataFrame:
     bio = io.BytesIO(file_bytes)
@@ -376,7 +532,7 @@ def _load_reviews_df(file_bytes: bytes) -> pd.DataFrame:
     df0.columns = [str(c).strip() for c in df0.columns]
     return df0
 
-# ------------------- Symptoms sheet parsing -------------------
+
 @st.cache_data(show_spinner=False)
 def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
     bio = io.BytesIO(file_bytes)
@@ -392,73 +548,56 @@ def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dic
 
     alias_col = next((lowcols.get(c) for c in ["aliases", "alias"] if c in lowcols), None)
     label_col = next((lowcols.get(c) for c in ["symptom", "label", "name", "item"] if c in lowcols), None)
-    type_col  = next((lowcols.get(c) for c in ["type", "polarity", "category", "side"] if c in lowcols), None)
+    type_col = next((lowcols.get(c) for c in ["type", "polarity", "category", "side"] if c in lowcols), None)
 
-    POS_TAGS = {"delighter", "delighters", "positive", "pos", "pros"}
-    NEG_TAGS = {"detractor", "detractors", "negative", "neg", "cons"}
+    pos_tags = {"delighter", "delighters", "positive", "pos", "pros"}
+    neg_tags = {"detractor", "detractors", "negative", "neg", "cons"}
 
     def _clean(series: pd.Series) -> List[str]:
         vals = series.dropna().astype(str).map(str.strip)
-        out, seen = [], set()
+        out: List[str] = []
+        seen: Set[str] = set()
         for v in vals:
             if v and v not in seen:
-                seen.add(v); out.append(v)
+                seen.add(v)
+                out.append(v)
         return out
 
-    delighters, detractors, alias_map = [], [], {}
+    delighters: List[str] = []
+    detractors: List[str] = []
+    alias_map: Dict[str, List[str]] = {}
 
     if label_col and type_col:
         df_sym[type_col] = df_sym[type_col].astype(str).str.lower().str.strip()
-        delighters = _clean(df_sym.loc[df_sym[type_col].isin(POS_TAGS), label_col])
-        detractors = _clean(df_sym.loc[df_sym[type_col].isin(NEG_TAGS), label_col])
+        delighters = _clean(df_sym.loc[df_sym[type_col].isin(pos_tags), label_col])
+        detractors = _clean(df_sym.loc[df_sym[type_col].isin(neg_tags), label_col])
         if alias_col:
-            for _, r in df_sym.iterrows():
-                lbl = str(r.get(label_col, "")).strip()
-                als = str(r.get(alias_col, "")).strip()
+            for _, row in df_sym.iterrows():
+                lbl = str(row.get(label_col, "")).strip()
+                als = str(row.get(alias_col, "")).strip()
                 if lbl:
                     if als:
-                        als_norm = als.replace(",", "|")
-                        alias_map[lbl] = [p.strip() for p in als_norm.split("|") if p.strip()]
+                        alias_map[lbl] = [p.strip() for p in als.replace(",", "|").split("|") if p.strip()]
                     else:
                         alias_map.setdefault(lbl, [])
     else:
         for lc, orig in lowcols.items():
-            if ("delight" in lc) or ("positive" in lc) or lc in {"pros"}:
+            if ("delight" in lc) or ("positive" in lc) or lc == "pros":
                 delighters.extend(_clean(df_sym[orig]))
-            if ("detract" in lc) or ("negative" in lc) or lc in {"cons"}:
+            if ("detract" in lc) or ("negative" in lc) or lc == "cons":
                 detractors.extend(_clean(df_sym[orig]))
         delighters = list(dict.fromkeys(delighters))
         detractors = list(dict.fromkeys(detractors))
 
     return delighters, detractors, alias_map
 
-# Canonicalization helpers
-def _canon(s: str) -> str:
-    return " ".join(str(s).split()).lower().strip()
-
-def _canon_simple(s: str) -> str:
-    return "".join(ch for ch in _canon(s) if ch.isalnum())
-
-# Evidence highlighting
-def highlight_text(text: str, terms: List[str]) -> str:
-    safe = html.escape(str(text))
-    terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
-    if not terms:
-        return safe
-    uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
-    try:
-        pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
-    except Exception:
-        return safe
-    return pattern.sub(lambda m: f"<mark class='hl'>{html.escape(m.group(0))}</mark>", safe)
-
-# Schema detection
+# ------------------------- Symptom schema helpers -------------------------
 def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
     cols = [str(c).strip() for c in df.columns]
     man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
     man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in cols]
-    ai_det  = [c for c in cols if c.startswith("AI Symptom Detractor ")]
-    ai_del  = [c for c in cols if c.startswith("AI Symptom Delighter ")]
+    ai_det = [c for c in cols if c.startswith("AI Symptom Detractor ")]
+    ai_del = [c for c in cols if c.startswith("AI Symptom Delighter ")]
     return {
         "manual_detractors": man_det,
         "manual_delighters": man_del,
@@ -466,20 +605,18 @@ def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
         "ai_delighters": ai_del,
     }
 
-# Vectorized missing detection
+
 def _filled_mask(df_in: pd.DataFrame, cols: List[str]) -> pd.Series:
-    """Vectorized 'is_filled' across multiple columns."""
     if not cols:
         return pd.Series(False, index=df_in.index)
-
     mask = pd.Series(False, index=df_in.index)
     for c in cols:
         if c not in df_in.columns:
             continue
         s = df_in[c].fillna("").astype(str).str.strip()
-        s_up = s.str.upper()
-        mask |= (s != "") & (~s_up.isin(NON_VALUES))
+        mask |= (s != "") & (~s.str.upper().isin(NON_VALUES))
     return mask
+
 
 def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFrame:
     det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
@@ -493,18 +630,18 @@ def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFra
     out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
     return out
 
-# ------------------- Fixed template mapping -------------------
-DET_LETTERS = ["K","L","M","N","O","P","Q","R","S","T"]
-DEL_LETTERS = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
+
+DET_LETTERS = ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"]
+DEL_LETTERS = ["U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD"]
 DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
 DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
-
-META_ORDER = [("Safety", "AE"),("Reliability", "AF"),("# of Sessions", "AG")]
+META_ORDER = [("Safety", "AE"), ("Reliability", "AF"), ("# of Sessions", "AG")]
 META_INDEXES = {name: column_index_from_string(col) for name, col in META_ORDER}
 
 AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
 AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
 AI_META_HEADERS = ["AI Safety", "AI Reliability", "AI # of Sessions"]
+
 
 def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
     for h in AI_DET_HEADERS + AI_DEL_HEADERS + AI_META_HEADERS:
@@ -512,17 +649,22 @@ def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
             df_in[h] = None
     return df_in
 
-def clear_all_ai_slots_in_df(df_in: pd.DataFrame) -> pd.DataFrame:
-    df2 = ensure_ai_columns(df_in.copy())
-    for j in range(1, 11):
-        df2[f"AI Symptom Detractor {j}"] = None
-        df2[f"AI Symptom Delighter {j}"] = None
-    df2["AI Safety"] = None
-    df2["AI Reliability"] = None
-    df2["AI # of Sessions"] = None
+
+def clear_ai_slots_for_indices(df_in: pd.DataFrame, indices: Iterable[int]) -> pd.DataFrame:
+    df2 = ensure_ai_columns(df_in)
+    for idx in indices:
+        for j in range(1, 11):
+            df2.loc[idx, f"AI Symptom Detractor {j}"] = None
+            df2.loc[idx, f"AI Symptom Delighter {j}"] = None
+        df2.loc[idx, "AI Safety"] = None
+        df2.loc[idx, "AI Reliability"] = None
+        df2.loc[idx, "AI # of Sessions"] = None
     return df2
 
-def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]):
+
+def build_canonical_maps(
+    delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     del_map = {_canon(x): x for x in delighters}
     det_map = {_canon(x): x for x in detractors}
     alias_to_label: Dict[str, str] = {}
@@ -531,62 +673,92 @@ def build_canonical_maps(delighters: List[str], detractors: List[str], alias_map
             alias_to_label[_canon(a)] = label
     return del_map, det_map, alias_to_label
 
-# ---------- LLM helpers ----------
+
 SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
 RELIABILITY_ENUM = ["Not Mentioned", "Negative", "Neutral", "Positive"]
 SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
+
 
 def _symptom_list_version(delighters: List[str], detractors: List[str], aliases: Dict[str, List[str]]) -> str:
     payload = json.dumps({"del": delighters, "det": detractors, "ali": aliases}, sort_keys=True, ensure_ascii=False)
     try:
         return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
     except Exception:
-        return str(len(delighters)) + "_" + str(len(detractors))
+        return f"{len(delighters)}_{len(detractors)}"
 
-def _ensure_label_cache():
+
+def _ensure_label_cache() -> Dict[Any, Any]:
     if "_label_cache" not in st.session_state:
         st.session_state["_label_cache"] = {}
     return st.session_state["_label_cache"]
 
-# ------------------- Theme normalization (Stronger + plural/synonym handling) -------------------
+
+# -------------------------- Theme normalization --------------------------
 THEME_RULES = [
-    (re.compile(r"\b(pulls?|pulled|pulling).{0,12}\bhair\b|\bhair\s+(?:loss|fall(?:ing)?|coming\s+out|pulled)\b", re.I),
-     {"det": "Hair Loss/Pull"}),
-    (re.compile(r"\b(snags?|tangles?|catches?)\s+(?:hair|strands?)\b", re.I),
-     {"det": "Hair Snag/Tangle"}),
-    (re.compile(r"\b(too\s+hot|burns?|scalds?|overheats?)\b", re.I),
-     {"det": "Excess Heat"}),
-    (re.compile(r"\b(too\s+noisy|loud|whine|high\s+noise)\b", re.I),
-     {"det": "High Noise"}),
-    (re.compile(r"\b(battery|charge|runtime)\b.+\b(poor|short|bad|low)\b|\b(poor|short|bad|low)\b.+\b(battery|charge|runtime)\b", re.I),
-     {"det": "Battery Life: Short"}),
-
-    (re.compile(r"\b(cooling\s+pad)\b.*\b(issue|issues|problem|problems|fail|failed|broken)\b|\b(issue|issues|problem|problems)\b.*\b(cooling\s+pad)\b", re.I),
-     {"det": "Cooling Pad Issue"}),
-    (re.compile(r"\b(learning\s+curve|hard\s+to\s+learn|takes\s+time\s+to\s+learn|not\s+intuitive)\b", re.I),
-     {"det": "Learning Curve"}),
-    (re.compile(r"\b(initially|at\s+first)\b.*\b(complicated|confusing|hard)\b|\b(complicated|confusing|hard)\b.*\b(at\s+first|initially)\b", re.I),
-     {"det": "Learning Curve"}),
-
-    (re.compile(r"\b(absolutely|totally|really)?\s*love(s|d)?\b|\bworks\s+(amazing|great|fantastic|perfect)\b|\boverall\b.+\b(great|good|positive|happy)\b", re.I),
-     {"del": "Overall Satisfaction"}),
-    (re.compile(r"\b(easy|quick|simple)\s+to\s+(use|clean|attach|remove)\b|\buser[-\s]?friendly\b|\bintuitive\b", re.I),
-     {"del": "Ease Of Use"}),
-    (re.compile(r"\b(fast|quick)\s+(dry|drying)\b|\bdries\s+quickly\b", re.I),
-     {"del": "Fast Drying"}),
-    (re.compile(r"\b(shine|smooth|sleek|frizz\s*(?:free|control))\b", re.I),
-     {"del": "Frizz Control/Shine"}),
-    (re.compile(r"\b(attachments?|accessories?)\b.+\b(handy|useful|versatile|helpful)\b", re.I),
-     {"del": "Attachment Usability"}),
-
-    (re.compile(r"\b(comfortable|comfort|comfy)\b", re.I),
-     {"del": "Comfort"}),
+    (
+        re.compile(r"\b(pulls?|pulled|pulling).{0,12}\bhair\b|\bhair\s+(?:loss|fall(?:ing)?|coming\s+out|pulled)\b", re.I),
+        {"det": "Hair Loss/Pull"},
+    ),
+    (re.compile(r"\b(snags?|tangles?|catches?)\s+(?:hair|strands?)\b", re.I), {"det": "Hair Snag/Tangle"}),
+    (re.compile(r"\b(too\s+hot|burns?|scalds?|overheats?)\b", re.I), {"det": "Excess Heat"}),
+    (re.compile(r"\b(too\s+noisy|loud|whine|high\s+noise)\b", re.I), {"det": "High Noise"}),
+    (
+        re.compile(r"\b(battery|charge|runtime)\b.+\b(poor|short|bad|low)\b|\b(poor|short|bad|low)\b.+\b(battery|charge|runtime)\b", re.I),
+        {"det": "Battery Life: Short"},
+    ),
+    (
+        re.compile(r"\b(cooling\s+pad)\b.*\b(issue|issues|problem|problems|fail|failed|broken)\b|\b(issue|issues|problem|problems)\b.*\b(cooling\s+pad)\b", re.I),
+        {"det": "Cooling Pad Issue"},
+    ),
+    (
+        re.compile(r"\b(learning\s+curve|hard\s+to\s+learn|takes\s+time\s+to\s+learn|not\s+intuitive)\b", re.I),
+        {"det": "Learning Curve"},
+    ),
+    (
+        re.compile(r"\b(initially|at\s+first)\b.*\b(complicated|confusing|hard)\b|\b(complicated|confusing|hard)\b.*\b(at\s+first|initially)\b", re.I),
+        {"det": "Learning Curve"},
+    ),
+    (
+        re.compile(r"\b(absolutely|totally|really)?\s*love(s|d)?\b|\bworks\s+(amazing|great|fantastic|perfect)\b|\boverall\b.+\b(great|good|positive|happy)\b", re.I),
+        {"del": "Overall Satisfaction"},
+    ),
+    (
+        re.compile(r"\b(easy|quick|simple)\s+to\s+(use|clean|attach|remove)\b|\buser[-\s]?friendly\b|\bintuitive\b", re.I),
+        {"del": "Ease Of Use"},
+    ),
+    (re.compile(r"\b(fast|quick)\s+(dry|drying)\b|\bdries\s+quickly\b", re.I), {"del": "Fast Drying"}),
+    (re.compile(r"\b(shine|smooth|sleek|frizz\s*(?:free|control))\b", re.I), {"del": "Frizz Control/Shine"}),
+    (
+        re.compile(r"\b(attachments?|accessories?)\b.+\b(handy|useful|versatile|helpful)\b", re.I),
+        {"del": "Attachment Usability"},
+    ),
+    (re.compile(r"\b(comfortable|comfort|comfy)\b", re.I), {"del": "Comfort"}),
 ]
 
 CANONICAL_SYNONYMS = [
-    ("Comfort", "del", [r"\bcomfortable\b", r"\bcomfort\b", r"\bcomfy\b", r"\bconfortable\b", r"\bconfort\b", r"\bcomftable\b", r"\bcomfort\s*(fit|use|design|feel)\b"]),
-    ("Cooling Pad Issue", "det", [r"\bcooling\s+pad\b.*\b(issue|problem|broken|fail)", r"\b(issue|problem)s?\b.*\bcooling\s+pad\b"]),
-    ("Learning Curve", "det", [r"\blearning\s+curve\b", r"\bnot\s+intuitive\b", r"\bhard\s+to\s+learn\b", r"\bconfusing\s+at\s+first\b", r"\binitially\s+complicated\b"]),
+    (
+        "Comfort",
+        "del",
+        [
+            r"\bcomfortable\b",
+            r"\bcomfort\b",
+            r"\bcomfy\b",
+            r"\bconfortable\b",
+            r"\bconfort\b",
+            r"\bcomftable\b",
+            r"\bcomfort\s*(fit|use|design|feel)\b",
+        ],
+    ),
+    (
+        "Cooling Pad Issue",
+        "det",
+        [r"\bcooling\s+pad\b.*\b(issue|problem|broken|fail)", r"\b(issue|problem)s?\b.*\bcooling\s+pad\b"],
+    ),
+    (
+        "Learning Curve",
+        "det",
+        [r"\blearning\s+curve\b", r"\bnot\s+intuitive\b", r"\bhard\s+to\s+learn\b", r"\bconfusing\s+at\s+first\b", r"\binitially\s+complicated\b"],
+    ),
 ]
 
 SINGULAR_LASTWORD_MAP = {
@@ -597,17 +769,19 @@ SINGULAR_LASTWORD_MAP = {
     "Glitches": "Glitch",
 }
 
+
 def _short_title(s: str) -> str:
     s = re.sub(r"[\s\-_/]+", " ", str(s).strip())
     s = re.sub(r"[^\w\s+/]", "", s)
     s = re.sub(r"\s+", " ", s)
-    parts = []
+    parts: List[str] = []
     for token in s.split(" "):
         if "/" in token:
             parts.append("/".join([p[:1].upper() + p[1:].lower() if p else "" for p in token.split("/")]))
         else:
             parts.append(token[:1].upper() + token[1:].lower())
     return " ".join(parts).strip()
+
 
 def _singularize_last_word(label: str) -> str:
     s = str(label).strip()
@@ -617,11 +791,12 @@ def _singularize_last_word(label: str) -> str:
     if not toks:
         return s
     last = toks[-1]
-    repl = SINGULAR_LASTWORD_MAP.get(last, None)
+    repl = SINGULAR_LASTWORD_MAP.get(last)
     if repl:
         toks[-1] = repl
         return " ".join(toks)
     return s
+
 
 def normalize_theme_label(raw: str, side_hint: str = "", singularize: bool = True) -> str:
     txt = str(raw or "").strip()
@@ -652,12 +827,12 @@ def normalize_theme_label(raw: str, side_hint: str = "", singularize: bool = Tru
     out = _short_title(txt[:60])
     if singularize:
         out = _singularize_last_word(out)
-
     if out.endswith(" Issues"):
         out = out[:-7] + " Issue"
     return out.strip()
 
-# ------------------- Learned Themes / Candidate Resolution -------------------
+
+# --------------------------- Learned theme store ---------------------------
 def _ensure_learned_store() -> Dict[str, Any]:
     if "learned" not in st.session_state:
         st.session_state["learned"] = {
@@ -671,13 +846,15 @@ def _ensure_learned_store() -> Dict[str, Any]:
         }
     return st.session_state["learned"]
 
-def _update_learned(side: str, canonical: str, synonym: str = ""):
+
+def _update_learned(side: str, canonical: str, synonym: str = "") -> None:
     ls = _ensure_learned_store()
     side = "Delighter" if str(side).lower().startswith("del") else "Detractor"
     d = ls["labels"][side].setdefault(canonical, {"synonyms": set(), "count": 0})
     d["count"] = int(d.get("count", 0)) + 1
     if synonym and synonym.strip() and _canon_simple(synonym) != _canon_simple(canonical):
         d["synonyms"].add(synonym.strip())
+
 
 def _known_learned_labels(side: str) -> List[str]:
     ls = _ensure_learned_store()
@@ -686,12 +863,14 @@ def _known_learned_labels(side: str) -> List[str]:
     items.sort(key=lambda k: -int(ls["labels"][side].get(k, {}).get("count", 0)))
     return items
 
-def _ensure_embed_cache():
+
+def _ensure_embed_cache() -> Dict[Any, Any]:
     if "_embed_cache" not in st.session_state:
         st.session_state["_embed_cache"] = {}
     return st.session_state["_embed_cache"]
 
-def _embed_text(text: str, client, model_id: str, component: str) -> Optional[List[float]]:
+
+def _embed_text(text: str, client: Any, model_id: str, component: str) -> Optional[List[float]]:
     if client is None:
         return None
     t = str(text or "").strip()
@@ -713,6 +892,7 @@ def _embed_text(text: str, client, model_id: str, component: str) -> Optional[Li
     except Exception:
         return None
 
+
 def _cos_sim(a: List[float], b: List[float]) -> float:
     if (not a) or (not b):
         return 0.0
@@ -727,11 +907,12 @@ def _cos_sim(a: List[float], b: List[float]) -> float:
         return 0.0
     return float(dot / (math.sqrt(na) * math.sqrt(nb)))
 
+
 def _best_semantic_match(
     candidate: str,
     pool: List[str],
     pool_emb: Dict[str, List[float]],
-    client,
+    client: Any,
     embed_model: str,
     component: str,
 ) -> Tuple[Optional[str], float]:
@@ -749,8 +930,10 @@ def _best_semantic_match(
             continue
         s = _cos_sim(cand_vec, v)
         if s > best:
-            best = s; best_lab = lab
+            best = s
+            best_lab = lab
     return (best_lab, float(best))
+
 
 def resolve_candidate_to_canonical(
     candidate_raw: str,
@@ -761,7 +944,7 @@ def resolve_candidate_to_canonical(
     learned_store: Dict[str, Any],
     sim_threshold_lex: float,
     sim_threshold_sem: float,
-    client,
+    client: Any,
     embed_model: str,
 ) -> Dict[str, Any]:
     side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
@@ -770,7 +953,6 @@ def resolve_candidate_to_canonical(
     cand_theme = normalize_theme_label(candidate_raw, side_norm)
     cand_canon = _canon(cand_theme)
     cand_key = _canon_simple(cand_theme)
-
     raw_key = _canon_simple(str(candidate_raw or "").strip())
     raw_canon = _canon(str(candidate_raw or "").strip())
 
@@ -779,7 +961,6 @@ def resolve_candidate_to_canonical(
         return {"canonical": allowed_keys[raw_key], "kind": "exact_existing", "target": allowed_keys[raw_key], "score": 1.0}
     if cand_key in allowed_keys:
         return {"canonical": allowed_keys[cand_key], "kind": "exact_existing", "target": allowed_keys[cand_key], "score": 1.0}
-
     if raw_canon in alias_to_label:
         tgt = alias_to_label[raw_canon]
         return {"canonical": tgt, "kind": "alias_to_existing", "target": tgt, "score": 1.0}
@@ -816,21 +997,24 @@ def resolve_candidate_to_canonical(
             best_lab, best_score, best_kind = best_a, score_a, "alias_to_existing"
         if best_l and score_l > best_score:
             best_lab, best_score, best_kind = best_l, score_l, "synonym_to_learned"
-
         if best_lab and best_score >= float(sim_threshold_sem):
             score_used = float(best_score)
             return {"canonical": best_lab, "kind": best_kind, "target": best_lab, "score": score_used}
 
     return {"canonical": cand_theme, "kind": "new", "target": "", "score": score_used}
 
-# ------------------- Product Knowledge Prelearn -------------------
+
+# --------------------------- Prelearn utilities ---------------------------
 STOPWORDS = {
-    "the","a","an","and","or","but","if","then","this","that","these","those","it","its","i","me","my","we","our","you","your",
-    "to","of","in","on","for","with","as","at","by","from","is","are","was","were","be","been","being","have","has","had","do","does","did",
-    "so","very","really","just","also","too","not","no","yes","they","them","their","he","she","his","her","him","there","here","when","while",
-    "because","into","out","up","down","over","under","again","more","most","less","least","can","could","should","would","will","won't","dont","don't",
-    "im","i'm","ive","i've","it's","cant","can't","didnt","didn't","wasnt","wasn't","isnt","isn't","arent","aren't",
+    "the", "a", "an", "and", "or", "but", "if", "then", "this", "that", "these", "those", "it", "its", "i", "me", "my",
+    "we", "our", "you", "your", "to", "of", "in", "on", "for", "with", "as", "at", "by", "from", "is", "are", "was",
+    "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "so", "very", "really", "just", "also", "too",
+    "not", "no", "yes", "they", "them", "their", "he", "she", "his", "her", "him", "there", "here", "when", "while",
+    "because", "into", "out", "up", "down", "over", "under", "again", "more", "most", "less", "least", "can", "could",
+    "should", "would", "will", "won't", "dont", "don't", "im", "i'm", "ive", "i've", "it's", "cant", "can't", "didnt",
+    "didn't", "wasnt", "wasn't", "isnt", "isn't", "arent", "aren't",
 }
+
 
 def _top_terms(texts: List[str], top_n: int = 30) -> List[Tuple[str, int]]:
     counts: Dict[str, int] = {}
@@ -842,15 +1026,16 @@ def _top_terms(texts: List[str], top_n: int = 30) -> List[Tuple[str, int]]:
     items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return items[:top_n]
 
+
 def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
+    if n >= len(df_in):
+        return df_in.copy()
     df2 = df_in.copy()
-    if n >= len(df2):
-        return df2
     if "Star Rating" in df2.columns:
         try:
             rng = random.Random(seed)
-            out_idx = []
-            for rating, g in df2.groupby("Star Rating"):
+            out_idx: List[int] = []
+            for _, g in df2.groupby("Star Rating"):
                 gidx = list(g.index)
                 take = max(1, int(round(n * (len(gidx) / len(df2)))))
                 rng.shuffle(gidx)
@@ -861,7 +1046,7 @@ def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
             pass
     return df2.sample(n=n, random_state=seed)
 
-# ---------- JSON salvage + retry wrappers (stability) ----------
+
 def _safe_json_load(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
     if not s:
@@ -874,13 +1059,14 @@ def _safe_json_load(s: str) -> Dict[str, Any]:
         i = s.find("{")
         j = s.rfind("}")
         if i >= 0 and j > i:
-            return json.loads(s[i:j+1])
+            return json.loads(s[i:j + 1])
     except Exception:
         return {}
     return {}
 
+
 def _chat_json_with_retries(
-    client,
+    client: Any,
     *,
     model: str,
     temperature: float,
@@ -890,51 +1076,39 @@ def _chat_json_with_retries(
 ) -> Dict[str, Any]:
     if client is None:
         return {}
-
     attempts = 1 + int(st.session_state.get("app_json_retries", 2) or 0)
-    last_err = None
-
+    last_err: Optional[Exception] = None
     for a in range(1, attempts + 1):
         try:
-            kwargs: Dict[str, Any] = dict(
-                model=model,
-                temperature=float(temperature),
-                messages=messages,
-            )
+            kwargs: Dict[str, Any] = {
+                "model": model,
+                "temperature": float(temperature),
+                "messages": messages,
+            }
             if response_format:
                 kwargs["response_format"] = response_format
-
-            # Throttle (coarse) to reduce rate-limit hits
-            est = 0
-            try:
-                est = sum(_estimate_tokens(m.get("content", ""), model_id=model) for m in (messages or []))
-            except Exception:
-                est = 0
+            est = sum(_estimate_tokens(m.get("content", ""), model_id=model) for m in (messages or []))
             _throttle("chat", est)
-
             resp = client.chat.completions.create(**kwargs)
             pt, ct = _extract_usage(resp)
             if pt or ct:
                 _track(component, model, in_tok=pt, out_tok=ct, embed=False)
-
             content = resp.choices[0].message.content or "{}"
             data = _safe_json_load(content)
             if data:
                 return data
-
             last_err = RuntimeError("Invalid/empty JSON response")
         except Exception as e:
             last_err = e
-
         if a < attempts:
             time.sleep(min((2 ** (a - 1)) + random.random(), 20))
-
     _ = last_err
     return {}
 
+
 def _prelearn_llm_batch_mine(
     texts: List[str],
-    client,
+    client: Any,
     model: str,
     temperature: float,
     known_themes: Dict[str, List[str]],
@@ -946,15 +1120,13 @@ def _prelearn_llm_batch_mine(
     sys = "\n".join([
         "You analyze consumer product reviews to extract CONSISTENT THEMES.",
         "Return STRICT JSON with schema:",
-        '{"product_profile":"<1-2 sentence product summary>",'
-        ' "detractors":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}],'
-        ' "delighters":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}]}',
+        '{"product_profile":"<1-2 sentence product summary>", "detractors":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}], "delighters":[{"label":"<2-4 words Title Case>", "keywords":["k1","k2","k3"]}]}',
         "",
         "Rules:",
         "- Labels must be mutually exclusive; avoid near-duplicates and synonyms.",
         "- Use singular nouns when possible (Issue, Problem, Complaint).",
         "- If a concept matches an existing theme, REUSE that exact label (do not invent a variant).",
-        f"- Return at most {max_themes//2} detractors and {max_themes//2} delighters.",
+        f"- Return at most {max_themes // 2} detractors and {max_themes // 2} delighters.",
         "- Keywords must be short (1-2 words), lowercase.",
     ])
 
@@ -968,24 +1140,18 @@ def _prelearn_llm_batch_mine(
         client,
         model=model,
         temperature=float(temperature),
-        messages=[{"role":"system","content":sys},{"role":"user","content":json.dumps(payload)}],
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(payload)}],
         component="prelearn-mine",
-        response_format={"type":"json_object"},
+        response_format={"type": "json_object"},
     )
-
     return {
-        "product_profile": str(data.get("product_profile","") or "").strip(),
+        "product_profile": str(data.get("product_profile", "") or "").strip(),
         "detractors": data.get("detractors", []) or [],
         "delighters": data.get("delighters", []) or [],
     }
 
-def _merge_theme_dict(
-    themes: Dict[str, Dict[str, Any]],
-    side: str,
-    canonical: str,
-    keywords: List[str],
-    count_inc: int = 1,
-):
+
+def _merge_theme_dict(themes: Dict[str, Dict[str, Any]], side: str, canonical: str, keywords: List[str], count_inc: int = 1) -> None:
     d = themes.setdefault(side, {})
     rec = d.setdefault(canonical, {"count": 0, "keywords": set()})
     rec["count"] = int(rec.get("count", 0)) + int(count_inc)
@@ -994,10 +1160,11 @@ def _merge_theme_dict(
         if kk and len(kk) <= 32:
             rec["keywords"].add(kk)
 
+
 def _consolidate_themes_semantic(
     side: str,
     themes: Dict[str, Dict[str, Any]],
-    client,
+    client: Any,
     embed_model: str,
     sem_merge_threshold: float = 0.92,
 ) -> Dict[str, Dict[str, Any]]:
@@ -1035,10 +1202,8 @@ def _consolidate_themes_semantic(
         va = pool_emb.get(a)
         if not va:
             continue
-        for b in labels_sorted[i+1:]:
-            if b not in themes[side]:
-                continue
-            if b == a:
+        for b in labels_sorted[i + 1:]:
+            if b not in themes[side] or b == a:
                 continue
             vb = pool_emb.get(b)
             if not vb:
@@ -1051,58 +1216,52 @@ def _consolidate_themes_semantic(
                 del themes[side][b]
     return themes
 
+
 def run_prelearn(
     df_in: pd.DataFrame,
-    client,
+    client: Any,
     prelearn_model: str,
     temperature: float,
     embed_model: str,
     sample_n: int,
     batch_size: int,
     sem_merge_threshold: float,
-    status_box,
-    prog_bar,
+    status_box: Any,
+    prog_bar: Any,
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
     learned = _ensure_learned_store()
 
-    status_box.markdown("🔎 **Prelearn:** Sampling reviews…")
+    status_box.markdown("🔎 **Prelearn:** sampling reviews…")
     df_s = _sample_reviews(df_in, n=int(sample_n))
     reviews = [str(x) for x in df_s["Verbatim"].tolist() if str(x).strip()]
     prog_bar.progress(0.05)
 
-    status_box.markdown("🧠 **Prelearn:** Building quick product glossary (no API)…")
-    terms = _top_terms(reviews, top_n=40)
-    learned["glossary_terms"] = terms
+    status_box.markdown("🧠 **Prelearn:** building quick product glossary…")
+    learned["glossary_terms"] = _top_terms(reviews, top_n=40)
     prog_bar.progress(0.12)
 
     themes: Dict[str, Dict[str, Any]] = {"Delighter": {}, "Detractor": {}}
     profiles: List[str] = []
     n = len(reviews)
     if n == 0:
-        status_box.markdown("⚠️ **Prelearn:** No reviews found to prelearn.")
+        status_box.markdown("⚠️ **Prelearn:** no reviews found.")
         prog_bar.progress(1.0)
         return learned
 
-    batches = [reviews[i:i+int(batch_size)] for i in range(0, n, int(batch_size))]
+    batches = [reviews[i:i + int(batch_size)] for i in range(0, n, int(batch_size))]
     total_batches = len(batches)
-    status_box.markdown(f"🤖 **Prelearn:** Mining themes with LLM… ({total_batches} batches)")
+    status_box.markdown(f"🤖 **Prelearn:** mining themes with LLM… ({total_batches} batches)")
     start_batch_time = time.perf_counter()
 
     for bi, chunk in enumerate(batches, start=1):
         elapsed = time.perf_counter() - start_batch_time
-        avg = (elapsed / max(1, bi-1)) if bi > 1 else 0.0
+        avg = (elapsed / max(1, bi - 1)) if bi > 1 else 0.0
         rem = (total_batches - bi + 1) * avg
         status_box.markdown(
-            f"🤖 **Prelearn:** Batch {bi}/{total_batches} • "
-            f"Reviews {((bi-1)*batch_size)+1}-{min(bi*batch_size, n)} of {n} • "
-            f"ETA ~ {_fmt_secs(rem)}"
+            f"🤖 **Prelearn:** batch {bi}/{total_batches} • reviews {((bi - 1) * batch_size) + 1}-{min(bi * batch_size, n)} of {n} • ETA ~ {_fmt_secs(rem)}"
         )
-
-        known = {
-            "Delighter": list(themes["Delighter"].keys()),
-            "Detractor": list(themes["Detractor"].keys()),
-        }
+        known = {"Delighter": list(themes["Delighter"].keys()), "Detractor": list(themes["Detractor"].keys())}
         data = _prelearn_llm_batch_mine(
             texts=chunk,
             client=client,
@@ -1113,23 +1272,16 @@ def run_prelearn(
         )
         if data.get("product_profile"):
             profiles.append(str(data["product_profile"]))
-
         for obj in data.get("delighters", []) or []:
-            lab = normalize_theme_label(obj.get("label",""), "Delighter")
+            lab = normalize_theme_label(obj.get("label", ""), "Delighter")
             kws = obj.get("keywords", []) or []
             _merge_theme_dict(themes, "Delighter", lab, kws, count_inc=1)
         for obj in data.get("detractors", []) or []:
-            lab = normalize_theme_label(obj.get("label",""), "Detractor")
+            lab = normalize_theme_label(obj.get("label", ""), "Detractor")
             kws = obj.get("keywords", []) or []
             _merge_theme_dict(themes, "Detractor", lab, kws, count_inc=1)
-
-        prog = 0.12 + 0.66 * (bi / max(1, total_batches))
-        prog_bar.progress(min(0.78, max(0.12, prog)))
-
-        try:
-            budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
-        except Exception:
-            budget = 0.0
+        prog_bar.progress(min(0.78, 0.12 + 0.66 * (bi / max(1, total_batches))))
+        budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
         if budget > 0:
             tr_now = _ensure_usage_tracker()
             session_total = float(tr_now["cost_chat"] + tr_now["cost_embed"])
@@ -1138,17 +1290,16 @@ def run_prelearn(
                     f"⛔ **Budget guard:** session spend {_fmt_money(session_total)} exceeded limit {_fmt_money(budget)}. Stopping prelearn early."
                 )
                 break
-
         if bi % 5 == 0:
             gc.collect()
 
-    status_box.markdown("🧩 **Prelearn:** Consolidating themes (dedupe + semantic merge)…")
+    status_box.markdown("🧩 **Prelearn:** consolidating themes…")
     themes = _consolidate_themes_semantic("Delighter", themes, client, embed_model, sem_merge_threshold=float(sem_merge_threshold))
     themes = _consolidate_themes_semantic("Detractor", themes, client, embed_model, sem_merge_threshold=float(sem_merge_threshold))
     prog_bar.progress(0.90)
 
     learned["labels"] = {"Delighter": {}, "Detractor": {}}
-    for side in ("Delighter","Detractor"):
+    for side in ("Delighter", "Detractor"):
         for lab, rec in sorted(themes.get(side, {}).items(), key=lambda kv: (-int(kv[1]["count"]), kv[0])):
             learned["labels"][side][lab] = {"synonyms": set(), "count": int(rec.get("count", 0))}
             learned["keywords"][side][lab] = set(rec.get("keywords", set()))
@@ -1157,138 +1308,24 @@ def run_prelearn(
     learned["version"] = f"prelearn_{int(learned['ts'] or 0)}"
 
     prog_bar.progress(1.0)
-    dt = time.perf_counter() - t0
-    status_box.markdown(f"✅ **Prelearn complete** in {_fmt_secs(dt)} • Learned {len(learned['labels']['Delighter'])} delighter themes, {len(learned['labels']['Detractor'])} detractor themes.")
+    status_box.markdown(
+        f"✅ **Prelearn complete** in {_fmt_secs(time.perf_counter() - t0)} • learned {len(learned['labels']['Delighter'])} delighter themes and {len(learned['labels']['Detractor'])} detractor themes."
+    )
     return learned
 
-# ------------------- Unified Labeler (single) -------------------
-def _openai_labeler_unified(
-    verbatim: str,
-    client,
-    model: str,
-    temperature: float,
-    allowed_delighters: List[str],
-    allowed_detractors: List[str],
-    known_theme_hints: Dict[str, List[str]],
-    max_ev_per_label: int = 2,
-    max_ev_chars: int = 120,
-) -> Dict[str, Any]:
-    if (client is None) or (not verbatim or not verbatim.strip()):
-        return {
-            "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
-            "ev_del_map": {}, "ev_det_map": {},
-            "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
-        }
-
-    key = ("lab2", _canon(verbatim), model, f"{float(temperature):.2f}",
-           _symptom_list_version(allowed_delighters, allowed_detractors, {}), max_ev_per_label, max_ev_chars,
-           json.dumps(known_theme_hints, sort_keys=True)[:2000])
-    cache = _ensure_label_cache()
-    if key in cache:
-        return cache[key]
-
-    sys = "\n".join([
-        "You label consumer reviews with predefined symptom lists and extract 3 meta fields.",
-        "Return STRICT JSON with this schema:",
-        '{'
-        '"detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring from review>", "..."]}],'
-        ' "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}],'
-        ' "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."],'
-        ' "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"'
-        '}',
-        "",
-        "Rules:",
-        f"- Evidence MUST be exact substrings from the review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
-        "- Only include a label if there is clear textual support in the review.",
-        "- Use ONLY allowed lists for 'detractors' and 'delighters'.",
-        "- For unlisted_* items, return a SHORT THEME (1–3 words), Title Case, no punctuation except slashes.",
-        "- Avoid duplicates and near-duplicates (plural vs singular, synonyms). Prefer reusing known themes if provided.",
-        "- Cap to maximum 10 detractors and 10 delighters. Cap to 10 unlisted per side.",
-        "",
-        "Meta enums:",
-        "SAFETY one of: ['Not Mentioned','Concern','Positive']",
-        "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
-        "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
-    ])
-
-    user_payload = {
-        "review": verbatim.strip(),
-        "allowed_delighters": allowed_delighters,
-        "allowed_detractors": allowed_detractors,
-        "known_unlisted_detractor_themes": (known_theme_hints.get("Detractor") or [])[:60],
-        "known_unlisted_delighter_themes": (known_theme_hints.get("Delighter") or [])[:60],
-    }
-
-    data = _chat_json_with_retries(
-        client,
-        model=model,
-        temperature=float(temperature),
-        messages=[{"role": "system", "content": sys},
-                  {"role": "user", "content": json.dumps(user_payload)}],
-        component="symptomize-label",
-        response_format={"type": "json_object"},
-    )
-
-    if not data:
-        return {
-            "dels": [], "dets": [], "unl_dels": [], "unl_dets": [],
-            "ev_del_map": {}, "ev_det_map": {},
-            "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
-        }
-
-    raw_dels = data.get("delighters", []) or []
-    raw_dets = data.get("detractors", []) or []
-    unl_dels = [x for x in (data.get("unlisted_delighters", []) or []) if isinstance(x, str) and x.strip()][:10]
-    unl_dets = [x for x in (data.get("unlisted_detractors", []) or []) if isinstance(x, str) and x.strip()][:10]
-
-    s = str(data.get("safety", "Not Mentioned")).strip()
-    r = str(data.get("reliability", "Not Mentioned")).strip()
-    n = str(data.get("sessions", "Unknown")).strip()
-    s = s if s in SAFETY_ENUM else "Not Mentioned"
-    r = r if r in RELIABILITY_ENUM else "Not Mentioned"
-    n = n if n in SESSIONS_ENUM else "Unknown"
-
-    def _extract_allowed(objs: Iterable[Any], allowed: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
-        out_labels: List[str] = []
-        ev_map: Dict[str, List[str]] = {}
-        allowed_set = set(allowed)
-        for obj in objs:
-            try:
-                lbl = str(obj.get("label", "")).strip()
-                evs = [str(e)[:max_ev_chars] for e in (obj.get("evidence", []) or []) if isinstance(e, str) and e.strip()]
-            except Exception:
-                continue
-            if lbl in allowed_set and lbl not in out_labels:
-                out_labels.append(lbl)
-                ev_map[lbl] = evs[:max_ev_per_label]
-            if len(out_labels) >= 10:
-                break
-        return out_labels, ev_map
-
-    dels, ev_del_map = _extract_allowed(raw_dels, allowed_delighters)
-    dets, ev_det_map = _extract_allowed(raw_dets, allowed_detractors)
-
-    out = {
-        "dels": dels,
-        "dets": dets,
-        "unl_dels": unl_dels,
-        "unl_dets": unl_dets,
-        "ev_del_map": ev_del_map,
-        "ev_det_map": ev_det_map,
-        "safety": s,
-        "reliability": r,
-        "sessions": n,
-    }
-    cache[key] = out
-    return out
-
-# ------------------- Unified Labeler (BATCH: fast) -------------------
+# ------------------------------ Batch labeler ------------------------------
 _LABELER_DEFAULT = {
-    "dels": [], "dets": [],
-    "unl_dels": [], "unl_dets": [],
-    "ev_del_map": {}, "ev_det_map": {},
-    "safety": "Not Mentioned", "reliability": "Not Mentioned", "sessions": "Unknown",
+    "dels": [],
+    "dets": [],
+    "unl_dels": [],
+    "unl_dets": [],
+    "ev_del_map": {},
+    "ev_det_map": {},
+    "safety": "Not Mentioned",
+    "reliability": "Not Mentioned",
+    "sessions": "Unknown",
 }
+
 
 def _label_cache_key(
     verbatim: str,
@@ -1311,6 +1348,7 @@ def _label_cache_key(
         json.dumps(known_theme_hints, sort_keys=True)[:2000],
     )
 
+
 def _normalize_unified_output(
     data: Any,
     allowed_delighters: List[str],
@@ -1320,7 +1358,6 @@ def _normalize_unified_output(
 ) -> Dict[str, Any]:
     if not isinstance(data, dict):
         data = {}
-
     raw_dels = data.get("delighters", []) or []
     raw_dets = data.get("detractors", []) or []
     unl_dels = [x for x in (data.get("unlisted_delighters", []) or []) if isinstance(x, str) and x.strip()][:10]
@@ -1342,7 +1379,7 @@ def _normalize_unified_output(
                 continue
             lbl = str(obj.get("label", "")).strip()
             evs_raw = obj.get("evidence", []) or []
-            evs = []
+            evs: List[str] = []
             for e in evs_raw:
                 if isinstance(e, str) and e.strip():
                     evs.append(str(e)[:max_ev_chars])
@@ -1355,7 +1392,6 @@ def _normalize_unified_output(
 
     dels, ev_del_map = _extract_allowed(raw_dels, allowed_delighters)
     dets, ev_det_map = _extract_allowed(raw_dets, allowed_detractors)
-
     return {
         "dels": dels,
         "dets": dets,
@@ -1368,9 +1404,10 @@ def _normalize_unified_output(
         "sessions": n,
     }
 
+
 def _openai_labeler_unified_batch(
     items: List[Dict[str, Any]],
-    client,
+    client: Any,
     model: str,
     temperature: float,
     allowed_delighters: List[str],
@@ -1380,11 +1417,6 @@ def _openai_labeler_unified_batch(
     max_ev_chars: int = 120,
     product_profile: str = "",
 ) -> Dict[int, Dict[str, Any]]:
-    """
-    Batch label N reviews in ONE request.
-    items: [{"idx": int, "review": str, "needs_del": bool, "needs_det": bool}, ...]
-    Returns: idx -> normalized output dict.
-    """
     out_by_idx: Dict[int, Dict[str, Any]] = {}
     if client is None or not items:
         return out_by_idx
@@ -1397,15 +1429,18 @@ def _openai_labeler_unified_batch(
         review = str(it.get("review") or "")
         needs_del = bool(it.get("needs_del", True))
         needs_det = bool(it.get("needs_det", True))
-
         if not review.strip():
             out_by_idx[idx] = dict(_LABELER_DEFAULT)
             continue
-
         key = _label_cache_key(
-            review, model, float(temperature),
-            allowed_delighters, allowed_detractors,
-            known_theme_hints, int(max_ev_per_label), int(max_ev_chars)
+            review,
+            model,
+            float(temperature),
+            allowed_delighters,
+            allowed_detractors,
+            known_theme_hints,
+            int(max_ev_per_label),
+            int(max_ev_chars),
         )
         if key in cache:
             out_by_idx[idx] = cache[key]
@@ -1419,13 +1454,7 @@ def _openai_labeler_unified_batch(
         "You label consumer reviews with predefined symptom lists and extract 3 meta fields.",
         "You will receive MULTIPLE reviews at once; treat each independently.",
         "Return STRICT JSON with schema:",
-        '{"items":['
-        '{"id":"<id>",'
-        '"detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring>", "..."]}],'
-        ' "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}],'
-        ' "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."],'
-        ' "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"}'
-        ']}',
+        '{"items":[{"id":"<id>","detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring>", "..."]}], "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}], "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."], "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"}]}',
         "",
         "Rules:",
         f"- Evidence MUST be exact substrings from THAT review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
@@ -1466,36 +1495,33 @@ def _openai_labeler_unified_batch(
         temperature=float(temperature),
         messages=[
             {"role": "system", "content": "\n".join(sys_lines)},
-            {"role": "user", "content": json.dumps(payload)}
+            {"role": "user", "content": json.dumps(payload)},
         ],
         component="symptomize-label-batch",
         response_format={"type": "json_object"},
     )
 
-    items_out = []
+    items_out: List[Any] = []
     if isinstance(data, dict) and isinstance(data.get("items"), list):
         items_out = data["items"]
     elif isinstance(data, list):
         items_out = data
-    else:
-        items_out = []
 
     by_id: Dict[str, Any] = {}
     for obj in items_out:
         if isinstance(obj, dict) and "id" in obj:
             by_id[str(obj.get("id"))] = obj
 
-    for (idx, review, needs_del, needs_det, key) in to_send:
+    for (idx, _, _, _, key) in to_send:
         obj = by_id.get(str(idx), {}) or {}
-        norm = _normalize_unified_output(
-            obj, allowed_delighters, allowed_detractors, int(max_ev_per_label), int(max_ev_chars)
-        )
+        norm = _normalize_unified_output(obj, allowed_delighters, allowed_detractors, int(max_ev_per_label), int(max_ev_chars))
         out_by_idx[idx] = norm
         cache[key] = norm
 
     return out_by_idx
 
-# ------------------- Export helpers (LAZY export: take bytes) -------------------
+
+# ------------------------------ Export helpers ------------------------------
 def generate_template_workbook_bytes(
     original_bytes: bytes,
     updated_df: pd.DataFrame,
@@ -1516,39 +1542,44 @@ def generate_template_workbook_bytes(
             ws.cell(row=1, column=col_idx, value=name)
 
     fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    fill_red   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    fill_yel   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-    fill_blu   = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
-    fill_pur   = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")
+    fill_red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    fill_yel = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    fill_blu = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
+    fill_pur = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")
 
     pset = set(processed_idx or [])
 
-    def _clear_template_slots(row_i: int):
+    def _clear_template_slots(row_i: int) -> None:
         for col_idx in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
             ws.cell(row=row_i, column=col_idx, value=None)
 
-    for i, (rid, r) in enumerate(df2.iterrows(), start=2):
+    for i, (rid, row) in enumerate(df2.iterrows(), start=2):
         if overwrite_processed_slots and (int(rid) in pset):
             _clear_template_slots(i)
         for j, col_idx in enumerate(DET_INDEXES, start=1):
-            val = r.get(f"AI Symptom Detractor {j}")
+            val = row.get(f"AI Symptom Detractor {j}")
             cv = None if (pd.isna(val) or str(val).strip() == "") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
             if cv is not None:
                 cell.fill = fill_red
         for j, col_idx in enumerate(DEL_INDEXES, start=1):
-            val = r.get(f"AI Symptom Delighter {j}")
+            val = row.get(f"AI Symptom Delighter {j}")
             cv = None if (pd.isna(val) or str(val).strip() == "") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
             if cv is not None:
                 cell.fill = fill_green
-        safety = r.get("AI Safety"); reliab = r.get("AI Reliability"); sess = r.get("AI # of Sessions")
+        safety = row.get("AI Safety")
+        reliab = row.get("AI Reliability")
+        sess = row.get("AI # of Sessions")
         if is_filled(safety):
-            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety)); c.fill = fill_yel
+            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety))
+            c.fill = fill_yel
         if is_filled(reliab):
-            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab)); c.fill = fill_blu
+            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab))
+            c.fill = fill_blu
         if is_filled(sess):
-            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess)); c.fill = fill_pur
+            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess))
+            c.fill = fill_pur
 
     for c in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
         try:
@@ -1560,25 +1591,21 @@ def generate_template_workbook_bytes(
     wb.save(out)
     return out.getvalue()
 
+
 def apply_symptoms_updates_to_workbook(
     original_bytes: bytes,
     new_symptoms: List[Tuple[str, str]],
     alias_additions: List[Tuple[str, str]],
 ) -> bytes:
     wb = load_workbook(io.BytesIO(original_bytes))
-
     if "Symptoms" not in wb.sheetnames:
         ws = wb.create_sheet("Symptoms")
     else:
         ws = wb["Symptoms"]
 
-    try:
-        headers_row = [c.value for c in ws[1]]
-    except Exception:
-        headers_row = []
+    headers_row = [c.value for c in ws[1]] if ws.max_row >= 1 else []
     headers = [str(h).strip() if h is not None else "" for h in headers_row]
     header_map = {str(h).strip().lower(): i + 1 for i, h in enumerate(headers) if str(h).strip()}
-
     used_cols: Set[int] = set()
 
     def _ensure_header(name: str, synonyms: List[str], preferred_index: Optional[int] = None) -> int:
@@ -1587,25 +1614,23 @@ def apply_symptoms_updates_to_workbook(
             if idx:
                 if not ws.cell(row=1, column=idx).value:
                     ws.cell(row=1, column=idx, value=name)
-                used_cols.add(idx); return idx
+                used_cols.add(idx)
+                return idx
         max_col = int(getattr(ws, "max_column", 0) or 0)
         idx = preferred_index if (preferred_index and preferred_index > 0) else (max_col + 1 if max_col > 0 else 1)
         while idx in used_cols:
             idx += 1
-        ws.cell(row=1, column=idx, value=name); used_cols.add(idx); return idx
+        ws.cell(row=1, column=idx, value=name)
+        used_cols.add(idx)
+        return idx
 
     col_label = _ensure_header("Symptom", ["symptom", "label", "name", "item"], preferred_index=1)
-    col_type  = _ensure_header("Type", ["type", "polarity", "category", "side"], preferred_index=2)
+    col_type = _ensure_header("Type", ["type", "polarity", "category", "side"], preferred_index=2)
     col_alias = _ensure_header("Aliases", ["aliases", "alias"], preferred_index=3)
 
     existing_row: Dict[str, int] = {}
     existing_aliases: Dict[str, Set[str]] = {}
-
-    try:
-        last_row = int(getattr(ws, "max_row", 0) or 0)
-    except Exception:
-        last_row = 0
-
+    last_row = int(getattr(ws, "max_row", 0) or 0)
     for r_i in range(2, last_row + 1):
         v = ws.cell(row=r_i, column=col_label).value
         if not v:
@@ -1615,15 +1640,12 @@ def apply_symptoms_updates_to_workbook(
         als = ws.cell(row=r_i, column=col_alias).value
         aset: Set[str] = set()
         if als:
-            als_norm = str(als).replace(",", "|")
-            aset = {a.strip() for a in als_norm.split("|") if a.strip()}
+            aset = {a.strip() for a in str(als).replace(",", "|").split("|") if a.strip()}
         existing_aliases[lab] = aset
 
     for label, side in new_symptoms:
         lab = str(label).strip()
-        if not lab:
-            continue
-        if lab in existing_row:
+        if not lab or lab in existing_row:
             continue
         rnew = (int(getattr(ws, "max_row", 1) or 1)) + 1
         ws.cell(row=rnew, column=col_label, value=lab)
@@ -1634,9 +1656,7 @@ def apply_symptoms_updates_to_workbook(
     for tgt_label, alias in alias_additions:
         tgt = str(tgt_label).strip()
         als = str(alias).strip()
-        if not tgt or not als:
-            continue
-        if tgt not in existing_row:
+        if not tgt or not als or tgt not in existing_row:
             continue
         aset = existing_aliases.setdefault(tgt, set())
         if _canon_simple(als) == _canon_simple(tgt):
@@ -1652,8 +1672,70 @@ def apply_symptoms_updates_to_workbook(
     out.seek(0)
     return out.getvalue()
 
-# ------------------- File Upload (SESSION-PERSISTED) -------------------
-uploaded_file = st.file_uploader("📂 Upload Excel (with 'Star Walk scrubbed verbatims' + 'Symptoms')", type=["xlsx"])
+# ----------------------------- Session bootstrap -----------------------------
+def _make_openai_client(api_key: str, timeout_s: float, max_retries: int):
+    if not (_HAS_OPENAI and api_key):
+        return None
+    try:
+        return OpenAI(api_key=api_key, timeout=float(timeout_s), max_retries=int(max_retries))
+    except TypeError:
+        try:
+            return OpenAI(api_key=api_key)
+        except Exception:
+            return None
+
+
+def _reset_filter_state() -> None:
+    for k in [
+        "f_source_sel",
+        "f_model_sel",
+        "f_country_sel",
+        "f_seeded_mode",
+        "f_new_mode",
+        "f_rating_sel",
+        "f_date_range",
+    ]:
+        st.session_state.pop(k, None)
+
+
+def _reset_run_outputs() -> None:
+    st.session_state["processed_rows"] = []
+    st.session_state["processed_idx_set"] = set()
+    st.session_state["new_symptom_candidates"] = {}
+    st.session_state["alias_suggestion_candidates"] = {}
+    st.session_state["last_run_processed_count"] = 0
+    st.session_state["ev_cov_num"] = 0
+    st.session_state["ev_cov_den"] = 0
+    st.session_state.pop("export_bytes", None)
+
+
+def _init_defaults() -> None:
+    defaults = {
+        "scope_choice": "Missing both",
+        "run_mode": "First N in current scope",
+        "overwrite_target": "Current scope only",
+        "confirm_overwrite": False,
+        "n_to_process": 10,
+        "ui_log_limit": 40,
+        "throttle_rpm": 0,
+        "throttle_tpm": 0,
+        "llm_batch_size": 6,
+        "batch_token_budget": 35000,
+        "budget_limit": 0.0,
+        "app_json_retries": 2,
+        "enable_undo": True,
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
+
+
+_init_defaults()
+
+uploaded_file = st.file_uploader(
+    "📂 Upload Excel workbook (reviews sheet + optional Symptoms sheet)",
+    type=["xlsx"],
+    help="Expected review sheet: 'Star Walk scrubbed verbatims'. Symptoms sheet is optional but recommended.",
+)
 if not uploaded_file:
     st.stop()
 
@@ -1663,16 +1745,16 @@ file_sig = hashlib.md5(uploaded_bytes).hexdigest()
 if st.session_state.get("_file_sig") != file_sig:
     st.session_state["_file_sig"] = file_sig
     st.session_state["uploaded_bytes"] = uploaded_bytes
+    st.session_state["uploaded_name"] = getattr(uploaded_file, "name", "reviews.xlsx")
 
     df0 = _load_reviews_df(uploaded_bytes)
     if "Verbatim" not in df0.columns:
-        st.error("Missing 'Verbatim' column.")
+        st.error("Missing required 'Verbatim' column.")
         st.stop()
 
     df0["Verbatim"] = df0["Verbatim"].map(clean_text)
     st.session_state["df_work"] = ensure_ai_columns(df0)
 
-    # Normalize common filter columns once per upload
     c_date = _find_col(st.session_state["df_work"], ["Review Date"])
     c_star = _find_col(st.session_state["df_work"], ["Star Rating", "star rating", "Rating"])
     _coerce_datetime_inplace(st.session_state["df_work"], c_date)
@@ -1691,184 +1773,103 @@ if st.session_state.get("_file_sig") != file_sig:
     st.session_state["last_run_processed_count"] = 0
     st.session_state["ev_cov_num"] = 0
     st.session_state["ev_cov_den"] = 0
-
     st.session_state["_label_cache"] = {}
     st.session_state["_embed_cache"] = {}
     st.session_state["_usage"] = {
-        "chat_in": 0, "chat_out": 0, "embed_in": 0,
-        "cost_chat": 0.0, "cost_embed": 0.0, "by_component": {}
+        "chat_in": 0,
+        "chat_out": 0,
+        "embed_in": 0,
+        "cost_chat": 0.0,
+        "cost_embed": 0.0,
+        "by_component": {},
     }
     st.session_state.pop("export_bytes", None)
-
     st.session_state.pop("learned", None)
     _ensure_learned_store()
 
+flash_msg = st.session_state.pop("_flash_msg", None)
+if flash_msg and isinstance(flash_msg, (tuple, list)) and len(flash_msg) == 2:
+    level, msg = flash_msg
+    if level == "success":
+        st.success(str(msg))
+    elif level == "warning":
+        st.warning(str(msg))
+    else:
+        st.info(str(msg))
+
+
+# ----------------------------- Core data state -----------------------------
 df = st.session_state["df_work"]
-DELIGHTERS = st.session_state.get("DELIGHTERS", [])
-DETRACTORS = st.session_state.get("DETRACTORS", [])
+DELIGHTERS = st.session_state.get("DELIGHTERS", []) or []
+DETRACTORS = st.session_state.get("DETRACTORS", []) or []
 ALIASES = st.session_state.get("ALIASES", {}) or {}
+_, _, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
 
 if not DELIGHTERS and not DETRACTORS:
-    st.warning("⚠️ No Symptoms found in 'Symptoms' tab. Prelearn can bootstrap themes.")
+    st.warning("No Symptoms sheet was found, or it was empty. Prelearn can bootstrap themes, and learned themes can be used temporarily.")
 else:
-    st.success(f"Loaded {len(DELIGHTERS)} Delighters, {len(DETRACTORS)} Detractors from Symptoms tab.")
+    st.success(f"Loaded {len(DELIGHTERS)} delighters and {len(DETRACTORS)} detractors from the Symptoms sheet.")
 
-DEL_MAP, DET_MAP, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
 
-# ------------------- Detection & KPIs -------------------
-colmap = detect_symptom_columns(df)
-work = detect_missing(df, colmap)
+# ----------------------------- Sidebar controls -----------------------------
+st.sidebar.header("⚙️ Controls")
 
-total = len(work)
-need_del = int(work["Needs_Delighters"].sum())
-need_det = int(work["Needs_Detractors"].sum())
-need_both = int(work["Needs_Symptomization"].sum())
-
-st.markdown(f"""
-<div class="hero">
-  <div class="hero-stats">
-    <div class="stat"><div class="label">Total Reviews</div><div class="value">{total:,}</div></div>
-    <div class="stat"><div class="label">Need Delighters</div><div class="value">{need_del:,}</div></div>
-    <div class="stat"><div class="label">Need Detractors</div><div class="value">{need_det:,}</div></div>
-    <div class="stat accent"><div class="label">Missing Both</div><div class="value">{need_both:,}</div></div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-# ------------------- LLM & Similarity Settings -------------------
-st.sidebar.header("🤖 LLM Settings")
-
-# Stability controls
-st.sidebar.subheader("🛡️ Stability")
-request_timeout_s = st.sidebar.number_input("OpenAI request timeout (sec)", 10, 300, 60, 10)
-sdk_max_retries = st.sidebar.number_input("OpenAI SDK retries (per request)", 0, 10, 3, 1)
-app_json_retries = st.sidebar.number_input("App JSON retries (parse/format)", 0, 6, 2, 1)
-ui_log_limit = st.sidebar.slider(
-    "Show last N processed reviews in UI",
-    0, 200, 40, 10,
-    help="0 = fastest (no per-review expanders). Prevents UI from freezing on huge runs."
-)
-enable_undo = st.sidebar.checkbox("Enable undo snapshots (uses RAM)", value=True)
-
-st.session_state["ui_log_limit"] = int(ui_log_limit)
-st.session_state["enable_undo"] = bool(enable_undo)
-st.session_state["app_json_retries"] = int(app_json_retries)
-
+st.sidebar.subheader("🤖 Model")
 MODEL_CHOICES = {
-    "Fast – GPT-4o-mini (default)": "gpt-4o-mini",
-    "Balanced – GPT-4.1": "gpt-4.1",
-    "Balanced – GPT-4o": "gpt-4o",
-    "Advanced – GPT-5": "gpt-5",
+    "Fast — GPT-4o-mini": "gpt-4o-mini",
+    "Balanced — GPT-4.1": "gpt-4.1",
+    "Balanced — GPT-4o": "gpt-4o",
+    "Advanced — GPT-5": "gpt-5",
 }
-model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=0)
-selected_model = MODEL_CHOICES[model_label]
+selected_model = MODEL_CHOICES[st.sidebar.selectbox("Run model", list(MODEL_CHOICES.keys()), index=0)]
 temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.1)
 
-def _make_openai_client(api_key: str, timeout_s: float, max_retries: int):
-    if not (_HAS_OPENAI and api_key):
-        return None
-    try:
-        return OpenAI(api_key=api_key, timeout=float(timeout_s), max_retries=int(max_retries))
-    except TypeError:
-        try:
-            return OpenAI(api_key=api_key)
-        except Exception:
-            return None
+st.sidebar.subheader("🛡️ Stability")
+request_timeout_s = st.sidebar.number_input("Request timeout (sec)", 10, 300, 60, 10)
+sdk_max_retries = st.sidebar.number_input("SDK retries", 0, 10, 3, 1)
+app_json_retries = st.sidebar.number_input("JSON retries", 0, 6, int(st.session_state.get("app_json_retries", 2)), 1)
+ui_log_limit = st.sidebar.slider("Show last N processed reviews", 0, 200, int(st.session_state.get("ui_log_limit", 40)), 10)
+enable_undo = st.sidebar.checkbox("Keep undo snapshots", value=bool(st.session_state.get("enable_undo", True)))
+st.session_state["app_json_retries"] = int(app_json_retries)
+st.session_state["ui_log_limit"] = int(ui_log_limit)
+st.session_state["enable_undo"] = bool(enable_undo)
 
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-client = _make_openai_client(api_key, request_timeout_s, sdk_max_retries)
-if client is None:
-    st.sidebar.warning("OpenAI not configured — set OPENAI_API_KEY and install 'openai'.")
-
-# ⚡ Speed / Rate-limit (NEW)
-st.sidebar.subheader("⚡ Speed / Rate-limit")
-
-llm_batch_size = st.sidebar.slider(
-    "LLM batch size (reviews per request)",
-    1, 12, 6, 1,
-    help="Batches multiple reviews into one API call. Much faster + fewer requests."
-)
-batch_token_budget = st.sidebar.slider(
-    "Batch token budget (approx prompt tokens)",
-    5000, 100000, 35000, 1000,
-    help="Caps how much text we pack into a single request (keeps quality stable)."
-)
-
-throttle_rpm = st.sidebar.number_input(
-    "Throttle: max chat requests/min (0 = off)",
-    0, 600, 0, 10,
-    help="Set this if you know your org RPM limit. Helps avoid 429s."
-)
-throttle_tpm = st.sidebar.number_input(
-    "Throttle: max estimated input tokens/min (0 = off)",
-    0, 2_000_000, 0, 10_000,
-    help="Coarse guard for TPM limits; uses estimated prompt tokens."
-)
-
+st.sidebar.subheader("⚡ Throughput")
+llm_batch_size = st.sidebar.slider("LLM batch size", 1, 12, int(st.session_state.get("llm_batch_size", 6)), 1)
+batch_token_budget = st.sidebar.slider("Batch token budget", 5000, 100000, int(st.session_state.get("batch_token_budget", 35000)), 1000)
+throttle_rpm = st.sidebar.number_input("Throttle chat requests/min (0 = off)", 0, 600, int(st.session_state.get("throttle_rpm", 0)), 10)
+throttle_tpm = st.sidebar.number_input("Throttle input tokens/min (0 = off)", 0, 2_000_000, int(st.session_state.get("throttle_tpm", 0)), 10_000)
 st.session_state["llm_batch_size"] = int(llm_batch_size)
 st.session_state["batch_token_budget"] = int(batch_token_budget)
 st.session_state["throttle_rpm"] = int(throttle_rpm)
 st.session_state["throttle_tpm"] = int(throttle_tpm)
 
-# Similarity guards
-st.sidebar.subheader("🧩 Consistency & Dedupe")
-sim_threshold_lex = st.sidebar.slider(
-    "Lexical similarity guard (difflib)",
-    0.80, 0.99, 0.94, 0.01,
-    help="Raise to suppress near-duplicates. Used for both New Symptoms & Alias Suggestions."
-)
-sim_threshold_sem = st.sidebar.slider(
-    "Semantic similarity guard (embeddings)",
-    0.80, 0.99, 0.92, 0.01,
-    help="Used to merge synonyms like 'Learning Curve' ~ 'Initially Complicated'. Requires embeddings + OpenAI."
-)
-
-# Evidence settings
 st.sidebar.subheader("🧾 Evidence")
-require_evidence = st.sidebar.checkbox(
-    "Require evidence to write labels",
-    value=True,
-    help="If ON, a label must include ≥1 exact snippet from the review to be written."
-)
-max_ev_per_label = st.sidebar.slider("Max evidence per label", 1, 3, 2)
-max_ev_chars = st.sidebar.slider("Max evidence length (chars)", 40, 200, 120, 10)
+require_evidence = st.sidebar.checkbox("Require evidence to write labels", value=True)
+max_ev_per_label = st.sidebar.slider("Max evidence snippets per label", 1, 3, 2)
+max_ev_chars = st.sidebar.slider("Max evidence length", 40, 200, 120, 10)
 
-# Embeddings + prelearn settings
-st.sidebar.subheader("🧠 Product Knowledge Prelearn (recommended)")
-prelearn_enabled = st.sidebar.checkbox(
-    "Auto-run Product Knowledge Prelearn before symptomizing",
-    value=True,
-    help="Runs a fast pre-pass to learn product glossary + canonical themes to reduce duplicates."
-)
-prelearn_model = st.sidebar.selectbox(
-    "Prelearn model (cheap recommended)",
-    ["gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5"],
-    index=0,
-    help="Used only for the prelearn mining step."
-)
-embed_model = st.sidebar.selectbox(
-    "Embedding model",
-    ["text-embedding-3-small"],
-    index=0,
-    help="Used for semantic merging and redundancy suppression."
-)
+st.sidebar.subheader("🧠 Prelearn")
+prelearn_enabled = st.sidebar.checkbox("Auto-run prelearn before symptomizing", value=True)
+prelearn_model = st.sidebar.selectbox("Prelearn model", ["gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5"], index=0)
+embed_model = st.sidebar.selectbox("Embedding model", ["text-embedding-3-small"], index=0)
 prelearn_sample_n = st.sidebar.slider("Prelearn sample size", 100, 3000, 800, 50)
 prelearn_batch_size = st.sidebar.slider("Prelearn batch size", 20, 120, 60, 10)
-prelearn_merge_threshold = st.sidebar.slider("Prelearn theme merge threshold", 0.85, 0.99, 0.92, 0.01)
-
+prelearn_merge_threshold = st.sidebar.slider("Prelearn merge threshold", 0.85, 0.99, 0.92, 0.01)
 use_learned_as_allowed = st.sidebar.checkbox(
-    "Use learned themes as temporary allowed list (helps when Symptoms tab is incomplete)",
+    "Use learned themes as temporary allowed labels",
     value=True,
-    help="When ON, the labeler can tag using learned themes in addition to the Symptoms tab."
+    help="Helpful when the Symptoms sheet is incomplete.",
 )
 
-# Cost panel
-st.sidebar.subheader("💰 Cost (this session)")
+st.sidebar.subheader("🧩 Consistency")
+sim_threshold_lex = st.sidebar.slider("Lexical similarity guard", 0.80, 0.99, 0.94, 0.01)
+sim_threshold_sem = st.sidebar.slider("Semantic similarity guard", 0.80, 0.99, 0.92, 0.01)
+
+st.sidebar.subheader("💰 Budget")
 if "_pricing_overrides" not in st.session_state:
     st.session_state["_pricing_overrides"] = {"models": {}, "embeddings": {}}
-
-with st.sidebar.expander("Pricing overrides (optional)", expanded=False):
-    st.caption("Defaults are from OpenAI docs; override here if pricing changes.")
+with st.sidebar.expander("Pricing overrides", expanded=False):
     models_to_show = sorted({selected_model, prelearn_model})
     for mid in models_to_show:
         default = MODEL_PRICING_PER_1M.get(mid, {"in": 0.0, "out": 0.0})
@@ -1882,168 +1883,65 @@ with st.sidebar.expander("Pricing overrides (optional)", expanded=False):
     emb_p = st.number_input(f"{embed_model} ($/1M tokens)", value=float(emb_cur), step=0.01, key=f"ov_{embed_model}_emb")
     st.session_state["_pricing_overrides"]["embeddings"][embed_model] = float(emb_p)
 
-tr = _ensure_usage_tracker()
-pin, pout = _price_for_model(selected_model)
-st.sidebar.markdown(
-    f"<div class='tiny'>Model <span class='mono'>{selected_model}</span>: "
-    f"<b>${pin}</b>/1M input • <b>${pout}</b>/1M output</div>",
-    unsafe_allow_html=True,
-)
-pemb = _price_for_embedding(embed_model)
-st.sidebar.markdown(
-    f"<div class='tiny'>Embeddings <span class='mono'>{embed_model}</span>: <b>${pemb}</b>/1M tokens</div>",
-    unsafe_allow_html=True,
-)
-
-st.sidebar.markdown(
-    f"<div class='chip-wrap'>"
-    f"<span class='chip blue'>Input tokens: {int(tr['chat_in']):,}</span>"
-    f"<span class='chip purple'>Output tokens: {int(tr['chat_out']):,}</span>"
-    f"<span class='chip yellow'>Embed tokens: {int(tr['embed_in']):,}</span>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-st.sidebar.markdown(
-    f"<div class='chip-wrap'>"
-    f"<span class='chip green'>Chat cost: {_fmt_money(float(tr['cost_chat']))}</span>"
-    f"<span class='chip green'>Embed cost: {_fmt_money(float(tr['cost_embed']))}</span>"
-    f"<span class='chip green'><b>Total:</b> {_fmt_money(float(tr['cost_chat']) + float(tr['cost_embed']))}</span>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-
 budget_limit = st.sidebar.number_input(
     "Stop runs if session spend exceeds (USD)",
     min_value=0.0,
     value=float(st.session_state.get("budget_limit", 0.0)),
     step=1.0,
-    help="0 disables. Useful to prevent accidental large runs."
 )
 st.session_state["budget_limit"] = float(budget_limit)
 
-# ------------------- Prelearn UI -------------------
-st.subheader("🧠 Product Knowledge Prelearn")
-prelearn_colA, prelearn_colB = st.columns([1.2, 2.8])
-with prelearn_colA:
-    run_prelearn_btn = st.button("🧠 Run Prelearn now", use_container_width=True, disabled=(client is None))
-with prelearn_colB:
-    st.markdown(
-        "<div class='tiny'>Prelearn builds a product glossary + canonical theme list so the system stops suggesting duplicates "
-        "like “Comfortable fit / comfortable use / comfortable design” and merges synonyms into one theme.</div>",
-        unsafe_allow_html=True,
-    )
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+client = _make_openai_client(api_key, request_timeout_s, sdk_max_retries)
+if client is None:
+    st.sidebar.warning("OpenAI is not configured. Upload / preview / export still work, but symptomization and prelearn require OPENAI_API_KEY.")
 
-prelearn_status = st.empty()
-prelearn_prog = st.progress(0.0)
+tr = _ensure_usage_tracker()
+pin, pout = _price_for_model(selected_model)
+pemb = _price_for_embedding(embed_model)
+st.sidebar.markdown(
+    f"<div class='tiny'>Model <span class='mono'>{selected_model}</span>: <b>${pin}</b>/1M input • <b>${pout}</b>/1M output</div>",
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown(
+    f"<div class='tiny'>Embeddings <span class='mono'>{embed_model}</span>: <b>${pemb}</b>/1M tokens</div>",
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown(
+    f"<div class='chip-wrap'>"
+    f"<span class='chip blue'>Input {int(tr['chat_in']):,}</span>"
+    f"<span class='chip purple'>Output {int(tr['chat_out']):,}</span>"
+    f"<span class='chip yellow'>Embed {int(tr['embed_in']):,}</span>"
+    f"</div>",
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown(
+    f"<div class='chip-wrap'>"
+    f"<span class='chip green'>Chat {_fmt_money(float(tr['cost_chat']))}</span>"
+    f"<span class='chip green'>Embed {_fmt_money(float(tr['cost_embed']))}</span>"
+    f"<span class='chip green'><b>Total {_fmt_money(float(tr['cost_chat']) + float(tr['cost_embed']))}</b></span>"
+    f"</div>",
+    unsafe_allow_html=True,
+)
 
-if run_prelearn_btn and client is not None:
-    learned = run_prelearn(
-        df_in=df,
-        client=client,
-        prelearn_model=prelearn_model,
-        temperature=0.0,
-        embed_model=embed_model,
-        sample_n=int(prelearn_sample_n),
-        batch_size=int(prelearn_batch_size),
-        sem_merge_threshold=float(prelearn_merge_threshold),
-        status_box=prelearn_status,
-        prog_bar=prelearn_prog,
-    )
-    st.session_state["learned"] = learned
 
-learned_store = _ensure_learned_store()
-if learned_store.get("labels", {}).get("Delighter") or learned_store.get("labels", {}).get("Detractor"):
-    with st.expander("See learned product knowledge", expanded=False):
-        st.markdown("**Product profile (learned)**")
-        st.write(learned_store.get("product_profile","") or "(none)")
-        st.markdown("**Top glossary terms (no-API)**")
-        if learned_store.get("glossary_terms"):
-            chips = "<div class='chip-wrap'>" + "".join(
-                [f"<span class='chip blue'>{html.escape(w)} · {c}</span>" for w,c in learned_store["glossary_terms"][:30]]
-            ) + "</div>"
-            st.markdown(chips, unsafe_allow_html=True)
-        else:
-            st.write("(none)")
-        st.markdown("**Learned themes (Delighters)**")
-        d1 = list(learned_store.get("labels", {}).get("Delighter", {}).keys())[:40]
-        st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{html.escape(x)}</span>" for x in d1]) + "</div>", unsafe_allow_html=True)
-        st.markdown("**Learned themes (Detractors)**")
-        d2 = list(learned_store.get("labels", {}).get("Detractor", {}).keys())[:40]
-        st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{html.escape(x)}</span>" for x in d2]) + "</div>", unsafe_allow_html=True)
+# ----------------------------- Filtering logic -----------------------------
+colmap = detect_symptom_columns(df)
+work = detect_missing(df, colmap)
 
-# ------------------- Review Filters (subset selection) -------------------
-st.subheader("🔎 Review Filters (optional)")
-
-# Resolve columns best-effort
-c_source  = _find_col(work, ["Source"])
-c_model   = _find_col(work, ["Model (SKU)", "Model", "SKU"])
-c_seeded  = _find_col(work, ["Seeded"])
+c_source = _find_col(work, ["Source"])
+c_model = _find_col(work, ["Model (SKU)", "Model", "SKU"])
+c_seeded = _find_col(work, ["Seeded"])
 c_country = _find_col(work, ["Country", "Region"])
-c_newrev  = _find_col(work, ["New Review", "New"])
-c_rdate   = _find_col(work, ["Review Date"])
-c_rating  = _find_col(work, ["Star Rating", "star rating", "Rating"])
-
+c_newrev = _find_col(work, ["New Review", "New"])
+c_rdate = _find_col(work, ["Review Date"])
+c_rating = _find_col(work, ["Star Rating", "star rating", "Rating"])
 _coerce_datetime_inplace(work, c_rdate)
 _coerce_numeric_inplace(work, c_rating)
 
-with st.expander("Choose a subset to symptomize (Source / SKU / Seeded / Country / New Review / Date / Rating)", expanded=False):
-    row1 = st.columns(3)
-    with row1[0]:
-        if c_source:
-            st.multiselect("Source", options=_unique_sorted_str(work[c_source]), key="f_source_sel")
-        else:
-            st.caption("Source: (column not found)")
-    with row1[1]:
-        if c_model:
-            st.multiselect("Model (SKU)", options=_unique_sorted_str(work[c_model]), key="f_model_sel")
-        else:
-            st.caption("Model (SKU): (column not found)")
-    with row1[2]:
-        if c_country:
-            st.multiselect("Country", options=_unique_sorted_str(work[c_country]), key="f_country_sel")
-        else:
-            st.caption("Country: (column not found)")
-
-    row2 = st.columns(3)
-    with row2[0]:
-        if c_seeded:
-            st.selectbox("Seeded", ["All", "Seeded only", "Non-seeded only"], index=0, key="f_seeded_mode")
-        else:
-            st.caption("Seeded: (column not found)")
-    with row2[1]:
-        if c_newrev:
-            st.selectbox("New Review", ["All", "New only", "Not new only"], index=0, key="f_new_mode")
-        else:
-            st.caption("New Review: (column not found)")
-    with row2[2]:
-        if c_rating:
-            vals = work[c_rating].dropna().tolist()
-            opts = sorted({int(v) if isinstance(v, (int, float)) and float(v).is_integer() else v for v in vals})
-            if opts:
-                st.multiselect("Star Rating", options=opts, default=opts, key="f_rating_sel")
-            else:
-                st.caption("Star Rating: (no values)")
-        else:
-            st.caption("Star Rating: (column not found)")
-
-    if c_rdate and work[c_rdate].notna().any():
-        try:
-            dmin = pd.to_datetime(work[c_rdate].min()).date()
-            dmax = pd.to_datetime(work[c_rdate].max()).date()
-            st.date_input("Review Date range", value=(dmin, dmax), key="f_date_range")
-        except Exception:
-            st.caption("Review Date: (could not parse dates)")
 
 def _apply_filters_to_work(work_df: pd.DataFrame) -> pd.DataFrame:
-    out = work_df
-
-    c_source  = _find_col(out, ["Source"])
-    c_model   = _find_col(out, ["Model (SKU)", "Model", "SKU"])
-    c_seeded  = _find_col(out, ["Seeded"])
-    c_country = _find_col(out, ["Country", "Region"])
-    c_newrev  = _find_col(out, ["New Review", "New"])
-    c_rdate   = _find_col(out, ["Review Date"])
-    c_rating  = _find_col(out, ["Star Rating", "star rating", "Rating"])
+    out = work_df.copy()
 
     src_sel = st.session_state.get("f_source_sel", []) or []
     if c_source and src_sel:
@@ -2074,9 +1972,8 @@ def _apply_filters_to_work(work_df: pd.DataFrame) -> pd.DataFrame:
             out = out[b == False]
 
     date_range = st.session_state.get("f_date_range", None)
-    if c_rdate and date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+    if c_rdate and date_range and isinstance(date_range, (tuple, list)) and len(date_range) == 2:
         try:
-            _coerce_datetime_inplace(out, c_rdate)
             start = pd.Timestamp(date_range[0])
             end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
             out = out[(out[c_rdate] >= start) & (out[c_rdate] <= end)]
@@ -2086,58 +1983,59 @@ def _apply_filters_to_work(work_df: pd.DataFrame) -> pd.DataFrame:
     rating_sel = st.session_state.get("f_rating_sel", None)
     if c_rating and rating_sel is not None and len(rating_sel) > 0:
         try:
-            _coerce_numeric_inplace(out, c_rating)
             out = out[out[c_rating].isin(list(rating_sel))]
         except Exception:
             out = out[out[c_rating].astype(str).isin([str(x) for x in rating_sel])]
 
     return out
 
+
 work_filtered = _apply_filters_to_work(work)
-st.caption(f"Filters active: **{len(work_filtered):,} / {len(work):,}** reviews eligible.")
-
-# ------------------- Scope & Preview -------------------
-st.subheader("🧪 Symptomize")
-scope = st.selectbox(
-    "Choose scope",
-    ["Missing both", "Any missing", "Missing delighters only", "Missing detractors only"],
-    index=0,
-)
-
-base = work_filtered
-
-if scope == "Missing both":
-    target = base[(base["Needs_Delighters"]) & (base["Needs_Detractors"])]
-elif scope == "Missing delighters only":
-    target = base[(base["Needs_Delighters"]) & (~base["Needs_Detractors"])]
-elif scope == "Missing detractors only":
-    target = base[(~base["Needs_Delighters"]) & (base["Needs_Detractors"])]
+scope_choice = st.session_state.get("scope_choice", "Missing both")
+if scope_choice == "Missing both":
+    target = work_filtered[(work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])]
+elif scope_choice == "Any missing":
+    target = work_filtered[(work_filtered["Needs_Delighters"]) | (work_filtered["Needs_Detractors"])]
+elif scope_choice == "Missing delighters only":
+    target = work_filtered[(work_filtered["Needs_Delighters"]) & (~work_filtered["Needs_Detractors"])]
 else:
-    target = base[(base["Needs_Delighters"]) | (base["Needs_Detractors"])]
+    target = work_filtered[(~work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])]
 
-st.write(f"🔎 **{len(target):,} reviews** match the selected scope (and filters).")
-with st.expander("Preview in-scope rows", expanded=False):
-    preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
-    extras = [c for c in ["Star Rating", "Review Date", "Source"] if c in target.columns]
-    st.dataframe(target[preview_cols + extras].head(200), use_container_width=True)
 
-# ------------------- Controls (SESSION-PERSISTED) -------------------
-st.session_state.setdefault("processed_rows", [])
-st.session_state.setdefault("processed_idx_set", set())
-st.session_state.setdefault("new_symptom_candidates", {})
-st.session_state.setdefault("alias_suggestion_candidates", {})
-st.session_state.setdefault("undo_stack", [])
-st.session_state.setdefault("last_run_processed_count", 0)
-st.session_state.setdefault("ev_cov_num", 0)
-st.session_state.setdefault("ev_cov_den", 0)
+def _active_filter_items() -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = []
+    src_sel = st.session_state.get("f_source_sel", []) or []
+    model_sel = st.session_state.get("f_model_sel", []) or []
+    country_sel = st.session_state.get("f_country_sel", []) or []
+    seeded_mode = str(st.session_state.get("f_seeded_mode", "All"))
+    new_mode = str(st.session_state.get("f_new_mode", "All"))
+    rating_sel = st.session_state.get("f_rating_sel", []) or []
+    date_range = st.session_state.get("f_date_range", None)
+    if src_sel:
+        items.append((f"Source: {len(src_sel)}", "blue"))
+    if model_sel:
+        items.append((f"SKU: {len(model_sel)}", "purple"))
+    if country_sel:
+        items.append((f"Country: {len(country_sel)}", "blue"))
+    if seeded_mode != "All":
+        items.append((seeded_mode, "yellow"))
+    if new_mode != "All":
+        items.append((new_mode, "yellow"))
+    if rating_sel:
+        items.append((f"Rating: {', '.join([str(x) for x in rating_sel])}", "green"))
+    if date_range and isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        items.append((f"Date: {date_range[0]} → {date_range[1]}", "gray"))
+    return items
 
-processed_rows: List[Dict[str, Any]] = st.session_state["processed_rows"]
-processed_idx_set: Set[int] = st.session_state["processed_idx_set"]
 
-new_symptom_candidates: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state["new_symptom_candidates"]
-alias_suggestion_candidates: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state["alias_suggestion_candidates"]
+# ----------------------------- Run helpers -----------------------------
+processed_rows: List[Dict[str, Any]] = st.session_state.get("processed_rows", []) or []
+processed_idx_set: Set[int] = st.session_state.get("processed_idx_set", set()) or set()
+new_symptom_candidates: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state.get("new_symptom_candidates", {}) or {}
+alias_suggestion_candidates: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state.get("alias_suggestion_candidates", {}) or {}
 
-def _agg_candidate(d: Dict, key: Tuple, idx: int, max_refs: int = 50):
+
+def _agg_candidate(d: Dict[Any, Any], key: Tuple[Any, ...], idx: int, max_refs: int = 50) -> None:
     rec = d.setdefault(key, {"count": 0, "refs": []})
     rec["count"] = int(rec.get("count", 0)) + 1
     refs = rec.get("refs", [])
@@ -2145,91 +2043,73 @@ def _agg_candidate(d: Dict, key: Tuple, idx: int, max_refs: int = 50):
         refs.append(int(idx))
         rec["refs"] = refs
 
-# Row 1: actions
-r1a, r1b, r1c, r1d, r1e = st.columns([1.4, 1.4, 1.8, 1.8, 1.2])
-with r1a: run_n_btn = st.button("▶️ Symptomize N", use_container_width=True)
-with r1b: run_all_btn = st.button("🚀 Symptomize All (current scope)", use_container_width=True)
-with r1c: overwrite_btn = st.button("🧹 Overwrite & Symptomize ALL (start at row 1)", use_container_width=True)
-with r1d: run_missing_both_btn = st.button("✨ Missing-Both One-Click", use_container_width=True)
-with r1e: undo_btn = st.button("↩️ Undo last run", use_container_width=True)
 
-st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-# Row 2: batch size + presets
-st.markdown("<div class='batch-row'></div>", unsafe_allow_html=True)
-cA, cB, cC, cD, cE = st.columns([1.0, 0.5, 0.5, 0.5, 0.5])
-
-with cA:
-    bound_min = 1
-    bound_max = max(1, len(target))
-    if "n_to_process" not in st.session_state:
-        st.session_state["n_to_process"] = min(10, bound_max)
-    cur = int(st.session_state.get("n_to_process", 1))
-    if cur < bound_min:
-        st.session_state["n_to_process"] = bound_min
-    elif cur > bound_max:
-        st.session_state["n_to_process"] = bound_max
-
-    n_to_process = st.number_input(
-        "How many to symptomize (from top of scope)",
-        min_value=bound_min,
-        max_value=bound_max,
-        step=1,
-        key="n_to_process",
-    )
-
-def _set_n(v: int):
-    st.session_state["n_to_process"] = min(max(int(v), 1), max(1, len(target)))
-    st.rerun()
-
-with cB: st.button("10",  use_container_width=True, on_click=_set_n, args=(10,))
-with cC: st.button("25",  use_container_width=True, on_click=_set_n, args=(25,))
-with cD: st.button("50",  use_container_width=True, on_click=_set_n, args=(50,))
-with cE: st.button("100", use_container_width=True, on_click=_set_n, args=(100,))
-
-# ------------------- Runner helpers -------------------
 def _active_allowed_lists() -> Tuple[List[str], List[str]]:
     dels = list(DELIGHTERS)
     dets = list(DETRACTORS)
-
     if use_learned_as_allowed:
-        learned_dels = _known_learned_labels("Delighter")[:60]
-        learned_dets = _known_learned_labels("Detractor")[:60]
-        for x in learned_dels:
+        for x in _known_learned_labels("Delighter")[:60]:
             if x not in dels:
                 dels.append(x)
-        for x in learned_dets:
+        for x in _known_learned_labels("Detractor")[:60]:
             if x not in dets:
                 dets.append(x)
     return dels, dets
 
-# ------------------- FAST batched runner -------------------
-def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
-    global df, new_symptom_candidates, alias_suggestion_candidates
 
-    st.session_state["processed_rows"] = []
-    st.session_state["processed_idx_set"] = set()
-    st.session_state["new_symptom_candidates"] = {}
-    st.session_state["alias_suggestion_candidates"] = {}
-    st.session_state["last_run_processed_count"] = 0
-    st.session_state["ev_cov_num"] = 0
-    st.session_state["ev_cov_den"] = 0
-    st.session_state.pop("export_bytes", None)
+def _build_run_selection() -> Tuple[pd.DataFrame, bool, str]:
+    run_mode = st.session_state.get("run_mode", "First N in current scope")
+    overwrite_mode = False
+    label = run_mode
+    if run_mode == "First N in current scope":
+        rows_iter = target.sort_index().head(int(st.session_state.get("n_to_process", 10) or 10))
+        label = f"First {len(rows_iter):,} rows in current scope"
+    elif run_mode == "All reviews in current scope":
+        rows_iter = target.sort_index()
+        label = f"All {len(rows_iter):,} rows in current scope"
+    elif run_mode == "Missing-both fast pass":
+        rows_iter = work_filtered[(work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])].sort_index()
+        label = f"Missing-both within current filters ({len(rows_iter):,} rows)"
+    else:
+        overwrite_mode = True
+        if st.session_state.get("overwrite_target", "Current scope only") == "Current scope only":
+            rows_iter = target.sort_index()
+            label = f"Rebuild current scope from scratch ({len(rows_iter):,} rows)"
+        else:
+            rows_iter = work_filtered.sort_index()
+            label = f"Rebuild all filtered rows from scratch ({len(rows_iter):,} rows)"
+    return rows_iter, overwrite_mode, label
 
+
+def _run_button_label(rows_df: pd.DataFrame, overwrite_mode: bool) -> str:
+    run_mode = st.session_state.get("run_mode", "First N in current scope")
+    n = len(rows_df)
+    if overwrite_mode:
+        return f"🧹 Rebuild {n:,} row(s)"
+    if run_mode == "Missing-both fast pass":
+        return f"✨ Run missing-both on {n:,} row(s)"
+    if run_mode == "All reviews in current scope":
+        return f"🚀 Run all {n:,} in scope"
+    return f"▶️ Run first {n:,} row(s)"
+
+
+def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False) -> None:
+    global df
+
+    _reset_run_outputs()
     processed_rows_local: List[Dict[str, Any]] = st.session_state["processed_rows"]
     processed_idx_set_local: Set[int] = st.session_state["processed_idx_set"]
-    new_symptom_candidates = st.session_state["new_symptom_candidates"]
-    alias_suggestion_candidates = st.session_state["alias_suggestion_candidates"]
+    new_symptom_candidates_local: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state["new_symptom_candidates"]
+    alias_suggestion_candidates_local: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state["alias_suggestion_candidates"]
 
     prog = st.progress(0.0)
     eta_box = st.empty()
     status_box = st.empty()
 
-    # Auto prelearn
     if prelearn_enabled and client is not None:
         ls = _ensure_learned_store()
         if not (ls.get("labels", {}).get("Delighter") or ls.get("labels", {}).get("Detractor")):
-            status_box.markdown("🧠 Auto-running Prelearn (recommended)…")
+            status_box.markdown("🧠 Auto-running prelearn…")
             pre_box = st.empty()
             pre_prog = st.progress(0.0)
             run_prelearn(
@@ -2248,14 +2128,13 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             pre_prog.empty()
 
     df = ensure_ai_columns(df)
-
     snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
     do_undo = bool(st.session_state.get("enable_undo", True))
 
     if overwrite_mode:
         idxs = rows_df.index.tolist()
-        for idx_clear in idxs:
-            if do_undo:
+        if do_undo:
+            for idx_clear in idxs:
                 old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
                 old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
                 old_vals.update({
@@ -2264,12 +2143,17 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                     "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"],
                 })
                 snapshot.append((int(idx_clear), old_vals))
-            for j in range(1, 11):
-                df.loc[idx_clear, f"AI Symptom Detractor {j}"] = None
-                df.loc[idx_clear, f"AI Symptom Delighter {j}"] = None
-            df.loc[idx_clear, "AI Safety"] = None
-            df.loc[idx_clear, "AI Reliability"] = None
-            df.loc[idx_clear, "AI # of Sessions"] = None
+        df = clear_ai_slots_for_indices(df, idxs)
+    elif do_undo:
+        for idx_keep in rows_df.index.tolist():
+            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_keep, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
+            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_keep, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
+            old_vals.update({
+                "AI Safety": df.loc[idx_keep, "AI Safety"],
+                "AI Reliability": df.loc[idx_keep, "AI Reliability"],
+                "AI # of Sessions": df.loc[idx_keep, "AI # of Sessions"],
+            })
+            snapshot.append((int(idx_keep), old_vals))
 
     total_n = max(1, len(rows_df))
     t0 = time.perf_counter()
@@ -2287,74 +2171,47 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
 
     batch_size = int(st.session_state.get("llm_batch_size", 6) or 1)
     batch_budget = int(st.session_state.get("batch_token_budget", 35000) or 35000)
-
-    try:
-        overhead_est = _estimate_tokens(
-            json.dumps(
-                {
-                    "allowed_delighters": allowed_dels,
-                    "allowed_detractors": allowed_dets,
-                    "known": known_hints,
-                    "profile": product_profile[:600],
-                }
-            ),
-            model_id=selected_model,
-        ) + 800
-    except Exception:
-        overhead_est = 2000
+    overhead_est = _estimate_tokens(
+        json.dumps({"allowed_delighters": allowed_dels, "allowed_detractors": allowed_dets, "known": known_hints, "profile": product_profile[:600]}),
+        model_id=selected_model,
+    ) + 800
 
     rows_list = list(rows_df.iterrows())
     batches: List[List[Tuple[int, pd.Series]]] = []
     cur: List[Tuple[int, pd.Series]] = []
     cur_tok = 0
-
     for idx, row in rows_list:
         vb = str(row.get("Verbatim", "") or "")
-        try:
-            t_est = _estimate_tokens(vb, model_id=selected_model)
-        except Exception:
-            t_est = max(1, len(vb) // 4)
-
+        t_est = _estimate_tokens(vb, model_id=selected_model)
         if cur and ((len(cur) >= batch_size) or (overhead_est + cur_tok + t_est > batch_budget)):
             batches.append(cur)
             cur = []
             cur_tok = 0
-
         cur.append((int(idx), row))
         cur_tok += int(t_est)
-
         if overhead_est + cur_tok > batch_budget and len(cur) == 1:
             batches.append(cur)
             cur = []
             cur_tok = 0
-
     if cur:
         batches.append(cur)
 
     done = 0
-
     for bi, batch_rows in enumerate(batches, start=1):
-        items = []
+        items: List[Dict[str, Any]] = []
         for idx, row in batch_rows:
             vb = str(row.get("Verbatim", "") or "")
-            needs_del = bool(row.get("Needs_Delighters", False))
-            needs_det = bool(row.get("Needs_Detractors", False))
+            if overwrite_mode:
+                needs_del = True
+                needs_det = True
+            else:
+                needs_del = bool(row.get("Needs_Delighters", False))
+                needs_det = bool(row.get("Needs_Detractors", False))
             items.append({"idx": int(idx), "review": vb, "needs_del": needs_del, "needs_det": needs_det})
 
-            if not overwrite_mode and do_undo:
-                old_vals = {f"AI Symptom Detractor {j}": df.loc[idx, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
-                old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
-                old_vals.update({
-                    "AI Safety": df.loc[idx, "AI Safety"],
-                    "AI Reliability": df.loc[idx, "AI Reliability"],
-                    "AI # of Sessions": df.loc[idx, "AI # of Sessions"],
-                })
-                snapshot.append((int(idx), old_vals))
-
-        status_box.markdown(f"🔄 **Batch {bi}/{len(batches)}** • labeling + meta…")
-
-        outs_by_idx = {}
-        if client:
+        status_box.markdown(f"🔄 **Batch {bi}/{len(batches)}** — labeling + meta…")
+        outs_by_idx: Dict[int, Dict[str, Any]] = {}
+        if client is not None:
             outs_by_idx = _openai_labeler_unified_batch(
                 items=items,
                 client=client,
@@ -2373,7 +2230,6 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             vb = str(it["review"] or "")
             needs_deli = bool(it["needs_del"])
             needs_detr = bool(it["needs_det"])
-
             out = outs_by_idx.get(idx, dict(_LABELER_DEFAULT))
 
             dels = out.get("dels", []) or []
@@ -2386,7 +2242,8 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             reliability = out.get("reliability", "Not Mentioned")
             sessions = out.get("sessions", "Unknown")
 
-            wrote_dets, wrote_dels = [], []
+            wrote_dets: List[str] = []
+            wrote_dels: List[str] = []
             ev_written_det: Dict[str, List[str]] = {}
             ev_written_del: Dict[str, List[str]] = {}
 
@@ -2396,17 +2253,21 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                 evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
                 return len(evs) > 0
 
+            if overwrite_mode:
+                for j in range(1, 11):
+                    df.loc[idx, f"AI Symptom Detractor {j}"] = None
+                    df.loc[idx, f"AI Symptom Delighter {j}"] = None
+
             if needs_detr and dets:
                 dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
                 for j, lab in enumerate(dets_to_write):
-                    df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
+                    df.loc[idx, f"AI Symptom Detractor {j + 1}"] = lab
                     ev_written_det[lab] = ev_det_map.get(lab, [])
                 wrote_dets = dets_to_write
-
             if needs_deli and dels:
                 dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
                 for j, lab in enumerate(dels_to_write):
-                    df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
+                    df.loc[idx, f"AI Symptom Delighter {j + 1}"] = lab
                     ev_written_del[lab] = ev_del_map.get(lab, [])
                 wrote_dels = dels_to_write
 
@@ -2419,7 +2280,7 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             new_unl_dets: List[str] = []
             alias_sugs_for_row: List[Tuple[str, str, str, float]] = []
 
-            def _handle_unlisted_list(items2: List[str], side_label: str):
+            def _handle_unlisted_list(items2: List[str], side_label: str) -> None:
                 nonlocal new_unl_dels, new_unl_dets, alias_sugs_for_row
                 for raw in items2 or []:
                     raw2 = str(raw).strip()
@@ -2434,16 +2295,14 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
                         learned_store=learned,
                         sim_threshold_lex=float(sim_threshold_lex),
                         sim_threshold_sem=float(sim_threshold_sem),
-                        client=client if client is not None else None,
+                        client=client,
                         embed_model=embed_model,
                     )
                     canon = str(res["canonical"]).strip()
                     kind = res.get("kind", "new")
                     tgt = str(res.get("target", "") or "").strip()
                     score = float(res.get("score", 0.0) or 0.0)
-
                     _update_learned(side_label, canon, synonym=raw2)
-
                     if kind in {"exact_existing", "alias_to_existing"} and tgt:
                         alias_sugs_for_row.append((tgt, raw2, side_label, score))
                     elif kind == "synonym_to_learned":
@@ -2458,28 +2317,29 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             _handle_unlisted_list(unl_dets, "Detractor")
 
             def _dedupe_keep_order(lst: List[str]) -> List[str]:
-                out2, seen = [], set()
+                out2: List[str] = []
+                seen: Set[str] = set()
                 for x in lst:
                     k2 = _canon_simple(x)
                     if not x or k2 in seen:
                         continue
-                    seen.add(k2); out2.append(x)
+                    seen.add(k2)
+                    out2.append(x)
                 return out2
 
             new_unl_dels = _dedupe_keep_order([normalize_theme_label(x, "Delighter") for x in new_unl_dels])
             new_unl_dets = _dedupe_keep_order([normalize_theme_label(x, "Detractor") for x in new_unl_dets])
 
             for lab in new_unl_dels:
-                _agg_candidate(new_symptom_candidates, (lab, "Delighter"), int(idx))
+                _agg_candidate(new_symptom_candidates_local, (lab, "Delighter"), int(idx))
             for lab in new_unl_dets:
-                _agg_candidate(new_symptom_candidates, (lab, "Detractor"), int(idx))
+                _agg_candidate(new_symptom_candidates_local, (lab, "Detractor"), int(idx))
             for tgt, alias, side_label, score in alias_sugs_for_row:
                 side_norm = "Delighter" if side_label.lower().startswith("del") else "Detractor"
-                _agg_candidate(alias_suggestion_candidates, (tgt, alias, side_norm), int(idx))
+                _agg_candidate(alias_suggestion_candidates_local, (tgt, alias, side_norm), int(idx))
 
             total_labels = len(wrote_dets) + len(wrote_dels)
-            labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, [])) > 0) + \
-                             sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, [])) > 0)
+            labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, [])) > 0) + sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, [])) > 0)
             cov_num += labels_with_ev
             cov_den += total_labels
             row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
@@ -2509,82 +2369,45 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False):
             done += 1
 
         prog.progress(done / total_n)
-
         elapsed = time.perf_counter() - t0
         rate = (done / elapsed) if elapsed > 0 else 0.0
         rem = total_n - done
         eta_sec = (rem / rate) if rate > 0 else 0.0
-
         tr2 = _ensure_usage_tracker()
         spent = float(tr2["cost_chat"] + tr2["cost_embed"]) - cost_start
         avg_per = (spent / done) if done else 0.0
         est_total = avg_per * total_n
-
         eta_box.markdown(
-            f"**Progress:** {done}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate*60:.1f} rev/min • "
-            f"**Spend:** {_fmt_money(spent)} • **Est total:** {_fmt_money(est_total)}"
+            f"**Progress:** {done}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate * 60:.1f} rev/min • **Spend:** {_fmt_money(spent)} • **Est total:** {_fmt_money(est_total)}"
         )
-
-        try:
-            budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
-        except Exception:
-            budget = 0.0
+        budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
         session_total = float(tr2["cost_chat"] + tr2["cost_embed"])
         if budget > 0 and session_total >= budget:
             status_box.markdown(
                 f"⛔ **Budget guard:** session spend {_fmt_money(session_total)} exceeded limit {_fmt_money(budget)}. Stopping early."
             )
             break
-
         if done % 50 == 0:
             gc.collect()
 
     status_box.markdown("✅ Done.")
-
     if do_undo and snapshot:
         st.session_state["undo_stack"].append({"rows": snapshot})
-
     st.session_state["processed_rows"] = processed_rows_local
     st.session_state["processed_idx_set"] = processed_idx_set_local
-    st.session_state["new_symptom_candidates"] = new_symptom_candidates
-    st.session_state["alias_suggestion_candidates"] = alias_suggestion_candidates
+    st.session_state["new_symptom_candidates"] = new_symptom_candidates_local
+    st.session_state["alias_suggestion_candidates"] = alias_suggestion_candidates_local
     st.session_state["last_run_processed_count"] = len(processed_idx_set_local)
     st.session_state["ev_cov_num"] = int(cov_num)
     st.session_state["ev_cov_den"] = int(cov_den)
-
     st.session_state["df_work"] = df
     st.session_state.pop("export_bytes", None)
 
-# ------------------- Execute by buttons -------------------
-if client is not None and (run_n_btn or run_all_btn or overwrite_btn or run_missing_both_btn):
-    if run_missing_both_btn:
-        rows_iter = work_filtered[(work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])].sort_index()
-        _run_symptomize(rows_iter, overwrite_mode=False)
 
-    elif overwrite_btn:
-        df = clear_all_ai_slots_in_df(df)
-        st.session_state["df_work"] = df
-        colmap = detect_symptom_columns(df)
-        work = detect_missing(df, colmap)
-        work = _apply_filters_to_work(work)   # ✅ respect filters
-        rows_iter = work.sort_index()
-        _run_symptomize(rows_iter, overwrite_mode=False)
-
-    else:
-        if run_all_btn:
-            rows_iter = target.sort_index()
-        else:
-            rows_iter = target.sort_index().head(int(st.session_state.get("n_to_process", 10)))
-        _run_symptomize(rows_iter, overwrite_mode=False)
-
-    st.success(f"Symptomized {int(st.session_state.get('last_run_processed_count', 0))} review(s).")
-
-# Undo last run
-def _undo_last_run():
+def _undo_last_run() -> Tuple[bool, str]:
     global df
     if not st.session_state.get("undo_stack"):
-        st.info("Nothing to undo.")
-        return
+        return (False, "Nothing to undo.")
     snap = st.session_state["undo_stack"].pop()
     for idx, old_vals in snap.get("rows", []):
         for col, val in old_vals.items():
@@ -2593,347 +2416,585 @@ def _undo_last_run():
             df.loc[idx, col] = val
     st.session_state["df_work"] = df
     st.session_state.pop("export_bytes", None)
-    st.success("Reverted last run.")
+    return (True, "Reverted the last run.")
 
-if undo_btn:
-    _undo_last_run()
+# ----------------------------- Main dashboard -----------------------------
+learned_store = _ensure_learned_store()
+file_name = st.session_state.get("uploaded_name", getattr(uploaded_file, "name", "reviews.xlsx"))
+file_base = os.path.splitext(file_name)[0]
+need_del = int(work["Needs_Delighters"].sum())
+need_det = int(work["Needs_Detractors"].sum())
+need_both = int(work["Needs_Symptomization"].sum())
+rows_for_run, overwrite_mode_selected, run_selection_label = _build_run_selection()
+estimated_batches = max(1, math.ceil(len(rows_for_run) / max(1, int(st.session_state.get("llm_batch_size", 6))))) if len(rows_for_run) else 0
 
-# ------------------- Processed Reviews (chips + highlighted evidence) -------------------
-processed_rows = st.session_state.get("processed_rows", []) or []
-if processed_rows and int(st.session_state.get("ui_log_limit", 40)) > 0:
-    st.subheader("🧾 Processed Reviews (this run — UI-capped)")
-    cov_num = int(st.session_state.get("ev_cov_num", 0) or 0)
-    cov_den = int(st.session_state.get("ev_cov_den", 0) or 0)
-    overall_cov = (cov_num / cov_den) if cov_den else 0.0
-    st.caption(f"**Evidence Coverage (this run):** {overall_cov*100:.1f}% of written labels include ≥1 snippet.")
+a1, a2 = st.columns([2.5, 1.2])
+with a1:
+    st.markdown(
+        f"""
+        <div class='hero-shell'>
+          <div class='hero-top'>
+            <div>
+              <div class='hero-title'>Review workspace</div>
+              <div class='hero-sub'>Workbook: <span class='mono'>{_safe(file_name)}</span></div>
+            </div>
+            <div class='badge-row'>
+              <span class='badge'>Symptoms: {len(DELIGHTERS) + len(DETRACTORS):,}</span>
+              <span class='badge'>Aliases: {sum(len(v) for v in ALIASES.values()) if ALIASES else 0:,}</span>
+              <span class='badge'>Learned themes: {len(learned_store.get('labels', {}).get('Delighter', {})) + len(learned_store.get('labels', {}).get('Detractor', {})):,}</span>
+            </div>
+          </div>
+          <div class='hero-grid'>
+            <div class='hero-stat'><div class='label'>Total reviews</div><div class='value'>{len(work):,}</div></div>
+            <div class='hero-stat'><div class='label'>Need delighters</div><div class='value'>{need_del:,}</div></div>
+            <div class='hero-stat'><div class='label'>Need detractors</div><div class='value'>{need_det:,}</div></div>
+            <div class='hero-stat accent'><div class='label'>Missing both</div><div class='value'>{need_both:,}</div></div>
+            <div class='hero-stat'><div class='label'>Filtered eligible</div><div class='value'>{len(work_filtered):,}</div></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with a2:
+    st.markdown(
+        f"""
+        <div class='info-card'>
+          <div class='title'>Current run plan</div>
+          <div class='big'>{len(rows_for_run):,}</div>
+          <div class='muted'>{_safe(run_selection_label)}</div>
+          <div class='muted' style='margin-top:8px;'>Estimated batches: <b>{estimated_batches:,}</b><br/>Overwrite mode: <b>{'Yes' if overwrite_mode_selected else 'No'}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    def _esc(s: str) -> str:
-        return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
-    for rec in processed_rows:
-        head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}"
-        if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
-            head += " • ⚠︎ >10 detected (trimmed to 10)"
-        with st.expander(head):
-            evidence_terms: List[str] = []
-            for _, evs in (rec.get("Evidence_Detractors", {}) or {}).items():
-                evidence_terms.extend(evs or [])
-            for _, evs in (rec.get("Evidence_Delighters", {}) or {}).items():
-                evidence_terms.extend(evs or [])
+tab_dash, tab_run, tab_log, tab_inbox, tab_export = st.tabs([
+    "📊 Dashboard",
+    "🚀 Run Center",
+    "🧾 Review Log",
+    "🟡 Inbox",
+    "📦 Exports",
+])
 
-            st.markdown("**Verbatim (evidence highlighted)**")
-            st.markdown(highlight_text(rec["Verbatim"], evidence_terms), unsafe_allow_html=True)
+with tab_dash:
+    st.markdown("<div class='section-title'>Filter reviews and inspect scope</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>The filters below decide which rows are eligible. The scope decides which of those rows are in your current working set.</div>", unsafe_allow_html=True)
 
-            meta_html = (
-                "<div class='chips-block chip-wrap'>"
-                f"<span class='chip yellow'>Safety: {_esc(rec.get('Safety','Not Mentioned'))}</span>"
-                f"<span class='chip blue'>Reliability: {_esc(rec.get('Reliability','Not Mentioned'))}</span>"
-                f"<span class='chip purple'># Sessions: {_esc(rec.get('Sessions','Unknown'))}</span>"
-                "</div>"
-            )
-            st.markdown(meta_html, unsafe_allow_html=True)
+    f1, f2 = st.columns([5, 1])
+    with f1:
+        st.markdown(_chip_html(_active_filter_items()), unsafe_allow_html=True)
+    with f2:
+        st.button("Clear filters", use_container_width=True, on_click=_reset_filter_state, key="clear_filters_btn")
 
-            st.markdown("**Detractors added**")
-            det_html = "<div class='chips-block chip-wrap'>"
-            for lab in rec["Added_Detractors"]:
-                k = len((rec.get("Evidence_Detractors", {}) or {}).get(lab, []))
-                det_html += f"<span class='chip red'>{html.escape(lab)} · Evidence: {k}</span>"
-            det_html += "</div>"
-            st.markdown(det_html, unsafe_allow_html=True)
-
-            st.markdown("**Delighters added**")
-            del_html = "<div class='chips-block chip-wrap'>"
-            for lab in rec["Added_Delighters"]:
-                k = len((rec.get("Evidence_Delighters", {}) or {}).get(lab, []))
-                del_html += f"<span class='chip green'>{html.escape(lab)} · Evidence: {k}</span>"
-            del_html += "</div>"
-            st.markdown(del_html, unsafe_allow_html=True)
-
-            if rec.get("NewCand_Delighters") or rec.get("NewCand_Detractors"):
-                st.markdown("**New symptom candidates (deduped & canonicalized)**")
-                chips = "<div class='chip-wrap'>"
-                for x in rec.get("NewCand_Delighters", []) or []:
-                    chips += f"<span class='chip green'>{html.escape(x)}</span>"
-                for x in rec.get("NewCand_Detractors", []) or []:
-                    chips += f"<span class='chip red'>{html.escape(x)}</span>"
-                chips += "</div>"
-                st.markdown(chips, unsafe_allow_html=True)
-
-            if rec.get("AliasSuggestions"):
-                st.markdown("**Alias suggestions (routes near-duplicates to existing labels)**")
-                chips = "<div class='chip-wrap'>"
-                for tgt, alias, side, score in rec["AliasSuggestions"]:
-                    chips += f"<span class='chip yellow'>{html.escape(alias)} → {html.escape(tgt)}</span>"
-                chips += "</div>"
-                st.markdown(chips, unsafe_allow_html=True)
-
-            with st.expander("See evidence snippets", expanded=False):
-                if rec.get("Evidence_Detractors"):
-                    st.markdown("**Detractor evidence**")
-                    for lab, evs in rec["Evidence_Detractors"].items():
-                        for e in evs:
-                            st.write(f"- {e}")
-                if rec.get("Evidence_Delighters"):
-                    st.markdown("**Delighter evidence**")
-                    for lab, evs in rec["Evidence_Delighters"].items():
-                        for e in evs:
-                            st.write(f"- {e}")
-elif int(st.session_state.get("ui_log_limit", 40)) == 0:
-    st.info("UI log is disabled (Show last N processed reviews in UI = 0). This is the fastest mode for very large runs.")
-
-# ------------------- 🟡 Inbox: New Symptoms + Alias Suggestions -------------------
-whitelist_all = set(DELIGHTERS + DETRACTORS)
-alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
-wl_canon = {_canon_simple(x) for x in whitelist_all}
-ali_canon = {_canon_simple(x) for x in alias_all}
-
-def _is_existing_label_or_alias(s: str) -> bool:
-    k = _canon_simple(s)
-    return (k in wl_canon) or (k in ali_canon)
-
-def _filter_new_symptom_candidates(
-    cands: Dict[Tuple[str, str], Dict[str, Any]]
-) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for (lab, side), rec in cands.items():
-        lab2 = normalize_theme_label(lab, side)
-        if not lab2:
-            continue
-        if _is_existing_label_or_alias(lab2):
-            continue
-        out[(lab2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-
-    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    seen: Dict[Tuple[str, str], str] = {}
-    for (lab, side), rec in out.items():
-        key = _canon_simple(lab)
-        k2 = (key, side)
-        if k2 in seen:
-            prev_lab = seen[k2]
-            mrec = merged.setdefault((prev_lab, side), {"count": 0, "refs": []})
-            mrec["count"] += int(rec.get("count", 0))
-            for ridx in rec.get("refs", [])[:50]:
-                if len(mrec["refs"]) < 50 and ridx not in mrec["refs"]:
-                    mrec["refs"].append(ridx)
+    row1 = st.columns(3)
+    with row1[0]:
+        if c_source:
+            st.multiselect("Source", options=_unique_sorted_str(work[c_source]), key="f_source_sel")
         else:
-            merged[(lab, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-            seen[k2] = lab
+            st.caption("Source column not found")
+    with row1[1]:
+        if c_model:
+            st.multiselect("Model (SKU)", options=_unique_sorted_str(work[c_model]), key="f_model_sel")
+        else:
+            st.caption("Model / SKU column not found")
+    with row1[2]:
+        if c_country:
+            st.multiselect("Country", options=_unique_sorted_str(work[c_country]), key="f_country_sel")
+        else:
+            st.caption("Country column not found")
 
-    final: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for (lab, side), rec in merged.items():
+    row2 = st.columns(3)
+    with row2[0]:
+        if c_seeded:
+            st.selectbox("Seeded", ["All", "Seeded only", "Non-seeded only"], key="f_seeded_mode")
+        else:
+            st.caption("Seeded column not found")
+    with row2[1]:
+        if c_newrev:
+            st.selectbox("New Review", ["All", "New only", "Not new only"], key="f_new_mode")
+        else:
+            st.caption("New Review column not found")
+    with row2[2]:
+        if c_rating:
+            vals = work[c_rating].dropna().tolist()
+            opts = sorted({int(v) if isinstance(v, (int, float)) and float(v).is_integer() else v for v in vals})
+            st.multiselect("Star Rating", options=opts, key="f_rating_sel", help="Leave empty to include all ratings.")
+        else:
+            st.caption("Star Rating column not found")
+
+    if c_rdate and work[c_rdate].notna().any():
         try:
-            m = difflib.get_close_matches(lab, list(whitelist_all), n=1, cutoff=float(sim_threshold_lex))
-            if m:
-                continue
+            dmin = pd.to_datetime(work[c_rdate].min()).date()
+            dmax = pd.to_datetime(work[c_rdate].max()).date()
+            current_date_value = st.session_state.get("f_date_range", (dmin, dmax))
+            if not isinstance(current_date_value, (tuple, list)) or len(current_date_value) != 2:
+                current_date_value = (dmin, dmax)
+            st.date_input("Review Date range", value=current_date_value, key="f_date_range")
         except Exception:
-            pass
-        final[(lab, side)] = rec
-    return final
+            st.caption("Review Date could not be parsed")
 
-def _filter_alias_candidates(
-    cands: Dict[Tuple[str, str, str], Dict[str, Any]]
-) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for (tgt, alias, side), rec in cands.items():
-        tgt2 = str(tgt).strip()
-        alias2 = normalize_theme_label(alias, side, singularize=True)
-        if not tgt2 or not alias2:
-            continue
-        if _canon_simple(alias2) == _canon_simple(tgt2):
-            continue
-        if _is_existing_label_or_alias(alias2):
-            continue
-        out[(tgt2, alias2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+    st.divider()
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        st.metric("Filtered eligible", f"{len(work_filtered):,}")
+    with p2:
+        st.metric("Current scope", f"{len(target):,}")
+    with p3:
+        st.metric("Selected for next run", f"{len(rows_for_run):,}")
 
-    merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    seen: Set[Tuple[str, str, str]] = set()
-    for (tgt, alias, side), rec in out.items():
-        key = (tgt, _canon_simple(alias), side)
-        if key in seen:
-            for kk in list(merged.keys()):
-                if kk[0] == tgt and _canon_simple(kk[1]) == _canon_simple(alias) and kk[2] == side:
-                    merged[kk]["count"] += int(rec.get("count", 0))
-                    for ridx in rec.get("refs", [])[:50]:
-                        if len(merged[kk]["refs"]) < 50 and ridx not in merged[kk]["refs"]:
-                            merged[kk]["refs"].append(ridx)
-                    break
+    with st.expander("Preview in-scope rows", expanded=False):
+        preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
+        extras = [c for c in [c_rating, c_rdate, c_source, c_model, c_country] if c and c in target.columns]
+        st.dataframe(target[preview_cols + extras].head(200), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("<div class='section-title'>Product Knowledge Prelearn</div>", unsafe_allow_html=True)
+    pc1, pc2 = st.columns([1.2, 2.8])
+    with pc1:
+        run_prelearn_btn = st.button("🧠 Run prelearn now", use_container_width=True, disabled=(client is None), key="run_prelearn_now")
+    with pc2:
+        st.markdown(
+            "<div class='tiny'>Prelearn builds a product glossary and canonical theme hints so the labeler stops inventing tiny wording variants.</div>",
+            unsafe_allow_html=True,
+        )
+
+    prelearn_status = st.empty()
+    prelearn_prog_box = st.empty()
+    if run_prelearn_btn and client is not None:
+        prelearn_prog = prelearn_prog_box.progress(0.0)
+        learned_store = run_prelearn(
+            df_in=df,
+            client=client,
+            prelearn_model=prelearn_model,
+            temperature=0.0,
+            embed_model=embed_model,
+            sample_n=int(prelearn_sample_n),
+            batch_size=int(prelearn_batch_size),
+            sem_merge_threshold=float(prelearn_merge_threshold),
+            status_box=prelearn_status,
+            prog_bar=prelearn_prog,
+        )
+        st.session_state["learned"] = learned_store
+    else:
+        prelearn_prog_box.empty()
+
+    learned_store = _ensure_learned_store()
+    if learned_store.get("labels", {}).get("Delighter") or learned_store.get("labels", {}).get("Detractor"):
+        with st.expander("Show learned product knowledge", expanded=False):
+            st.markdown("**Product profile**")
+            st.write(learned_store.get("product_profile", "") or "(none)")
+            st.markdown("**Glossary terms**")
+            if learned_store.get("glossary_terms"):
+                st.markdown(
+                    "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_safe(w)} · {c}</span>" for w, c in learned_store["glossary_terms"][:30]]) + "</div>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("**Learned delighters**")
+            d1 = list(learned_store.get("labels", {}).get("Delighter", {}).keys())[:40]
+            st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_safe(x)}</span>" for x in d1]) + "</div>", unsafe_allow_html=True)
+            st.markdown("**Learned detractors**")
+            d2 = list(learned_store.get("labels", {}).get("Detractor", {}).keys())[:40]
+            st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_safe(x)}</span>" for x in d2]) + "</div>", unsafe_allow_html=True)
+
+with tab_run:
+    st.markdown("<div class='section-title'>Run Center</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>One place to choose scope, choose run mode, inspect the plan, and start safely.</div>", unsafe_allow_html=True)
+
+    rleft, rright = st.columns([1.45, 1.05])
+    with rleft:
+        st.selectbox(
+            "Scope",
+            ["Missing both", "Any missing", "Missing delighters only", "Missing detractors only"],
+            key="scope_choice",
+            help="Current scope is used for normal runs. Missing-both fast pass ignores this selector and always uses missing-both within the current filters.",
+        )
+        st.radio(
+            "Run mode",
+            [
+                "First N in current scope",
+                "All reviews in current scope",
+                "Missing-both fast pass",
+                "Rebuild selected rows (overwrite AI output)",
+            ],
+            key="run_mode",
+        )
+
+        if st.session_state.get("run_mode") == "First N in current scope":
+            n_cols = st.columns([1.3, 1, 1, 1, 1])
+            with n_cols[0]:
+                bound_max = max(1, len(target))
+                cur_n = int(st.session_state.get("n_to_process", 10) or 10)
+                st.session_state["n_to_process"] = min(max(cur_n, 1), bound_max)
+                st.number_input(
+                    "How many rows from the top of scope?",
+                    min_value=1,
+                    max_value=bound_max,
+                    step=1,
+                    key="n_to_process",
+                )
+
+            def _set_n(v: int) -> None:
+                st.session_state["n_to_process"] = min(max(int(v), 1), max(1, len(target)))
+
+            with n_cols[1]:
+                st.button("10", use_container_width=True, on_click=_set_n, args=(10,), key="set_n_10")
+            with n_cols[2]:
+                st.button("25", use_container_width=True, on_click=_set_n, args=(25,), key="set_n_25")
+            with n_cols[3]:
+                st.button("50", use_container_width=True, on_click=_set_n, args=(50,), key="set_n_50")
+            with n_cols[4]:
+                st.button("100", use_container_width=True, on_click=_set_n, args=(100,), key="set_n_100")
+
+        if st.session_state.get("run_mode") == "Rebuild selected rows (overwrite AI output)":
+            st.markdown(
+                "<div class='danger-box'><b>Overwrite mode</b><br/>Selected AI slots will be cleared for the chosen rows, then rebuilt from scratch. Manual symptom columns are not touched.</div>",
+                unsafe_allow_html=True,
+            )
+            st.radio(
+                "Overwrite target",
+                ["Current scope only", "All filtered reviews"],
+                key="overwrite_target",
+                horizontal=True,
+            )
+            st.checkbox("I understand this will replace existing AI output for the selected rows", key="confirm_overwrite")
         else:
-            merged[(tgt, alias, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-            seen.add(key)
-    return merged
+            st.session_state["confirm_overwrite"] = False
 
-new_symptom_candidates_f = _filter_new_symptom_candidates(st.session_state.get("new_symptom_candidates", {}) or {})
-alias_suggestion_candidates_f = _filter_alias_candidates(st.session_state.get("alias_suggestion_candidates", {}) or {})
+    with rright:
+        rows_for_run, overwrite_mode_selected, run_selection_label = _build_run_selection()
+        estimated_batches = max(1, math.ceil(len(rows_for_run) / max(1, int(st.session_state.get("llm_batch_size", 6))))) if len(rows_for_run) else 0
+        st.markdown(
+            f"""
+            <div class='info-card'>
+              <div class='title'>Run summary</div>
+              <div class='run-plan'>
+                <div class='kv'><div class='k'>Filtered eligible</div><div class='v'>{len(work_filtered):,}</div></div>
+                <div class='kv'><div class='k'>Current scope</div><div class='v'>{len(target):,}</div></div>
+                <div class='kv'><div class='k'>Selected now</div><div class='v'>{len(rows_for_run):,}</div></div>
+                <div class='kv'><div class='k'>Estimated batches</div><div class='v'>{estimated_batches:,}</div></div>
+              </div>
+              <div class='muted' style='margin-top:10px;'>{_safe(run_selection_label)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if client is None:
+            st.warning("OpenAI is not configured, so runs are disabled.")
+        elif len(rows_for_run) == 0:
+            st.info("No rows match the current filters / scope / run mode.")
+        elif overwrite_mode_selected:
+            st.info("Overwrite rebuilds both sides for selected rows, even if they were not previously missing.")
 
-if new_symptom_candidates_f or alias_suggestion_candidates_f:
-    st.subheader("🟡 Inbox: New Symptoms + Alias Suggestions")
-    tabs_inbox = st.tabs(["New Symptoms", "Alias Suggestions"])
+        btn_cols = st.columns([1.5, 1])
+        run_disabled = (client is None) or (len(rows_for_run) == 0) or (overwrite_mode_selected and not st.session_state.get("confirm_overwrite", False))
+        with btn_cols[0]:
+            start_run_btn = st.button(_run_button_label(rows_for_run, overwrite_mode_selected), use_container_width=True, disabled=run_disabled, key="start_run_btn")
+        with btn_cols[1]:
+            undo_btn = st.button("↩️ Undo last run", use_container_width=True, key="undo_last_run_btn")
 
-    def _mk_examples(refs: List[int], n: int = 3) -> str:
-        ex = []
-        for ridx in refs[:n]:
+        if overwrite_mode_selected and not st.session_state.get("confirm_overwrite", False):
+            st.caption("Check the confirmation box to enable overwrite mode.")
+
+    if start_run_btn:
+        _run_symptomize(rows_for_run, overwrite_mode=overwrite_mode_selected)
+        st.session_state["_flash_msg"] = ("success", f"Processed {int(st.session_state.get('last_run_processed_count', 0)):,} review(s).")
+        st.rerun()
+    if undo_btn:
+        ok, msg = _undo_last_run()
+        st.session_state["_flash_msg"] = ("success" if ok else "info", msg)
+        st.rerun()
+
+with tab_log:
+    st.markdown("<div class='section-title'>Processed reviews</div>", unsafe_allow_html=True)
+    current_processed_rows = st.session_state.get("processed_rows", []) or []
+    if current_processed_rows and int(st.session_state.get("ui_log_limit", 40)) > 0:
+        cov_num = int(st.session_state.get("ev_cov_num", 0) or 0)
+        cov_den = int(st.session_state.get("ev_cov_den", 0) or 0)
+        overall_cov = (cov_num / cov_den) if cov_den else 0.0
+        st.caption(f"Evidence coverage for the latest run: {overall_cov * 100:.1f}% of written labels include at least one snippet.")
+        for rec in current_processed_rows:
+            head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}"
+            if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
+                head += " • ⚠ trimmed to 10"
+            with st.expander(head):
+                evidence_terms: List[str] = []
+                for _, evs in (rec.get("Evidence_Detractors", {}) or {}).items():
+                    evidence_terms.extend(evs or [])
+                for _, evs in (rec.get("Evidence_Delighters", {}) or {}).items():
+                    evidence_terms.extend(evs or [])
+
+                st.markdown("**Verbatim**")
+                st.markdown(highlight_text(rec["Verbatim"], evidence_terms), unsafe_allow_html=True)
+                st.markdown(
+                    "<div class='chip-wrap'>"
+                    f"<span class='chip yellow'>Safety: {_safe(rec.get('Safety', 'Not Mentioned'))}</span>"
+                    f"<span class='chip blue'>Reliability: {_safe(rec.get('Reliability', 'Not Mentioned'))}</span>"
+                    f"<span class='chip purple'># Sessions: {_safe(rec.get('Sessions', 'Unknown'))}</span>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("**Detractors written**")
+                st.markdown(
+                    "<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_safe(lab)} · evidence {len((rec.get('Evidence_Detractors', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Added_Detractors", [])]) + "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("**Delighters written**")
+                st.markdown(
+                    "<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_safe(lab)} · evidence {len((rec.get('Evidence_Delighters', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Added_Delighters", [])]) + "</div>",
+                    unsafe_allow_html=True,
+                )
+                if rec.get("NewCand_Delighters") or rec.get("NewCand_Detractors"):
+                    st.markdown("**New symptom candidates**")
+                    chips = "<div class='chip-wrap'>"
+                    for x in rec.get("NewCand_Delighters", []) or []:
+                        chips += f"<span class='chip green'>{_safe(x)}</span>"
+                    for x in rec.get("NewCand_Detractors", []) or []:
+                        chips += f"<span class='chip red'>{_safe(x)}</span>"
+                    chips += "</div>"
+                    st.markdown(chips, unsafe_allow_html=True)
+                if rec.get("AliasSuggestions"):
+                    st.markdown("**Alias suggestions**")
+                    chips = "<div class='chip-wrap'>"
+                    for tgt, alias, _, _ in rec["AliasSuggestions"]:
+                        chips += f"<span class='chip yellow'>{_safe(alias)} → {_safe(tgt)}</span>"
+                    chips += "</div>"
+                    st.markdown(chips, unsafe_allow_html=True)
+                with st.expander("Evidence snippets", expanded=False):
+                    if rec.get("Evidence_Detractors"):
+                        st.markdown("**Detractor evidence**")
+                        for lab, evs in rec["Evidence_Detractors"].items():
+                            for e in evs:
+                                st.write(f"- {lab}: {e}")
+                    if rec.get("Evidence_Delighters"):
+                        st.markdown("**Delighter evidence**")
+                        for lab, evs in rec["Evidence_Delighters"].items():
+                            for e in evs:
+                                st.write(f"- {lab}: {e}")
+    elif int(st.session_state.get("ui_log_limit", 40)) == 0:
+        st.info("Review log is disabled (fastest mode). Increase 'Show last N processed reviews' in the sidebar to see row-level details.")
+    else:
+        st.info("No processed reviews yet in this session.")
+
+with tab_inbox:
+    st.markdown("<div class='section-title'>Inbox: new symptoms and alias suggestions</div>", unsafe_allow_html=True)
+    whitelist_all = set(DELIGHTERS + DETRACTORS)
+    alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
+    wl_canon = {_canon_simple(x) for x in whitelist_all}
+    ali_canon = {_canon_simple(x) for x in alias_all}
+
+    def _is_existing_label_or_alias(s: str) -> bool:
+        k = _canon_simple(s)
+        return (k in wl_canon) or (k in ali_canon)
+
+    def _filter_new_symptom_candidates(cands: Dict[Tuple[str, str], Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (lab, side), rec in cands.items():
+            lab2 = normalize_theme_label(lab, side)
+            if not lab2 or _is_existing_label_or_alias(lab2):
+                continue
+            out[(lab2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        seen: Dict[Tuple[str, str], str] = {}
+        for (lab, side), rec in out.items():
+            key = _canon_simple(lab)
+            k2 = (key, side)
+            if k2 in seen:
+                prev_lab = seen[k2]
+                mrec = merged.setdefault((prev_lab, side), {"count": 0, "refs": []})
+                mrec["count"] += int(rec.get("count", 0))
+                for ridx in rec.get("refs", [])[:50]:
+                    if len(mrec["refs"]) < 50 and ridx not in mrec["refs"]:
+                        mrec["refs"].append(ridx)
+            else:
+                merged[(lab, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+                seen[k2] = lab
+        final: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (lab, side), rec in merged.items():
             try:
-                ex.append(str(df.loc[ridx, "Verbatim"])[:200])
+                m = difflib.get_close_matches(lab, list(whitelist_all), n=1, cutoff=float(sim_threshold_lex))
+                if m:
+                    continue
             except Exception:
                 pass
-        return " | ".join(["— " + e for e in ex])
+            final[(lab, side)] = rec
+        return final
 
-    with tabs_inbox[0]:
-        st.markdown("**New symptom candidates** (deduped, canonical, excludes existing Symptoms + existing Aliases)")
-        rows_tbl = []
-        for (lab, side), rec in sorted(new_symptom_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0])):
-            rows_tbl.append({
-                "Add": False,
-                "Label": lab,
-                "Side": side,
-                "Count": int(rec.get("count", 0)),
-                "Examples": _mk_examples(list(rec.get("refs", []))),
-            })
-        tbl_new = pd.DataFrame(rows_tbl) if rows_tbl else pd.DataFrame(columns=["Add","Label","Side","Count","Examples"])
-        editor_new = st.data_editor(
-            tbl_new,
-            num_rows="fixed",
-            use_container_width=True,
-            column_config={
-                "Add": st.column_config.CheckboxColumn(help="Check to add as a NEW symptom"),
-                "Label": st.column_config.TextColumn(),
-                "Side": st.column_config.SelectboxColumn(options=["Delighter","Detractor"]),
-                "Count": st.column_config.NumberColumn(format="%d"),
-                "Examples": st.column_config.TextColumn(width="large"),
-            },
-            key="inbox_new_editor",
-        )
+    def _filter_alias_candidates(cands: Dict[Tuple[str, str, str], Dict[str, Any]]) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for (tgt, alias, side), rec in cands.items():
+            tgt2 = str(tgt).strip()
+            alias2 = normalize_theme_label(alias, side, singularize=True)
+            if not tgt2 or not alias2:
+                continue
+            if _canon_simple(alias2) == _canon_simple(tgt2):
+                continue
+            if _is_existing_label_or_alias(alias2):
+                continue
+            out[(tgt2, alias2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+        merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        seen: Set[Tuple[str, str, str]] = set()
+        for (tgt, alias, side), rec in out.items():
+            key = (tgt, _canon_simple(alias), side)
+            if key in seen:
+                for kk in list(merged.keys()):
+                    if kk[0] == tgt and _canon_simple(kk[1]) == _canon_simple(alias) and kk[2] == side:
+                        merged[kk]["count"] += int(rec.get("count", 0))
+                        for ridx in rec.get("refs", [])[:50]:
+                            if len(merged[kk]["refs"]) < 50 and ridx not in merged[kk]["refs"]:
+                                merged[kk]["refs"].append(ridx)
+                        break
+            else:
+                merged[(tgt, alias, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
+                seen.add(key)
+        return merged
 
-    with tabs_inbox[1]:
-        st.markdown("**Alias suggestions** (routes near-duplicate phrasing to an existing symptom label)")
-        rows_tbl2 = []
-        for (tgt, alias, side), rec in sorted(alias_suggestion_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0], kv[0][1])):
-            rows_tbl2.append({
-                "Add": False,
-                "Target Symptom": tgt,
-                "Alias": alias,
-                "Side": side,
-                "Count": int(rec.get("count", 0)),
-                "Examples": _mk_examples(list(rec.get("refs", []))),
-            })
-        tbl_alias = pd.DataFrame(rows_tbl2) if rows_tbl2 else pd.DataFrame(columns=["Add","Target Symptom","Alias","Side","Count","Examples"])
-        editor_alias = st.data_editor(
-            tbl_alias,
-            num_rows="fixed",
-            use_container_width=True,
-            column_config={
-                "Add": st.column_config.CheckboxColumn(help="Check to add this Alias to the target symptom"),
-                "Target Symptom": st.column_config.TextColumn(disabled=True),
-                "Alias": st.column_config.TextColumn(),
-                "Side": st.column_config.SelectboxColumn(options=["Delighter","Detractor"]),
-                "Count": st.column_config.NumberColumn(format="%d"),
-                "Examples": st.column_config.TextColumn(width="large"),
-            },
-            key="inbox_alias_editor",
-        )
+    new_symptom_candidates_f = _filter_new_symptom_candidates(st.session_state.get("new_symptom_candidates", {}) or {})
+    alias_suggestion_candidates_f = _filter_alias_candidates(st.session_state.get("alias_suggestion_candidates", {}) or {})
 
-    with st.form("apply_inbox_updates_form", clear_on_submit=False):
-        st.markdown("When you submit, we will update the **Symptoms** sheet and provide a download.")
-        apply_btn = st.form_submit_button("✅ Apply selected updates to Symptoms & Download")
+    if not new_symptom_candidates_f and not alias_suggestion_candidates_f:
+        st.info("No inbox items yet. Run symptomization first, then review new symptom candidates and alias suggestions here.")
+    else:
+        tabs_inbox = st.tabs(["New Symptoms", "Alias Suggestions"])
 
-    if apply_btn:
-        new_to_add: List[Tuple[str, str]] = []
-        alias_to_add: List[Tuple[str, str]] = []
+        def _mk_examples(refs: List[int], n: int = 3) -> str:
+            ex: List[str] = []
+            for ridx in refs[:n]:
+                try:
+                    ex.append(str(df.loc[ridx, "Verbatim"])[:200])
+                except Exception:
+                    pass
+            return " | ".join(["— " + e for e in ex])
 
-        try:
-            if isinstance(editor_new, pd.DataFrame) and not editor_new.empty:
-                for _, r_ in editor_new.iterrows():
-                    if bool(r_.get("Add", False)) and str(r_.get("Label","")).strip():
-                        lab = normalize_theme_label(str(r_["Label"]).strip(), str(r_.get("Side","Delighter")))
-                        side = str(r_.get("Side","Delighter")).strip()
-                        if lab and not _is_existing_label_or_alias(lab):
-                            new_to_add.append((lab, side))
-        except Exception:
-            pass
-
-        try:
-            if isinstance(editor_alias, pd.DataFrame) and not editor_alias.empty:
-                for _, r_ in editor_alias.iterrows():
-                    if bool(r_.get("Add", False)) and str(r_.get("Alias","")).strip() and str(r_.get("Target Symptom","")).strip():
-                        tgt = str(r_["Target Symptom"]).strip()
-                        als = normalize_theme_label(str(r_["Alias"]).strip(), str(r_.get("Side","Detractor")))
-                        if tgt and als and not _is_existing_label_or_alias(als) and _canon_simple(als) != _canon_simple(tgt):
-                            alias_to_add.append((tgt, als))
-        except Exception:
-            pass
-
-        if new_to_add or alias_to_add:
-            updated_bytes = apply_symptoms_updates_to_workbook(
-                st.session_state["uploaded_bytes"],
-                new_symptoms=new_to_add,
-                alias_additions=alias_to_add,
+        with tabs_inbox[0]:
+            rows_tbl = []
+            for (lab, side), rec in sorted(new_symptom_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0])):
+                rows_tbl.append({"Add": False, "Label": lab, "Side": side, "Count": int(rec.get("count", 0)), "Examples": _mk_examples(list(rec.get("refs", [])))})
+            tbl_new = pd.DataFrame(rows_tbl) if rows_tbl else pd.DataFrame(columns=["Add", "Label", "Side", "Count", "Examples"])
+            editor_new = st.data_editor(
+                tbl_new,
+                num_rows="fixed",
+                use_container_width=True,
+                column_config={
+                    "Add": st.column_config.CheckboxColumn(help="Select to add as a new symptom"),
+                    "Label": st.column_config.TextColumn(),
+                    "Side": st.column_config.SelectboxColumn(options=["Delighter", "Detractor"]),
+                    "Count": st.column_config.NumberColumn(format="%d"),
+                    "Examples": st.column_config.TextColumn(width="large"),
+                },
+                key="inbox_new_editor",
             )
-            st.download_button(
-                "⬇️ Download 'Symptoms' (updated)",
-                data=updated_bytes,
-                file_name="Symptoms_Updated.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+        with tabs_inbox[1]:
+            rows_tbl2 = []
+            for (tgt, alias, side), rec in sorted(alias_suggestion_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0], kv[0][1])):
+                rows_tbl2.append({"Add": False, "Target Symptom": tgt, "Alias": alias, "Side": side, "Count": int(rec.get("count", 0)), "Examples": _mk_examples(list(rec.get("refs", [])))})
+            tbl_alias = pd.DataFrame(rows_tbl2) if rows_tbl2 else pd.DataFrame(columns=["Add", "Target Symptom", "Alias", "Side", "Count", "Examples"])
+            editor_alias = st.data_editor(
+                tbl_alias,
+                num_rows="fixed",
+                use_container_width=True,
+                column_config={
+                    "Add": st.column_config.CheckboxColumn(help="Select to add as an alias"),
+                    "Target Symptom": st.column_config.TextColumn(disabled=True),
+                    "Alias": st.column_config.TextColumn(),
+                    "Side": st.column_config.SelectboxColumn(options=["Delighter", "Detractor"]),
+                    "Count": st.column_config.NumberColumn(format="%d"),
+                    "Examples": st.column_config.TextColumn(width="large"),
+                },
+                key="inbox_alias_editor",
             )
-            st.success(f"Applied {len(new_to_add)} new symptom(s) and {len(alias_to_add)} alias addition(s).")
-        else:
-            st.info("No updates selected.")
 
-# ------------------- Download Symptomized Workbook (LAZY BUILD) -------------------
-st.subheader("📦 Download Symptomized Workbook")
-try:
-    file_base = os.path.splitext(getattr(uploaded_file, 'name', 'Reviews'))[0]
-except Exception:
-    file_base = 'Reviews'
+        with st.form("apply_inbox_updates_form", clear_on_submit=False):
+            st.markdown("Apply the selected updates to the **Symptoms** sheet and download the updated workbook.")
+            apply_btn = st.form_submit_button("✅ Apply selected updates")
 
-prep = st.button("🧾 Prepare XLSX export (build file now)", use_container_width=True)
-if prep:
-    with st.spinner("Building XLSX export..."):
-        st.session_state["export_bytes"] = generate_template_workbook_bytes(
-            st.session_state["uploaded_bytes"],
-            df,
-            processed_idx=st.session_state.get("processed_idx_set", set()) or None,
-            overwrite_processed_slots=False,
+        if apply_btn:
+            new_to_add: List[Tuple[str, str]] = []
+            alias_to_add: List[Tuple[str, str]] = []
+            try:
+                if isinstance(editor_new, pd.DataFrame) and not editor_new.empty:
+                    for _, r_ in editor_new.iterrows():
+                        if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
+                            lab = normalize_theme_label(str(r_["Label"]).strip(), str(r_.get("Side", "Delighter")))
+                            side = str(r_.get("Side", "Delighter")).strip()
+                            if lab and not _is_existing_label_or_alias(lab):
+                                new_to_add.append((lab, side))
+            except Exception:
+                pass
+            try:
+                if isinstance(editor_alias, pd.DataFrame) and not editor_alias.empty:
+                    for _, r_ in editor_alias.iterrows():
+                        if bool(r_.get("Add", False)) and str(r_.get("Alias", "")).strip() and str(r_.get("Target Symptom", "")).strip():
+                            tgt = str(r_["Target Symptom"]).strip()
+                            als = normalize_theme_label(str(r_["Alias"]).strip(), str(r_.get("Side", "Detractor")))
+                            if tgt and als and not _is_existing_label_or_alias(als) and _canon_simple(als) != _canon_simple(tgt):
+                                alias_to_add.append((tgt, als))
+            except Exception:
+                pass
+
+            if new_to_add or alias_to_add:
+                updated_bytes = apply_symptoms_updates_to_workbook(st.session_state["uploaded_bytes"], new_symptoms=new_to_add, alias_additions=alias_to_add)
+                st.download_button(
+                    "⬇️ Download updated Symptoms workbook",
+                    data=updated_bytes,
+                    file_name="Symptoms_Updated.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.success(f"Applied {len(new_to_add)} new symptom(s) and {len(alias_to_add)} alias addition(s).")
+            else:
+                st.info("No updates were selected.")
+
+with tab_export:
+    st.markdown("<div class='section-title'>Exports</div>", unsafe_allow_html=True)
+    ex1, ex2 = st.columns(2)
+    with ex1:
+        st.markdown("<div class='info-card tight'><div class='title'>Symptomized workbook</div><div class='muted'>Build the XLSX once, then download it. The export preserves your original workbook and writes AI output to the exact template columns.</div></div>", unsafe_allow_html=True)
+        prep = st.button("🧾 Prepare XLSX export", use_container_width=True, key="prepare_export_btn")
+        if prep:
+            with st.spinner("Building XLSX export…"):
+                st.session_state["export_bytes"] = generate_template_workbook_bytes(
+                    st.session_state["uploaded_bytes"],
+                    st.session_state["df_work"],
+                    processed_idx=st.session_state.get("processed_idx_set", set()) or None,
+                    overwrite_processed_slots=False,
+                )
+            st.success("Export prepared.")
+        export_bytes = st.session_state.get("export_bytes", None)
+        st.download_button(
+            "⬇️ Download symptomized workbook",
+            data=(export_bytes or b""),
+            file_name=f"{file_base}_Symptomized.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=(export_bytes is None),
         )
-    st.success("Export prepared — click download below.")
 
-export_bytes = st.session_state.get("export_bytes", None)
-st.download_button(
-    "⬇️ Download symptomized workbook (XLSX)",
-    data=(export_bytes or b""),
-    file_name=f"{file_base}_Symptomized.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    disabled=(export_bytes is None),
-)
+    with ex2:
+        st.markdown("<div class='info-card tight'><div class='title'>Symptoms catalog</div><div class='muted'>Quick export of the current Symptoms sheet, including aliases when present.</div></div>", unsafe_allow_html=True)
+        sym_df = pd.DataFrame({
+            "Symptom": (DELIGHTERS + DETRACTORS),
+            "Type": ["Delighter"] * len(DELIGHTERS) + ["Detractor"] * len(DETRACTORS),
+        })
+        if ALIASES:
+            alias_rows = [{"Symptom": k, "Aliases": " | ".join(v)} for k, v in ALIASES.items()]
+            alias_df = pd.DataFrame(alias_rows)
+            sym_df = sym_df.merge(alias_df, how="left", on="Symptom")
+        sym_bytes = io.BytesIO()
+        with pd.ExcelWriter(sym_bytes, engine="openpyxl") as xw:
+            sym_df.to_excel(xw, index=False, sheet_name="Symptoms")
+        sym_bytes.seek(0)
+        st.download_button(
+            "⬇️ Download symptoms catalog",
+            sym_bytes.getvalue(),
+            file_name=f"{file_base}_Symptoms_Catalog.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-# ------------------- Symptoms Catalog quick export -------------------
-st.subheader("🗂️ Download Symptoms Catalog")
-sym_df = pd.DataFrame({
-    "Symptom": (DELIGHTERS + DETRACTORS),
-    "Type":    ["Delighter"]*len(DELIGHTERS) + ["Detractor"]*len(DETRACTORS)
-})
-if ALIASES:
-    alias_rows = [{"Symptom": k, "Aliases": " | ".join(v)} for k, v in ALIASES.items()]
-    alias_df = pd.DataFrame(alias_rows)
-    sym_df = sym_df.merge(alias_df, how="left", on="Symptom")
-
-sym_bytes = io.BytesIO()
-with pd.ExcelWriter(sym_bytes, engine="openpyxl") as xw:
-    sym_df.to_excel(xw, index=False, sheet_name="Symptoms")
-sym_bytes.seek(0)
-st.download_button(
-    "⬇️ Download Symptoms Catalog (XLSX)",
-    sym_bytes.getvalue(),
-    file_name=f"{file_base}_Symptoms_Catalog.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-# Footer
 st.divider()
 st.caption(
-    "v7.7 (Fast+Stable) — Evidence-locked labeling + Product Knowledge Prelearn + canonical merging + "
-    "🟡 Inbox: New Symptoms + Alias Suggestions + ⚡ Batch symptomization + 🔎 Subset filters + Optional throttle. "
-    "Exports: K–T/U–AD, meta: AE/AF/AG. Stability: session persistence + vectorized detection + retries + lazy export."
+    "v8.0 — rewritten for a smoother and more accurate workflow. Safer overwrite, cleaner run center, batch symptomization, prelearn, inbox, exact template export, and session persistence."
 )
+
 
 
 
