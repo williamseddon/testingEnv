@@ -13,4 +13,4 @@ playwright
 requests
 beautifulsoup4
 chromium
-parser 
+urllib.parse
