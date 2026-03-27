@@ -12,3 +12,4 @@ apify-client>=1.6
 playwright
 requests
 beautifulsoup4
+chromium
