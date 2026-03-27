@@ -1,643 +1,430 @@
+from __future__ import annotations
+
+import io
 import json
+import math
 import re
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from openpyxl.utils import get_column_letter
 
-APP_TITLE = "SharkNinja Bazaarvoice Review Puller"
-REQUEST_TIMEOUT = 25
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36"
-)
 
+APP_TITLE = "SharkNinja Review Downloader"
+DEFAULT_PASSKEY = "caC6wVBHos09eVeBkLIniLUTzrNMMH2XMADEhpHe1ewUw"
+DEFAULT_DISPLAYCODE = "15973_3_0-en_us"
 DEFAULT_API_VERSION = "5.5"
-DEFAULT_DISPLAY_CODE = "15973_3_0-en_us"
-DEFAULT_LIMIT = 100
-DEFAULT_MAX_REVIEWS = 500
-DEFAULT_LIMIT_COMMENTS = 3
-DEFAULT_SORT = "relevancy:a1"
-DEFAULT_LOCALE_FILTER = (
+DEFAULT_PAGE_SIZE = 100
+DEFAULT_SORT = "SubmissionTime:desc"
+DEFAULT_CONTENT_LOCALES = (
     "en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,"
     "id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,"
     "tr*,vi*,en_AU,en_CA,en_GB"
 )
-SUPPORTED_SHARKNINJA_DOMAINS = {
-    "www.sharkninja.com",
-    "sharkninja.com",
-    "www.sharkclean.com",
-    "sharkclean.com",
-    "www.ninjakitchen.com",
-    "ninjakitchen.com",
-    "www.sharkbeauty.com",
-    "sharkbeauty.com",
-}
-BV_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
+BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
 
 
-def get_secret(name: str, default: str = "") -> str:
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
+class ReviewDownloaderError(Exception):
+    """Raised when the product page or Bazaarvoice API cannot be processed."""
 
 
-def normalize_text(value: str) -> str:
-    return value.strip()
+@dataclass
+class ReviewBatchSummary:
+    product_url: str
+    product_id: str
+    total_reviews: int
+    page_size: int
+    requests_needed: int
+    reviews_downloaded: int
 
 
-def safe_get(url: str) -> requests.Response:
-    return requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+def normalize_product_url(url: str) -> str:
+    url = url.strip()
+    if not url:
+        raise ReviewDownloaderError("Please paste a product URL.")
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        url = f"https://{url}"
+    return url
 
 
-def is_bazaarvoice_api_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value)
-        return "bazaarvoice.com" in (parsed.netloc or "") and parsed.path.endswith("/data/reviews.json")
-    except Exception:
-        return False
+def get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0 Safari/537.36"
+            )
+        }
+    )
+    return session
 
 
-def is_supported_sharkninja_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value)
-        return (parsed.scheme in {"http", "https"}) and (parsed.netloc.lower() in SUPPORTED_SHARKNINJA_DOMAINS)
-    except Exception:
-        return False
+def fetch_product_html(session: requests.Session, product_url: str) -> str:
+    response = session.get(product_url, timeout=30)
+    response.raise_for_status()
+    return response.text
 
 
-def clean_product_id(value: str) -> str:
-    value = normalize_text(value)
-    value = re.sub(r"\.html$", "", value, flags=re.IGNORECASE)
-    value = value.strip("/")
-    return value
-
-
-def looks_like_product_id(value: str) -> bool:
-    value = clean_product_id(value)
-    if not value:
-        return False
-    return bool(re.fullmatch(r"[A-Za-z0-9_-]{3,60}", value) and re.search(r"\d", value))
-
-
-def extract_product_id_from_sharkninja_url(page_url: str) -> Optional[str]:
-    parsed = urlparse(page_url)
-    path = parsed.path or ""
-    query = parse_qs(parsed.query or "")
-
-    match = re.search(r"/([A-Za-z0-9_-]+)\.html$", path, flags=re.IGNORECASE)
+def _extract_product_id_from_url(product_url: str) -> Optional[str]:
+    path = urlparse(product_url).path
+    match = re.search(r"/([A-Za-z0-9_-]+)\.html(?:$|[?#])", path)
     if match:
-        candidate = clean_product_id(match.group(1))
-        if looks_like_product_id(candidate):
+        candidate = match.group(1).strip().upper()
+        if re.fullmatch(r"[A-Z0-9_-]{3,}", candidate):
             return candidate
+    return None
 
-    for key in query.keys():
-        match = re.match(r"dwvar_([A-Za-z0-9_-]+)_", key, flags=re.IGNORECASE)
+
+def _extract_product_id_from_html(html: str) -> Optional[str]:
+    patterns = [
+        r"Item\s*No\.\s*([A-Z0-9_-]{3,})",
+        r"Model\s*:?\s*([A-Z0-9_-]{3,})",
+        r'"sku"\s*:\s*"([A-Z0-9_-]{3,})"',
+        r'"productId"\s*:\s*"([A-Z0-9_-]{3,})"',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
         if match:
-            candidate = clean_product_id(match.group(1))
-            if looks_like_product_id(candidate):
-                return candidate
+            return match.group(1).strip().upper()
 
-    for segment in reversed([part for part in path.split("/") if part]):
-        candidate = clean_product_id(segment)
-        if looks_like_product_id(candidate):
-            return candidate
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    for pattern in patterns[:2]:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().upper()
 
     return None
 
 
-def parse_bv_style_url(bv_url: str) -> Dict[str, Optional[str]]:
-    parsed = urlparse(bv_url)
-    query = parse_qs(parsed.query or "")
-
-    product_id = None
-    for raw_filter in query.get("filter", []):
-        match = re.search(r"productid:.*?:([A-Za-z0-9_-]{3,60})", raw_filter, flags=re.IGNORECASE)
-        if match:
-            product_id = match.group(1)
-            break
-
-    return {
-        "product_id": clean_product_id(product_id or "") or None,
-        "displaycode": (query.get("displaycode", [None])[0] or None),
-        "apiversion": (query.get("apiversion", [None])[0] or None),
-        "sort": (query.get("sort", [None])[0] or None),
-        "limit": (query.get("limit", [None])[0] or None),
-        "offset": (query.get("offset", [None])[0] or None),
-    }
-
-
-def extract_json_candidates_from_html(html: str) -> List[str]:
-    candidates: List[str] = []
-
-    for match in re.finditer(
-        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    ):
-        candidates.append(match.group(1))
-
-    for match in re.finditer(r"<script[^>]*>(.*?)</script>", html, re.IGNORECASE | re.DOTALL):
-        body = match.group(1)
-        lowered = body.lower()
-        if any(token in lowered for token in ["productid", "sku", "item no", "itemno", "model"]):
-            candidates.append(body)
-
-    return candidates
-
-
-def find_product_id_in_text(text: str) -> List[str]:
-    patterns = [
-        r'(?i)["\']productid["\']\s*[:=]\s*["\']([^"\']{1,120})["\']',
-        r'(?i)["\']product[_-]?id["\']\s*[:=]\s*["\']([^"\']{1,120})["\']',
-        r'(?i)["\']sku["\']\s*[:=]\s*["\']([^"\']{1,120})["\']',
-        r'(?i)item\s*no\.?\s*[:#]?\s*([A-Z0-9_-]{3,60})',
-        r'(?i)data-bv-product-id\s*=\s*["\']([^"\']{1,120})["\']',
-        r'(?i)data-product-id\s*=\s*["\']([^"\']{1,120})["\']',
-    ]
-
-    results: List[str] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            candidate = clean_product_id(match.group(1))
-            if looks_like_product_id(candidate):
-                results.append(candidate)
-    return results
-
-
-def detect_product_id_from_page(page_url: str) -> Dict[str, Any]:
-    response = safe_get(page_url)
-    response.raise_for_status()
-    html = response.text
-    soup = BeautifulSoup(html, "html.parser")
-
-    candidates: List[str] = []
-
-    url_candidate = extract_product_id_from_sharkninja_url(page_url)
-    if url_candidate:
-        candidates.append(url_candidate)
-
-    for attr in ["data-bv-product-id", "data-product-id", "data-sku", "data-model-number"]:
-        for tag in soup.find_all(attrs={attr: True}):
-            value = clean_product_id(str(tag.get(attr)))
-            if looks_like_product_id(value):
-                candidates.append(value)
-
-    for blob in extract_json_candidates_from_html(html):
-        candidates.extend(find_product_id_in_text(blob))
-        try:
-            parsed = json.loads(blob)
-            items = parsed if isinstance(parsed, list) else [parsed]
-            for item in items:
-                if isinstance(item, dict):
-                    for key in ["sku", "productID", "productId", "mpn"]:
-                        value = item.get(key)
-                        if isinstance(value, str):
-                            cleaned = clean_product_id(value)
-                            if looks_like_product_id(cleaned):
-                                candidates.append(cleaned)
-        except Exception:
-            pass
-
-    candidates.extend(find_product_id_in_text(html))
-
-    deduped: List[str] = []
-    seen = set()
-    for item in candidates:
-        key = item.lower()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(item)
-
-    return {
-        "title": soup.title.text.strip() if soup.title and soup.title.text else "",
-        "status_code": response.status_code,
-        "top_candidate": deduped[0] if deduped else None,
-        "candidates": deduped,
-    }
-
-
-def resolve_input_to_product_id(user_input: str, manual_override: str = "") -> Dict[str, Any]:
-    manual_override = clean_product_id(manual_override)
-    if manual_override:
-        return {
-            "mode": "manual_product_id",
-            "product_id": manual_override,
-            "displaycode_from_input": None,
-            "details": {"source": "manual override"},
-        }
-
-    value = normalize_text(user_input)
-    if not value:
-        return {
-            "mode": "empty",
-            "product_id": None,
-            "displaycode_from_input": None,
-            "details": {},
-        }
-
-    if is_bazaarvoice_api_url(value):
-        parsed = parse_bv_style_url(value)
-        return {
-            "mode": "bazaarvoice_url",
-            "product_id": parsed.get("product_id"),
-            "displaycode_from_input": parsed.get("displaycode"),
-            "details": parsed,
-        }
-
-    if is_supported_sharkninja_url(value):
-        direct_candidate = extract_product_id_from_sharkninja_url(value)
-        if direct_candidate:
-            return {
-                "mode": "sharkninja_url",
-                "product_id": direct_candidate,
-                "displaycode_from_input": None,
-                "details": {"source": "url path / dwvar", "url": value},
-            }
-
-        detected = detect_product_id_from_page(value)
-        return {
-            "mode": "sharkninja_url_scraped",
-            "product_id": detected.get("top_candidate"),
-            "displaycode_from_input": None,
-            "details": detected,
-        }
-
-    cleaned = clean_product_id(value)
-    if looks_like_product_id(cleaned):
-        return {
-            "mode": "product_id",
-            "product_id": cleaned,
-            "displaycode_from_input": None,
-            "details": {"source": "direct product id"},
-        }
-
-    return {
-        "mode": "unknown",
-        "product_id": None,
-        "displaycode_from_input": None,
-        "details": {"source": "unrecognized input", "value": value},
-    }
+def extract_product_id(product_url: str, html: str) -> str:
+    product_id = _extract_product_id_from_html(html) or _extract_product_id_from_url(product_url)
+    if not product_id:
+        raise ReviewDownloaderError(
+            "Could not find a product ID on the page. Try a SharkNinja product detail URL like /AF181.html."
+        )
+    return product_id
 
 
 def build_bv_params(
+    *,
     product_id: str,
     passkey: str,
     displaycode: str,
-    apiversion: str,
-    limit: int,
+    api_version: str,
+    page_size: int,
     offset: int,
     sort: str,
-    locale_filter: str,
-    limit_comments: int,
-) -> List[Tuple[str, str]]:
-    return [
-        ("resource", "reviews"),
-        ("action", "REVIEWS_N_STATS"),
-        ("filter", f"productid:eq:{product_id}"),
-        ("filter", f"contentlocale:eq:{locale_filter}"),
-        ("filter", "isratingsonly:eq:false"),
-        ("filter_reviews", f"contentlocale:eq:{locale_filter}"),
-        ("include", "authors,products,comments"),
-        ("filteredstats", "reviews"),
-        ("Stats", "Reviews"),
-        ("limit", str(limit)),
-        ("offset", str(offset)),
-        ("limit_comments", str(limit_comments)),
-        ("sort", sort),
-        ("passkey", passkey),
-        ("apiversion", apiversion),
-        ("displaycode", displaycode),
-    ]
+    content_locales: str,
+) -> Dict[str, Any]:
+    return {
+        "resource": "reviews",
+        "action": "REVIEWS_N_STATS",
+        "filter": [f"productid:eq:{product_id}", f"contentlocale:eq:{content_locales}", "isratingsonly:eq:false"],
+        "filter_reviews": f"contentlocale:eq:{content_locales}",
+        "include": "authors,products,comments",
+        "filteredstats": "reviews",
+        "Stats": "Reviews",
+        "limit": int(page_size),
+        "offset": int(offset),
+        "limit_comments": 3,
+        "sort": sort,
+        "passkey": passkey,
+        "apiversion": api_version,
+        "displaycode": displaycode,
+    }
 
 
-def build_preview_url(params: List[Tuple[str, str]]) -> str:
-    safe_params = [(k, v) for k, v in params if k.lower() != "passkey"]
-    return f"{BV_ENDPOINT}?{urlencode(safe_params, doseq=True)}"
-
-
-def fetch_reviews_page_style(
-    passkey: str,
+def fetch_reviews_page(
+    session: requests.Session,
+    *,
     product_id: str,
+    passkey: str,
     displaycode: str,
-    apiversion: str,
-    limit: int,
+    api_version: str,
+    page_size: int,
     offset: int,
     sort: str,
-    locale_filter: str,
-    limit_comments: int,
+    content_locales: str,
 ) -> Dict[str, Any]:
     params = build_bv_params(
         product_id=product_id,
         passkey=passkey,
         displaycode=displaycode,
-        apiversion=apiversion,
-        limit=limit,
+        api_version=api_version,
+        page_size=page_size,
         offset=offset,
         sort=sort,
-        locale_filter=locale_filter,
-        limit_comments=limit_comments,
+        content_locales=content_locales,
     )
-
-    response = requests.get(
-        BV_ENDPOINT,
-        params=params,
-        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    content_type = response.headers.get("content-type", "")
-    if "json" not in content_type.lower():
-        raise RuntimeError(f"Unexpected response type: {content_type or 'unknown'}")
-
+    response = session.get(BAZAARVOICE_ENDPOINT, params=params, timeout=45)
+    response.raise_for_status()
     payload = response.json()
-    if response.status_code >= 400:
-        raise RuntimeError(json.dumps(payload, indent=2))
 
-    payload["_request_preview_url"] = build_preview_url(params)
+    if payload.get("HasErrors"):
+        errors = payload.get("Errors") or []
+        raise ReviewDownloaderError(f"Bazaarvoice returned an error: {json.dumps(errors, ensure_ascii=False)}")
+
     return payload
 
 
-def fetch_all_reviews_page_style(
-    passkey: str,
+def get_total_reviews(
+    session: requests.Session,
+    *,
     product_id: str,
+    passkey: str,
     displaycode: str,
-    apiversion: str,
-    page_size: int,
-    max_reviews: int,
+    api_version: str,
     sort: str,
-    locale_filter: str,
-    limit_comments: int,
-) -> Dict[str, Any]:
-    all_reviews: List[Dict[str, Any]] = []
-    offset = 0
-    first_payload: Optional[Dict[str, Any]] = None
+    content_locales: str,
+) -> int:
+    payload = fetch_reviews_page(
+        session,
+        product_id=product_id,
+        passkey=passkey,
+        displaycode=displaycode,
+        api_version=api_version,
+        page_size=1,
+        offset=0,
+        sort=sort,
+        content_locales=content_locales,
+    )
+    return int(payload.get("TotalResults", 0))
 
-    while len(all_reviews) < max_reviews:
-        limit = min(page_size, max_reviews - len(all_reviews))
-        payload = fetch_reviews_page_style(
-            passkey=passkey,
+
+def extract_photo_urls(photos: Iterable[Dict[str, Any]]) -> List[str]:
+    urls: List[str] = []
+    for photo in photos or []:
+        sizes = photo.get("Sizes") or {}
+        for size_name in ["large", "normal", "thumbnail"]:
+            candidate = ((sizes.get(size_name) or {}).get("Url"))
+            if candidate:
+                urls.append(candidate)
+                break
+    return urls
+
+
+def flatten_review(review: Dict[str, Any]) -> Dict[str, Any]:
+    syndication_source = review.get("SyndicationSource") or {}
+    photos = review.get("Photos") or []
+    badges_order = review.get("BadgesOrder") or []
+
+    context_data = review.get("ContextDataValues") or {}
+    if not isinstance(context_data, dict):
+        context_data = {}
+
+    return {
+        "review_id": review.get("Id"),
+        "cid": review.get("CID"),
+        "product_id": review.get("ProductId"),
+        "original_product_name": review.get("OriginalProductName"),
+        "title": review.get("Title"),
+        "review_text": review.get("ReviewText"),
+        "rating": review.get("Rating"),
+        "is_recommended": review.get("IsRecommended"),
+        "user_nickname": review.get("UserNickname"),
+        "author_id": review.get("AuthorId"),
+        "user_location": review.get("UserLocation"),
+        "content_locale": review.get("ContentLocale"),
+        "submission_time": review.get("SubmissionTime"),
+        "last_modification_time": review.get("LastModificationTime"),
+        "last_moderated_time": review.get("LastModeratedTime"),
+        "moderation_status": review.get("ModerationStatus"),
+        "campaign_id": review.get("CampaignId"),
+        "source_client": review.get("SourceClient"),
+        "is_featured": review.get("IsFeatured"),
+        "is_syndicated": review.get("IsSyndicated"),
+        "syndication_source_name": syndication_source.get("Name"),
+        "syndication_source_link": syndication_source.get("ContentLink"),
+        "is_ratings_only": review.get("IsRatingsOnly"),
+        "total_feedback_count": review.get("TotalFeedbackCount"),
+        "total_positive_feedback_count": review.get("TotalPositiveFeedbackCount"),
+        "total_negative_feedback_count": review.get("TotalNegativeFeedbackCount"),
+        "total_inappropriate_feedback_count": review.get("TotalInappropriateFeedbackCount"),
+        "total_comment_count": review.get("TotalCommentCount"),
+        "total_client_response_count": review.get("TotalClientResponseCount"),
+        "badges": ", ".join(badges_order),
+        "badges_json": json.dumps(review.get("Badges") or {}, ensure_ascii=False),
+        "context_data_json": json.dumps(context_data, ensure_ascii=False),
+        "secondary_ratings_json": json.dumps(review.get("SecondaryRatings") or [], ensure_ascii=False),
+        "tag_dimensions_json": json.dumps(review.get("TagDimensions") or {}, ensure_ascii=False),
+        "photos_count": len(photos),
+        "photo_urls": " | ".join(extract_photo_urls(photos)),
+        "incentivized_review": "incentivizedReview" in badges_order or "IncentivizedReview" in context_data,
+        "raw_json": json.dumps(review, ensure_ascii=False),
+    }
+
+
+def fetch_all_reviews(
+    session: requests.Session,
+    *,
+    product_id: str,
+    passkey: str,
+    displaycode: str,
+    api_version: str,
+    page_size: int,
+    sort: str,
+    content_locales: str,
+    total_reviews: int,
+) -> List[Dict[str, Any]]:
+    reviews: List[Dict[str, Any]] = []
+    if total_reviews <= 0:
+        return reviews
+
+    progress_bar = st.progress(0.0, text="Starting review download...")
+    status = st.empty()
+
+    offsets = list(range(0, total_reviews, page_size))
+    for index, offset in enumerate(offsets, start=1):
+        status.info(f"Pulling request {index} of {len(offsets)} (offset {offset})")
+        payload = fetch_reviews_page(
+            session,
             product_id=product_id,
+            passkey=passkey,
             displaycode=displaycode,
-            apiversion=apiversion,
-            limit=limit,
+            api_version=api_version,
+            page_size=page_size,
             offset=offset,
             sort=sort,
-            locale_filter=locale_filter,
-            limit_comments=limit_comments,
+            content_locales=content_locales,
         )
+        page_results = payload.get("Results") or []
+        reviews.extend(page_results)
+        progress_bar.progress(index / len(offsets), text=f"Downloaded {len(reviews)} of {total_reviews} reviews")
 
-        if first_payload is None:
-            first_payload = payload
-
-        chunk = payload.get("Results", []) or []
-        if not chunk:
-            break
-
-        all_reviews.extend(chunk)
-        offset += len(chunk)
-
-        total_results = payload.get("TotalResults", 0)
-        if len(all_reviews) >= total_results:
-            break
-
-    if first_payload is None:
-        first_payload = {}
-
-    first_payload["Results"] = all_reviews[:max_reviews]
-    return first_payload
+    status.success(f"Finished downloading {len(reviews)} reviews.")
+    return reviews
 
 
-def summarize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    includes = payload.get("Includes", {}) or {}
-    products = includes.get("Products", {}) or {}
+def build_excel_file(summary: ReviewBatchSummary, reviews_df: pd.DataFrame) -> bytes:
+    summary_df = pd.DataFrame(
+        [
+            {
+                "product_url": summary.product_url,
+                "product_id": summary.product_id,
+                "total_reviews": summary.total_reviews,
+                "page_size": summary.page_size,
+                "requests_needed": summary.requests_needed,
+                "reviews_downloaded": summary.reviews_downloaded,
+                "generated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+        ]
+    )
 
-    product_name = None
-    average_rating = None
-    review_count = payload.get("TotalResults")
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        reviews_df.to_excel(writer, sheet_name="Reviews", index=False)
 
-    if products:
-        first_key = next(iter(products))
-        first_product = products.get(first_key, {}) or {}
-        product_name = first_product.get("Name")
-        stats = first_product.get("ReviewStatistics", {}) or {}
-        average_rating = stats.get("AverageOverallRating")
-        if stats.get("TotalReviewCount") is not None:
-            review_count = stats.get("TotalReviewCount")
+        for sheet_name, df in {"Summary": summary_df, "Reviews": reviews_df}.items():
+            worksheet = writer.sheets[sheet_name]
+            for idx, column in enumerate(df.columns, start=1):
+                max_len = max(len(str(column)), *(len(str(v)) for v in df[column].head(200).fillna("")))
+                worksheet.column_dimensions[get_column_letter(idx)].width = min(max_len + 2, 50)
 
-    return {
-        "product_name": product_name,
-        "average_rating": average_rating,
-        "review_count": review_count,
-    }
-
-
-def flatten_review(review: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    includes = payload.get("Includes", {}) or {}
-    comments_lookup = includes.get("Comments", {}) or {}
-    authors_lookup = includes.get("Authors", {}) or {}
-
-    comment_ids = review.get("CommentIds", []) or []
-    comment_texts: List[str] = []
-    for comment_id in comment_ids:
-        comment = comments_lookup.get(str(comment_id)) or comments_lookup.get(comment_id) or {}
-        comment_text = comment.get("CommentText") or comment.get("Comment") or ""
-        if comment_text:
-            comment_texts.append(comment_text)
-
-    author = authors_lookup.get(str(review.get("AuthorId"))) or authors_lookup.get(review.get("AuthorId")) or {}
-    badges = review.get("Badges", {}) or {}
-    contextual = review.get("ContextDataValues", {}) or {}
-
-    return {
-        "ReviewId": review.get("Id"),
-        "ProductId": review.get("ProductId"),
-        "Title": review.get("Title"),
-        "ReviewText": review.get("ReviewText"),
-        "Rating": review.get("Rating"),
-        "IsRecommended": review.get("IsRecommended"),
-        "UserNickname": review.get("UserNickname"),
-        "AuthorId": review.get("AuthorId"),
-        "AuthorLocation": author.get("Location"),
-        "SubmissionTime": review.get("SubmissionTime"),
-        "LastModificationTime": review.get("LastModificationTime"),
-        "Locale": review.get("ContentLocale"),
-        "SyndicationSource": review.get("SyndicationSource"),
-        "HelpfulYes": review.get("TotalPositiveFeedbackCount"),
-        "HelpfulNo": review.get("TotalNegativeFeedbackCount"),
-        "CommentCount": len(comment_texts),
-        "Comments": " | ".join(comment_texts),
-        "Badges": json.dumps(badges, ensure_ascii=False),
-        "ContextDataValues": json.dumps(contextual, ensure_ascii=False),
-    }
-
-
-def reviews_to_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
-    rows = [flatten_review(review, payload) for review in payload.get("Results", []) or []]
-    return pd.DataFrame(rows)
-
-
-def make_download_filename(product_id: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", product_id).strip("_") or "reviews"
-    return f"sharkninja_bazaarvoice_reviews_{cleaned}.csv"
+    output.seek(0)
+    return output.getvalue()
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(
-    "Paste a SharkNinja product URL, a SharkNinja product ID, or a Bazaarvoice reviews URL. "
-    "The app resolves the Product ID, then calls Bazaarvoice using the same request style used on SharkNinja pages."
+    "Paste a SharkNinja product page, pull the product ID, calculate how many Bazaarvoice requests are needed, "
+    "and download all reviews to Excel."
 )
 
 with st.sidebar:
-    st.header("SharkNinja Bazaarvoice settings")
+    st.header("Bazaarvoice settings")
+    passkey = st.text_input("Passkey", value=DEFAULT_PASSKEY, type="password")
+    displaycode = st.text_input("Display code", value=DEFAULT_DISPLAYCODE)
+    api_version = st.text_input("API version", value=DEFAULT_API_VERSION)
+    page_size = st.number_input("Reviews per request", min_value=1, max_value=100, value=DEFAULT_PAGE_SIZE, step=1)
+    sort = st.text_input("Sort", value=DEFAULT_SORT)
+    content_locales = st.text_area("Content locale filter", value=DEFAULT_CONTENT_LOCALES, height=120)
+    st.caption("The defaults are based on the SharkNinja AF181 Bazaarvoice calls you shared.")
 
-    passkey = get_secret("BAZAARVOICE_PASSKEY") or get_secret("SHARKNINJA_BV_PASSKEY")
-    displaycode_default = get_secret("SHARKNINJA_BV_DISPLAYCODE", DEFAULT_DISPLAY_CODE)
-
-    if not passkey:
-        st.error("Missing Bazaarvoice passkey. Add BAZAARVOICE_PASSKEY or SHARKNINJA_BV_PASSKEY to Streamlit secrets.")
-
-    displaycode = st.text_input("Display code", value=displaycode_default)
-    apiversion = st.text_input("API version", value=DEFAULT_API_VERSION)
-    page_size = st.number_input("API page size", min_value=1, max_value=100, value=DEFAULT_LIMIT)
-    max_reviews = st.number_input("Max reviews to fetch", min_value=1, max_value=5000, value=DEFAULT_MAX_REVIEWS)
-    limit_comments = st.number_input("Max comments per review", min_value=0, max_value=20, value=DEFAULT_LIMIT_COMMENTS)
-    sort = st.selectbox(
-        "Sort",
-        options=["relevancy:a1", "SubmissionTime:desc", "Rating:desc", "Rating:asc"],
-        index=0,
-    )
-    locale_filter = st.text_area("Content locale filter", value=DEFAULT_LOCALE_FILTER, height=120)
-
-    st.markdown("---")
-    st.markdown(
-        "**Supported inputs**\n\n"
-        "- SharkNinja product page URL\n"
-        "- Direct product ID such as `HT400PU` or `RV2820YE`\n"
-        "- Existing Bazaarvoice reviews URL\n\n"
-        "For SharkNinja product pages, the app first tries to extract the model code from the URL path like `HT400PU.html`, "
-        "then falls back to page inspection if needed."
-    )
-
-input_value = st.text_input(
-    "Paste SharkNinja product URL, Product ID, or Bazaarvoice reviews URL",
-    placeholder="https://www.sharkninja.com/.../HT400PU.html or RV2820YE or https://api.bazaarvoice.com/data/reviews.json?...",
+product_url = st.text_input(
+    "Product URL",
+    value="https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
+    help="Example: https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
 )
-manual_product_id = st.text_input("Optional manual Product ID override", placeholder="Leave blank unless you want to force a Product ID")
 
-col_a, col_b = st.columns(2)
-with col_a:
-    inspect_input = st.button("Inspect input", use_container_width=True)
-with col_b:
-    pull_reviews = st.button("Pull reviews", type="primary", use_container_width=True)
+run_button = st.button("Pull all reviews and build Excel", type="primary")
 
-if inspect_input:
+if run_button:
     try:
-        resolution = resolve_input_to_product_id(input_value, manual_product_id)
-        st.session_state["resolution"] = resolution
-        st.session_state["resolved_product_id"] = resolution.get("product_id")
-        st.session_state["input_displaycode"] = resolution.get("displaycode_from_input")
+        product_url = normalize_product_url(product_url)
+        session = get_session()
 
-        st.subheader("Resolved input")
-        st.write(
-            {
-                "mode": resolution.get("mode"),
-                "product_id": resolution.get("product_id"),
-                "displaycode_from_input": resolution.get("displaycode_from_input"),
-                "details": resolution.get("details"),
-            }
+        with st.spinner("Loading product page..."):
+            html = fetch_product_html(session, product_url)
+            product_id = extract_product_id(product_url, html)
+
+        with st.spinner("Checking total review count..."):
+            total_reviews = get_total_reviews(
+                session,
+                product_id=product_id,
+                passkey=passkey,
+                displaycode=displaycode,
+                api_version=api_version,
+                sort=sort,
+                content_locales=content_locales,
+            )
+
+        requests_needed = math.ceil(total_reviews / page_size) if total_reviews else 0
+
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Product ID", product_id)
+        metric_cols[1].metric("Total reviews", total_reviews)
+        metric_cols[2].metric("Requests needed", requests_needed)
+
+        raw_reviews = fetch_all_reviews(
+            session,
+            product_id=product_id,
+            passkey=passkey,
+            displaycode=displaycode,
+            api_version=api_version,
+            page_size=int(page_size),
+            sort=sort,
+            content_locales=content_locales,
+            total_reviews=total_reviews,
         )
-    except Exception as exc:
+
+        reviews_df = pd.DataFrame(flatten_review(review) for review in raw_reviews)
+        summary = ReviewBatchSummary(
+            product_url=product_url,
+            product_id=product_id,
+            total_reviews=total_reviews,
+            page_size=int(page_size),
+            requests_needed=requests_needed,
+            reviews_downloaded=len(reviews_df),
+        )
+
+        excel_bytes = build_excel_file(summary, reviews_df)
+        file_name = f"{product_id}_reviews_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        st.success("Done. Your Excel file is ready.")
+        st.download_button(
+            label="Download Excel",
+            data=excel_bytes,
+            file_name=file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        with st.expander("Preview first 20 reviews"):
+            st.dataframe(reviews_df.head(20), use_container_width=True)
+
+    except requests.HTTPError as exc:
+        st.error(f"HTTP error: {exc}")
+    except ReviewDownloaderError as exc:
+        st.error(str(exc))
+    except Exception as exc:  # pragma: no cover - useful for Streamlit UI debugging
         st.exception(exc)
-
-resolved_product_id = clean_product_id(manual_product_id) or st.session_state.get("resolved_product_id", "")
-if resolved_product_id:
-    st.info(f"Using Product ID: `{resolved_product_id}`")
-
-if pull_reviews:
-    try:
-        resolution = resolve_input_to_product_id(input_value, manual_product_id)
-        product_id = resolution.get("product_id")
-        displaycode_to_use = resolution.get("displaycode_from_input") or displaycode
-
-        if not passkey:
-            st.error("Missing Bazaarvoice passkey in Streamlit secrets.")
-        elif not product_id:
-            st.error("Could not resolve a Product ID from the input. Paste a SharkNinja product URL, product ID, or Bazaarvoice reviews URL.")
-        else:
-            with st.spinner("Fetching SharkNinja Bazaarvoice reviews..."):
-                payload = fetch_all_reviews_page_style(
-                    passkey=passkey,
-                    product_id=product_id,
-                    displaycode=displaycode_to_use,
-                    apiversion=apiversion,
-                    page_size=int(page_size),
-                    max_reviews=int(max_reviews),
-                    sort=sort,
-                    locale_filter=locale_filter,
-                    limit_comments=int(limit_comments),
-                )
-
-            df = reviews_to_dataframe(payload)
-            summary = summarize_payload(payload)
-
-            metric1, metric2, metric3 = st.columns(3)
-            metric1.metric("Reviews returned", int(len(df)))
-            metric2.metric("Average rating", summary.get("average_rating") or "N/A")
-            metric3.metric("Product", summary.get("product_name") or product_id)
-
-            with st.expander("Request preview", expanded=False):
-                st.code(payload.get("_request_preview_url", ""), language="text")
-
-            tab1, tab2, tab3 = st.tabs(["Reviews", "Raw JSON", "Summary"])
-
-            with tab1:
-                if df.empty:
-                    st.warning("No reviews were returned for this Product ID.")
-                else:
-                    st.dataframe(df, use_container_width=True)
-                    st.download_button(
-                        label="Download reviews as CSV",
-                        data=df.to_csv(index=False).encode("utf-8"),
-                        file_name=make_download_filename(product_id),
-                        mime="text/csv",
-                    )
-
-            with tab2:
-                st.json(payload)
-
-            with tab3:
-                st.write(
-                    {
-                        "input_mode": resolution.get("mode"),
-                        "product_id": product_id,
-                        "displaycode_used": displaycode_to_use,
-                        "api_version": apiversion,
-                        "sort": sort,
-                        "average_rating": summary.get("average_rating"),
-                        "review_count_reported": summary.get("review_count"),
-                        "reviews_loaded_in_app": len(df),
-                    }
-                )
-    except Exception as exc:
-        st.exception(exc)
-
-st.markdown("---")
-st.subheader("Streamlit secrets")
-st.code(
-    'BAZAARVOICE_PASSKEY = "your_actual_passkey_here"\n'
-    'SHARKNINJA_BV_DISPLAYCODE = "15973_3_0-en_us"',
-    language="toml",
-)
-
-st.subheader("Design notes")
-st.markdown(
-    "This app is SharkNinja-specific by design. It accepts a SharkNinja product page URL, a direct Product ID, or a Bazaarvoice review URL, "
-    "then requests reviews using the Bazaarvoice query style you shared."
-)
