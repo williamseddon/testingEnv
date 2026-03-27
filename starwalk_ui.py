@@ -1,12 +1,12 @@
-# starwalk_ui_v8_0_knowledge_plus_amazing.py
-# v8.2 — universal deep-L2 symptomization with auto-tuned routing + rescue
+# starwalk_ui_v8_3_catalog_first_better_output.py
+# v8.3 — catalog-first symptomization with stronger provided-symptom detection
 #
 # Highlights:
-#   - Cleaner main UI with tabs and a single Run Center
-#   - Safer overwrite mode with explicit confirmation and exact row targeting
-#   - Correct overwrite semantics: selected rows are rebuilt from scratch
-#   - Batch symptomization, filters, inbox, prelearn, export, undo, throttling, cost tracking
-#   - Stronger summaries and reduced button clutter
+#   - Catalog-first matching of provided Symptoms + aliases
+#   - Stronger rescue for supplied labels before falling back to learned labels
+#   - Clearer processed-review log: detected vs written
+#   - Safer overwrite semantics, filters, inbox, export, undo, throttling, cost tracking
+#   - Tuned defaults for better real-world output
 
 import gc
 import hashlib
@@ -44,10 +44,10 @@ except Exception:
 
 
 # ----------------------------- Page setup -----------------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v8.2 Universal")
-st.title("✨ Review Symptomizer — v8.2 Universal")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v8.3 Catalog-First")
+st.title("✨ Review Symptomizer — v8.3 Catalog-First")
 st.caption(
-    "Universal L1 backbone • deeper reusable L2 symptomization • auto-tuned settings • smarter prelearn • safer overwrite • exact K–T / U–AD export • inbox + aliases • filters"
+    "Catalog-first detection • stronger provided-symptom matching • clearer review log • tuned defaults • safer overwrite • exact K–T / U–AD export • inbox + aliases • filters"
 )
 
 st.markdown(
@@ -1112,7 +1112,7 @@ UNIVERSAL_ASPECT_BACKBONE = {
     },
     "Effective Results": {
         "positive_patterns": [
-            r"\bworks? (?:great|well|amazingly|perfectly)\b", r"\bactually works?\b", r"\bdid what (?:it|this) (?:says|promised?)\b",
+            r"\bworks? (?:great|well|amazing(?:ly)?|perfectly)\b", r"\bactually works?\b", r"\bdid what (?:it|this) (?:says|promised?)\b",
             r"\bmade a difference\b", r"\bnoticeable difference\b", r"\bnoticeable results?\b",
             r"\beffective\b", r"\bhelped\b", r"\bgot results?\b", r"\bdoes the job\b",
             r"\bimproved?\b", r"\bbetter than\b", r"\bremoved?\b", r"\bcleaned?\b",
@@ -1128,8 +1128,8 @@ UNIVERSAL_ASPECT_BACKBONE = {
     "Visible Improvement": {
         "positive_patterns": [
             r"\bglow(?:ing)?\b", r"\bsmoother\b", r"\bsofter\b", r"\bbrighter\b", r"\bclearer\b",
-            r"\bshinier\b", r"\bnoticeable improvement\b", r"\blooks better\b", r"\bhealthier\b",
-            r"\bless frizz\b", r"\bdead skin gone\b", r"\bskin was glowing\b",
+            r"\bshinier\b", r"\bshine\b", r"\bnoticeable improvement\b", r"\blooks better\b", r"\bhealthier\b",
+            r"\bless frizz\b", r"\bwithout frizz\b", r"\bfrizz[- ]?free\b", r"\bsalon look\b", r"\bdead skin gone\b", r"\bskin was glowing\b",
         ],
         "negative_patterns": [],
         "positive_labels": ["Visible Improvement", "Improved Appearance"],
@@ -1152,7 +1152,7 @@ UNIVERSAL_ASPECT_BACKBONE = {
     "Time Saver": {
         "positive_patterns": [
             r"\bsaves? time\b", r"\bquick(?:er)?\b", r"\bfaster\b", r"\bcut my .* time\b", r"\bsped up\b",
-            r"\btakes less time\b", r"\bso much quicker\b",
+            r"\btakes less time\b", r"\bso much quicker\b", r"\bin minutes?\b",
         ],
         "negative_patterns": [r"\btoo slow\b", r"\btakes forever\b", r"\btime consuming\b"],
         "positive_labels": ["Time Saver", "Fast Results"],
@@ -1172,7 +1172,7 @@ UNIVERSAL_ASPECT_BACKBONE = {
     },
     "Value": {
         "positive_patterns": [
-            r"\bworth (?:it|the money|every penny)\b", r"\bgood value\b", r"\bgreat value\b", r"\breasonably priced\b",
+            r"\bworth (?:it|the money|every penny)\b", r"\bgood value\b", r"\bgreat value\b", r"\breasonably priced\b", r"\bsaves? me money\b", r"\bwithout spending money\b",
         ],
         "negative_patterns": [
             r"\bexpensive\b", r"\boverpriced\b", r"\btoo pricey\b", r"\btoo expensive\b", r"\bnot worth\b",
@@ -1235,7 +1235,7 @@ UNIVERSAL_ASPECT_BACKBONE = {
     },
     "Attachments / Versatility": {
         "positive_patterns": [
-            r"\battachments?\b.*\b(?:useful|helpful|versatile|handy|great)\b", r"\bversatile\b", r"\bmultiple uses\b",
+            r"\battachments?\b.*\b(?:useful|helpful|versatile|handy|great)\b", r"\bversatile\b", r"\bmultiple uses\b", r"\bwet and dry\b", r"\bwet or dry\b", r"\bcan be used on wet and dry\b", r"\bworks? on (?:curly|straight|thick|fine) hair\b",
         ],
         "negative_patterns": [r"\battachment issue\b", r"\bmissing attachment\b", r"\blimited functionality\b"],
         "positive_labels": ["Attachment Usability", "Versatility"],
@@ -1456,18 +1456,18 @@ UNIVERSAL_L2_TEMPLATES_COMPILED = _compile_l2_templates()
 
 FAMILY_TOKEN_HINTS = {
     "Overall Satisfaction": ["satisfaction", "recommend", "favorite", "best", "happy", "impressed", "regret", "disappointed", "return"],
-    "Effective Results": ["result", "results", "performance", "effective", "works", "working", "improvement", "difference", "quality", "output"],
+    "Effective Results": ["result", "results", "performance", "effective", "works", "working", "improvement", "difference", "quality", "output", "glow", "smooth", "smoother", "shine", "frizz", "curly", "curl", "salon"],
     "Ease Of Use": ["easy", "setup", "clean", "instructions", "intuitive", "simple", "user", "friendly", "complicated"],
-    "Time Saver": ["time", "quick", "quicker", "fast", "faster", "slow", "forever"],
+    "Time Saver": ["time", "quick", "quicker", "fast", "faster", "slow", "forever", "minutes"],
     "Comfort": ["comfort", "comfortable", "lightweight", "ergonomic", "heavy", "bulky", "awkward", "fit"],
-    "Value": ["value", "worth", "price", "priced", "cost", "expensive", "overpriced", "pricey"],
+    "Value": ["value", "worth", "price", "priced", "cost", "expensive", "overpriced", "pricey", "money", "affordable"],
     "Reliability": ["reliable", "durable", "sturdy", "broke", "broken", "defective", "faulty", "failure", "leak", "lasting"],
     "Battery": ["battery", "charge", "charging", "runtime", "power"],
     "Noise": ["noise", "noisy", "loud", "quiet", "whine"],
     "Cleaning / Maintenance": ["clean", "cleaning", "maintenance", "messy", "clog", "residue", "buildup"],
     "Connectivity": ["connect", "connected", "pair", "pairing", "sync", "app", "bluetooth", "wifi"],
     "Design": ["design", "compact", "portable", "size", "bulky", "flimsy", "sleek", "premium"],
-    "Attachments / Versatility": ["attachment", "attachments", "accessory", "versatile", "multi", "tool", "nozzle"],
+    "Attachments / Versatility": ["attachment", "attachments", "accessory", "versatile", "multi", "tool", "nozzle", "wet", "dry", "curly", "straight"],
     "Safety": ["safe", "safety", "burn", "irritation", "rash", "hot", "heat", "gentle"],
 }
 
@@ -1597,6 +1597,31 @@ def _parse_label_textarea(text_in: Any) -> List[str]:
     raw = re.split(r"[\n,;|]+", s)
     vals = [normalize_theme_label(x.strip()) for x in raw if str(x).strip()]
     return _dedupe_keep_order_str(vals)
+
+
+def _provided_catalog_labels(side: str) -> List[str]:
+    side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
+    vals = DELIGHTERS if side_norm == "Delighter" else DETRACTORS
+    return [str(x).strip() for x in (vals or []) if str(x).strip()]
+
+
+def _provided_catalog_keyset(side: str) -> Set[str]:
+    return {_canon_simple(x) for x in _provided_catalog_labels(side)}
+
+
+def _label_phrase_parts(label: str) -> List[str]:
+    raw_parts = re.split(r"\s*-\s*|[/|,&]+", str(label or ""))
+    parts: List[str] = []
+    for p in raw_parts:
+        ps = str(p or "").strip()
+        if not ps:
+            continue
+        if len(ps) < 4:
+            continue
+        if _canon_simple(ps) == _canon_simple(label):
+            continue
+        parts.append(ps)
+    return _dedupe_keep_order_str(parts)
 
 
 def _priority_theme_labels(side: str) -> List[str]:
@@ -1775,8 +1800,12 @@ def _score_existing_label(
 ) -> Tuple[float, List[str]]:
     score = 0.0
     evs: List[str] = []
+    catalog_keys = _provided_catalog_keyset(side)
+    label_key = _canon_simple(label)
     if label in _priority_theme_labels(side):
         score += 0.08
+    if label_key in catalog_keys:
+        score += 0.12
 
     family = _get_label_family(label, side, learned_store)
     if family and matched_families and family in matched_families:
@@ -1787,7 +1816,12 @@ def _score_existing_label(
         score += 1.00
         evs.extend(label_evs)
 
-    for alias in (ALIASES.get(label, []) or [])[:10]:
+    part_hits = _phrase_snippets(review, _label_phrase_parts(label)[:4], max_hits=2, max_chars=max_ev_chars)
+    if part_hits:
+        score += 0.28 + (0.06 * min(2, len(part_hits)))
+        evs.extend(part_hits)
+
+    for alias in (ALIASES.get(label, []) or [])[:12]:
         hit = _phrase_snippets(review, [alias], max_hits=2, max_chars=max_ev_chars)
         if hit:
             score += 0.85
@@ -1808,9 +1842,17 @@ def _score_existing_label(
     if len(overlap) >= 2:
         score += 0.42 + (0.08 * min(3, len(overlap)))
         evs.extend(_phrase_snippets(review, overlap[:2], max_hits=2, max_chars=max_ev_chars))
+        if label_key in catalog_keys:
+            score += 0.12
     elif len(overlap) == 1 and len(ltoks) >= 1 and len(overlap[0]) >= 5:
         score += 0.22
         evs.extend(_phrase_snippets(review, overlap[:1], max_hits=1, max_chars=max_ev_chars))
+
+    if family:
+        fam_kw_hits = _keyword_snippets(review, list(FAMILY_TOKEN_HINTS.get(family, []))[:12], max_hits=2, max_chars=max_ev_chars)
+        if fam_kw_hits and label_key in catalog_keys:
+            score += 0.12 * min(2, len(fam_kw_hits))
+            evs.extend(fam_kw_hits)
 
     if family and matched_families and family in matched_families:
         is_specific_l2 = _canon_simple(label) != _canon_simple(family)
@@ -1882,6 +1924,7 @@ def _route_review_candidates(
         scores: Dict[str, float] = {}
         ev_map: Dict[str, List[str]] = {}
         priority = set(_priority_theme_labels(side))
+        provided_catalog_keys = _provided_catalog_keyset(side)
 
         aspect_hits: Dict[str, List[str]] = {}
         for aspect, spec in UNIVERSAL_ASPECT_BACKBONE_COMPILED.items():
@@ -1895,6 +1938,8 @@ def _route_review_candidates(
             if not resolved:
                 continue
             base = 1.15 if resolved in priority else 0.95
+            if _canon_simple(resolved) in provided_catalog_keys:
+                base += 0.18
             scores[resolved] = scores.get(resolved, 0.0) + base + (0.10 * len(hits))
             ev_map.setdefault(resolved, [])
             ev_map[resolved] = _dedupe_keep_order_str(ev_map[resolved] + hits)[:2]
@@ -1911,7 +1956,8 @@ def _route_review_candidates(
         )
         out[cfg["out_l2"]] = list(l2_raw_labels)[: max(1, int(st.session_state.get("l2_candidate_top_n", 3) or 3) * 3)]
         for lab, sc in l2_scores.items():
-            scores[lab] = max(scores.get(lab, 0.0), float(sc))
+            sc2 = float(sc) + (0.12 if _canon_simple(lab) in provided_catalog_keys else 0.0)
+            scores[lab] = max(scores.get(lab, 0.0), sc2)
         for lab, evs in l2_ev_map.items():
             ev_map.setdefault(lab, [])
             ev_map[lab] = _dedupe_keep_order_str(ev_map[lab] + list(evs or []))[:2]
@@ -1927,7 +1973,7 @@ def _route_review_candidates(
                 matched_families.add("Effective Results")
                 out[cfg["out_families"]] = sorted(matched_families)
 
-        pool = list(allowed)
+        pool = sorted(list(allowed), key=lambda lab: (0 if _canon_simple(lab) in provided_catalog_keys else 1, str(lab)))
         for lab in pool:
             sc, evs = _score_existing_label(
                 review_s,
@@ -1939,6 +1985,8 @@ def _route_review_candidates(
             )
             if sc <= 0:
                 continue
+            if _canon_simple(lab) in provided_catalog_keys:
+                sc += 0.12
             family = _get_label_family(lab, side, learned_store)
             is_specific_l2 = bool(family) and (_canon_simple(lab) != _canon_simple(family))
             if sc >= 0.35 or lab in priority or (is_specific_l2 and family in matched_families):
@@ -1947,13 +1995,18 @@ def _route_review_candidates(
                     ev_map.setdefault(lab, [])
                     ev_map[lab] = _dedupe_keep_order_str(ev_map[lab] + evs)[:2]
 
-        ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        ordered = sorted(scores.items(), key=lambda kv: (0 if _canon_simple(kv[0]) in provided_catalog_keys else 1, -kv[1], kv[0]))
         picked: List[str] = []
         picked_specific: List[str] = []
         for lab, sc in ordered:
             family = _get_label_family(lab, side, learned_store)
             is_specific_l2 = bool(family) and (_canon_simple(lab) != _canon_simple(family))
+            is_catalog = _canon_simple(lab) in provided_catalog_keys
             min_score = 0.45 if lab not in priority else 0.30
+            if is_catalog and ev_map.get(lab):
+                min_score = min(min_score, 0.28 if not is_specific_l2 else 0.32)
+            elif is_catalog:
+                min_score = min(min_score, 0.32 if not is_specific_l2 else 0.36)
             if is_specific_l2 and family in matched_families:
                 min_score = min(min_score, 0.40)
             if sc < min_score:
@@ -1996,7 +2049,10 @@ def _apply_router_rescue(
             evs = list(route_evs.get(lab, []) or [])[:max_ev_per_label]
             family = _get_label_family(lab, side_name, _ensure_learned_store())
             is_specific_l2 = bool(family) and (_canon_simple(lab) != _canon_simple(family))
+            is_catalog = _canon_simple(lab) in _provided_catalog_keyset(side_name)
             required_score = l2_threshold if is_specific_l2 else base_threshold
+            if is_catalog:
+                required_score = min(required_score, max(0.62, base_threshold - (0.14 if is_specific_l2 else 0.22)))
             if lab in labs:
                 if evs and not ev_map.get(lab):
                     ev_map[lab] = evs
@@ -2502,14 +2558,15 @@ def _openai_labeler_unified_batch(
         "You are a high-recall but disciplined review symptomizer for consumer products across MANY product categories.",
         "Start broad: reason in reusable L1 product aspects first (Overall Satisfaction, Effective Results, Ease Of Use, Time Saver, Comfort, Value, Reliability, Battery, Noise, Cleaning / Maintenance, Connectivity, Design, Attachments / Versatility, Safety).",
         "Then go one level deeper: when the evidence is direct, add a reusable L2 subtheme such as Easy Setup, Confusing Instructions, Visible Improvement, Fast Results, Strong Recommendation, Product Failure, Short Battery Life, Pairing Issue, Compact Design, High Cost, or Irritation.",
-        "Candidate labels, matched aspect families, and evidence supplied per review are strong hints derived from rules, aliases, learned keywords, and prelearned knowledge. Reuse them whenever supported.",
+        "Candidate labels, matched aspect families, and evidence supplied per review are strong hints derived from rules, aliases, the provided Symptoms sheet, learned keywords, and prelearned knowledge. Reuse them whenever supported.",
+        "Prefer labels from the provided Symptoms sheet first. Only fall back to universal backbone labels or learned temporary labels when no provided label fits as well.",
         "Do not be overly sparse. If the same review clearly supports multiple broad labels, include all of them. If it clearly supports both a broad L1 and a reusable L2 under that L1, include both when available.",
         "Return STRICT JSON with schema:",
         '{"items":[{"id":"<id>","detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring>", "..."]}], "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}], "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."], "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"}]}',
         "",
         "Rules:",
         f"- Evidence MUST be exact substrings from THAT review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
-        "- Use ONLY allowed lists for delighters and detractors. Prefer broad stable labels plus reusable L2 themes over tiny wording variants.",
+        "- Use ONLY allowed lists for delighters and detractors. Prefer provided catalog labels first, then broad stable labels plus reusable L2 themes over tiny wording variants.",
         "- If a review clearly shows strong recommendation, strong results, visible improvement, ease, comfort, value, reliability, setup experience, connectivity experience, or safety, tag it. Do not leave obvious broad labels blank.",
         "- Only include a label if there is textual support in the review.",
         "- For unlisted_* items, return a SHORT reusable THEME (1–3 words), Title Case, no punctuation except slashes.",
@@ -2526,6 +2583,10 @@ def _openai_labeler_unified_batch(
         sys_lines.insert(1, f"Product context (brief): {str(product_profile).strip()[:600]}")
 
     payload = {
+        "provided_catalog_delighters": _provided_catalog_labels("Delighter")[:200],
+        "provided_catalog_detractors": _provided_catalog_labels("Detractor")[:200],
+        "fallback_delighters": [x for x in allowed_delighters if _canon_simple(x) not in _provided_catalog_keyset("Delighter")][:120],
+        "fallback_detractors": [x for x in allowed_detractors if _canon_simple(x) not in _provided_catalog_keyset("Detractor")][:120],
         "priority_delighter_themes": _priority_theme_labels("Delighter")[:20],
         "priority_detractor_themes": _priority_theme_labels("Detractor")[:20],
         "allowed_delighters": allowed_delighters,
@@ -2847,7 +2908,7 @@ def _suggest_autotune_settings(
         "prelearn_sample_n": prelearn_sample_n,
         "prelearn_batch_size": 80 if n_reviews >= 1200 else 60,
         "prelearn_merge_threshold": 0.91 if (sparse_catalog or heavy_gap) else 0.93,
-        "use_learned_as_allowed": True,
+        "use_learned_as_allowed": (catalog_total < 45 and learned_total > 0),
         "use_universal_l1_backbone": True,
         "high_recall_labeling": True,
         "enable_deep_l2_routing": True,
@@ -2915,7 +2976,7 @@ def _init_defaults() -> None:
         "prelearn_sample_n": 800,
         "prelearn_batch_size": 60,
         "prelearn_merge_threshold": 0.92,
-        "use_learned_as_allowed": True,
+        "use_learned_as_allowed": False,
         "use_universal_l1_backbone": True,
         "high_recall_labeling": True,
         "enable_deep_l2_routing": True,
@@ -3151,8 +3212,8 @@ prelearn_merge_threshold = st.sidebar.slider(
 )
 use_learned_as_allowed = st.sidebar.checkbox(
     "Use learned themes as temporary allowed labels",
-    value=bool(st.session_state.get("use_learned_as_allowed", True)),
-    help="Helpful when the Symptoms sheet is incomplete and when you want deeper reusable L2 coverage.",
+    value=bool(st.session_state.get("use_learned_as_allowed", False)),
+    help="Leave this OFF when your Symptoms sheet is already strong. Turn it ON only when you want learned fallback labels to supplement a sparse catalog.",
 )
 st.session_state["prelearn_enabled"] = bool(prelearn_enabled)
 st.session_state["prelearn_sample_n"] = int(prelearn_sample_n)
@@ -3455,7 +3516,7 @@ def _active_allowed_lists() -> Tuple[List[str], List[str]]:
         for x in _priority_theme_labels("Detractor"):
             if x not in dets:
                 dets.append(x)
-    if bool(st.session_state.get("use_learned_as_allowed", True)):
+    if bool(st.session_state.get("use_learned_as_allowed", False)):
         for x in _known_learned_labels("Delighter")[:80]:
             if x not in dels:
                 dels.append(x)
@@ -3765,13 +3826,27 @@ def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False) -> None
             row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
 
             if ui_keep > 0:
+                detected_dets = list(dets)[:10]
+                detected_dels = list(dels)[:10]
+                detected_ev_det = {lab: list((ev_det_map.get(lab, []) or []))[:max_ev_per_label] for lab in detected_dets if ev_det_map.get(lab)}
+                detected_ev_del = {lab: list((ev_del_map.get(lab, []) or []))[:max_ev_per_label] for lab in detected_dels if ev_del_map.get(lab)}
+                det_status = "Written to workbook" if wrote_dets else ("Detected but not written because this row already had detractors." if (detected_dets and not needs_detr) else ("Detected but filtered out by the evidence guard." if (detected_dets and needs_detr) else "No strong detractor match found."))
+                del_status = "Written to workbook" if wrote_dels else ("Detected but not written because this row already had delighters." if (detected_dels and not needs_deli) else ("Detected but filtered out by the evidence guard." if (detected_dels and needs_deli) else "No strong delighter match found."))
                 processed_rows_local.append({
                     "Index": int(idx),
                     "Verbatim": str(vb)[:4000],
+                    "Needs_Detractors": needs_detr,
+                    "Needs_Delighters": needs_deli,
+                    "Detected_Detractors": detected_dets,
+                    "Detected_Delighters": detected_dels,
+                    "Detected_Evidence_Detractors": detected_ev_det,
+                    "Detected_Evidence_Delighters": detected_ev_del,
                     "Added_Detractors": wrote_dets,
                     "Added_Delighters": wrote_dels,
                     "Evidence_Detractors": ev_written_det,
                     "Evidence_Delighters": ev_written_del,
+                    "Detractor_Status": det_status,
+                    "Delighter_Status": del_status,
                     "NewCand_Detractors": new_unl_dets,
                     "NewCand_Delighters": new_unl_dels,
                     "AliasSuggestions": alias_sugs_for_row,
@@ -4152,34 +4227,52 @@ with tab_log:
         overall_cov = (cov_num / cov_den) if cov_den else 0.0
         st.caption(f"Evidence coverage for the latest run: {overall_cov * 100:.1f}% of written labels include at least one snippet.")
         for rec in current_processed_rows:
-            head = f"Row {rec['Index']} — Dets: {len(rec['Added_Detractors'])} • Dels: {len(rec['Added_Delighters'])}"
+            head = f"Row {rec['Index']} — written Dets: {len(rec['Added_Detractors'])} • written Dels: {len(rec['Added_Delighters'])}"
+            detected_total = len(rec.get("Detected_Detractors", []) or []) + len(rec.get("Detected_Delighters", []) or [])
+            if detected_total:
+                head += f" • detected total: {detected_total}"
             if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
                 head += " • ⚠ trimmed to 10"
             with st.expander(head):
                 evidence_terms: List[str] = []
-                for _, evs in (rec.get("Evidence_Detractors", {}) or {}).items():
+                for _, evs in (rec.get("Detected_Evidence_Detractors", {}) or {}).items():
                     evidence_terms.extend(evs or [])
-                for _, evs in (rec.get("Evidence_Delighters", {}) or {}).items():
+                for _, evs in (rec.get("Detected_Evidence_Delighters", {}) or {}).items():
                     evidence_terms.extend(evs or [])
 
                 st.markdown("**Verbatim**")
                 st.markdown(highlight_text(rec["Verbatim"], evidence_terms), unsafe_allow_html=True)
                 st.markdown(
                     "<div class='chip-wrap'>"
+                    f"<span class='chip gray'>Needed detractors: {'Yes' if rec.get('Needs_Detractors', False) else 'No'}</span>"
+                    f"<span class='chip gray'>Needed delighters: {'Yes' if rec.get('Needs_Delighters', False) else 'No'}</span>"
                     f"<span class='chip yellow'>Safety: {_safe(rec.get('Safety', 'Not Mentioned'))}</span>"
                     f"<span class='chip blue'>Reliability: {_safe(rec.get('Reliability', 'Not Mentioned'))}</span>"
                     f"<span class='chip purple'># Sessions: {_safe(rec.get('Sessions', 'Unknown'))}</span>"
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                st.markdown("**Detractors written**")
+
+                st.markdown("**Detractors detected**")
                 st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_safe(lab)} · evidence {len((rec.get('Evidence_Detractors', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Added_Detractors", [])]) + "</div>",
+                    "<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_safe(lab)} · evidence {len((rec.get('Detected_Evidence_Detractors', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Detected_Detractors", [])]) + "</div>",
                     unsafe_allow_html=True,
                 )
-                st.markdown("**Delighters written**")
+                st.caption(str(rec.get("Detractor_Status", "")))
+
+                st.markdown("**Delighters detected**")
                 st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_safe(lab)} · evidence {len((rec.get('Evidence_Delighters', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Added_Delighters", [])]) + "</div>",
+                    "<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_safe(lab)} · evidence {len((rec.get('Detected_Evidence_Delighters', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Detected_Delighters", [])]) + "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(str(rec.get("Delighter_Status", "")))
+
+                st.markdown("**Written to workbook**")
+                st.markdown(
+                    "<div class='chip-wrap'>"
+                    + "".join([f"<span class='chip red'>{_safe(lab)}</span>" for lab in rec.get("Added_Detractors", [])])
+                    + "".join([f"<span class='chip green'>{_safe(lab)}</span>" for lab in rec.get("Added_Delighters", [])])
+                    + "</div>",
                     unsafe_allow_html=True,
                 )
                 if rec.get("NewCand_Delighters") or rec.get("NewCand_Detractors"):
@@ -4199,14 +4292,14 @@ with tab_log:
                     chips += "</div>"
                     st.markdown(chips, unsafe_allow_html=True)
                 with st.expander("Evidence snippets", expanded=False):
-                    if rec.get("Evidence_Detractors"):
+                    if rec.get("Detected_Evidence_Detractors"):
                         st.markdown("**Detractor evidence**")
-                        for lab, evs in rec["Evidence_Detractors"].items():
+                        for lab, evs in rec["Detected_Evidence_Detractors"].items():
                             for e in evs:
                                 st.write(f"- {lab}: {e}")
-                    if rec.get("Evidence_Delighters"):
+                    if rec.get("Detected_Evidence_Delighters"):
                         st.markdown("**Delighter evidence**")
-                        for lab, evs in rec["Evidence_Delighters"].items():
+                        for lab, evs in rec["Detected_Evidence_Delighters"].items():
                             for e in evs:
                                 st.write(f"- {lab}: {e}")
     elif int(st.session_state.get("ui_log_limit", 40)) == 0:
