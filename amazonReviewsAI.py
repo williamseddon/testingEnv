@@ -3,9 +3,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
+import queue
 import re
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from html import escape
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -24,6 +30,7 @@ SORT_OPTIONS = {
     "Most recent": "recent",
     "Most helpful": "helpful",
 }
+SORT_KEY_TO_LABEL = {value: key for key, value in SORT_OPTIONS.items()}
 
 HOST_TO_MARKET = {
     "amazon.com": {"country": "United States", "label": "US", "domain": ".com"},
@@ -35,13 +42,48 @@ HOST_TO_MARKET = {
     "amazon.ca": {"country": "Canada", "label": "CA", "domain": ".ca"},
     "amazon.co.jp": {"country": "Japan", "label": "JP", "domain": ".co.jp"},
 }
-SUPPORTED_COUNTRIES = sorted({v["country"] for v in HOST_TO_MARKET.values()})
+SUPPORTED_COUNTRIES = sorted({value["country"] for value in HOST_TO_MARKET.values()})
 
 VIDEO_MARKER = "This is a modal window."
 ASIN_RE = re.compile(r"\b([A-Z0-9]{10})\b", re.IGNORECASE)
 
+ALL_STAR_FILTER = ("all_stars",)
+ALL_STAR_FALLBACK = ("one_star", "two_star", "three_star", "four_star", "five_star")
+STAR_BUCKETS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("1-star", ("one_star",)),
+    ("2-star", ("two_star",)),
+    ("3-star", ("three_star",)),
+    ("4-star", ("four_star",)),
+    ("5-star", ("five_star",)),
+]
+
+SCRAPE_MODES = {
+    "Fast": "Exact URL first, then one pooled ASIN fallback if needed. Best when speed matters most.",
+    "Balanced": "Adaptive recovery across exact URL, ASIN fallback, and selective star fan-out. Best default when you want to get close to 100.",
+    "Max coverage": "Most aggressive fan-out across sort orders and star buckets. Slowest, but strongest when a listing keeps stalling at a low count.",
+}
+
+STAKEHOLDER_OPTIONS = [
+    "Product Development",
+    "Quality Engineer",
+    "Consumer Insights",
+]
+
 AI_REPORT_MODELS = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-pro"]
 CHAT_MODELS = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-pro"]
+WORKSPACE_SECTIONS = ["Overview", "Reviews", "AI report", "Chatbot", "Export", "Help"]
+
+
+@dataclass(frozen=True)
+class PathSpec:
+    label: str
+    stage: str
+    input_value: str
+    input_scope: str
+    sort_key: str
+    rating_label: str
+    rating_filters: Tuple[str, ...]
+    request_n: int
 
 
 class ThemeEvidence(BaseModel):
@@ -79,8 +121,12 @@ class ProductIntelReport(BaseModel):
     confidence_note: str
 
 
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+
 def init_state() -> None:
     defaults: Dict[str, Any] = {
+        "workspace_section": "Overview",
         "reviews_df": None,
         "raw_reviews": None,
         "overview": None,
@@ -88,6 +134,8 @@ def init_state() -> None:
         "product_meta": None,
         "chat_messages": [],
         "last_scraped_url": "",
+        "last_scrape_warning": "",
+        "last_run_paths": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -98,43 +146,313 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
+            [data-testid="stAppViewContainer"] {
+                background:
+                    radial-gradient(circle at top right, rgba(16, 185, 129, 0.11), transparent 26%),
+                    radial-gradient(circle at top left, rgba(59, 130, 246, 0.12), transparent 30%),
+                    linear-gradient(180deg, #f8fafc 0%, #f3f6fb 100%);
+            }
             .block-container {
-                padding-top: 1.4rem;
+                padding-top: 1.05rem;
                 padding-bottom: 2rem;
+                max-width: 1400px;
+            }
+            div[data-testid="stButton"] > button,
+            div[data-testid="stDownloadButton"] > button {
+                border-radius: 14px;
+                border: 1px solid rgba(15, 23, 42, 0.12);
+                font-weight: 600;
+                min-height: 2.8rem;
+                box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
             }
             .hero-card {
-                padding: 1.25rem 1.4rem;
-                border-radius: 22px;
-                border: 1px solid rgba(49, 51, 63, 0.12);
-                background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(16,185,129,0.08));
+                padding: 1.35rem 1.45rem;
+                border-radius: 24px;
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                background: linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(37, 99, 235, 0.94));
+                color: white;
+                box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18);
                 margin-bottom: 1rem;
             }
+            .hero-kicker {
+                display: inline-block;
+                padding: 0.3rem 0.65rem;
+                border-radius: 999px;
+                background: rgba(255,255,255,0.12);
+                font-size: 0.82rem;
+                margin-bottom: 0.7rem;
+                letter-spacing: 0.02em;
+            }
             .soft-card {
-                padding: 1rem 1rem 0.9rem 1rem;
+                padding: 1rem 1rem 0.95rem 1rem;
+                border-radius: 20px;
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                background: rgba(255, 255, 255, 0.9);
+                box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+                margin-bottom: 0.9rem;
+                backdrop-filter: blur(8px);
+            }
+            .stat-card {
+                padding: 1rem 1rem 0.95rem 1rem;
                 border-radius: 18px;
-                border: 1px solid rgba(49, 51, 63, 0.10);
-                background: rgba(255,255,255,0.80);
-                margin-bottom: 0.8rem;
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,250,252,0.96));
+                min-height: 126px;
+                box-shadow: 0 10px 22px rgba(15, 23, 42, 0.05);
+            }
+            .stat-label {
+                color: #64748b;
+                font-size: 0.85rem;
+                margin-bottom: 0.45rem;
+            }
+            .stat-value {
+                color: #0f172a;
+                font-size: 1.95rem;
+                line-height: 1.05;
+                font-weight: 700;
+                margin-bottom: 0.35rem;
             }
             .mini-note {
-                color: #6b7280;
-                font-size: 0.93rem;
+                color: #64748b;
+                font-size: 0.92rem;
+                line-height: 1.45;
+            }
+            .badge-row {
+                margin-top: 0.25rem;
+                margin-bottom: 0.2rem;
+            }
+            .badge {
+                display: inline-block;
+                padding: 0.28rem 0.62rem;
+                margin: 0 0.34rem 0.34rem 0;
+                border-radius: 999px;
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                background: rgba(15, 23, 42, 0.04);
+                font-size: 0.84rem;
+                color: #0f172a;
+            }
+            .quote-card {
+                padding: 0.95rem 1rem;
+                border-radius: 18px;
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                background: rgba(255,255,255,0.86);
+                box-shadow: 0 8px 18px rgba(15,23,42,0.05);
+                margin-bottom: 0.75rem;
+            }
+            .quote-text {
+                font-size: 0.98rem;
+                line-height: 1.55;
+                color: #0f172a;
+            }
+            .quote-meta {
+                color: #64748b;
+                font-size: 0.84rem;
+                margin-top: 0.6rem;
             }
             .evidence-chip {
                 display: inline-block;
-                padding: 0.15rem 0.5rem;
-                margin: 0.12rem 0.18rem 0.12rem 0;
+                padding: 0.16rem 0.5rem;
+                margin: 0.14rem 0.2rem 0.14rem 0;
                 border-radius: 999px;
-                background: rgba(15,23,42,0.06);
-                border: 1px solid rgba(15,23,42,0.08);
+                font-size: 0.78rem;
+                color: #1d4ed8;
+                background: rgba(59, 130, 246, 0.10);
+                border: 1px solid rgba(59, 130, 246, 0.12);
+                font-weight: 600;
+            }
+            .ref-tooltip {
+                position: relative;
+                display: inline-block;
+                vertical-align: middle;
+            }
+            .ref-tooltip-content {
+                visibility: hidden;
+                opacity: 0;
+                transition: opacity 0.18s ease;
+                position: absolute;
+                z-index: 1000000;
+                left: 50%;
+                transform: translateX(-50%);
+                bottom: calc(100% + 10px);
+                width: min(380px, 70vw);
+                padding: 0.75rem 0.85rem;
+                border-radius: 16px;
+                background: rgba(15, 23, 42, 0.98);
+                color: white;
+                box-shadow: 0 16px 40px rgba(15, 23, 42, 0.30);
                 font-size: 0.82rem;
+                line-height: 1.45;
+                text-align: left;
+                pointer-events: none;
+            }
+            .ref-tooltip:hover .ref-tooltip-content {
+                visibility: visible;
+                opacity: 1;
+            }
+            .ref-tooltip-title {
+                font-weight: 700;
+                color: #dbeafe;
+                margin-bottom: 0.25rem;
+            }
+            .ref-tooltip-meta {
+                color: #cbd5e1;
+                margin-bottom: 0.28rem;
+            }
+            .scrape-modal-overlay {
+                position: fixed;
+                inset: 0;
+                z-index: 999999;
+                background: rgba(15, 23, 42, 0.32);
+                backdrop-filter: blur(8px);
+                display: flex;
+                align-items: flex-start;
+                justify-content: center;
+                padding: 3.2rem 1rem 1.5rem 1rem;
+            }
+            .scrape-modal-card {
+                width: min(860px, 94vw);
+                border-radius: 26px;
+                background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98));
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                box-shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+                padding: 1.15rem 1.2rem 1.1rem 1.2rem;
+            }
+            .scrape-kicker {
+                display: inline-block;
+                padding: 0.28rem 0.62rem;
+                border-radius: 999px;
+                background: rgba(37, 99, 235, 0.10);
+                border: 1px solid rgba(37, 99, 235, 0.12);
+                color: #1d4ed8;
+                font-size: 0.78rem;
+                margin-bottom: 0.5rem;
+            }
+            .scrape-title {
+                color: #0f172a;
+                font-size: 1.28rem;
+                font-weight: 700;
+                margin-bottom: 0.12rem;
+            }
+            .scrape-subtitle {
+                color: #475569;
+                font-size: 0.96rem;
+                line-height: 1.45;
+                margin-bottom: 0.95rem;
+            }
+            .scrape-progress-track {
+                width: 100%;
+                height: 12px;
+                border-radius: 999px;
+                background: rgba(148, 163, 184, 0.22);
+                overflow: hidden;
+                margin-bottom: 0.95rem;
+            }
+            .scrape-progress-fill {
+                height: 100%;
+                border-radius: 999px;
+                background: linear-gradient(90deg, #2563eb 0%, #10b981 100%);
+                transition: width 0.2s ease;
+            }
+            .scrape-metrics {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 0.75rem;
+                margin-bottom: 0.95rem;
+            }
+            .scrape-metric {
+                border-radius: 18px;
+                background: rgba(255,255,255,0.9);
+                border: 1px solid rgba(15, 23, 42, 0.06);
+                padding: 0.8rem 0.9rem;
+            }
+            .scrape-metric-label {
+                color: #64748b;
+                font-size: 0.78rem;
+                margin-bottom: 0.26rem;
+            }
+            .scrape-metric-value {
+                color: #0f172a;
+                font-weight: 700;
+                font-size: 1.2rem;
+                line-height: 1.1;
+            }
+            .scrape-pill-row {
+                margin-bottom: 0.65rem;
+            }
+            .scrape-pill {
+                display: inline-block;
+                padding: 0.24rem 0.55rem;
+                border-radius: 999px;
+                margin: 0 0.35rem 0.35rem 0;
+                font-size: 0.78rem;
+                color: #0f172a;
+                background: rgba(15, 23, 42, 0.05);
+                border: 1px solid rgba(15, 23, 42, 0.07);
+            }
+            .scrape-activity-shell {
+                border-radius: 20px;
+                border: 1px solid rgba(15, 23, 42, 0.06);
+                background: rgba(248,250,252,0.92);
+                padding: 0.8rem 0.9rem;
+            }
+            .scrape-activity-title {
+                color: #0f172a;
+                font-weight: 700;
+                margin-bottom: 0.55rem;
+            }
+            table.scrape-activity-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 0.87rem;
+            }
+            table.scrape-activity-table th,
+            table.scrape-activity-table td {
+                text-align: left;
+                padding: 0.46rem 0.32rem;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+                vertical-align: top;
+            }
+            table.scrape-activity-table th {
+                color: #64748b;
+                font-weight: 600;
+            }
+            .status-chip {
+                display: inline-block;
+                padding: 0.18rem 0.46rem;
+                border-radius: 999px;
+                font-size: 0.74rem;
+                font-weight: 600;
+            }
+            .status-running {
+                color: #1d4ed8;
+                background: rgba(59, 130, 246, 0.12);
+            }
+            .status-ok {
+                color: #047857;
+                background: rgba(16, 185, 129, 0.12);
+            }
+            .status-error {
+                color: #b91c1c;
+                background: rgba(239, 68, 68, 0.12);
+            }
+            @media (max-width: 920px) {
+                .scrape-metrics {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                }
+            }
+            @media (max-width: 640px) {
+                .scrape-metrics {
+                    grid-template-columns: 1fr;
+                }
             }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-
+# ----------------------------
+# General helpers
+# ----------------------------
 def get_secret(name: str) -> str:
     try:
         if name in st.secrets:
@@ -158,49 +476,68 @@ def normalize_url(url: str) -> str:
 
 
 def is_probably_amazon_url(url: str) -> bool:
+    if not url:
+        return False
     try:
         host = urlparse(normalize_url(url)).netloc.lower()
     except Exception:
         return False
-    host = host.split(":")[0]
-    return "amazon." in host
+    if host.startswith("www."):
+        host = host[4:]
+    return host.startswith("amazon.") or ".amazon." in host
 
 
-def host_candidates(host: str) -> List[str]:
-    host = host.lower().split(":")[0]
-    parts = host.split(".")
-    candidates = []
-    for i in range(len(parts)):
-        candidate = ".".join(parts[i:])
-        if candidate:
-            candidates.append(candidate)
-    return candidates
-
-
-def detect_marketplace(url: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+def detect_marketplace(url: str) -> Tuple[Optional[Dict[str, str]], str]:
+    if not url:
+        return None, ""
     try:
         host = urlparse(normalize_url(url)).netloc.lower()
     except Exception:
-        return None, None
-    for candidate in host_candidates(host):
-        if candidate in HOST_TO_MARKET:
-            return HOST_TO_MARKET[candidate], candidate
-    return None, None
+        return None, ""
+    if host.startswith("www."):
+        host = host[4:]
+    if host in HOST_TO_MARKET:
+        return HOST_TO_MARKET[host], host
+    return None, host
+
+
+def marketplace_status(url: str) -> Tuple[str, str, str]:
+    market, host = detect_marketplace(url)
+    asin = extract_asin(url)
+    if not url:
+        return "", "", ""
+    if market:
+        market_text = f"Detected marketplace: {host} → {market['country']}"
+    else:
+        market_text = "Marketplace could not be auto-detected"
+    asin_text = f"ASIN: {asin}" if asin else "ASIN: not found"
+    return market_text, asin_text, host or ""
 
 
 def extract_asin(text: str) -> str:
     raw = normalize_url(text)
+    if not raw:
+        return ""
+
     patterns = [
         r"/dp/([A-Z0-9]{10})",
         r"/gp/product/([A-Z0-9]{10})",
         r"/product/([A-Z0-9]{10})",
+        r"\b([A-Z0-9]{10})\b",
     ]
     for pattern in patterns:
-        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        match = re.search(pattern, raw, re.IGNORECASE)
         if match:
             return match.group(1).upper()
-    match = ASIN_RE.search(raw)
-    return match.group(1).upper() if match else ""
+    return ""
+
+
+def pick(record: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def parse_score_value(score: Any) -> Optional[float]:
@@ -211,30 +548,24 @@ def parse_score_value(score: Any) -> Optional[float]:
 
 
 def parse_bool(value: Any) -> Optional[bool]:
-    if value is None or value == "":
+    if value in (None, ""):
         return None
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     text = str(value).strip().lower()
-    truthy = {"true", "yes", "y", "1", "verified", "verified purchase"}
-    falsy = {"false", "no", "n", "0", "unverified"}
-    if text in truthy:
+    if text in {"true", "yes", "y", "verified", "1", "verified purchase"}:
         return True
-    if text in falsy:
+    if text in {"false", "no", "n", "0", "unverified"}:
         return False
-    return None
-
-
-def pick(item: Dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in item and item.get(key) not in (None, ""):
-            return item.get(key)
     return None
 
 
 def split_leading_json(value: str) -> Tuple[Optional[str], str]:
     if not value.startswith("{"):
         return None, value
+
     depth = 0
     in_string = False
     escaped = False
@@ -288,22 +619,40 @@ def clean_review_content(raw: Any) -> Tuple[str, Dict[str, Any], bool]:
     return value.strip(), {}, False
 
 
-def dedupe_key(item: Dict[str, Any]) -> str:
-    review_id = str(item.get("ReviewId") or "").strip()
+def classify_sentiment(rating_value: Any) -> str:
+    try:
+        score = float(rating_value)
+    except Exception:
+        return "Unknown"
+    if score >= 4:
+        return "Positive"
+    if score <= 2:
+        return "Negative"
+    return "Mixed"
+
+
+def review_key_from_row(row: Dict[str, Any]) -> str:
+    review_id = str(row.get("ReviewId") or "").strip()
     if review_id:
         return f"id::{review_id}"
-    review_url = str(item.get("ReviewUrl") or "").strip()
+    review_url = str(row.get("ReviewUrl") or "").strip()
     if review_url:
         return f"url::{review_url}"
-    body = str(item.get("ReviewText") or "").strip()
-    title = str(item.get("Title") or "").strip()
-    author = str(item.get("Author") or "").strip()
-    date = str(item.get("ReviewDate") or "").strip()
-    rating = str(item.get("RatingValue") or "").strip()
-    raw = " | ".join([author, title, date, rating, body])
+    raw = " | ".join(
+        [
+            str(row.get("Author") or "").strip(),
+            str(row.get("Title") or "").strip(),
+            str(row.get("ReviewDate") or "").strip(),
+            str(row.get("RatingValue") or "").strip(),
+            str(row.get("ReviewText") or "").strip(),
+        ]
+    )
     return "fp::" + hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
+# ----------------------------
+# Review shaping / overview
+# ----------------------------
 def standardize_reviews(
     items: List[Dict[str, Any]],
     product_url: str,
@@ -311,6 +660,10 @@ def standardize_reviews(
     country: str,
     marketplace_host: str,
     max_reviews: int,
+    retrieval_path: str,
+    retrieval_scope: str,
+    retrieval_sort: str,
+    retrieval_rating: str,
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     seen = set()
@@ -345,10 +698,14 @@ def standardize_reviews(
             "Country": country,
             "MarketplaceHost": marketplace_host,
             "SentimentBucket": classify_sentiment(score_value),
+            "RetrievalPath": retrieval_path,
+            "RetrievalScope": retrieval_scope,
+            "RetrievalSort": SORT_KEY_TO_LABEL.get(retrieval_sort, retrieval_sort),
+            "RetrievalRatingBucket": retrieval_rating,
         }
         row.update(video_meta)
 
-        key = dedupe_key(row)
+        key = review_key_from_row(row)
         if key in seen:
             continue
         seen.add(key)
@@ -365,16 +722,33 @@ def standardize_reviews(
     return frame
 
 
-def classify_sentiment(rating_value: Any) -> str:
-    try:
-        score = float(rating_value)
-    except Exception:
-        return "Unknown"
-    if score >= 4:
-        return "Positive"
-    if score <= 2:
-        return "Negative"
-    return "Mixed"
+def merge_review_frames(frames: Sequence[pd.DataFrame], limit: Optional[int] = None) -> pd.DataFrame:
+    non_empty = [frame for frame in frames if frame is not None and not frame.empty]
+    if not non_empty:
+        return pd.DataFrame()
+
+    merged = pd.concat(non_empty, ignore_index=True)
+    deduped_rows: List[Dict[str, Any]] = []
+    seen = set()
+
+    for _, row in merged.iterrows():
+        payload = row.to_dict()
+        key = review_key_from_row(payload)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_rows.append(payload)
+        if limit is not None and len(deduped_rows) >= limit:
+            break
+
+    if not deduped_rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(deduped_rows)
+    frame["ReviewRef"] = [f"R{i:03d}" for i in range(1, len(frame) + 1)]
+    if "ReviewDateParsed" not in frame.columns:
+        frame["ReviewDateParsed"] = pd.to_datetime(frame["ReviewDate"], errors="coerce", utc=False)
+    return frame
 
 
 def infer_product_title(raw_items: List[Dict[str, Any]], asin: str) -> str:
@@ -395,7 +769,10 @@ def infer_product_title(raw_items: List[Dict[str, Any]], asin: str) -> str:
 
 def summarize_overview(df: pd.DataFrame, meta: Dict[str, Any]) -> pd.DataFrame:
     review_count = int(len(df))
-    avg_rating = float(df["RatingValue"].dropna().mean()) if "RatingValue" in df.columns and not df["RatingValue"].dropna().empty else None
+    avg_rating = None
+    if "RatingValue" in df.columns and not df["RatingValue"].dropna().empty:
+        avg_rating = float(df["RatingValue"].dropna().mean())
+
     verified_share = None
     if "VerifiedPurchase" in df.columns:
         valid = df["VerifiedPurchase"].dropna()
@@ -418,7 +795,7 @@ def summarize_overview(df: pd.DataFrame, meta: Dict[str, Any]) -> pd.DataFrame:
             date_min = valid_dates.min().date().isoformat()
             date_max = valid_dates.max().date().isoformat()
 
-    star_distribution = {}
+    star_distribution: Dict[str, int] = {}
     if "RatingValue" in df.columns and not df["RatingValue"].dropna().empty:
         counts = df["RatingValue"].fillna(0).astype(float).round(0).value_counts().sort_index()
         for star, count in counts.items():
@@ -435,7 +812,11 @@ def summarize_overview(df: pd.DataFrame, meta: Dict[str, Any]) -> pd.DataFrame:
         "Marketplace": meta.get("marketplace_host", ""),
         "SortOrder": meta.get("sort_label", ""),
         "VerifiedOnly": meta.get("verified_only", False),
+        "ScrapeMode": meta.get("scrape_mode", "Balanced"),
+        "RequestedReviews": meta.get("requested_reviews"),
         "ReviewsCollected": review_count,
+        "ShortfallToTarget": max(int(meta.get("requested_reviews") or review_count) - review_count, 0),
+        "CompletedPaths": meta.get("completed_paths"),
         "AverageRating": round(avg_rating, 2) if avg_rating is not None else None,
         "PositiveShare": round(positive_share * 100, 1) if positive_share is not None else None,
         "NegativeShare": round(negative_share * 100, 1) if negative_share is not None else None,
@@ -443,25 +824,168 @@ def summarize_overview(df: pd.DataFrame, meta: Dict[str, Any]) -> pd.DataFrame:
         "ReviewDateMin": date_min,
         "ReviewDateMax": date_max,
         "StarDistributionJSON": json.dumps(star_distribution, ensure_ascii=False),
+        "ScrapeWarning": meta.get("warning", ""),
     }
     return pd.DataFrame([overview])
 
-
-def build_actor_input(product_url: str, country: str, max_reviews: int, sort_key: str, verified_only: bool) -> Dict[str, Any]:
+# ----------------------------
+# Scraping engine
+# ----------------------------
+def build_actor_input(
+    input_value: str,
+    country: str,
+    max_reviews: int,
+    sort_key: str,
+    verified_only: bool,
+    rating_filters: Sequence[str],
+) -> Dict[str, Any]:
     return {
-        "ASIN_or_URL": [product_url],
+        "ASIN_or_URL": [input_value],
         "country": country,
         "max_reviews": int(max_reviews),
         "sort_reviews_by": [sort_key],
         "filter_by_verified_purchase_only": ["avp_only_reviews" if verified_only else "all_reviews"],
         "filter_by_mediaType": ["all_contents"],
-        "filter_by_ratings": ["all_stars"],
+        "filter_by_ratings": list(rating_filters),
         "unique_only": True,
         "get_customers_say": False,
     }
 
 
-def scrape_reviews(
+def alt_sort_key(sort_key: str) -> str:
+    return "helpful" if sort_key == "recent" else "recent"
+
+
+def sort_label_for_key(sort_key: str) -> str:
+    return SORT_KEY_TO_LABEL.get(sort_key, sort_key)
+
+
+def build_scrape_plan(product_url: str, asin: str, max_reviews: int, sort_key: str, scrape_mode: str) -> List[PathSpec]:
+    url = normalize_url(product_url)
+    asin_value = asin.strip().upper()
+    alternate_sort = alt_sort_key(sort_key)
+    per_bucket_reviews = min(30, max(16, int(math.ceil(max_reviews / 4))))
+
+    plan: List[PathSpec] = [
+        PathSpec(
+            label=f"Exact URL · {sort_label_for_key(sort_key)} · All stars",
+            stage="Primary",
+            input_value=url,
+            input_scope="Exact URL",
+            sort_key=sort_key,
+            rating_label="All stars",
+            rating_filters=ALL_STAR_FILTER,
+            request_n=max_reviews,
+        )
+    ]
+
+    if asin_value:
+        plan.append(
+            PathSpec(
+                label=f"ASIN fallback · {sort_label_for_key(sort_key)} · All stars",
+                stage="Recovery",
+                input_value=asin_value,
+                input_scope="ASIN fallback",
+                sort_key=sort_key,
+                rating_label="All stars",
+                rating_filters=ALL_STAR_FILTER,
+                request_n=max_reviews,
+            )
+        )
+
+    if scrape_mode in {"Balanced", "Max coverage"}:
+        plan.append(
+            PathSpec(
+                label=f"Exact URL · {sort_label_for_key(alternate_sort)} · All stars",
+                stage="Recovery",
+                input_value=url,
+                input_scope="Exact URL",
+                sort_key=alternate_sort,
+                rating_label="All stars",
+                rating_filters=ALL_STAR_FILTER,
+                request_n=max_reviews,
+            )
+        )
+        if asin_value:
+            plan.append(
+                PathSpec(
+                    label=f"ASIN fallback · {sort_label_for_key(alternate_sort)} · All stars",
+                    stage="Recovery",
+                    input_value=asin_value,
+                    input_scope="ASIN fallback",
+                    sort_key=alternate_sort,
+                    rating_label="All stars",
+                    rating_filters=ALL_STAR_FILTER,
+                    request_n=max_reviews,
+                )
+            )
+
+    bucket_sorts: List[str] = []
+    if scrape_mode == "Balanced":
+        bucket_sorts = [sort_key]
+        if max_reviews >= 90:
+            bucket_sorts.append(alternate_sort)
+    elif scrape_mode == "Max coverage":
+        bucket_sorts = [sort_key, alternate_sort]
+
+    bucket_input = asin_value or url
+    bucket_scope = "ASIN fallback" if asin_value else "Exact URL"
+    for bucket_sort in bucket_sorts:
+        for rating_label, rating_filters in STAR_BUCKETS:
+            plan.append(
+                PathSpec(
+                    label=f"{bucket_scope} · {sort_label_for_key(bucket_sort)} · {rating_label}",
+                    stage="Star fan-out",
+                    input_value=bucket_input,
+                    input_scope=bucket_scope,
+                    sort_key=bucket_sort,
+                    rating_label=rating_label,
+                    rating_filters=rating_filters,
+                    request_n=per_bucket_reviews,
+                )
+            )
+
+    return plan
+
+
+def run_actor_path(
+    client: ApifyClient,
+    actor_id: str,
+    path: PathSpec,
+    country: str,
+    verified_only: bool,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    actor_input = build_actor_input(
+        input_value=path.input_value,
+        country=country,
+        max_reviews=path.request_n,
+        sort_key=path.sort_key,
+        verified_only=verified_only,
+        rating_filters=path.rating_filters,
+    )
+    used_all_star_fallback = False
+
+    try:
+        run = client.actor(actor_id).call(run_input=actor_input)
+    except ApifyApiError as exc:
+        message = str(exc)
+        if path.rating_filters == ALL_STAR_FILTER and (
+            "all_stars" in message or "filter_by_ratings" in message or "ratings" in message
+        ):
+            used_all_star_fallback = True
+            actor_input["filter_by_ratings"] = list(ALL_STAR_FALLBACK)
+            run = client.actor(actor_id).call(run_input=actor_input)
+        else:
+            raise RuntimeError(message) from exc
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    dataset_id = run.get("defaultDatasetId")
+    items = list(client.dataset(dataset_id).iterate_items()) if dataset_id else []
+    return run, items, used_all_star_fallback
+
+
+def scrape_reviews_with_recovery(
     apify_token: str,
     actor_id: str,
     product_url: str,
@@ -470,51 +994,455 @@ def scrape_reviews(
     max_reviews: int,
     sort_key: str,
     verified_only: bool,
-) -> Tuple[pd.DataFrame, List[Dict[str, Any]], Dict[str, Any]]:
+    scrape_mode: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], str]:
     client = ApifyClient(apify_token)
-    actor_input = build_actor_input(
-        product_url=product_url,
-        country=country,
-        max_reviews=max_reviews,
-        sort_key=sort_key,
-        verified_only=verified_only,
-    )
+    normalized_url = normalize_url(product_url)
+    asin = extract_asin(normalized_url)
+    plan = build_scrape_plan(normalized_url, asin, max_reviews, sort_key, scrape_mode)
 
-    try:
-        run = client.actor(actor_id).call(run_input=actor_input)
-    except ApifyApiError as exc:
-        raise RuntimeError(str(exc)) from exc
+    if progress_callback:
+        progress_callback(
+            {
+                "type": "start",
+                "total_paths": len(plan),
+                "target_reviews": max_reviews,
+                "asin": asin,
+                "scrape_mode": scrape_mode,
+            }
+        )
 
-    dataset_id = run.get("defaultDatasetId")
-    if not dataset_id:
-        raise RuntimeError("The Apify actor did not return a dataset ID.")
+    all_frames: List[pd.DataFrame] = []
+    all_raw_items: List[Dict[str, Any]] = []
+    path_logs: List[Dict[str, Any]] = []
+    dataset_ids: List[str] = []
+    run_ids: List[str] = []
+    combined_df = pd.DataFrame()
 
-    raw_items = list(client.dataset(dataset_id).iterate_items())
-    asin = extract_asin(product_url)
-    reviews_df = standardize_reviews(
-        items=raw_items,
-        product_url=product_url,
-        asin=asin,
-        country=country,
-        marketplace_host=marketplace_host,
-        max_reviews=max_reviews,
-    )
-    if reviews_df.empty:
-        raise RuntimeError("No reviews were returned for this product URL.")
+    for index, path in enumerate(plan, start=1):
+        current_unique = int(len(combined_df)) if not combined_df.empty else 0
+        if current_unique >= max_reviews:
+            break
 
-    product_title = infer_product_title(raw_items, asin)
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "path_start",
+                    "index": index,
+                    "total_paths": len(plan),
+                    "label": path.label,
+                    "stage": path.stage,
+                    "scope": path.input_scope,
+                    "sort_label": sort_label_for_key(path.sort_key),
+                    "rating_label": path.rating_label,
+                    "requested": path.request_n,
+                    "current_unique": current_unique,
+                }
+            )
+
+        started_at = time.time()
+        path_status = "OK"
+        error_text = ""
+        path_items: List[Dict[str, Any]] = []
+        run_obj: Dict[str, Any] = {}
+        used_all_star_fallback = False
+
+        try:
+            run_obj, path_items, used_all_star_fallback = run_actor_path(
+                client=client,
+                actor_id=actor_id,
+                path=path,
+                country=country,
+                verified_only=verified_only,
+            )
+            dataset_id = run_obj.get("defaultDatasetId")
+            run_id = run_obj.get("id")
+            if dataset_id:
+                dataset_ids.append(str(dataset_id))
+            if run_id:
+                run_ids.append(str(run_id))
+        except Exception as exc:
+            path_status = "ERROR"
+            error_text = str(exc)
+
+        duration_s = max(time.time() - started_at, 0.01)
+        previous_unique = current_unique
+        path_returned = len(path_items)
+        unique_added = 0
+
+        if path_items:
+            path_frame = standardize_reviews(
+                items=path_items,
+                product_url=normalized_url,
+                asin=asin,
+                country=country,
+                marketplace_host=marketplace_host,
+                max_reviews=path.request_n,
+                retrieval_path=path.label,
+                retrieval_scope=path.input_scope,
+                retrieval_sort=path.sort_key,
+                retrieval_rating=path.rating_label,
+            )
+            if not path_frame.empty:
+                all_frames.append(path_frame)
+                combined_df = merge_review_frames(all_frames, limit=max_reviews)
+                unique_added = len(combined_df) - previous_unique
+            all_raw_items.extend(path_items)
+
+        unique_total = int(len(combined_df)) if not combined_df.empty else previous_unique
+
+        path_log = {
+            "Stage": path.stage,
+            "Path": path.label,
+            "InputScope": path.input_scope,
+            "Sort": sort_label_for_key(path.sort_key),
+            "Rating": path.rating_label,
+            "Requested": path.request_n,
+            "Returned": path_returned,
+            "UniqueAdded": max(unique_added, 0),
+            "UniqueTotal": unique_total,
+            "DurationSec": round(duration_s, 2),
+            "FallbackAllStars": used_all_star_fallback,
+            "Status": path_status,
+            "Error": error_text,
+        }
+        path_logs.append(path_log)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "path_done",
+                    "index": index,
+                    "total_paths": len(plan),
+                    "label": path.label,
+                    "status": path_status,
+                    "returned": path_returned,
+                    "unique_added": max(unique_added, 0),
+                    "unique_total": unique_total,
+                    "duration_s": duration_s,
+                    "error": error_text,
+                }
+            )
+
+        if unique_total >= max_reviews:
+            break
+
+    if combined_df.empty:
+        raise RuntimeError("No reviews were returned across any retrieval path for this product.")
+
+    final_df = combined_df.head(max_reviews).copy().reset_index(drop=True)
+    final_df["ReviewRef"] = [f"R{i:03d}" for i in range(1, len(final_df) + 1)]
+
+    product_title = infer_product_title(all_raw_items, asin)
+    completed_paths = len(path_logs)
+    warning = ""
+    if len(final_df) < max_reviews:
+        warning = (
+            f"Recovered {len(final_df)} unique reviews after {completed_paths} retrieval path(s), which is below the requested {max_reviews}. "
+            f"This usually means the exact variant page is sparse, the actor is only exposing a limited pool for that listing, "
+            f"or Amazon is heavily pooling or limiting the reachable review pages."
+        )
+
     meta = {
-        "product_url": product_url,
+        "product_url": normalized_url,
         "asin": asin,
         "country": country,
         "marketplace_host": marketplace_host,
         "product_title": product_title,
-        "dataset_id": dataset_id,
-        "run_id": run.get("id"),
+        "dataset_ids": ", ".join(dataset_ids),
+        "run_ids": ", ".join(run_ids),
+        "requested_reviews": max_reviews,
+        "completed_paths": completed_paths,
+        "sort_label": sort_label_for_key(sort_key),
+        "verified_only": verified_only,
+        "scrape_mode": scrape_mode,
+        "warning": warning,
     }
-    return reviews_df, raw_items, meta
+
+    if progress_callback:
+        progress_callback(
+            {
+                "type": "complete",
+                "collected": len(final_df),
+                "completed_paths": completed_paths,
+                "total_paths": len(plan),
+                "warning": warning,
+            }
+        )
+
+    return final_df, all_raw_items, meta, path_logs, warning
 
 
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(float(seconds), 0.0)
+    if seconds < 60:
+        return f"{int(round(seconds))}s"
+    minutes = int(seconds // 60)
+    sec = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours = int(minutes // 60)
+    minutes = minutes % 60
+    return f"{hours}h {minutes:02d}m"
+
+
+def estimate_eta_seconds(progress_state: Dict[str, Any]) -> Optional[float]:
+    total_paths = int(progress_state.get("total_paths") or 0)
+    completed_paths = int(progress_state.get("completed_paths") or 0)
+    durations: List[float] = list(progress_state.get("durations") or [])
+    scrape_mode = str(progress_state.get("scrape_mode") or "Balanced")
+    current_started_at = progress_state.get("current_path_started_at")
+
+    if total_paths <= 0:
+        return None
+
+    default_seconds = {
+        "Fast": 12.0,
+        "Balanced": 15.0,
+        "Max coverage": 18.0,
+    }.get(scrape_mode, 15.0)
+    avg_path_s = (sum(durations) / len(durations)) if durations else default_seconds
+
+    current_remaining = 0.0
+    if current_started_at:
+        elapsed_current = max(time.time() - float(current_started_at), 0.0)
+        current_remaining = max(avg_path_s - elapsed_current, 2.0)
+
+    remaining_after_current = max(total_paths - completed_paths - (1 if current_started_at else 0), 0)
+    return max(current_remaining + remaining_after_current * avg_path_s, 0.0)
+
+
+def compute_progress_pct(progress_state: Dict[str, Any]) -> float:
+    target_reviews = max(int(progress_state.get("target_reviews") or 0), 1)
+    unique_total = int(progress_state.get("unique_total") or 0)
+    total_paths = max(int(progress_state.get("total_paths") or 0), 1)
+    completed_paths = int(progress_state.get("completed_paths") or 0)
+
+    path_share = completed_paths / total_paths
+    review_share = min(unique_total / target_reviews, 1.0)
+    pct = (path_share * 0.55 + review_share * 0.45) * 100
+    return max(2.0, min(pct, 100.0))
+
+
+def render_scrape_overlay(placeholder: Any, progress_state: Dict[str, Any]) -> None:
+    current_label = progress_state.get("current_path") or "Preparing retrieval plan"
+    stage = progress_state.get("current_stage") or "Initializing"
+    target_reviews = int(progress_state.get("target_reviews") or 0)
+    unique_total = int(progress_state.get("unique_total") or 0)
+    total_paths = int(progress_state.get("total_paths") or 0)
+    completed_paths = int(progress_state.get("completed_paths") or 0)
+    elapsed_s = max(time.time() - float(progress_state.get("started_at") or time.time()), 0.0)
+    eta_s = estimate_eta_seconds(progress_state)
+    progress_pct = compute_progress_pct(progress_state)
+
+    path_logs = list(progress_state.get("path_logs") or [])[-6:]
+    row_html = ""
+    for row in reversed(path_logs):
+        status = str(row.get("Status") or "RUNNING")
+        status_class = "status-running"
+        if status == "OK":
+            status_class = "status-ok"
+        elif status == "ERROR":
+            status_class = "status-error"
+        row_html += (
+            "<tr>"
+            f"<td>{escape(str(row.get('Path') or ''))}</td>"
+            f"<td>{escape(str(row.get('Returned') or 0))}</td>"
+            f"<td>{escape(str(row.get('UniqueAdded') or 0))}</td>"
+            f"<td>{escape(str(row.get('UniqueTotal') or 0))}</td>"
+            f"<td>{escape(str(row.get('DurationSec') or ''))}s</td>"
+            f"<td><span class='status-chip {status_class}'>{escape(status)}</span></td>"
+            "</tr>"
+        )
+    if not row_html:
+        row_html = (
+            "<tr>"
+            "<td colspan='6' style='color:#64748b;'>Waiting for the first retrieval path to complete…</td>"
+            "</tr>"
+        )
+
+    eta_text = format_duration(eta_s) if eta_s is not None else "Calibrating…"
+    progress_style = f"width:{progress_pct:.1f}%"
+
+    placeholder.markdown(
+        f"""
+        <div class="scrape-modal-overlay">
+            <div class="scrape-modal-card">
+                <div class="scrape-kicker">Live scrape tracker</div>
+                <div class="scrape-title">Scraping Amazon reviews</div>
+                <div class="scrape-subtitle">
+                    Stage: <strong>{escape(str(stage))}</strong><br>
+                    Current path: <strong>{escape(str(current_label))}</strong>
+                </div>
+                <div class="scrape-progress-track">
+                    <div class="scrape-progress-fill" style="{progress_style}"></div>
+                </div>
+                <div class="scrape-metrics">
+                    <div class="scrape-metric">
+                        <div class="scrape-metric-label">Unique reviews</div>
+                        <div class="scrape-metric-value">{unique_total}/{target_reviews}</div>
+                    </div>
+                    <div class="scrape-metric">
+                        <div class="scrape-metric-label">Paths complete</div>
+                        <div class="scrape-metric-value">{completed_paths}/{total_paths}</div>
+                    </div>
+                    <div class="scrape-metric">
+                        <div class="scrape-metric-label">Elapsed</div>
+                        <div class="scrape-metric-value">{escape(format_duration(elapsed_s))}</div>
+                    </div>
+                    <div class="scrape-metric">
+                        <div class="scrape-metric-label">Estimated time left</div>
+                        <div class="scrape-metric-value">{escape(eta_text)}</div>
+                    </div>
+                </div>
+                <div class="scrape-pill-row">
+                    <span class="scrape-pill">Mode: {escape(str(progress_state.get('scrape_mode') or 'Balanced'))}</span>
+                    <span class="scrape-pill">Marketplace: {escape(str(progress_state.get('marketplace_host') or ''))}</span>
+                    <span class="scrape-pill">ASIN: {escape(str(progress_state.get('asin') or ''))}</span>
+                </div>
+                <div class="scrape-activity-shell">
+                    <div class="scrape-activity-title">Activity</div>
+                    <table class="scrape-activity-table">
+                        <thead>
+                            <tr>
+                                <th>Path</th>
+                                <th>Returned</th>
+                                <th>Added</th>
+                                <th>Total</th>
+                                <th>Time</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {row_html}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def run_scrape_with_live_overlay(
+    apify_token: str,
+    actor_id: str,
+    product_url: str,
+    country: str,
+    marketplace_host: str,
+    max_reviews: int,
+    sort_key: str,
+    verified_only: bool,
+    scrape_mode: str,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], str]:
+    events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    outcome: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
+
+    def on_progress(event: Dict[str, Any]) -> None:
+        events.put(event)
+
+    def worker() -> None:
+        try:
+            result = scrape_reviews_with_recovery(
+                apify_token=apify_token,
+                actor_id=actor_id,
+                product_url=product_url,
+                country=country,
+                marketplace_host=marketplace_host,
+                max_reviews=max_reviews,
+                sort_key=sort_key,
+                verified_only=verified_only,
+                scrape_mode=scrape_mode,
+                progress_callback=on_progress,
+            )
+            outcome.put({"status": "ok", "result": result})
+        except Exception as exc:
+            outcome.put({"status": "error", "error": str(exc)})
+
+    progress_state: Dict[str, Any] = {
+        "started_at": time.time(),
+        "target_reviews": max_reviews,
+        "unique_total": 0,
+        "total_paths": 0,
+        "completed_paths": 0,
+        "durations": [],
+        "current_path": "Preparing retrieval plan",
+        "current_stage": "Initializing",
+        "current_path_started_at": None,
+        "path_logs": [],
+        "scrape_mode": scrape_mode,
+        "marketplace_host": marketplace_host,
+        "asin": extract_asin(product_url),
+    }
+
+    overlay = st.empty()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    while thread.is_alive() or not events.empty():
+        try:
+            while True:
+                event = events.get_nowait()
+                event_type = event.get("type")
+                if event_type == "start":
+                    progress_state["total_paths"] = int(event.get("total_paths") or 0)
+                    progress_state["target_reviews"] = int(event.get("target_reviews") or max_reviews)
+                    progress_state["asin"] = event.get("asin") or progress_state.get("asin")
+                    progress_state["scrape_mode"] = event.get("scrape_mode") or scrape_mode
+                elif event_type == "path_start":
+                    progress_state["current_path"] = event.get("label") or "Working"
+                    progress_state["current_stage"] = event.get("stage") or "Working"
+                    progress_state["current_path_started_at"] = time.time()
+                    try:
+                        st.toast(f"Processing {event.get('label')}")
+                    except Exception:
+                        pass
+                elif event_type == "path_done":
+                    progress_state["completed_paths"] = int(event.get("index") or progress_state.get("completed_paths") or 0)
+                    progress_state["unique_total"] = int(event.get("unique_total") or progress_state.get("unique_total") or 0)
+                    progress_state.setdefault("durations", []).append(float(event.get("duration_s") or 0.0))
+                    progress_state["current_path_started_at"] = None
+                    progress_state.setdefault("path_logs", []).append(
+                        {
+                            "Path": event.get("label"),
+                            "Returned": event.get("returned"),
+                            "UniqueAdded": event.get("unique_added"),
+                            "UniqueTotal": event.get("unique_total"),
+                            "DurationSec": round(float(event.get("duration_s") or 0.0), 2),
+                            "Status": event.get("status") or "OK",
+                        }
+                    )
+                elif event_type == "complete":
+                    progress_state["unique_total"] = int(event.get("collected") or progress_state.get("unique_total") or 0)
+                    progress_state["completed_paths"] = int(event.get("completed_paths") or progress_state.get("completed_paths") or 0)
+                    progress_state["current_stage"] = "Complete"
+                    progress_state["current_path"] = "Finalizing review dataset"
+                    progress_state["current_path_started_at"] = None
+        except queue.Empty:
+            pass
+
+        render_scrape_overlay(overlay, progress_state)
+        time.sleep(0.18)
+
+    render_scrape_overlay(overlay, progress_state)
+    time.sleep(0.18)
+    overlay.empty()
+
+    if outcome.empty():
+        raise RuntimeError("The scrape worker stopped before returning a result.")
+
+    result = outcome.get()
+    if result.get("status") != "ok":
+        raise RuntimeError(str(result.get("error") or "Scrape failed."))
+    return result["result"]
+
+# ----------------------------
+# OpenAI helpers
+# ----------------------------
 def build_review_context(df: pd.DataFrame, overview_df: pd.DataFrame, max_chars_per_review: int = 750) -> str:
     overview = overview_df.iloc[0].to_dict()
     header_lines = [
@@ -523,12 +1451,14 @@ def build_review_context(df: pd.DataFrame, overview_df: pd.DataFrame, max_chars_
         f"ASIN: {overview.get('ASIN')}",
         f"Marketplace: {overview.get('Marketplace')} ({overview.get('Country')})",
         f"Reviews analyzed: {overview.get('ReviewsCollected')}",
+        f"Requested reviews: {overview.get('RequestedReviews')}",
         f"Average rating: {overview.get('AverageRating')}",
         f"Positive share %: {overview.get('PositiveShare')}",
         f"Negative share %: {overview.get('NegativeShare')}",
         f"Verified share %: {overview.get('VerifiedShare')}",
         f"Review date window: {overview.get('ReviewDateMin')} to {overview.get('ReviewDateMax')}",
         f"Star distribution JSON: {overview.get('StarDistributionJSON')}",
+        f"Scrape warning: {overview.get('ScrapeWarning')}",
     ]
 
     review_lines = []
@@ -540,7 +1470,7 @@ def build_review_context(df: pd.DataFrame, overview_df: pd.DataFrame, max_chars_
         review_lines.append(
             "\n".join(
                 [
-                    f"[{row.get('ReviewRef')}] {row.get('RatingValue')} stars | verified={row.get('VerifiedPurchase')} | date={row.get('ReviewDate')}",
+                    f"[{row.get('ReviewRef')}] {row.get('RatingValue')} stars | verified={row.get('VerifiedPurchase')} | date={row.get('ReviewDate')} | path={row.get('RetrievalPath')}",
                     f"Title: {row.get('Title')}",
                     f"Review: {text}",
                 ]
@@ -568,17 +1498,16 @@ def generate_product_intel_report(
     dataset_context = build_review_context(reviews_df, overview_df)
 
     system_prompt = (
-        "You are a senior product intelligence analyst helping product developers, quality engineers, "
-        "UX researchers, and product leaders understand Amazon reviews. Use only the supplied review evidence. "
-        "Do not invent facts, counts, or review IDs. Cite evidence only with the provided ReviewRef values like R001. "
-        "Separate true delight drivers from detractors. Treat durability, reliability, defects, packaging issues, "
-        "performance instability, and safety-adjacent concerns as quality risks. Keep the executive summary crisp and useful. "
+        "You are a senior product intelligence analyst helping Product Development, Quality Engineers, and Consumer Insights teams understand Amazon reviews. "
+        "Use only the supplied review evidence. Do not invent facts, counts, or review IDs. Cite evidence only with the provided ReviewRef values like R001. "
+        "Separate true delight drivers from detractors. Treat durability, reliability, defects, packaging issues, performance instability, and safety-adjacent concerns as quality risks. "
+        "Highlight unmet needs and demand signals that Consumer Insights should watch. Keep the executive summary crisp and useful. "
         "If evidence is thin or mixed, say so explicitly in confidence_note."
     )
 
     user_prompt = (
         "Analyze this Amazon review dataset and produce a structured product intelligence report. "
-        "Focus on what a product developer or quality engineer should know next.\n\n"
+        "Focus on what Product Development, Quality Engineers, and Consumer Insights should know next.\n\n"
         f"{dataset_context}"
     )
 
@@ -623,7 +1552,7 @@ def ask_product_chatbot(
         "You are Product Intelligence Copilot. Answer only from the supplied Amazon review dataset and the structured report. "
         "Never claim evidence that is not present. Cite review refs in square brackets like [R003] whenever you make a factual claim. "
         "If the reviews do not support a conclusion, say that clearly. Tailor your answer to the stakeholder lens provided. "
-        "Prefer concise, decision-ready answers."
+        "Prefer concise, decision-ready answers for Product Development, Quality Engineers, or Consumer Insights users."
     )
 
     messages: List[Dict[str, str]] = [
@@ -653,53 +1582,64 @@ def ask_product_chatbot(
     return response.output_text.strip()
 
 
+# ----------------------------
+# Export helpers
+# ----------------------------
 def safe_sheet_name(name: str) -> str:
     cleaned = re.sub(r"[:\\/?*\[\]]", "_", name)
     return cleaned[:31]
 
 
 def report_to_frames(report: ProductIntelReport) -> Dict[str, pd.DataFrame]:
-    executive_rows = [{
-        "ExecutiveSummary": report.executive_summary,
-        "ConfidenceNote": report.confidence_note,
-        "ExecutiveTakeaways": " | ".join(report.executive_takeaways),
-        "JobsToBeDone": " | ".join(report.jobs_to_be_done),
-        "ActionsForProduct": " | ".join(report.actions_for_product),
-        "ActionsForQuality": " | ".join(report.actions_for_quality),
-    }]
+    executive_rows = [
+        {
+            "ExecutiveSummary": report.executive_summary,
+            "ConfidenceNote": report.confidence_note,
+            "ExecutiveTakeaways": " | ".join(report.executive_takeaways),
+            "JobsToBeDone": " | ".join(report.jobs_to_be_done),
+            "ActionsForProduct": " | ".join(report.actions_for_product),
+            "ActionsForQuality": " | ".join(report.actions_for_quality),
+        }
+    ]
 
     def theme_rows(items: List[ThemeEvidence]) -> pd.DataFrame:
-        return pd.DataFrame([
-            {
-                "Theme": item.theme,
-                "Summary": item.summary,
-                "SupportingReviews": ", ".join(item.supporting_reviews),
-            }
-            for item in items
-        ])
+        return pd.DataFrame(
+            [
+                {
+                    "Theme": item.theme,
+                    "Summary": item.summary,
+                    "SupportingReviews": ", ".join(item.supporting_reviews),
+                }
+                for item in items
+            ]
+        )
 
     def quality_rows(items: List[QualityRisk]) -> pd.DataFrame:
-        return pd.DataFrame([
-            {
-                "Issue": item.issue,
-                "Severity": item.severity,
-                "WhyItMatters": item.why_it_matters,
-                "SupportingReviews": ", ".join(item.supporting_reviews),
-                "SuggestedOwner": item.suggested_owner,
-            }
-            for item in items
-        ])
+        return pd.DataFrame(
+            [
+                {
+                    "Issue": item.issue,
+                    "Severity": item.severity,
+                    "WhyItMatters": item.why_it_matters,
+                    "SupportingReviews": ", ".join(item.supporting_reviews),
+                    "SuggestedOwner": item.suggested_owner,
+                }
+                for item in items
+            ]
+        )
 
     def request_rows(items: List[FeatureRequest]) -> pd.DataFrame:
-        return pd.DataFrame([
-            {
-                "Request": item.request,
-                "Rationale": item.rationale,
-                "SupportingReviews": ", ".join(item.supporting_reviews),
-                "SuggestedOwner": item.suggested_owner,
-            }
-            for item in items
-        ])
+        return pd.DataFrame(
+            [
+                {
+                    "Request": item.request,
+                    "Rationale": item.rationale,
+                    "SupportingReviews": ", ".join(item.supporting_reviews),
+                    "SuggestedOwner": item.suggested_owner,
+                }
+                for item in items
+            ]
+        )
 
     return {
         "AI_Executive": pd.DataFrame(executive_rows),
@@ -709,14 +1649,8 @@ def report_to_frames(report: ProductIntelReport) -> Dict[str, pd.DataFrame]:
         "AI_Quality_Risks": quality_rows(report.quality_risks),
         "AI_Feature_Requests": request_rows(report.feature_requests),
         "AI_Actions": pd.DataFrame(
-            [
-                {"Audience": "Product", "Action": action}
-                for action in report.actions_for_product
-            ]
-            + [
-                {"Audience": "Quality", "Action": action}
-                for action in report.actions_for_quality
-            ]
+            [{"Audience": "Product", "Action": action} for action in report.actions_for_product]
+            + [{"Audience": "Quality", "Action": action} for action in report.actions_for_quality]
         ),
     }
 
@@ -725,11 +1659,14 @@ def build_excel_bytes(
     reviews_df: pd.DataFrame,
     overview_df: pd.DataFrame,
     report: Optional[ProductIntelReport],
+    path_logs: Optional[List[Dict[str, Any]]],
 ) -> bytes:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         overview_df.to_excel(writer, sheet_name="Overview", index=False)
         reviews_df.to_excel(writer, sheet_name="Reviews", index=False)
+        if path_logs:
+            pd.DataFrame(path_logs).to_excel(writer, sheet_name="Scrape_Diagnostics", index=False)
         if report:
             for sheet_name, frame in report_to_frames(report).items():
                 frame.to_excel(writer, sheet_name=safe_sheet_name(sheet_name), index=False)
@@ -737,17 +1674,71 @@ def build_excel_bytes(
     return buffer.read()
 
 
-def render_theme_cards(items: List[ThemeEvidence], empty_message: str) -> None:
+# ----------------------------
+# Evidence helpers
+# ----------------------------
+def build_review_ref_lookup(reviews_df: Optional[pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+    if reviews_df is None or reviews_df.empty:
+        return {}
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for _, row in reviews_df.iterrows():
+        ref = str(row.get("ReviewRef") or "").strip()
+        if ref:
+            lookup[ref] = row.to_dict()
+    return lookup
+
+
+def review_tooltip_html(ref: str, review: Optional[Dict[str, Any]]) -> str:
+    chip = f'<span class="evidence-chip">{escape(ref)}</span>'
+    if not review:
+        return chip
+
+    title = str(review.get("Title") or "Untitled review").strip()
+    rating = review.get("RatingValue")
+    verified = review.get("VerifiedPurchase")
+    review_date = str(review.get("ReviewDate") or "").strip()
+    text = str(review.get("ReviewText") or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > 220:
+        text = text[:219].rstrip() + "…"
+
+    tooltip = (
+        f'<div class="ref-tooltip-title">{escape(ref)} · {escape(title)}</div>'
+        f'<div class="ref-tooltip-meta">{escape(str(rating))} stars · verified={escape(str(verified))} · {escape(review_date)}</div>'
+        f'<div>{escape(text)}</div>'
+    )
+    return f'<span class="ref-tooltip">{chip}<span class="ref-tooltip-content">{tooltip}</span></span>'
+
+
+def render_reference_badges(refs: List[str], ref_lookup: Dict[str, Dict[str, Any]]) -> str:
+    if not refs:
+        return ""
+    return "".join([review_tooltip_html(ref, ref_lookup.get(ref)) for ref in refs])
+
+
+def render_text_with_review_tooltips(text: str, ref_lookup: Dict[str, Dict[str, Any]]) -> str:
+    escaped_text = escape(text or "")
+
+    def replacer(match: re.Match[str]) -> str:
+        raw_ref = match.group(0).strip("[]")
+        review = ref_lookup.get(raw_ref)
+        return review_tooltip_html(raw_ref, review)
+
+    with_refs = re.sub(r"\[?(R\d{3})\]?", replacer, escaped_text)
+    return with_refs.replace("\n", "<br>")
+
+
+def render_theme_cards(items: List[ThemeEvidence], empty_message: str, ref_lookup: Dict[str, Dict[str, Any]]) -> None:
     if not items:
         st.info(empty_message)
         return
     for item in items:
-        chips = "".join([f'<span class="evidence-chip">{ref}</span>' for ref in item.supporting_reviews])
+        chips = render_reference_badges(item.supporting_reviews, ref_lookup)
         st.markdown(
             f"""
             <div class="soft-card">
-                <strong>{item.theme}</strong><br>
-                <span>{item.summary}</span>
+                <strong>{escape(item.theme)}</strong><br>
+                <span>{escape(item.summary)}</span>
                 <div style="margin-top:0.55rem;">{chips}</div>
             </div>
             """,
@@ -755,17 +1746,17 @@ def render_theme_cards(items: List[ThemeEvidence], empty_message: str) -> None:
         )
 
 
-def render_quality_cards(items: List[QualityRisk], empty_message: str) -> None:
+def render_quality_cards(items: List[QualityRisk], empty_message: str, ref_lookup: Dict[str, Dict[str, Any]]) -> None:
     if not items:
         st.info(empty_message)
         return
     for item in items:
-        chips = "".join([f'<span class="evidence-chip">{ref}</span>' for ref in item.supporting_reviews])
+        chips = render_reference_badges(item.supporting_reviews, ref_lookup)
         st.markdown(
             f"""
             <div class="soft-card">
-                <strong>{item.issue}</strong> · <span class="mini-note">Severity: {item.severity} · Owner: {item.suggested_owner}</span><br>
-                <span>{item.why_it_matters}</span>
+                <strong>{escape(item.issue)}</strong> · <span class="mini-note">Severity: {escape(item.severity)} · Owner: {escape(item.suggested_owner)}</span><br>
+                <span>{escape(item.why_it_matters)}</span>
                 <div style="margin-top:0.55rem;">{chips}</div>
             </div>
             """,
@@ -773,17 +1764,17 @@ def render_quality_cards(items: List[QualityRisk], empty_message: str) -> None:
         )
 
 
-def render_request_cards(items: List[FeatureRequest], empty_message: str) -> None:
+def render_request_cards(items: List[FeatureRequest], empty_message: str, ref_lookup: Dict[str, Dict[str, Any]]) -> None:
     if not items:
         st.info(empty_message)
         return
     for item in items:
-        chips = "".join([f'<span class="evidence-chip">{ref}</span>' for ref in item.supporting_reviews])
+        chips = render_reference_badges(item.supporting_reviews, ref_lookup)
         st.markdown(
             f"""
             <div class="soft-card">
-                <strong>{item.request}</strong> · <span class="mini-note">Owner: {item.suggested_owner}</span><br>
-                <span>{item.rationale}</span>
+                <strong>{escape(item.request)}</strong> · <span class="mini-note">Owner: {escape(item.suggested_owner)}</span><br>
+                <span>{escape(item.rationale)}</span>
                 <div style="margin-top:0.55rem;">{chips}</div>
             </div>
             """,
@@ -791,26 +1782,453 @@ def render_request_cards(items: List[FeatureRequest], empty_message: str) -> Non
         )
 
 
-def reset_analysis_state() -> None:
+def render_stat_card(label: str, value: str, note: str) -> None:
+    st.markdown(
+        f"""
+        <div class="stat-card">
+            <div class="stat-label">{escape(label)}</div>
+            <div class="stat-value">{escape(value)}</div>
+            <div class="mini-note">{escape(note)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def sample_review_quotes(reviews_df: pd.DataFrame, sentiment: str, limit: int = 3) -> pd.DataFrame:
+    if reviews_df is None or reviews_df.empty:
+        return pd.DataFrame()
+    filtered = reviews_df.copy()
+    if sentiment == "Positive":
+        filtered = filtered[filtered["RatingValue"].fillna(0) >= 4]
+    elif sentiment == "Negative":
+        filtered = filtered[filtered["RatingValue"].fillna(0) <= 2]
+    filtered = filtered.sort_values(by=["HelpfulVotes", "ReviewDateParsed"], ascending=[False, False], na_position="last")
+    return filtered.head(limit)
+
+
+def render_quote_cards(df: pd.DataFrame, title: str) -> None:
+    st.markdown(f"#### {title}")
+    if df is None or df.empty:
+        st.info("No review examples available.")
+        return
+    for _, row in df.iterrows():
+        text = str(row.get("ReviewText") or "").strip()
+        if len(text) > 260:
+            text = text[:259].rstrip() + "…"
+        st.markdown(
+            f"""
+            <div class="quote-card">
+                <div class="quote-text">“{escape(text)}”</div>
+                <div class="quote-meta">{escape(str(row.get('ReviewRef')))} · {escape(str(row.get('RatingValue')))} stars · {escape(str(row.get('ReviewDate')))} · {escape(str(row.get('Title') or 'Untitled'))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+# ----------------------------
+# View helpers
+# ----------------------------
+def reset_analysis_state(clear_reviews: bool = False) -> None:
     st.session_state["report"] = None
     st.session_state["chat_messages"] = []
+    if clear_reviews:
+        st.session_state["reviews_df"] = None
+        st.session_state["raw_reviews"] = None
+        st.session_state["overview"] = None
+        st.session_state["product_meta"] = None
+        st.session_state["last_scrape_warning"] = ""
+        st.session_state["last_run_paths"] = []
 
 
-def marketplace_status(url: str) -> Tuple[str, str, str]:
-    market, host = detect_marketplace(url)
-    asin = extract_asin(url)
-    if not url:
-        return "", "", ""
-    if market:
-        market_text = f"Detected marketplace: {host} -> {market['country']}"
+def render_navigation() -> str:
+    st.markdown("### Workspace")
+    return st.radio(
+        "Sections",
+        WORKSPACE_SECTIONS,
+        key="workspace_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+
+def render_workspace(reviews_df: Optional[pd.DataFrame], overview_df: Optional[pd.DataFrame], meta: Dict[str, Any]) -> None:
+    if reviews_df is None or overview_df is None:
+        st.info("Fetch reviews to populate the dashboard.")
+        return
+
+    overview = overview_df.iloc[0].to_dict()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        render_stat_card("Reviews", str(int(overview.get("ReviewsCollected") or 0)), "Unique reviews collected")
+    with c2:
+        render_stat_card("Average rating", str(overview.get("AverageRating") or "—"), "Mean review score")
+    with c3:
+        pos = overview.get("PositiveShare")
+        render_stat_card("Positive share", f"{pos}%" if pos is not None else "—", "4–5 star review share")
+    with c4:
+        neg = overview.get("NegativeShare")
+        render_stat_card("Negative share", f"{neg}%" if neg is not None else "—", "1–2 star review share")
+    with c5:
+        verified = overview.get("VerifiedShare")
+        render_stat_card("Verified share", f"{verified}%" if verified is not None else "—", "Verified purchase share")
+
+    top_left, top_right = st.columns([1.2, 1], vertical_alignment="top")
+    with top_left:
+        st.markdown(
+            f"""
+            <div class="soft-card">
+                <strong>{escape(str(meta.get('product_title') or 'Amazon product'))}</strong><br>
+                <span class="mini-note">{escape(str(meta.get('product_url') or ''))}</span><br><br>
+                <div class="badge-row">
+                    <span class="badge">ASIN: {escape(str(meta.get('asin') or '—'))}</span>
+                    <span class="badge">Marketplace: {escape(str(meta.get('marketplace_host') or '—'))}</span>
+                    <span class="badge">Country: {escape(str(meta.get('country') or '—'))}</span>
+                    <span class="badge">Sort: {escape(str(meta.get('sort_label') or '—'))}</span>
+                    <span class="badge">Mode: {escape(str(meta.get('scrape_mode') or 'Balanced'))}</span>
+                    <span class="badge">Verified only: {escape(str(meta.get('verified_only') or False))}</span>
+                    <span class="badge">Paths used: {escape(str(meta.get('completed_paths') or '—'))}</span>
+                </div>
+                <div class="mini-note">
+                    Review date window: {escape(str(overview.get('ReviewDateMin') or '—'))} to {escape(str(overview.get('ReviewDateMax') or '—'))}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        warning = str(meta.get("warning") or "").strip()
+        if warning:
+            st.warning(warning)
+
+    with top_right:
+        star_json = overview.get("StarDistributionJSON") or "{}"
+        try:
+            star_data = json.loads(star_json)
+        except Exception:
+            star_data = {}
+        if star_data:
+            dist_df = pd.DataFrame({"Star rating": list(star_data.keys()), "Reviews": list(star_data.values())})
+            st.bar_chart(dist_df.set_index("Star rating"))
+        else:
+            st.info("No star distribution available.")
+
+    quote_left, quote_right = st.columns(2, vertical_alignment="top")
+    with quote_left:
+        render_quote_cards(sample_review_quotes(reviews_df, "Positive", limit=3), "Sample delight evidence")
+    with quote_right:
+        render_quote_cards(sample_review_quotes(reviews_df, "Negative", limit=3), "Sample detractor evidence")
+
+    path_logs = st.session_state.get("last_run_paths") or []
+    if path_logs:
+        with st.expander("Scrape diagnostics", expanded=False):
+            st.caption("This shows each retrieval path the scraper attempted. It is especially useful when a listing stalls below the target review count.")
+            st.dataframe(pd.DataFrame(path_logs), use_container_width=True, hide_index=True)
+
+
+def render_reviews_view(reviews_df: Optional[pd.DataFrame]) -> None:
+    if reviews_df is None or reviews_df.empty:
+        st.info("No reviews yet.")
+        return
+
+    filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 1.2], vertical_alignment="center")
+    with filter_col1:
+        sentiment_filter = st.selectbox("Sentiment", ["All", "Positive", "Mixed", "Negative"], index=0)
+    with filter_col2:
+        rating_filter = st.selectbox("Rating", ["All", "5", "4", "3", "2", "1"], index=0)
+    with filter_col3:
+        search_text = st.text_input("Search review text or title", value="").strip().lower()
+
+    filtered = reviews_df.copy()
+    if sentiment_filter != "All":
+        filtered = filtered[filtered["SentimentBucket"] == sentiment_filter]
+    if rating_filter != "All":
+        filtered = filtered[filtered["RatingValue"].fillna(0).astype(int) == int(rating_filter)]
+    if search_text:
+        title_mask = filtered["Title"].fillna("").str.lower().str.contains(search_text)
+        text_mask = filtered["ReviewText"].fillna("").str.lower().str.contains(search_text)
+        filtered = filtered[title_mask | text_mask]
+
+    preview_cols = [
+        "ReviewRef",
+        "RatingValue",
+        "SentimentBucket",
+        "VerifiedPurchase",
+        "ReviewDate",
+        "Title",
+        "ReviewText",
+        "Author",
+        "HelpfulVotes",
+        "RetrievalPath",
+    ]
+    st.dataframe(filtered[preview_cols], use_container_width=True, hide_index=True)
+
+    if filtered.empty:
+        st.info("No reviews match the current filters.")
+        return
+
+    with st.expander("Evidence browser", expanded=False):
+        ref_choice = st.selectbox("Review reference", options=filtered["ReviewRef"].tolist(), index=0)
+        selected = filtered[filtered["ReviewRef"] == ref_choice].iloc[0].to_dict()
+        st.markdown(
+            f"""
+            <div class="soft-card">
+                <strong>{escape(str(selected.get('Title') or 'Untitled review'))}</strong><br>
+                <span class="mini-note">{escape(str(selected.get('ReviewRef')))} · {escape(str(selected.get('RatingValue')))} stars · verified={escape(str(selected.get('VerifiedPurchase')))} · {escape(str(selected.get('ReviewDate')))}</span><br><br>
+                <span>{escape(str(selected.get('ReviewText') or ''))}</span><br><br>
+                <span class="mini-note">Path: {escape(str(selected.get('RetrievalPath') or ''))} · Author: {escape(str(selected.get('Author') or ''))}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_ai_report_view(report: Optional[ProductIntelReport], reviews_df: Optional[pd.DataFrame]) -> None:
+    if reviews_df is None:
+        st.info("Fetch reviews first.")
+        return
+    if report is None:
+        st.info("Generate the AI report to unlock product intelligence views.")
+        return
+
+    ref_lookup = build_review_ref_lookup(reviews_df)
+    st.caption("Hover over any review reference like R001 to preview the underlying evidence.")
+
+    st.markdown(
+        f"""
+        <div class="soft-card">
+            <strong>Executive summary</strong><br>
+            <span>{render_text_with_review_tooltips(report.executive_summary, ref_lookup)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    takeaway_c1, takeaway_c2 = st.columns(2, vertical_alignment="top")
+    with takeaway_c1:
+        st.markdown("#### Executive takeaways")
+        for item in report.executive_takeaways:
+            st.markdown(
+                f"<div class='soft-card'>{render_text_with_review_tooltips(item, ref_lookup)}</div>",
+                unsafe_allow_html=True,
+            )
+        st.markdown("#### Jobs to be done")
+        for item in report.jobs_to_be_done:
+            st.markdown(
+                f"<div class='soft-card'>{render_text_with_review_tooltips(item, ref_lookup)}</div>",
+                unsafe_allow_html=True,
+            )
+    with takeaway_c2:
+        st.markdown("#### Confidence note")
+        st.markdown(
+            f"<div class='soft-card'>{render_text_with_review_tooltips(report.confidence_note, ref_lookup)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("#### Recommended actions")
+        for item in report.actions_for_product[:4]:
+            st.markdown(
+                f"<div class='soft-card'><strong>Product Development</strong><br>{render_text_with_review_tooltips(item, ref_lookup)}</div>",
+                unsafe_allow_html=True,
+            )
+        for item in report.actions_for_quality[:4]:
+            st.markdown(
+                f"<div class='soft-card'><strong>Quality Engineer</strong><br>{render_text_with_review_tooltips(item, ref_lookup)}</div>",
+                unsafe_allow_html=True,
+            )
+
+    d1, d2 = st.columns(2, vertical_alignment="top")
+    with d1:
+        st.markdown("#### Delighters")
+        render_theme_cards(report.delighters, "No strong delight themes detected.", ref_lookup)
+    with d2:
+        st.markdown("#### Detractors")
+        render_theme_cards(report.detractors, "No major detractor themes detected.", ref_lookup)
+
+    q1, q2 = st.columns(2, vertical_alignment="top")
+    with q1:
+        st.markdown("#### Quality risks")
+        render_quality_cards(report.quality_risks, "No notable quality risks surfaced.", ref_lookup)
+    with q2:
+        st.markdown("#### Feature requests")
+        render_request_cards(report.feature_requests, "No clear feature requests surfaced.", ref_lookup)
+
+    st.markdown("#### Top cross-cutting themes")
+    render_theme_cards(report.top_themes, "No theme map available.", ref_lookup)
+
+
+def render_chat_message(role: str, content: str, ref_lookup: Dict[str, Dict[str, Any]]) -> None:
+    with st.chat_message(role):
+        html = render_text_with_review_tooltips(content, ref_lookup)
+        st.markdown(html, unsafe_allow_html=True)
+
+
+def render_chatbot_view(
+    openai_api_key: str,
+    chat_model: str,
+    stakeholder_lens: str,
+    reviews_df: Optional[pd.DataFrame],
+    overview_df: Optional[pd.DataFrame],
+    report: Optional[ProductIntelReport],
+) -> None:
+    if reviews_df is None or overview_df is None:
+        st.info("Fetch reviews first.")
+        return
+    if not openai_api_key:
+        st.info("Add your OpenAI API key to use the chatbot.")
+        return
+
+    ref_lookup = build_review_ref_lookup(reviews_df)
+
+    current_lens = st.selectbox(
+        "Stakeholder lens",
+        options=STAKEHOLDER_OPTIONS,
+        index=STAKEHOLDER_OPTIONS.index(stakeholder_lens),
+        key="chat_lens_select",
+    )
+    st.caption("Hover over citations like R001 in the answers to preview the evidence.")
+
+    suggestion_cols = st.columns(4)
+    suggestions = [
+        "What should Product Development fix first?",
+        "What would a Quality Engineer investigate next?",
+        "What is Consumer Insights learning about unmet needs?",
+        "Which review themes are blocking satisfaction most?",
+    ]
+    selected_prompt = None
+    for col, suggestion in zip(suggestion_cols, suggestions):
+        if col.button(suggestion, use_container_width=True):
+            selected_prompt = suggestion
+
+    for message in st.session_state.get("chat_messages", []):
+        render_chat_message(message["role"], message["content"], ref_lookup)
+
+    prompt = st.chat_input("Ask the product intelligence chatbot")
+    user_prompt = prompt or selected_prompt
+
+    if user_prompt:
+        st.session_state["chat_messages"].append({"role": "user", "content": user_prompt})
+        render_chat_message("user", user_prompt, ref_lookup)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking through the review evidence..."):
+                try:
+                    answer = ask_product_chatbot(
+                        openai_api_key=openai_api_key,
+                        model_name=chat_model,
+                        reviews_df=reviews_df,
+                        overview_df=overview_df,
+                        report=report,
+                        chat_history=st.session_state["chat_messages"][:-1],
+                        user_message=user_prompt,
+                        stakeholder_lens=current_lens,
+                    )
+                except Exception as exc:
+                    answer = str(exc)
+                st.markdown(render_text_with_review_tooltips(answer, ref_lookup), unsafe_allow_html=True)
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+
+
+def render_export_view(
+    reviews_df: Optional[pd.DataFrame],
+    overview_df: Optional[pd.DataFrame],
+    report: Optional[ProductIntelReport],
+    meta: Dict[str, Any],
+) -> None:
+    if reviews_df is None or overview_df is None:
+        st.info("Fetch reviews first.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_root = f"amazon_product_intelligence_{timestamp}"
+    path_logs = st.session_state.get("last_run_paths") or []
+    excel_bytes = build_excel_bytes(reviews_df, overview_df, report, path_logs)
+    csv_bytes = reviews_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    overview_csv = overview_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    diagnostics_csv = pd.DataFrame(path_logs).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig") if path_logs else None
+
+    c1, c2, c3 = st.columns(3)
+    c1.download_button(
+        "Download Excel workbook",
+        data=excel_bytes,
+        file_name=f"{file_root}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    c2.download_button(
+        "Download reviews CSV",
+        data=csv_bytes,
+        file_name=f"{file_root}_reviews.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    c3.download_button(
+        "Download overview CSV",
+        data=overview_csv,
+        file_name=f"{file_root}_overview.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    if diagnostics_csv is not None:
+        st.download_button(
+            "Download scrape diagnostics CSV",
+            data=diagnostics_csv,
+            file_name=f"{file_root}_scrape_diagnostics.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    if report is not None:
+        st.download_button(
+            "Download AI report JSON",
+            data=report.model_dump_json(indent=2).encode("utf-8"),
+            file_name=f"{file_root}_ai_report.json",
+            mime="application/json",
+            use_container_width=True,
+        )
     else:
-        market_text = "Marketplace could not be auto-detected"
-    asin_text = f"ASIN: {asin}" if asin else "ASIN: not found"
-    return market_text, asin_text, host or ""
+        st.caption("Generate the AI report first if you want the workbook to include AI summary tabs.")
+
+    st.markdown(
+        f"""
+        <div class="soft-card">
+            <strong>Latest run metadata</strong><br>
+            <span class="mini-note">ASIN: {escape(str(meta.get('asin') or '—'))} · Marketplace: {escape(str(meta.get('marketplace_host') or '—'))} · Completed paths: {escape(str(meta.get('completed_paths') or '—'))}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
+def render_help_view() -> None:
+    st.markdown("### What changed")
+    st.markdown(
+        "- The workflow is built around a single Amazon product URL.\n"
+        "- The app auto-detects supported marketplaces from the URL.\n"
+        "- Scraping now uses an adaptive recovery strategy to reduce the common 'only 8 reviews' failure mode.\n"
+        "- A live popup tracker shows current retrieval path, recent activity, and estimated time left while scraping.\n"
+        "- AI lenses are tuned for Product Development, Quality Engineer, and Consumer Insights.\n"
+        "- Hover over citations like R001 in AI views to preview the exact supporting review."
+    )
+
+    st.markdown("### Scrape modes")
+    for mode, description in SCRAPE_MODES.items():
+        st.markdown(f"- **{mode}**: {description}")
+
+    st.markdown("### Supported marketplace auto-detection")
+    st.code("amazon.com, amazon.co.uk, amazon.de, amazon.fr, amazon.it, amazon.es, amazon.ca, amazon.co.jp", language="text")
+
+    st.markdown("### Best use cases")
+    st.markdown(
+        "- Product Development teams prioritizing fixes and feature opportunities\n"
+        "- Quality Engineers surfacing defect patterns and reliability risks\n"
+        "- Consumer Insights teams spotting unmet needs and delight drivers"
+    )
+
+# ----------------------------
+# Main app
+# ----------------------------
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
     inject_css()
 
@@ -818,9 +2236,10 @@ def main() -> None:
     st.markdown(
         """
         <div class="hero-card">
-            <h3 style="margin:0 0 0.35rem 0;">From one Amazon URL to a product-intelligence workbook</h3>
-            <div class="mini-note">
-                Auto-detects the Amazon marketplace, scrapes up to 100 reviews with Apify, exports Excel, and layers on an OpenAI-powered product intelligence copilot for summaries, delighters, detractors, quality risks, and feature requests.
+            <div class="hero-kicker">Amazon review intelligence</div>
+            <h3 style="margin:0 0 0.35rem 0;">From one Amazon URL to a product-intelligence workspace</h3>
+            <div class="mini-note" style="color:rgba(255,255,255,0.85);">
+                Auto-detects the Amazon marketplace, scrapes up to 100 reviews with Apify, exports Excel, and layers on an OpenAI-powered copilot for executive summaries, delighters, detractors, quality risks, feature requests, and stakeholder Q&A.
             </div>
         </div>
         """,
@@ -836,12 +2255,12 @@ def main() -> None:
         apify_token = st.text_input(
             "Apify API token",
             type="password",
-            value="" if not (use_secrets and apify_secret) else apify_secret,
+            value=apify_secret if (use_secrets and apify_secret) else "",
         ).strip()
         openai_api_key = st.text_input(
             "OpenAI API key",
             type="password",
-            value="" if not (use_secrets and openai_secret) else openai_secret,
+            value=openai_secret if (use_secrets and openai_secret) else "",
         ).strip()
 
         st.divider()
@@ -850,6 +2269,8 @@ def main() -> None:
         max_reviews = st.slider("Reviews to collect", min_value=10, max_value=MAX_REVIEWS_CAP, value=100, step=10)
         sort_label = st.selectbox("Review sort", options=list(SORT_OPTIONS.keys()), index=0)
         verified_only = st.toggle("Verified purchases only", value=False)
+        scrape_mode = st.selectbox("Scrape mode", options=list(SCRAPE_MODES.keys()), index=1)
+        st.caption(SCRAPE_MODES[scrape_mode])
         manual_country = st.selectbox("Country override", options=["Auto-detect"] + SUPPORTED_COUNTRIES, index=0)
 
         st.divider()
@@ -858,8 +2279,8 @@ def main() -> None:
         chat_model = st.selectbox("Chatbot model", options=CHAT_MODELS, index=1)
         stakeholder_lens = st.selectbox(
             "Default stakeholder lens",
-            options=["Product Management", "Product Development", "Quality Engineering", "UX Research", "Customer Support"],
-            index=2,
+            options=STAKEHOLDER_OPTIONS,
+            index=0,
         )
 
         with st.expander("Secrets file example", expanded=False):
@@ -875,26 +2296,28 @@ def main() -> None:
     )
 
     market_text, asin_text, detected_host = marketplace_status(product_url)
-    info_c1, info_c2, info_c3 = st.columns([1.2, 1, 1], vertical_alignment="center")
+    info_c1, info_c2, info_c3, info_c4 = st.columns([1.2, 1, 1, 1.1], vertical_alignment="center")
     with info_c1:
         st.caption(market_text or "Paste an Amazon URL to begin")
     with info_c2:
         st.caption(asin_text)
     with info_c3:
         st.caption(f"Review cap: {max_reviews}")
+    with info_c4:
+        st.caption(f"Mode: {scrape_mode}")
 
-    scrape_col, report_col, reset_col = st.columns([1.1, 1.1, 1], vertical_alignment="center")
+    scrape_col, report_col, clear_col = st.columns([1.2, 1.1, 1], vertical_alignment="center")
     scrape_clicked = scrape_col.button("Fetch reviews", type="primary", use_container_width=True)
     report_clicked = report_col.button(
         "Generate AI report",
         use_container_width=True,
         disabled=st.session_state.get("reviews_df") is None,
     )
-    reset_clicked = reset_col.button("Clear session", use_container_width=True)
+    clear_clicked = clear_col.button("Clear session", use_container_width=True)
 
-    if reset_clicked:
-        for key in ["reviews_df", "raw_reviews", "overview", "report", "product_meta", "chat_messages", "last_scraped_url"]:
-            st.session_state[key] = None if key not in {"chat_messages", "last_scraped_url"} else ([] if key == "chat_messages" else "")
+    if clear_clicked:
+        reset_analysis_state(clear_reviews=True)
+        st.session_state["last_scraped_url"] = ""
         st.rerun()
 
     if scrape_clicked:
@@ -910,42 +2333,56 @@ def main() -> None:
             if manual_country != "Auto-detect":
                 chosen_country = manual_country
             if not chosen_country:
-                st.error("This app could not auto-detect a supported Amazon marketplace from the URL. Use a supported URL or choose a country override.")
+                st.error(
+                    "This app could not auto-detect a supported Amazon marketplace from the URL. Use a supported URL or choose a country override."
+                )
             else:
-                with st.spinner("Scraping reviews from Amazon via Apify..."):
-                    try:
-                        reviews_df, raw_items, meta = scrape_reviews(
-                            apify_token=apify_token,
-                            actor_id=actor_id.strip(),
-                            product_url=normalize_url(product_url),
-                            country=chosen_country,
-                            marketplace_host=detected_host or "manual_override",
-                            max_reviews=max_reviews,
-                            sort_key=SORT_OPTIONS[sort_label],
-                            verified_only=verified_only,
-                        )
-                        meta["sort_label"] = sort_label
-                        meta["verified_only"] = verified_only
-                        overview_df = summarize_overview(reviews_df, meta)
+                try:
+                    reviews_df, raw_items, meta, path_logs, warning = run_scrape_with_live_overlay(
+                        apify_token=apify_token,
+                        actor_id=actor_id.strip(),
+                        product_url=normalize_url(product_url),
+                        country=chosen_country,
+                        marketplace_host=detected_host or "manual_override",
+                        max_reviews=max_reviews,
+                        sort_key=SORT_OPTIONS[sort_label],
+                        verified_only=verified_only,
+                        scrape_mode=scrape_mode,
+                    )
+                    meta["sort_label"] = sort_label
+                    meta["verified_only"] = verified_only
+                    meta["warning"] = warning
+                    overview_df = summarize_overview(reviews_df, meta)
 
-                        st.session_state["reviews_df"] = reviews_df
-                        st.session_state["raw_reviews"] = raw_items
-                        st.session_state["overview"] = overview_df
-                        st.session_state["product_meta"] = meta
-                        st.session_state["last_scraped_url"] = normalize_url(product_url)
-                        reset_analysis_state()
-                        st.success(f"Collected {len(reviews_df)} reviews for {meta['product_title']}.")
-                    except Exception as exc:
-                        st.error(str(exc))
+                    st.session_state["reviews_df"] = reviews_df
+                    st.session_state["raw_reviews"] = raw_items
+                    st.session_state["overview"] = overview_df
+                    st.session_state["product_meta"] = meta
+                    st.session_state["last_scraped_url"] = normalize_url(product_url)
+                    st.session_state["last_scrape_warning"] = warning
+                    st.session_state["last_run_paths"] = path_logs
+                    reset_analysis_state(clear_reviews=False)
+                    st.session_state["reviews_df"] = reviews_df
+                    st.session_state["raw_reviews"] = raw_items
+                    st.session_state["overview"] = overview_df
+                    st.session_state["product_meta"] = meta
+                    st.session_state["last_run_paths"] = path_logs
+                    st.session_state["last_scrape_warning"] = warning
+                    if warning:
+                        st.warning(warning)
+                    st.success(f"Collected {len(reviews_df)} unique reviews for {meta['product_title']}.")
+                except Exception as exc:
+                    st.error(str(exc))
 
     if report_clicked:
-        if st.session_state.get("reviews_df") is None:
+        if st.session_state.get("reviews_df") is None or st.session_state.get("overview") is None:
             st.error("Fetch reviews first.")
         elif not openai_api_key:
             st.error("Add your OpenAI API key in the sidebar.")
         else:
-            with st.spinner("Generating product intelligence report with OpenAI..."):
+            with st.status("Generating AI report", expanded=True) as report_status:
                 try:
+                    report_status.write("Analyzing the review evidence with OpenAI…")
                     report = generate_product_intel_report(
                         openai_api_key=openai_api_key,
                         model_name=report_model,
@@ -953,247 +2390,37 @@ def main() -> None:
                         overview_df=st.session_state["overview"],
                     )
                     st.session_state["report"] = report
-                    st.success("AI report ready.")
+                    report_status.update(label="AI report ready", state="complete", expanded=False)
+                    st.success("AI report generated.")
                 except Exception as exc:
+                    report_status.update(label="AI report failed", state="error", expanded=True)
                     st.error(str(exc))
 
+    current_view = render_navigation()
     reviews_df = st.session_state.get("reviews_df")
     overview_df = st.session_state.get("overview")
     report = st.session_state.get("report")
-    product_meta = st.session_state.get("product_meta") or {}
+    meta = st.session_state.get("product_meta") or {}
 
-    tabs = st.tabs(["Overview", "Reviews", "AI report", "Chatbot", "Export", "Help"])
-
-    with tabs[0]:
-        if reviews_df is None or overview_df is None:
-            st.info("Fetch reviews to populate the dashboard.")
-        else:
-            overview = overview_df.iloc[0].to_dict()
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Reviews", int(overview.get("ReviewsCollected") or 0))
-            m2.metric("Average rating", overview.get("AverageRating") or "—")
-            m3.metric("Positive share", f"{overview.get('PositiveShare')}%" if overview.get("PositiveShare") is not None else "—")
-            m4.metric("Negative share", f"{overview.get('NegativeShare')}%" if overview.get("NegativeShare") is not None else "—")
-            m5.metric("Verified share", f"{overview.get('VerifiedShare')}%" if overview.get("VerifiedShare") is not None else "—")
-
-            c1, c2 = st.columns([1.1, 1], vertical_alignment="top")
-            with c1:
-                st.markdown(
-                    f"""
-                    <div class="soft-card">
-                        <strong>{product_meta.get('product_title', 'Amazon product')}</strong><br>
-                        <span class="mini-note">{product_meta.get('product_url', '')}</span><br><br>
-                        <span><strong>ASIN:</strong> {product_meta.get('asin', '—')}</span><br>
-                        <span><strong>Marketplace:</strong> {product_meta.get('marketplace_host', '—')}</span><br>
-                        <span><strong>Country:</strong> {product_meta.get('country', '—')}</span><br>
-                        <span><strong>Sort:</strong> {product_meta.get('sort_label', '—')}</span><br>
-                        <span><strong>Verified only:</strong> {product_meta.get('verified_only', False)}</span><br>
-                        <span><strong>Date window:</strong> {overview.get('ReviewDateMin') or '—'} to {overview.get('ReviewDateMax') or '—'}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with c2:
-                star_json = overview.get("StarDistributionJSON") or "{}"
-                try:
-                    star_data = json.loads(star_json)
-                except Exception:
-                    star_data = {}
-                if star_data:
-                    dist_df = pd.DataFrame(
-                        {"Star rating": list(star_data.keys()), "Reviews": list(star_data.values())}
-                    )
-                    st.bar_chart(dist_df.set_index("Star rating"))
-                else:
-                    st.info("No star distribution available.")
-
-    with tabs[1]:
-        if reviews_df is None:
-            st.info("No reviews yet.")
-        else:
-            preview_cols = [
-                "ReviewRef",
-                "RatingValue",
-                "SentimentBucket",
-                "VerifiedPurchase",
-                "ReviewDate",
-                "Title",
-                "ReviewText",
-                "Author",
-                "HelpfulVotes",
-            ]
-            st.dataframe(reviews_df[preview_cols], use_container_width=True, hide_index=True)
-
-    with tabs[2]:
-        if reviews_df is None:
-            st.info("Fetch reviews first.")
-        elif not openai_api_key:
-            st.info("Add your OpenAI API key to generate the AI report.")
-        elif report is None:
-            st.info("Generate the AI report to unlock product intelligence views.")
-        else:
-            st.markdown(
-                f"""
-                <div class="soft-card">
-                    <strong>Executive summary</strong><br>
-                    <span>{report.executive_summary}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            takeaway_c1, takeaway_c2 = st.columns(2, vertical_alignment="top")
-            with takeaway_c1:
-                st.markdown("#### Executive takeaways")
-                for item in report.executive_takeaways:
-                    st.write(f"- {item}")
-                st.markdown("#### Jobs to be done")
-                for item in report.jobs_to_be_done:
-                    st.write(f"- {item}")
-            with takeaway_c2:
-                st.markdown("#### Confidence note")
-                st.write(report.confidence_note)
-                st.markdown("#### Recommended actions")
-                for item in report.actions_for_product[:4]:
-                    st.write(f"- Product: {item}")
-                for item in report.actions_for_quality[:4]:
-                    st.write(f"- Quality: {item}")
-
-            d1, d2 = st.columns(2, vertical_alignment="top")
-            with d1:
-                st.markdown("#### Delighters")
-                render_theme_cards(report.delighters, "No strong delight themes detected.")
-            with d2:
-                st.markdown("#### Detractors")
-                render_theme_cards(report.detractors, "No major detractor themes detected.")
-
-            q1, q2 = st.columns(2, vertical_alignment="top")
-            with q1:
-                st.markdown("#### Quality risks")
-                render_quality_cards(report.quality_risks, "No notable quality risks surfaced.")
-            with q2:
-                st.markdown("#### Feature requests")
-                render_request_cards(report.feature_requests, "No clear feature requests surfaced.")
-
-            st.markdown("#### Top cross-cutting themes")
-            render_theme_cards(report.top_themes, "No theme map available.")
-
-    with tabs[3]:
-        if reviews_df is None:
-            st.info("Fetch reviews first.")
-        elif not openai_api_key:
-            st.info("Add your OpenAI API key to use the chatbot.")
-        else:
-            current_lens = st.selectbox(
-                "Stakeholder lens",
-                options=["Product Management", "Product Development", "Quality Engineering", "UX Research", "Customer Support"],
-                index=["Product Management", "Product Development", "Quality Engineering", "UX Research", "Customer Support"].index(stakeholder_lens),
-                key="chat_lens_select",
-            )
-
-            suggestion_cols = st.columns(4)
-            suggestions = [
-                "What should product fix first?",
-                "What would a quality engineer investigate next?",
-                "What feature requests appear most often?",
-                "What do 1-star reviews complain about most?",
-            ]
-            selected_prompt = None
-            for col, suggestion in zip(suggestion_cols, suggestions):
-                if col.button(suggestion, use_container_width=True):
-                    selected_prompt = suggestion
-
-            for message in st.session_state.get("chat_messages", []):
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-
-            prompt = st.chat_input("Ask the product intelligence chatbot")
-            user_prompt = prompt or selected_prompt
-
-            if user_prompt:
-                st.session_state["chat_messages"].append({"role": "user", "content": user_prompt})
-                with st.chat_message("user"):
-                    st.markdown(user_prompt)
-
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking through the review evidence..."):
-                        try:
-                            answer = ask_product_chatbot(
-                                openai_api_key=openai_api_key,
-                                model_name=chat_model,
-                                reviews_df=reviews_df,
-                                overview_df=overview_df,
-                                report=report,
-                                chat_history=st.session_state["chat_messages"][:-1],
-                                user_message=user_prompt,
-                                stakeholder_lens=current_lens,
-                            )
-                        except Exception as exc:
-                            answer = str(exc)
-                        st.markdown(answer)
-                st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
-
-    with tabs[4]:
-        if reviews_df is None or overview_df is None:
-            st.info("Fetch reviews first.")
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_root = f"amazon_product_intelligence_{timestamp}"
-            excel_bytes = build_excel_bytes(reviews_df, overview_df, report)
-            csv_bytes = reviews_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            overview_csv = overview_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-
-            c1, c2, c3 = st.columns(3)
-            c1.download_button(
-                "Download Excel workbook",
-                data=excel_bytes,
-                file_name=f"{file_root}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            c2.download_button(
-                "Download reviews CSV",
-                data=csv_bytes,
-                file_name=f"{file_root}_reviews.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            c3.download_button(
-                "Download overview CSV",
-                data=overview_csv,
-                file_name=f"{file_root}_overview.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-            if report is not None:
-                st.download_button(
-                    "Download AI report JSON",
-                    data=report.model_dump_json(indent=2).encode("utf-8"),
-                    file_name=f"{file_root}_ai_report.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
-            else:
-                st.caption("Generate the AI report first if you want the workbook to include AI summary tabs.")
-
-    with tabs[5]:
-        st.markdown("### What changed from your original app")
-        st.markdown(
-            "- The workflow is now built around a single Amazon product URL.\n"
-            "- The app auto-detects supported marketplaces from the URL.\n"
-            "- Review collection is intentionally capped at 100 to keep the UI fast and the AI analysis grounded.\n"
-            "- Excel exports now support both raw reviews and AI insight tabs.\n"
-            "- A built-in OpenAI chatbot answers product and quality questions grounded in the review evidence."
+    if current_view == "Overview":
+        render_workspace(reviews_df, overview_df, meta)
+    elif current_view == "Reviews":
+        render_reviews_view(reviews_df)
+    elif current_view == "AI report":
+        render_ai_report_view(report, reviews_df)
+    elif current_view == "Chatbot":
+        render_chatbot_view(
+            openai_api_key=openai_api_key,
+            chat_model=chat_model,
+            stakeholder_lens=stakeholder_lens,
+            reviews_df=reviews_df,
+            overview_df=overview_df,
+            report=report,
         )
-        st.markdown("### Best use cases")
-        st.markdown(
-            "- Product developers triaging feature gaps and usability issues\n"
-            "- Quality engineers surfacing reliability and defect patterns\n"
-            "- PMs writing executive snapshots before reviews or design critiques\n"
-            "- Support leads identifying repeat pain points"
-        )
-        st.markdown("### Supported marketplace auto-detection")
-        st.code("amazon.com, amazon.co.uk, amazon.de, amazon.fr, amazon.it, amazon.es, amazon.ca, amazon.co.jp", language="text")
+    elif current_view == "Export":
+        render_export_view(reviews_df, overview_df, report, meta)
+    else:
+        render_help_view()
 
 
 if __name__ == "__main__":
