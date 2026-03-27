@@ -347,10 +347,11 @@ st.caption(
 
 with st.sidebar:
     st.header("API settings")
-    passkey = st.text_input(
-        "Bazaarvoice passkey",
-        type="password",
-        value=os.getenv("BAZAARVOICE_PASSKEY", ""),
+    # Load passkey from Streamlit secrets
+    passkey = st.secrets.get("BAZAARVOICE_PASSKEY", "")
+
+    if not passkey:
+        st.warning("No Bazaarvoice passkey found in secrets.toml. Add BAZAARVOICE_PASSKEY to your Streamlit secrets."),
         help="Use a Conversations API passkey that has access to the target client instance.",
     )
     environment = st.selectbox("Environment", options=["production", "staging"], index=0)
