@@ -1,5 +1,5 @@
 # starwalk_ui_v8_0_knowledge_plus_amazing.py
-# v8.0 — rewritten for a smoother, safer, more accurate workflow
+# v8.1 — universal high-recall symptomization with backbone routing + rescue
 #
 # Highlights:
 #   - Cleaner main UI with tabs and a single Run Center
@@ -44,10 +44,10 @@ except Exception:
 
 
 # ----------------------------- Page setup -----------------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v8.0")
-st.title("✨ Review Symptomizer — v8.0")
+st.set_page_config(layout="wide", page_title="Review Symptomizer — v8.1 Universal")
+st.title("✨ Review Symptomizer — v8.1 Universal")
 st.caption(
-    "Smoother run center • safer overwrite • exact K–T / U–AD export • inbox + aliases • batch speedups • filters • prelearn"
+    "Universal L1 backbone • higher-recall symptomization • smarter prelearn • safer overwrite • exact K–T / U–AD export • inbox + aliases • filters"
 )
 
 st.markdown(
@@ -1047,6 +1047,569 @@ def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
     return df2.sample(n=n, random_state=seed)
 
 
+
+
+# ---------------------- Universal backbone + routing ----------------------
+ROUTER_STOPWORDS = set(STOPWORDS) | {
+    "product", "item", "thing", "device", "review", "reviews", "using", "used", "works", "working",
+    "one", "two", "first", "really", "super", "pretty", "quite", "much", "lot", "lots", "also",
+}
+
+DEFAULT_PRIORITY_DELIGHTERS = [
+    "Overall Satisfaction",
+    "Ease Of Use",
+    "Effective Results",
+    "Visible Improvement",
+    "Time Saver",
+    "Comfort",
+    "Value",
+    "Reliability",
+]
+DEFAULT_PRIORITY_DETRACTORS = [
+    "Poor Results",
+    "Ease Of Use",
+    "Reliability Issue",
+    "High Cost",
+    "Irritation",
+    "Battery Problem",
+    "High Noise",
+    "Cleaning Difficulty",
+    "Setup Issue",
+    "Connectivity Issue",
+    "Safety Concern",
+]
+
+UNIVERSAL_ASPECT_BACKBONE = {
+    "Overall Satisfaction": {
+        "positive_patterns": [
+            r"\bbest\b", r"\bfavorite\b", r"\blove(?:d)?\b", r"\bamazing\b", r"\bexcellent\b",
+            r"\bhighly recommend\b", r"\bcould not recommend more\b", r"\bwould recommend\b",
+            r"\bworth it\b", r"\bvery happy\b", r"\bso happy\b", r"\bglad i bought\b",
+            r"\bimpressed\b", r"\bgame changer\b",
+        ],
+        "negative_patterns": [
+            r"\bdo not recommend\b", r"\bwould not recommend\b", r"\bregret\b", r"\bwaste of money\b",
+            r"\bvery disappointed\b", r"\bso disappointed\b", r"\breturn(?:ed|ing)?\b",
+        ],
+        "positive_labels": ["Overall Satisfaction"],
+        "negative_labels": ["Overall Dissatisfaction", "Poor Results"],
+    },
+    "Effective Results": {
+        "positive_patterns": [
+            r"\bworks? (?:great|well|amazingly|perfectly)\b", r"\bactually works?\b", r"\bdid what (?:it|this) (?:says|promised?)\b",
+            r"\bmade a difference\b", r"\bnoticeable difference\b", r"\bnoticeable results?\b",
+            r"\beffective\b", r"\bhelped\b", r"\bgot results?\b", r"\bdoes the job\b",
+            r"\bimproved?\b", r"\bbetter than\b", r"\bremoved?\b", r"\bcleaned?\b",
+        ],
+        "negative_patterns": [
+            r"\bdidn['’]t work\b", r"\bdoesn['’]t work\b", r"\bnot effective\b", r"\bno results?\b",
+            r"\bno difference\b", r"\bunderwhelming\b", r"\bpoor results?\b", r"\bdoes very little\b",
+            r"\bexpected more\b", r"\bbarely works?\b",
+        ],
+        "positive_labels": ["Effective Results", "Performance", "Works Well"],
+        "negative_labels": ["Poor Results", "Performance Issue", "Poor Performance"],
+    },
+    "Visible Improvement": {
+        "positive_patterns": [
+            r"\bglow(?:ing)?\b", r"\bsmoother\b", r"\bsofter\b", r"\bbrighter\b", r"\bclearer\b",
+            r"\bshinier\b", r"\bnoticeable improvement\b", r"\blooks better\b", r"\bhealthier\b",
+            r"\bless frizz\b", r"\bdead skin gone\b", r"\bskin was glowing\b",
+        ],
+        "negative_patterns": [],
+        "positive_labels": ["Visible Improvement", "Improved Appearance"],
+        "negative_labels": [],
+    },
+    "Ease Of Use": {
+        "positive_patterns": [
+            r"\beasy to (?:use|clean|attach|remove|assemble|set up|setup|operate)\b", r"\bsimple to use\b",
+            r"\buser[- ]?friendly\b", r"\bintuitive\b", r"\bstraightforward\b", r"\beffortless\b",
+            r"\bquick to (?:use|set up|setup)\b",
+        ],
+        "negative_patterns": [
+            r"\bhard to (?:use|clean|attach|remove|assemble|set up|setup|operate)\b", r"\bdifficult to (?:use|clean|assemble|set up|setup)\b",
+            r"\bconfusing\b", r"\bcomplicated\b", r"\bnot intuitive\b", r"\blearning curve\b",
+            r"\bfrustrating\b", r"\bcumbersome\b", r"\binstructions? (?:are )?(?:bad|unclear|confusing)\b",
+        ],
+        "positive_labels": ["Ease Of Use", "Easy Setup", "Easy To Clean"],
+        "negative_labels": ["Ease Of Use", "Difficult To Use", "Setup Issue", "Learning Curve", "Cleaning Difficulty"],
+    },
+    "Time Saver": {
+        "positive_patterns": [
+            r"\bsaves? time\b", r"\bquick(?:er)?\b", r"\bfaster\b", r"\bcut my .* time\b", r"\bsped up\b",
+            r"\btakes less time\b", r"\bso much quicker\b",
+        ],
+        "negative_patterns": [r"\btoo slow\b", r"\btakes forever\b", r"\btime consuming\b"],
+        "positive_labels": ["Time Saver", "Fast Results"],
+        "negative_labels": ["Slow Performance", "Time Consuming"],
+    },
+    "Comfort": {
+        "positive_patterns": [
+            r"\bcomfortable\b", r"\bcomfort\b", r"\blightweight\b", r"\bergonomic\b", r"\bfeels good\b",
+            r"\beasy on my (?:hand|arms|ears|skin)\b",
+        ],
+        "negative_patterns": [
+            r"\buncomfortable\b", r"\bheavy\b", r"\bawkward\b", r"\bbulky\b", r"\bhurts?\b",
+            r"\bsore\b", r"\btiring to hold\b",
+        ],
+        "positive_labels": ["Comfort"],
+        "negative_labels": ["Comfort Issue", "Size Issue"],
+    },
+    "Value": {
+        "positive_patterns": [
+            r"\bworth (?:it|the money|every penny)\b", r"\bgood value\b", r"\bgreat value\b", r"\breasonably priced\b",
+        ],
+        "negative_patterns": [
+            r"\bexpensive\b", r"\boverpriced\b", r"\btoo pricey\b", r"\btoo expensive\b", r"\bnot worth\b",
+            r"\bpricey\b", r"\bcosts? too much\b",
+        ],
+        "positive_labels": ["Value", "Worth The Price"],
+        "negative_labels": ["High Cost", "Value Issue"],
+    },
+    "Reliability": {
+        "positive_patterns": [
+            r"\breliable\b", r"\bsturdy\b", r"\bdurable\b", r"\bwell built\b", r"\bholds up\b",
+            r"\bstill working\b", r"\bsolid build\b",
+        ],
+        "negative_patterns": [
+            r"\bbroke(?:n)?\b", r"\bstopped working\b", r"\bdefective\b", r"\bfaulty\b", r"\bmalfunction(?:ed|ing)?\b",
+            r"\bdead on arrival\b", r"\bleaks?\b", r"\bcracked\b", r"\bnot durable\b", r"\bquit working\b",
+            r"\bproduct failure\b",
+        ],
+        "positive_labels": ["Reliability", "Durability"],
+        "negative_labels": ["Reliability Issue", "Product Failure", "Reliability"],
+    },
+    "Battery": {
+        "positive_patterns": [r"\blong battery life\b", r"\bbattery lasts?\b", r"\bholds a charge\b", r"\blasts all day\b"],
+        "negative_patterns": [
+            r"\bbattery dies?\b", r"\bshort battery life\b", r"\bwon['’]t charge\b", r"\bcharging issue\b",
+            r"\bbattery problem\b", r"\bdrains? quickly\b",
+        ],
+        "positive_labels": ["Battery Life"],
+        "negative_labels": ["Battery Problem", "Short Battery Life", "Battery Life"],
+    },
+    "Noise": {
+        "positive_patterns": [r"\bquiet\b", r"\bnot noisy\b", r"\bsurprisingly quiet\b"],
+        "negative_patterns": [r"\bloud\b", r"\bnoisy\b", r"\bhigh[- ]pitched\b", r"\bwhin(?:e|y)\b"],
+        "positive_labels": ["Quiet Operation"],
+        "negative_labels": ["High Noise", "Noise"],
+    },
+    "Cleaning / Maintenance": {
+        "positive_patterns": [r"\beasy to clean\b", r"\blow maintenance\b", r"\bsimple to clean\b"],
+        "negative_patterns": [
+            r"\bhard to clean\b", r"\bdifficult to clean\b", r"\bmessy\b", r"\bmaintenance hassle\b",
+            r"\bclogs?\b", r"\bresidue\b", r"\bwater spill(?:age)?\b",
+        ],
+        "positive_labels": ["Easy To Clean"],
+        "negative_labels": ["Cleaning Difficulty", "Clogged Pores", "Maintenance Issue"],
+    },
+    "Connectivity": {
+        "positive_patterns": [r"\bconnects? quickly\b", r"\bpairs? easily\b", r"\bapp works?\b"],
+        "negative_patterns": [
+            r"\bwon['’]t connect\b", r"\bpairing issue\b", r"\bapp issue\b", r"\bdisconnects?\b",
+            r"\bbluetooth issue\b", r"\bsync issue\b",
+        ],
+        "positive_labels": ["Connectivity", "App Experience"],
+        "negative_labels": ["Connectivity Issue", "App Issue"],
+    },
+    "Design": {
+        "positive_patterns": [r"\bcompact\b", r"\bsleek\b", r"\bwell designed\b", r"\bportable\b", r"\bgreat design\b"],
+        "negative_patterns": [r"\bbulky\b", r"\btoo big\b", r"\btoo small\b", r"\bpoor design\b", r"\bflimsy\b"],
+        "positive_labels": ["Design", "Compact Design", "Portability"],
+        "negative_labels": ["Design Issue", "Size Issue"],
+    },
+    "Attachments / Versatility": {
+        "positive_patterns": [
+            r"\battachments?\b.*\b(?:useful|helpful|versatile|handy|great)\b", r"\bversatile\b", r"\bmultiple uses\b",
+        ],
+        "negative_patterns": [r"\battachment issue\b", r"\bmissing attachment\b", r"\blimited functionality\b"],
+        "positive_labels": ["Attachment Usability", "Versatility"],
+        "negative_labels": ["Attachment Issue", "Limited Functionality"],
+    },
+    "Safety": {
+        "positive_patterns": [r"\bfeels safe\b", r"\bsafe to use\b", r"\bgentle\b", r"\bno irritation\b"],
+        "negative_patterns": [
+            r"\bburn(?:ed|s|ing)?\b", r"\birritat(?:ed|es|ing|ion)\b", r"\bhurt\b", r"\bunsafe\b",
+            r"\bconcerning\b", r"\btoo hot\b", r"\bheat(?:ing)? issue\b",
+        ],
+        "positive_labels": ["Safety"],
+        "negative_labels": ["Safety Concern", "Irritation", "Excess Heat"],
+    },
+}
+
+
+def _compile_backbone_rules() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for aspect, spec in UNIVERSAL_ASPECT_BACKBONE.items():
+        out[aspect] = dict(spec)
+        out[aspect]["positive_patterns"] = [re.compile(p, re.I) for p in spec.get("positive_patterns", [])]
+        out[aspect]["negative_patterns"] = [re.compile(p, re.I) for p in spec.get("negative_patterns", [])]
+    return out
+
+
+UNIVERSAL_ASPECT_BACKBONE_COMPILED = _compile_backbone_rules()
+
+
+def _dedupe_keep_order_str(values: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        k = _canon_simple(s)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return out
+
+
+def _parse_label_textarea(text_in: Any) -> List[str]:
+    s = str(text_in or "")
+    raw = re.split(r"[\n,;|]+", s)
+    vals = [normalize_theme_label(x.strip()) for x in raw if str(x).strip()]
+    return _dedupe_keep_order_str(vals)
+
+
+def _priority_theme_labels(side: str) -> List[str]:
+    side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
+    defaults = DEFAULT_PRIORITY_DELIGHTERS if side_norm == "Delighter" else DEFAULT_PRIORITY_DETRACTORS
+    key = "priority_delighters_text" if side_norm == "Delighter" else "priority_detractors_text"
+    custom = _parse_label_textarea(st.session_state.get(key, ""))
+    if not custom:
+        custom = list(defaults)
+    return _dedupe_keep_order_str(list(defaults) + custom)
+
+
+def _route_config_signature() -> str:
+    payload = {
+        "universal": bool(st.session_state.get("use_universal_l1_backbone", True)),
+        "recall": bool(st.session_state.get("high_recall_labeling", True)),
+        "top_n": int(st.session_state.get("router_candidate_top_n", 6) or 6),
+        "threshold": float(st.session_state.get("router_rescue_threshold", 0.95) or 0.95),
+        "pd": _priority_theme_labels("Delighter"),
+        "pt": _priority_theme_labels("Detractor"),
+    }
+    try:
+        return hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        return str(payload)
+
+
+def _label_tokens(label: str) -> List[str]:
+    toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9+/']*", str(label or ""))]
+    return [t for t in toks if t not in ROUTER_STOPWORDS and len(t) >= 3]
+
+
+def _phrase_snippets(text_in: str, phrases: Iterable[str], max_hits: int = 2, max_chars: int = 120) -> List[str]:
+    text_s = str(text_in or "")
+    out: List[str] = []
+    seen: Set[str] = set()
+    for ph in phrases:
+        phs = str(ph or "").strip()
+        if not phs:
+            continue
+        try:
+            rx = re.compile(r"(?<!\w)" + re.escape(phs) + r"(?!\w)", re.I)
+        except Exception:
+            continue
+        for m in rx.finditer(text_s):
+            hit = text_s[m.start():m.end()][:max_chars].strip()
+            if hit and hit.lower() not in seen:
+                seen.add(hit.lower())
+                out.append(hit)
+                if len(out) >= max_hits:
+                    return out
+    return out
+
+
+def _regex_snippets(text_in: str, patterns: Iterable[Any], max_hits: int = 2, max_chars: int = 120) -> List[str]:
+    text_s = str(text_in or "")
+    out: List[str] = []
+    seen: Set[str] = set()
+    for p in patterns:
+        rx = p if hasattr(p, "finditer") else re.compile(str(p), re.I)
+        for m in rx.finditer(text_s):
+            hit = text_s[m.start():m.end()][:max_chars].strip(" .,;:-")
+            if hit and hit.lower() not in seen:
+                seen.add(hit.lower())
+                out.append(hit[:max_chars])
+                if len(out) >= max_hits:
+                    return out
+    return out
+
+
+def _keyword_snippets(text_in: str, keywords: Iterable[str], max_hits: int = 2, max_chars: int = 120) -> List[str]:
+    text_s = str(text_in or "")
+    out: List[str] = []
+    seen: Set[str] = set()
+    for kw in keywords:
+        k = str(kw or "").strip().lower()
+        if not k:
+            continue
+        if (len(k) < 4) and (" " not in k):
+            continue
+        try:
+            if " " in k:
+                rx = re.compile(re.escape(k), re.I)
+            else:
+                rx = re.compile(r"(?<!\w)" + re.escape(k) + r"(?!\w)", re.I)
+        except Exception:
+            continue
+        for m in rx.finditer(text_s):
+            hit = text_s[m.start():m.end()][:max_chars].strip()
+            if hit and hit.lower() not in seen:
+                seen.add(hit.lower())
+                out.append(hit)
+                if len(out) >= max_hits:
+                    return out
+    return out
+
+
+def _resolve_available_label(candidate_names: List[str], allowed_labels: List[str], side: str) -> Optional[str]:
+    clean_allowed = [str(x).strip() for x in (allowed_labels or []) if str(x).strip()]
+    if not clean_allowed:
+        return candidate_names[0] if bool(st.session_state.get("use_universal_l1_backbone", True)) and candidate_names else None
+
+    exact = {_canon_simple(x): x for x in clean_allowed}
+    for cand in candidate_names:
+        c = str(cand or "").strip()
+        if not c:
+            continue
+        k = _canon_simple(c)
+        if k in exact:
+            return exact[k]
+        norm = normalize_theme_label(c, side)
+        kn = _canon_simple(norm)
+        if kn in exact:
+            return exact[kn]
+        tgt = ALIAS_TO_LABEL.get(_canon(c))
+        if tgt and _canon_simple(tgt) in exact:
+            return exact[_canon_simple(tgt)]
+    cutoff = max(0.84, float(st.session_state.get("sim_threshold_lex", 0.94)) - 0.06)
+    for cand in candidate_names:
+        c = normalize_theme_label(cand, side)
+        m = difflib.get_close_matches(c, clean_allowed, n=1, cutoff=cutoff)
+        if m:
+            return m[0]
+    if bool(st.session_state.get("use_universal_l1_backbone", True)) and candidate_names:
+        return normalize_theme_label(candidate_names[0], side)
+    return None
+
+
+def _coerce_label_to_allowed(raw_label: str, allowed_labels: List[str], side: str) -> Optional[str]:
+    raw = str(raw_label or "").strip()
+    if not raw:
+        return None
+    exact = {_canon_simple(x): x for x in allowed_labels}
+    for cand in [raw, normalize_theme_label(raw, side)]:
+        if _canon_simple(cand) in exact:
+            return exact[_canon_simple(cand)]
+        tgt = ALIAS_TO_LABEL.get(_canon(cand))
+        if tgt and _canon_simple(tgt) in exact:
+            return exact[_canon_simple(tgt)]
+    cutoff = max(0.84, float(st.session_state.get("sim_threshold_lex", 0.94)) - 0.06)
+    candidates = difflib.get_close_matches(normalize_theme_label(raw, side), list(allowed_labels), n=1, cutoff=cutoff)
+    if candidates:
+        return candidates[0]
+    raw_tokens = set(_label_tokens(raw))
+    if raw_tokens:
+        best = None
+        best_score = 0.0
+        for lab in allowed_labels:
+            toks = set(_label_tokens(lab))
+            if not toks:
+                continue
+            inter = len(raw_tokens & toks)
+            if inter <= 0:
+                continue
+            score = inter / max(1, len(raw_tokens | toks))
+            if score > best_score:
+                best_score = score
+                best = lab
+        if best and best_score >= 0.5:
+            return best
+    return None
+
+
+def _score_existing_label(review: str, label: str, side: str, learned_store: Dict[str, Any], max_ev_chars: int = 120) -> Tuple[float, List[str]]:
+    score = 0.0
+    evs: List[str] = []
+    if label in _priority_theme_labels(side):
+        score += 0.08
+
+    label_evs = _phrase_snippets(review, [label], max_hits=2, max_chars=max_ev_chars)
+    if label_evs:
+        score += 1.00
+        evs.extend(label_evs)
+
+    for alias in (ALIASES.get(label, []) or [])[:8]:
+        hit = _phrase_snippets(review, [alias], max_hits=2, max_chars=max_ev_chars)
+        if hit:
+            score += 0.85
+            evs.extend(hit)
+            break
+
+    kw_pool = list((learned_store.get("keywords", {}).get(side, {}).get(label, set()) or set()))[:10]
+    kw_hits = _keyword_snippets(review, kw_pool, max_hits=2, max_chars=max_ev_chars)
+    if kw_hits:
+        score += 0.32 * min(3, len(kw_hits))
+        evs.extend(kw_hits)
+
+    rtoks = set(re.findall(r"[A-Za-z][A-Za-z0-9+/']*", str(review or "").lower()))
+    ltoks = [t for t in _label_tokens(label) if t not in ROUTER_STOPWORDS]
+    overlap = [t for t in ltoks if t in rtoks]
+    if len(overlap) >= 2:
+        score += 0.40 + (0.08 * min(3, len(overlap)))
+        evs.extend(_phrase_snippets(review, overlap[:2], max_hits=2, max_chars=max_ev_chars))
+    elif len(overlap) == 1 and len(ltoks) == 1 and len(ltoks[0]) >= 5:
+        score += 0.20
+        evs.extend(_phrase_snippets(review, overlap[:1], max_hits=1, max_chars=max_ev_chars))
+
+    return (score, _dedupe_keep_order_str(evs)[:2])
+
+
+def _route_review_candidates(
+    review: str,
+    allowed_delighters: List[str],
+    allowed_detractors: List[str],
+    learned_store: Dict[str, Any],
+    top_n: int = 6,
+    max_ev_chars: int = 120,
+) -> Dict[str, Any]:
+    review_s = str(review or "").strip()
+    out = {
+        "dels": [],
+        "dets": [],
+        "ev_del_map": {},
+        "ev_det_map": {},
+        "del_scores": {},
+        "det_scores": {},
+    }
+    if not review_s:
+        return out
+
+    side_cfg = {
+        "Delighter": {
+            "allowed": allowed_delighters,
+            "labels_key": "positive_labels",
+            "patterns_key": "positive_patterns",
+            "out_labels": "dels",
+            "out_ev": "ev_del_map",
+            "out_scores": "del_scores",
+        },
+        "Detractor": {
+            "allowed": allowed_detractors,
+            "labels_key": "negative_labels",
+            "patterns_key": "negative_patterns",
+            "out_labels": "dets",
+            "out_ev": "ev_det_map",
+            "out_scores": "det_scores",
+        },
+    }
+
+    for side, cfg in side_cfg.items():
+        allowed = list(cfg["allowed"] or [])
+        scores: Dict[str, float] = {}
+        ev_map: Dict[str, List[str]] = {}
+        priority = set(_priority_theme_labels(side))
+
+        aspect_hits: Dict[str, List[str]] = {}
+        for aspect, spec in UNIVERSAL_ASPECT_BACKBONE_COMPILED.items():
+            pats = spec.get(cfg["patterns_key"], []) or []
+            hits = _regex_snippets(review_s, pats, max_hits=2, max_chars=max_ev_chars)
+            if not hits:
+                continue
+            aspect_hits[aspect] = hits
+            names = list(spec.get(cfg["labels_key"], []) or []) + [aspect]
+            resolved = _resolve_available_label(names, allowed, side)
+            if not resolved:
+                continue
+            base = 1.15 if resolved in priority else 0.95
+            scores[resolved] = scores.get(resolved, 0.0) + base + (0.10 * len(hits))
+            ev_map.setdefault(resolved, [])
+            ev_map[resolved] = _dedupe_keep_order_str(ev_map[resolved] + hits)[:2]
+
+        if side == "Delighter" and aspect_hits.get("Visible Improvement"):
+            eff_label = _resolve_available_label(["Effective Results", "Performance", "Works Well"], allowed, side)
+            if eff_label:
+                eff_hits = list(aspect_hits.get("Visible Improvement", []))
+                scores[eff_label] = max(scores.get(eff_label, 0.0), 0.92 + (0.08 * len(eff_hits)))
+                if eff_hits:
+                    ev_map.setdefault(eff_label, [])
+                    ev_map[eff_label] = _dedupe_keep_order_str(ev_map[eff_label] + eff_hits)[:2]
+
+        pool = list(allowed)
+        for lab in pool:
+            sc, evs = _score_existing_label(review_s, lab, side, learned_store, max_ev_chars=max_ev_chars)
+            if sc <= 0:
+                continue
+            if sc >= 0.35 or lab in priority:
+                scores[lab] = max(scores.get(lab, 0.0), sc if lab not in scores else scores[lab] + (0.20 * sc))
+                if evs:
+                    ev_map.setdefault(lab, [])
+                    ev_map[lab] = _dedupe_keep_order_str(ev_map[lab] + evs)[:2]
+
+        ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        picked: List[str] = []
+        for lab, sc in ordered:
+            min_score = 0.45 if lab not in priority else 0.30
+            if sc < min_score:
+                continue
+            picked.append(lab)
+            if len(picked) >= int(top_n):
+                break
+
+        out[cfg["out_labels"]] = picked
+        out[cfg["out_ev"]] = {lab: ev_map.get(lab, [])[:2] for lab in picked if ev_map.get(lab)}
+        out[cfg["out_scores"]] = {lab: float(scores.get(lab, 0.0)) for lab in picked}
+
+    return out
+
+
+def _apply_router_rescue(
+    norm: Dict[str, Any],
+    router: Dict[str, Any],
+    needs_del: bool,
+    needs_det: bool,
+    require_evidence_flag: bool,
+    max_ev_per_label: int,
+) -> Dict[str, Any]:
+    threshold = float(st.session_state.get("router_rescue_threshold", 0.95) or 0.95)
+
+    def _merge(side_key: str, ev_key: str, route_key: str, route_ev_key: str, score_key: str, needs_side: bool) -> None:
+        if not needs_side:
+            return
+        labs = list(norm.get(side_key, []) or [])
+        ev_map = dict(norm.get(ev_key, {}) or {})
+        route_labs = list(router.get(route_key, []) or [])
+        route_evs = dict(router.get(route_ev_key, {}) or {})
+        scores = dict(router.get(score_key, {}) or {})
+
+        for lab in route_labs:
+            sc = float(scores.get(lab, 0.0) or 0.0)
+            evs = list(route_evs.get(lab, []) or [])[:max_ev_per_label]
+            if lab in labs:
+                if evs and not ev_map.get(lab):
+                    ev_map[lab] = evs
+                continue
+            if sc < threshold:
+                continue
+            if require_evidence_flag and not evs:
+                continue
+            labs.append(lab)
+            if evs:
+                ev_map[lab] = evs
+            if len(labs) >= 10:
+                break
+
+        norm[side_key] = labs[:10]
+        norm[ev_key] = {k: list(v)[:max_ev_per_label] for k, v in ev_map.items() if k in norm[side_key]}
+
+    _merge("dels", "ev_del_map", "dels", "ev_del_map", "del_scores", needs_del)
+    _merge("dets", "ev_det_map", "dets", "ev_det_map", "det_scores", needs_det)
+    return norm
+
 def _safe_json_load(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
     if not s:
@@ -1134,6 +1697,8 @@ def _prelearn_llm_batch_mine(
         "reviews": texts[:40],
         "known_detractor_themes": known_themes.get("Detractor", [])[:60],
         "known_delighter_themes": known_themes.get("Delighter", [])[:60],
+        "priority_delighter_backbone": _priority_theme_labels("Delighter")[:20],
+        "priority_detractor_backbone": _priority_theme_labels("Detractor")[:20],
     }
 
     data = _chat_json_with_retries(
@@ -1338,7 +1903,7 @@ def _label_cache_key(
     max_ev_chars: int,
 ) -> Tuple[Any, ...]:
     return (
-        "lab2",
+        "lab4",
         _canon(verbatim),
         model,
         f"{float(temperature):.2f}",
@@ -1346,6 +1911,7 @@ def _label_cache_key(
         int(max_ev_per_label),
         int(max_ev_chars),
         json.dumps(known_theme_hints, sort_keys=True)[:2000],
+        _route_config_signature(),
     )
 
 
@@ -1370,28 +1936,32 @@ def _normalize_unified_output(
     r = r if r in RELIABILITY_ENUM else "Not Mentioned"
     n = n if n in SESSIONS_ENUM else "Unknown"
 
-    def _extract_allowed(objs: Iterable[Any], allowed: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+    def _extract_allowed(objs: Iterable[Any], allowed: List[str], side: str) -> Tuple[List[str], Dict[str, List[str]]]:
         out_labels: List[str] = []
         ev_map: Dict[str, List[str]] = {}
-        allowed_set = set(allowed)
         for obj in objs:
             if not isinstance(obj, dict):
                 continue
-            lbl = str(obj.get("label", "")).strip()
+            raw_lbl = str(obj.get("label", "")).strip()
+            lbl = _coerce_label_to_allowed(raw_lbl, allowed, side)
+            if not lbl:
+                continue
             evs_raw = obj.get("evidence", []) or []
-            evs: List[str] = []
+            evs = []
             for e in evs_raw:
                 if isinstance(e, str) and e.strip():
                     evs.append(str(e)[:max_ev_chars])
-            if lbl in allowed_set and lbl not in out_labels:
+            if lbl not in out_labels:
                 out_labels.append(lbl)
-                ev_map[lbl] = evs[:max_ev_per_label]
+                ev_map[lbl] = _dedupe_keep_order_str(evs)[:max_ev_per_label]
+            elif evs:
+                ev_map[lbl] = _dedupe_keep_order_str((ev_map.get(lbl, []) or []) + evs)[:max_ev_per_label]
             if len(out_labels) >= 10:
                 break
         return out_labels, ev_map
 
-    dels, ev_del_map = _extract_allowed(raw_dels, allowed_delighters)
-    dets, ev_det_map = _extract_allowed(raw_dets, allowed_detractors)
+    dels, ev_del_map = _extract_allowed(raw_dels, allowed_delighters, "Delighter")
+    dets, ev_det_map = _extract_allowed(raw_dets, allowed_detractors, "Detractor")
     return {
         "dels": dels,
         "dets": dets,
@@ -1418,11 +1988,14 @@ def _openai_labeler_unified_batch(
     product_profile: str = "",
 ) -> Dict[int, Dict[str, Any]]:
     out_by_idx: Dict[int, Dict[str, Any]] = {}
-    if client is None or not items:
+    if not items:
         return out_by_idx
 
     cache = _ensure_label_cache()
     to_send: List[Tuple[int, str, bool, bool, Tuple[Any, ...]]] = []
+    router_by_idx: Dict[int, Dict[str, Any]] = {}
+    learned_store = _ensure_learned_store()
+    router_top_n = int(st.session_state.get("router_candidate_top_n", 6) or 6)
 
     for it in items:
         idx = int(it.get("idx"))
@@ -1432,6 +2005,7 @@ def _openai_labeler_unified_batch(
         if not review.strip():
             out_by_idx[idx] = dict(_LABELER_DEFAULT)
             continue
+
         key = _label_cache_key(
             review,
             model,
@@ -1442,8 +2016,27 @@ def _openai_labeler_unified_batch(
             int(max_ev_per_label),
             int(max_ev_chars),
         )
+        router = _route_review_candidates(
+            review,
+            allowed_delighters=allowed_delighters,
+            allowed_detractors=allowed_detractors,
+            learned_store=learned_store,
+            top_n=router_top_n,
+            max_ev_chars=max_ev_chars,
+        )
+        router_by_idx[idx] = router
         if key in cache:
-            out_by_idx[idx] = cache[key]
+            cached = dict(cache[key])
+            if bool(st.session_state.get("high_recall_labeling", True)):
+                cached = _apply_router_rescue(
+                    cached,
+                    router,
+                    needs_del=needs_del,
+                    needs_det=needs_det,
+                    require_evidence_flag=bool(st.session_state.get("require_evidence_flag", True)),
+                    max_ev_per_label=int(max_ev_per_label),
+                )
+            out_by_idx[idx] = cached
         else:
             to_send.append((idx, review, needs_del, needs_det, key))
 
@@ -1451,17 +2044,21 @@ def _openai_labeler_unified_batch(
         return out_by_idx
 
     sys_lines = [
-        "You label consumer reviews with predefined symptom lists and extract 3 meta fields.",
-        "You will receive MULTIPLE reviews at once; treat each independently.",
+        "You are a high-recall but disciplined review symptomizer for consumer products across MANY product categories.",
+        "Start broad: think in reusable product aspects first (Ease Of Use, Effective Results, Visible Improvement, Overall Satisfaction, Reliability, Value, Comfort, Battery Life, Noise, Cleaning Difficulty, Setup, Connectivity, Safety, Attachment Usability, Design).",
+        "Then add product-specific themes only when they are clearly supported and still broad enough to reuse.",
+        "Candidate labels supplied per review are strong hints derived from rules, aliases, learned keywords, and prelearned knowledge. Reuse them whenever the evidence supports them.",
+        "Do not be overly sparse. If the same review clearly supports multiple broad labels, include all of them.",
         "Return STRICT JSON with schema:",
         '{"items":[{"id":"<id>","detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring>", "..."]}], "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}], "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."], "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"}]}',
         "",
         "Rules:",
         f"- Evidence MUST be exact substrings from THAT review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
-        "- Only include a label if there is clear textual support in the review.",
-        "- Use ONLY allowed lists for 'detractors' and 'delighters'.",
+        "- Use ONLY allowed lists for delighters and detractors. Prefer broad stable labels over tiny wording variants.",
+        "- If a review clearly shows strong recommendation, strong results, visible improvement, ease, comfort, value, reliability, setup experience, or safety, tag it. Do not leave obvious broad labels blank.",
+        "- Only include a label if there is textual support in the review.",
         "- For unlisted_* items, return a SHORT THEME (1–3 words), Title Case, no punctuation except slashes.",
-        "- Avoid duplicates and near-duplicates (plural vs singular, synonyms). Prefer reusing known themes if provided.",
+        "- Avoid duplicates and near-duplicates.",
         "- Cap to maximum 10 detractors and 10 delighters. Cap to 10 unlisted per side.",
         "- Always return ALL keys for every item (use empty lists / Not Mentioned if none).",
         "",
@@ -1471,35 +2068,43 @@ def _openai_labeler_unified_batch(
         "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
     ]
     if product_profile and str(product_profile).strip():
-        sys_lines.insert(2, f"Product context (brief): {str(product_profile).strip()[:600]}")
+        sys_lines.insert(1, f"Product context (brief): {str(product_profile).strip()[:600]}")
 
     payload = {
+        "priority_delighter_themes": _priority_theme_labels("Delighter")[:20],
+        "priority_detractor_themes": _priority_theme_labels("Detractor")[:20],
+        "allowed_delighters": allowed_delighters,
+        "allowed_detractors": allowed_detractors,
+        "known_unlisted_detractor_themes": (known_theme_hints.get("Detractor") or [])[:60],
+        "known_unlisted_delighter_themes": (known_theme_hints.get("Delighter") or [])[:60],
         "items": [
             {
                 "id": str(idx),
                 "review": review,
                 "needs_delighters": bool(needs_del),
                 "needs_detractors": bool(needs_det),
+                "candidate_delighters": (router_by_idx.get(idx, {}) or {}).get("dels", [])[:router_top_n],
+                "candidate_detractors": (router_by_idx.get(idx, {}) or {}).get("dets", [])[:router_top_n],
+                "candidate_delighter_evidence": (router_by_idx.get(idx, {}) or {}).get("ev_del_map", {}),
+                "candidate_detractor_evidence": (router_by_idx.get(idx, {}) or {}).get("ev_det_map", {}),
             }
             for (idx, review, needs_del, needs_det, _) in to_send
         ],
-        "allowed_delighters": allowed_delighters,
-        "allowed_detractors": allowed_detractors,
-        "known_unlisted_detractor_themes": (known_theme_hints.get("Detractor") or [])[:60],
-        "known_unlisted_delighter_themes": (known_theme_hints.get("Delighter") or [])[:60],
     }
 
-    data = _chat_json_with_retries(
-        client,
-        model=model,
-        temperature=float(temperature),
-        messages=[
-            {"role": "system", "content": "\n".join(sys_lines)},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        component="symptomize-label-batch",
-        response_format={"type": "json_object"},
-    )
+    data = {}
+    if client is not None:
+        data = _chat_json_with_retries(
+            client,
+            model=model,
+            temperature=float(temperature),
+            messages=[
+                {"role": "system", "content": "\n".join(sys_lines)},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            component="symptomize-label-batch",
+            response_format={"type": "json_object"},
+        )
 
     items_out: List[Any] = []
     if isinstance(data, dict) and isinstance(data.get("items"), list):
@@ -1512,11 +2117,21 @@ def _openai_labeler_unified_batch(
         if isinstance(obj, dict) and "id" in obj:
             by_id[str(obj.get("id"))] = obj
 
-    for (idx, _, _, _, key) in to_send:
+    for (idx, _, needs_del, needs_det, key) in to_send:
         obj = by_id.get(str(idx), {}) or {}
         norm = _normalize_unified_output(obj, allowed_delighters, allowed_detractors, int(max_ev_per_label), int(max_ev_chars))
+        router = router_by_idx.get(idx, {}) or {}
+        if bool(st.session_state.get("high_recall_labeling", True)):
+            norm = _apply_router_rescue(
+                norm,
+                router,
+                needs_del=needs_del,
+                needs_det=needs_det,
+                require_evidence_flag=bool(st.session_state.get("require_evidence_flag", True)),
+                max_ev_per_label=int(max_ev_per_label),
+            )
         out_by_idx[idx] = norm
-        cache[key] = norm
+        cache[key] = dict(norm)
 
     return out_by_idx
 
@@ -1848,6 +2463,7 @@ st.sidebar.subheader("🧾 Evidence")
 require_evidence = st.sidebar.checkbox("Require evidence to write labels", value=True)
 max_ev_per_label = st.sidebar.slider("Max evidence snippets per label", 1, 3, 2)
 max_ev_chars = st.sidebar.slider("Max evidence length", 40, 200, 120, 10)
+st.session_state["require_evidence_flag"] = bool(require_evidence)
 
 st.sidebar.subheader("🧠 Prelearn")
 prelearn_enabled = st.sidebar.checkbox("Auto-run prelearn before symptomizing", value=True)
@@ -1862,9 +2478,51 @@ use_learned_as_allowed = st.sidebar.checkbox(
     help="Helpful when the Symptoms sheet is incomplete.",
 )
 
+
+st.sidebar.subheader("🎯 Universal tagging")
+use_universal_l1_backbone = st.sidebar.checkbox(
+    "Use universal L1 backbone (works for any product)",
+    value=bool(st.session_state.get("use_universal_l1_backbone", True)),
+    help="Always makes broad reusable themes like Ease Of Use, Effective Results, Overall Satisfaction, Reliability, Value, and Safety available as temporary labels.",
+)
+high_recall_labeling = st.sidebar.checkbox(
+    "High-recall symptomization",
+    value=bool(st.session_state.get("high_recall_labeling", True)),
+    help="Blends LLM output with rule/keyword/alias routing so obvious broad tags are not missed.",
+)
+router_candidate_top_n = st.sidebar.slider(
+    "Candidate tags per review",
+    3, 12, int(st.session_state.get("router_candidate_top_n", 6) or 6), 1,
+    help="How many routed candidate tags the model sees for each review.",
+)
+router_rescue_threshold = st.sidebar.slider(
+    "Rescue threshold",
+    0.40, 1.80, float(st.session_state.get("router_rescue_threshold", 0.95) or 0.95), 0.05,
+    help="Lower values add more high-confidence routed tags when the model misses them.",
+)
+priority_delighters_text = st.sidebar.text_area(
+    "Priority delighter themes",
+    value=str(st.session_state.get("priority_delighters_text", ", ".join(DEFAULT_PRIORITY_DELIGHTERS))),
+    height=90,
+    help="Broad L1 themes to always prioritize when supported by evidence.",
+)
+priority_detractors_text = st.sidebar.text_area(
+    "Priority detractor themes",
+    value=str(st.session_state.get("priority_detractors_text", ", ".join(DEFAULT_PRIORITY_DETRACTORS))),
+    height=90,
+    help="Broad L1 themes to always prioritize when supported by evidence.",
+)
+st.session_state["use_universal_l1_backbone"] = bool(use_universal_l1_backbone)
+st.session_state["high_recall_labeling"] = bool(high_recall_labeling)
+st.session_state["router_candidate_top_n"] = int(router_candidate_top_n)
+st.session_state["router_rescue_threshold"] = float(router_rescue_threshold)
+st.session_state["priority_delighters_text"] = str(priority_delighters_text or "")
+st.session_state["priority_detractors_text"] = str(priority_detractors_text or "")
+
 st.sidebar.subheader("🧩 Consistency")
 sim_threshold_lex = st.sidebar.slider("Lexical similarity guard", 0.80, 0.99, 0.94, 0.01)
 sim_threshold_sem = st.sidebar.slider("Semantic similarity guard", 0.80, 0.99, 0.92, 0.01)
+st.session_state["_router_sig"] = _route_config_signature()
 
 st.sidebar.subheader("💰 Budget")
 if "_pricing_overrides" not in st.session_state:
@@ -2047,11 +2705,18 @@ def _agg_candidate(d: Dict[Any, Any], key: Tuple[Any, ...], idx: int, max_refs: 
 def _active_allowed_lists() -> Tuple[List[str], List[str]]:
     dels = list(DELIGHTERS)
     dets = list(DETRACTORS)
-    if use_learned_as_allowed:
-        for x in _known_learned_labels("Delighter")[:60]:
+    if bool(st.session_state.get("use_universal_l1_backbone", True)):
+        for x in _priority_theme_labels("Delighter"):
             if x not in dels:
                 dels.append(x)
-        for x in _known_learned_labels("Detractor")[:60]:
+        for x in _priority_theme_labels("Detractor"):
+            if x not in dets:
+                dets.append(x)
+    if use_learned_as_allowed:
+        for x in _known_learned_labels("Delighter")[:80]:
+            if x not in dels:
+                dels.append(x)
+        for x in _known_learned_labels("Detractor")[:80]:
             if x not in dets:
                 dets.append(x)
     return dels, dets
@@ -2994,6 +3659,7 @@ st.divider()
 st.caption(
     "v8.0 — rewritten for a smoother and more accurate workflow. Safer overwrite, cleaner run center, batch symptomization, prelearn, inbox, exact template export, and session persistence."
 )
+
 
 
 
