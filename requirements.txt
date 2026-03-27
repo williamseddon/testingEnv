@@ -1,16 +1,13 @@
-streamlit>=1.30
-pandas>=2.0
-plotly
-openpyxl>=3.1
-xlsxwriter
-matplotlib
-wordcloud
-pyserial
-openai
-scikit-learn
-apify-client>=1.6
-playwright
-requests
-beautifulsoup4
-chromium
-urllib.parse
+streamlit>=1.44.0
+pandas>=2.2.0
+openpyxl>=3.1.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.2.0
+openai>=1.99.0
+pydantic>=2.7.0
+plotly>=5.20.0
+scikit-learn>=1.4.0
+wordcloud>=1.9.3
+matplotlib>=3.8.0   # if you add charts beyond plotly
+xlsxwriter>=3.2.0   # if you need advanced Excel formatting
