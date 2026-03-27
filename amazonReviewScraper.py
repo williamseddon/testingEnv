@@ -18,9 +18,6 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from openai import OpenAI
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 from pydantic import BaseModel, Field
 
 
@@ -753,7 +750,114 @@ def extract_ld_reviews(ld_objects: Sequence[Any], product_url: str) -> List[Dict
 
 
 # ----------------------------
-# DOM / browser scraping helpers
+# HTTP scraping helpers
+# ----------------------------
+def build_http_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+    )
+    return session
+
+
+def fetch_page_html(session: requests.Session, url: str, timeout: int = 45) -> Tuple[str, str]:
+    response = session.get(url, timeout=timeout, allow_redirects=True)
+    response.raise_for_status()
+    return response.text, response.url
+
+
+def extract_candidate_review_api_urls(html_text: str, page_url: str) -> List[str]:
+    candidates: List[str] = []
+
+    patterns = [
+        r"https?://[^\"'\s<>]+(?:bazaarvoice|reviews\.json)[^\"'\s<>]*",
+        r"//[^\"'\s<>]+(?:bazaarvoice|reviews\.json)[^\"'\s<>]*",
+        r"https?:\\/\\/[^\"'\s<>]+(?:bazaarvoice|reviews\.json)[^\"'\s<>]*",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, html_text or '', flags=re.I):
+            url = html.unescape(match).replace('\\/', '/').strip('"\' ')
+            if url.startswith('//'):
+                url = 'https:' + url
+            if 'reviews.json' in url.lower() or 'bazaarvoice' in url.lower():
+                candidates.append(url)
+
+    soup = BeautifulSoup(html_text or '', 'lxml')
+    attrs = ['data-bv-show', 'data-bv-product-id', 'data-bv-seo', 'data-bv-url', 'src', 'href']
+    for node in soup.find_all(True):
+        for attr in attrs:
+            value = node.get(attr)
+            if not value or not isinstance(value, str):
+                continue
+            lowered = value.lower()
+            if 'bazaarvoice' in lowered or 'reviews.json' in lowered:
+                url = html.unescape(value).replace('\\/', '/')
+                if url.startswith('//'):
+                    url = 'https:' + url
+                elif url.startswith('/'):
+                    parsed = urlparse(page_url)
+                    url = f'{parsed.scheme}://{parsed.netloc}{url}'
+                candidates.append(url)
+
+    deduped: List[str] = []
+    seen = set()
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append(url)
+    return deduped
+
+
+def fetch_review_pages_via_http(
+    session: requests.Session,
+    base_url: str,
+    target_reviews: int,
+    progress_cb: Callable[[str, str, float, int], None],
+    merged_seed: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    fallback_rows: List[Dict[str, Any]] = []
+    max_pages = max(2, math.ceil(target_reviews / 8) + 2)
+    for page_num in range(1, max_pages + 1):
+        page_url = append_bvstate(base_url, page_num)
+        try:
+            html_page, _ = fetch_page_html(session, page_url, timeout=45)
+            batch = parse_reviews_from_dom_html(html_page, page_url)
+            batch += extract_ld_reviews(extract_ld_json_objects(html_page), page_url)
+            batch = dedupe_reviews(batch)
+            if not batch:
+                if page_num > 1:
+                    break
+                continue
+            before = len(dedupe_reviews(fallback_rows))
+            fallback_rows.extend(batch)
+            after = len(dedupe_reviews(fallback_rows))
+            progress = min(0.92, 0.72 + 0.20 * (page_num / max_pages))
+            progress_cb(
+                'HTML fallback',
+                f'Processed SharkNinja review page {page_num}. Collected {after} direct-page review(s).',
+                progress,
+                len(dedupe_reviews(list(merged_seed) + fallback_rows)),
+            )
+            if after == before and page_num > 1:
+                break
+            if len(dedupe_reviews(list(merged_seed) + fallback_rows)) >= target_reviews:
+                break
+        except Exception:
+            if page_num == 1:
+                continue
+            break
+    return dedupe_reviews(fallback_rows)
+
+
+# ----------------------------
+# DOM / HTML parsing helpers
 # ----------------------------
 def accept_cookie_banner(page: Any) -> None:
     patterns = [
@@ -1095,13 +1199,11 @@ def scrape_sharkninja_reviews(
     product_url: str,
     target_reviews: int,
     sort_key: str,
-    headless: bool,
     progress_cb: Callable[[str, str, float, int], None],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     normalized_url = normalize_url(product_url)
-    captured_request_urls: List[str] = []
+    session = build_http_session()
     raw_payloads: List[Dict[str, Any]] = []
-    network_rows: List[Dict[str, Any]] = []
     meta: Dict[str, Any] = {
         "product_url": normalized_url,
         "source_method": "unknown",
@@ -1109,162 +1211,89 @@ def scrape_sharkninja_reviews(
         "site_average_rating": None,
     }
 
-    progress_cb("Browser setup", "Launching local browser engine for SharkNinja...", 0.08, 0)
+    progress_cb("Open product page", "Fetching the SharkNinja product page...", 0.08, 0)
+    html_text, final_url = fetch_page_html(session, normalized_url, timeout=60)
+    normalized_url = normalize_url(final_url)
+    meta["product_url"] = normalized_url
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(viewport={"width": 1440, "height": 1600})
-        page = context.new_page()
+    progress_cb("Parse page", "Parsing structured data and rendered reviews from the product page...", 0.20, 0)
+    ld_objects = extract_ld_json_objects(html_text)
+    ld_meta = extract_product_ld_meta(ld_objects)
+    ld_rows = extract_ld_reviews(ld_objects, normalized_url)
+    dom_rows = parse_reviews_from_dom_html(html_text, normalized_url)
 
-        def on_request(request: Any) -> None:
-            lowered = request.url.lower()
-            if "bazaarvoice" in lowered or "reviews.json" in lowered:
-                captured_request_urls.append(request.url)
+    page_title_match = re.search(r"<title>(.*?)</title>", html_text or "", flags=re.I | re.S)
+    page_title = html.unescape(page_title_match.group(1)).strip() if page_title_match else "SharkNinja product"
+    meta["product_title"] = ld_meta.get("product_title") or page_title.split("|")[0].strip() or "SharkNinja product"
+    meta["model_code"] = ld_meta.get("sku") or infer_model_code(normalized_url, html_text)
+    meta["brand"] = ld_meta.get("brand") or "SharkNinja"
+    meta["site_average_rating"] = ld_meta.get("site_average_rating") or meta.get("site_average_rating")
+    if ld_meta.get("site_review_count"):
+        meta["site_review_count"] = ld_meta.get("site_review_count")
 
-        def on_response(response: Any) -> None:
-            lowered = response.url.lower()
-            if not ("bazaarvoice" in lowered or "reviews.json" in lowered or "review" in lowered):
-                return
-            try:
-                body_text = response.text()
-            except Exception:
-                return
-            data = parse_json_like(body_text)
-            if data is None:
-                return
-            payloads = walk_review_payloads(data)
-            if not payloads:
-                return
-            raw_payloads.append({"source": "network", "url": response.url, "data": data})
-            for _, payload in payloads:
-                if payload.get("TotalResults") not in (None, ""):
-                    try:
-                        meta["site_review_count"] = max(int(float(payload.get("TotalResults"))), meta.get("site_review_count") or 0)
-                    except Exception:
-                        pass
-                for item in payload.get("Results", []):
-                    normalized = standardize_bazaarvoice_item(item, response.url, "network_capture", normalized_url)
-                    if normalized:
-                        network_rows.append(normalized)
+    merged_seed = dedupe_reviews(ld_rows + dom_rows)
+    progress_cb(
+        "Initial capture",
+        f"Initial page capture done. Found {len(merged_seed)} candidate review(s).",
+        0.32,
+        len(merged_seed),
+    )
 
-        page.on("request", on_request)
-        page.on("response", on_response)
-
-        try:
-            progress_cb("Open product page", "Opening the SharkNinja product page...", 0.16, 0)
-            page.goto(normalized_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1800)
-            accept_cookie_banner(page)
-            progress_cb("Inspect page", "Inspecting the page and opening the review area...", 0.26, len(dedupe_reviews(network_rows)))
-            open_review_panel(page)
-            page.wait_for_timeout(1800)
-            for _ in range(2):
-                page.mouse.wheel(0, 2000)
-                page.wait_for_timeout(700)
-        except PlaywrightTimeoutError as exc:
-            browser.close()
-            raise RuntimeError(f"Timed out loading the SharkNinja page: {exc}") from exc
-        except PlaywrightError as exc:
-            browser.close()
-            raise RuntimeError(f"Browser automation failed while loading the SharkNinja page: {exc}") from exc
-
-        html_text = page.content()
-        ld_objects = extract_ld_json_objects(html_text)
-        ld_meta = extract_product_ld_meta(ld_objects)
-        ld_rows = extract_ld_reviews(ld_objects, normalized_url)
-        dom_rows = parse_reviews_from_dom_html(html_text, normalized_url)
-
-        meta["product_title"] = ld_meta.get("product_title") or page.title().split("|")[0].strip() or "SharkNinja product"
-        meta["model_code"] = ld_meta.get("sku") or infer_model_code(normalized_url, html_text)
-        meta["brand"] = ld_meta.get("brand") or "SharkNinja"
-        meta["site_average_rating"] = ld_meta.get("site_average_rating") or meta.get("site_average_rating")
-        if ld_meta.get("site_review_count"):
-            meta["site_review_count"] = ld_meta.get("site_review_count")
-
+    candidate_api_urls = extract_candidate_review_api_urls(html_text, normalized_url)
+    api_rows: List[Dict[str, Any]] = []
+    api_meta: Dict[str, Any] = {}
+    api_url = choose_best_api_url(candidate_api_urls)
+    if api_url:
         progress_cb(
-            "Initial capture",
-            f"Initial page capture done. Found {len(dedupe_reviews(network_rows + ld_rows + dom_rows))} candidate review(s).",
-            0.40,
-            len(dedupe_reviews(network_rows + ld_rows + dom_rows)),
+            "Fast review feed",
+            "Review feed detected in page markup. Switching to the faster direct feed path...",
+            0.42,
+            len(merged_seed),
         )
+        api_rows, api_raw, api_meta = fetch_reviews_from_bazaarvoice_api(
+            api_url=api_url,
+            product_url=normalized_url,
+            target_reviews=target_reviews,
+            sort_key=sort_key,
+            progress_cb=progress_cb,
+        )
+        raw_payloads.extend(api_raw)
+        if api_meta.get("total_results"):
+            meta["site_review_count"] = api_meta.get("total_results")
 
-        api_rows: List[Dict[str, Any]] = []
-        api_meta: Dict[str, Any] = {}
-        api_url = choose_best_api_url(captured_request_urls)
-        if api_url:
-            progress_cb("Fast review feed", "Bazaarvoice review feed detected. Switching to the faster feed path...", 0.48, len(dedupe_reviews(network_rows + ld_rows + dom_rows)))
-            api_rows, api_raw, api_meta = fetch_reviews_from_bazaarvoice_api(
-                api_url=api_url,
-                product_url=normalized_url,
-                target_reviews=target_reviews,
-                sort_key=sort_key,
-                progress_cb=progress_cb,
-            )
-            raw_payloads.extend(api_raw)
-            if api_meta.get("total_results"):
-                meta["site_review_count"] = api_meta.get("total_results")
+    merged = dedupe_reviews(api_rows + merged_seed)
 
-        merged = dedupe_reviews(api_rows + network_rows + ld_rows + dom_rows)
-
-        if len(merged) < target_reviews:
-            progress_cb(
-                "Fallback pagination",
-                "Fast feed was not enough. Walking SharkNinja review pages directly for more reviews...",
-                0.68,
-                len(merged),
-            )
-            fallback_rows: List[Dict[str, Any]] = []
-            max_pages = max(2, math.ceil(target_reviews / 8) + 2)
-            for page_num in range(1, max_pages + 1):
-                page_url = append_bvstate(normalized_url, page_num)
-                try:
-                    page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(1200)
-                    html_page = page.content()
-                    batch = parse_reviews_from_dom_html(html_page, page_url)
-                    batch += extract_ld_reviews(extract_ld_json_objects(html_page), page_url)
-                    batch = dedupe_reviews(batch)
-                    if not batch:
-                        if page_num > 1:
-                            break
-                        continue
-                    before = len(dedupe_reviews(fallback_rows))
-                    fallback_rows.extend(batch)
-                    after = len(dedupe_reviews(fallback_rows))
-                    progress = min(0.86, 0.68 + 0.18 * (page_num / max_pages))
-                    progress_cb(
-                        "Fallback pagination",
-                        f"Processed SharkNinja review page {page_num}. Collected {after} direct-page review(s).",
-                        progress,
-                        len(dedupe_reviews(merged + fallback_rows)),
-                    )
-                    if after == before and page_num > 1:
-                        break
-                    merged = dedupe_reviews(api_rows + network_rows + ld_rows + dom_rows + fallback_rows)
-                    if len(merged) >= target_reviews:
-                        break
-                except Exception:
-                    if page_num == 1:
-                        continue
-                    break
-
-        browser.close()
+    if len(merged) < target_reviews:
+        progress_cb(
+            "HTML fallback",
+            "Direct feed was not enough. Walking review pages over HTTP for more coverage...",
+            0.72,
+            len(merged),
+        )
+        fallback_rows = fetch_review_pages_via_http(
+            session=session,
+            base_url=normalized_url,
+            target_reviews=target_reviews,
+            progress_cb=progress_cb,
+            merged_seed=merged,
+        )
+        merged = dedupe_reviews(api_rows + merged_seed + fallback_rows)
 
     merged = dedupe_reviews(merged)[:target_reviews]
     if not merged:
         raise RuntimeError(
-            "No reviews could be extracted from this SharkNinja page. Try a product page that visibly shows reviews, or run again with the page fully public and accessible."
+            "No reviews could be extracted from this SharkNinja page. Try a product page that visibly shows reviews, or run again on a public product URL."
         )
 
     if api_rows:
-        meta["source_method"] = "bazaarvoice_api + page fallback"
-    elif network_rows:
-        meta["source_method"] = "network capture + dom"
+        meta["source_method"] = "bazaarvoice_api + html fallback"
+    elif dom_rows or ld_rows:
+        meta["source_method"] = "html / ld_json"
     else:
-        meta["source_method"] = "dom / ld_json fallback"
+        meta["source_method"] = "html fallback"
 
     meta["captured_api_url"] = api_url
-    meta["captured_request_count"] = len(captured_request_urls)
+    meta["captured_request_count"] = len(candidate_api_urls)
     return merged, raw_payloads, meta
 
 
@@ -1834,7 +1863,6 @@ def main() -> None:
         st.subheader("Scrape settings")
         target_reviews = st.slider("Reviews to collect", min_value=10, max_value=MAX_REVIEWS_CAP, value=100, step=10)
         sort_label = st.selectbox("Review sort", options=list(SORT_OPTIONS.keys()), index=0)
-        headless = st.toggle("Run browser headless", value=True)
         accept_sharkclean = st.toggle("Allow SharkClean URLs that redirect to SharkNinja", value=True)
 
         st.divider()
@@ -1845,7 +1873,7 @@ def main() -> None:
 
         with st.expander("Install note", expanded=False):
             st.code(
-                "pip install -r requirements.txt\npython -m playwright install chromium",
+                "pip install -r requirements.txt",
                 language="bash",
             )
 
@@ -1898,7 +1926,6 @@ def main() -> None:
                     product_url=normalized_url,
                     target_reviews=target_reviews,
                     sort_key=SORT_OPTIONS[sort_label],
-                    headless=headless,
                     progress_cb=progress_cb,
                 )
                 meta["target_reviews"] = target_reviews
@@ -2176,7 +2203,7 @@ def main() -> None:
             """
             - Amazon and Apify are fully removed.
             - The scraper now targets SharkNinja product pages only.
-            - Reviews are collected locally through a browser-assisted SharkNinja scraper.
+            - Reviews are collected locally through a feed-first SharkNinja scraper with HTML fallback.
             - Each scrape is stored locally as a snapshot with CSV, JSON, and Excel artifacts.
             - The AI layer is tuned for Product Development, Quality Engineer, and Consumer Insights teams.
             - Review references like R001 show hover evidence in the AI report and chatbot.
@@ -2196,7 +2223,7 @@ def main() -> None:
         st.markdown(
             """
             - If a product page only exposes 8 or 12 reviews publicly, the app will tell you that the visible feed was smaller than your requested cap.
-            - Install Playwright's Chromium browser once on the machine that runs the app.
+            - No browser install is required in the default setup.
             - Use public product pages only and make sure you comply with the site's terms and internal data-governance rules.
             """
         )
@@ -2204,4 +2231,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
