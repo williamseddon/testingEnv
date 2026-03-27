@@ -83,21 +83,24 @@ def _extract_product_id_from_url(product_url: str) -> Optional[str]:
 
 
 def _extract_product_id_from_html(html: str) -> Optional[str]:
-    patterns = [
-        r"Item\s*No\.\s*([A-Z0-9_-]{3,})",
-        r"Model\s*:?\s*([A-Z0-9_-]{3,})",
-        r'"sku"\s*:\s*"([A-Z0-9_-]{3,})"',
+    # Prefer product-specific identifiers over generic "Model" matches because
+    # SharkNinja PDPs often contain add-ons/accessories above the main specs.
+    primary_patterns = [
+        r"Item\s*No\.?\s*([A-Z0-9_-]{3,})",
         r'"productId"\s*:\s*"([A-Z0-9_-]{3,})"',
+        r'"sku"\s*:\s*"([A-Z0-9_-]{3,})"',
+        r'"mpn"\s*:\s*"([A-Z0-9_-]{3,})"',
     ]
 
-    for pattern in patterns:
+    for pattern in primary_patterns:
         match = re.search(pattern, html, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip().upper()
 
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
-    for pattern in patterns[:2]:
+
+    for pattern in [r"Item\s*No\.?\s*([A-Z0-9_-]{3,})", r"Model\s*:?\s*([A-Z0-9_-]{3,})"]:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip().upper()
@@ -106,7 +109,10 @@ def _extract_product_id_from_html(html: str) -> Optional[str]:
 
 
 def extract_product_id(product_url: str, html: str) -> str:
-    product_id = _extract_product_id_from_html(html) or _extract_product_id_from_url(product_url)
+    # For SharkNinja PDPs, the final path segment (e.g. /AF181.html) is usually
+    # the canonical product ID and is more reliable than the first "Model:" found
+    # anywhere in the raw HTML.
+    product_id = _extract_product_id_from_url(product_url) or _extract_product_id_from_html(html)
     if not product_id:
         raise ReviewDownloaderError(
             "Could not find a product ID on the page. Try a SharkNinja product detail URL like /AF181.html."
