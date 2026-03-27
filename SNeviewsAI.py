@@ -1,55 +1,56 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
+import math
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from openai import OpenAI
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 from pydantic import BaseModel, Field
 
 
 APP_TITLE = "SharkNinja Review Intelligence Studio"
-APP_TAGLINE = "Bazaarvoice API-first SharkNinja review retrieval, diagnostics, local snapshots, and evidence-grounded AI."
+APP_TAGLINE = "Local SharkNinja review scraping, evidence-grounded AI analysis, and local snapshot storage."
 MAX_REVIEWS_CAP = 100
-LOCAL_STORE_ROOT = Path("local_store") / "sharkninja_bv"
+LOCAL_STORE_ROOT = Path("local_store") / "sharkninja"
 ALLOWED_HOSTS = ("sharkninja.com", "sharkclean.com")
-BV_DEFAULT_HOST = "api.bazaarvoice.com"
-BV_DEFAULT_API_VERSION = "5.4"
-BV_DEFAULT_HEADER_VERSION = "5.4.1"
-DEFAULT_LOCALE = "en_US"
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 SORT_OPTIONS = {
-    "Most recent": "SubmissionTime:desc",
-    "Most helpful": "TotalFeedbackCount:desc",
-    "Highest rated": "Rating:desc",
-    "Lowest rated": "Rating:asc",
+    "Most recent": "recent",
+    "Most helpful": "helpful",
+    "Highest rated": "highest",
+    "Lowest rated": "lowest",
 }
-AI_MODELS = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.4-pro"]
+
+SORT_TO_BAZAARVOICE = {
+    "recent": "SubmissionTime:desc",
+    "helpful": "TotalFeedbackCount:desc",
+    "highest": "Rating:desc",
+    "lowest": "Rating:asc",
+}
+
+AI_REPORT_MODELS = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-pro"]
+CHAT_MODELS = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.4-pro"]
 LENS_OPTIONS = ["Product Development", "Quality Engineer", "Consumer Insights"]
+
 REF_RE = re.compile(r"\bR\d{3}\b")
-MODEL_CODE_RE = re.compile(r"\b[A-Z]{1,8}[0-9]{2,}[A-Z0-9-]*\b")
-HTML_CODE_RE = re.compile(r"(?i)(?:Item\s*(?:No\.?|#)|Model|SKU)\s*[:\-]?\s*([A-Z0-9-]{3,40})")
-SCRIPT_KV_RE = re.compile(
-    r"(?i)(?:productid|product_id|masterpid|master_pid|pid|sku|itemno|item_no|itemnumber|modelnumber|model_number)"
-    r"\s*[:=]\s*[\"']([A-Za-z0-9_-]{3,40})[\"']"
-)
+MODEL_CODE_RE = re.compile(r"\b[A-Z]{1,6}\d{2,}[A-Z0-9-]*\b")
+JSONP_RE = re.compile(r"^[\w$.]+\((.*)\)\s*;?\s*$", re.DOTALL)
 
 
 class ThemeEvidence(BaseModel):
@@ -58,13 +59,30 @@ class ThemeEvidence(BaseModel):
     supporting_reviews: List[str] = Field(default_factory=list)
 
 
+class QualityRisk(BaseModel):
+    issue: str
+    severity: str
+    why_it_matters: str
+    supporting_reviews: List[str] = Field(default_factory=list)
+    suggested_owner: str
+
+
+class FeatureRequest(BaseModel):
+    request: str
+    rationale: str
+    supporting_reviews: List[str] = Field(default_factory=list)
+    suggested_owner: str
+
+
 class ProductIntelReport(BaseModel):
     executive_summary: str
     executive_takeaways: List[str] = Field(default_factory=list)
+    jobs_to_be_done: List[str] = Field(default_factory=list)
     delighters: List[ThemeEvidence] = Field(default_factory=list)
     detractors: List[ThemeEvidence] = Field(default_factory=list)
-    quality_watchouts: List[ThemeEvidence] = Field(default_factory=list)
-    consumer_insights: List[ThemeEvidence] = Field(default_factory=list)
+    top_themes: List[ThemeEvidence] = Field(default_factory=list)
+    quality_risks: List[QualityRisk] = Field(default_factory=list)
+    feature_requests: List[FeatureRequest] = Field(default_factory=list)
     actions_for_product_development: List[str] = Field(default_factory=list)
     actions_for_quality_engineering: List[str] = Field(default_factory=list)
     actions_for_consumer_insights: List[str] = Field(default_factory=list)
@@ -72,63 +90,70 @@ class ProductIntelReport(BaseModel):
 
 
 @dataclass
-class PageSignals:
-    source_url: str
-    final_url: str
-    title: str
-    item_numbers: List[str] = field(default_factory=list)
-    family_codes: List[str] = field(default_factory=list)
-    visible_rating: Optional[float] = None
-    visible_review_count: Optional[int] = None
-    raw_hints: Dict[str, Any] = field(default_factory=dict)
-    text_excerpt: str = ""
+class ProgressEvent:
+    ts: float
+    stage: str
+    detail: str
+    progress: float
+    collected: int = 0
 
 
 @dataclass
-class CandidateProbe:
-    candidate_id: str
-    reasons: List[str] = field(default_factory=list)
-    product_found: bool = False
-    product_name: str = ""
-    stats_review_count: Optional[int] = None
-    stats_average_rating: Optional[float] = None
-    review_probe_total: Optional[int] = None
-    similarity_score: float = 0.0
-    final_score: float = 0.0
-    notes: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ResolvedProduct:
-    product_id: str
-    product_name: str
-    review_count: Optional[int]
-    average_rating: Optional[float]
-    source: str
-
-
-@dataclass
-class FetchArtifact:
+class ScrapeResult:
     reviews_df: pd.DataFrame
     overview_df: pd.DataFrame
-    probes_df: pd.DataFrame
-    api_log_df: pd.DataFrame
     meta: Dict[str, Any]
+    raw_payloads: List[Dict[str, Any]]
     snapshot_dir: Path
 
 
+# ----------------------------
+# Session state / styling
+# ----------------------------
 def init_state() -> None:
     defaults: Dict[str, Any] = {
-        "artifact": None,
+        "reviews_df": None,
+        "overview_df": None,
         "report": None,
+        "product_meta": None,
+        "raw_payloads": None,
         "chat_messages": [],
+        "last_product_url": "",
+        "snapshot_dir": "",
         "nav": "Studio",
-        "last_url": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def sanitize_value_for_display(value: Any) -> Any:
+    if isinstance(value, (dict, list, tuple, set)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return value
+
+
+def prepare_dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    safe_df = df.copy()
+    for col in safe_df.columns:
+        safe_df[col] = safe_df[col].map(sanitize_value_for_display)
+        if pd.api.types.is_object_dtype(safe_df[col]):
+            non_null = safe_df[col].dropna()
+            sample_types = {type(v).__name__ for v in non_null.head(200)}
+            if len(sample_types) > 1:
+                safe_df[col] = safe_df[col].map(lambda v: "" if pd.isna(v) else str(v))
+    return safe_df
+
+
+def render_dataframe(df: pd.DataFrame, *, hide_index: bool = False) -> None:
+    try:
+        st.dataframe(prepare_dataframe_for_display(df), width="stretch", hide_index=hide_index)
+    except Exception:
+        fallback_df = df.copy().fillna("").astype(str)
+        st.dataframe(fallback_df, width="stretch", hide_index=hide_index)
 
 
 def inject_css() -> None:
@@ -136,898 +161,387 @@ def inject_css() -> None:
         """
         <style>
             :root {
-                --sn-border: rgba(15, 23, 42, 0.10);
-                --sn-card: rgba(255,255,255,0.94);
-                --sn-shadow: 0 18px 48px rgba(15, 23, 42, 0.10);
-                --sn-subtle: #475569;
+                --sn-blue: #0f4c81;
+                --sn-indigo: #4338ca;
+                --sn-teal: #0f766e;
+                --sn-slate: #0f172a;
+                --sn-surface: rgba(255,255,255,0.88);
+                --sn-border: rgba(15, 23, 42, 0.08);
+                --sn-shadow: 0 24px 80px rgba(15, 23, 42, 0.10);
             }
             .block-container {
-                max-width: 1360px;
-                padding-top: 1rem;
+                padding-top: 1.2rem;
                 padding-bottom: 2rem;
+                max-width: 1400px;
             }
             .sn-hero {
-                margin-bottom: 1rem;
-                padding: 1.2rem 1.35rem;
-                border-radius: 26px;
+                padding: 1.35rem 1.5rem;
+                border-radius: 28px;
                 border: 1px solid rgba(255,255,255,0.5);
                 background:
-                    radial-gradient(circle at top left, rgba(59,130,246,0.18), transparent 32%),
-                    radial-gradient(circle at top right, rgba(16,185,129,0.15), transparent 28%),
-                    linear-gradient(135deg, rgba(248,250,252,0.98), rgba(239,246,255,0.98));
+                    radial-gradient(circle at top left, rgba(59,130,246,0.20), transparent 34%),
+                    radial-gradient(circle at top right, rgba(16,185,129,0.18), transparent 30%),
+                    linear-gradient(135deg, rgba(248,250,252,0.96), rgba(240,249,255,0.96));
                 box-shadow: var(--sn-shadow);
+                margin-bottom: 1rem;
+            }
+            .sn-hero h2 {
+                margin: 0 0 0.3rem 0;
+                letter-spacing: -0.02em;
+            }
+            .sn-muted {
+                color: #64748b;
+                font-size: 0.96rem;
             }
             .sn-card {
-                background: var(--sn-card);
+                background: var(--sn-surface);
                 border: 1px solid var(--sn-border);
                 border-radius: 22px;
-                padding: 1rem 1rem 0.95rem;
-                box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06);
-                margin-bottom: 1rem;
+                padding: 1rem 1rem 0.95rem 1rem;
+                box-shadow: 0 16px 40px rgba(15, 23, 42, 0.05);
+                margin-bottom: 0.95rem;
+                backdrop-filter: blur(8px);
+            }
+            .sn-card h4, .sn-card h5 {
+                margin: 0 0 0.35rem 0;
             }
             .sn-chip-row {
                 display: flex;
                 gap: 0.35rem;
                 flex-wrap: wrap;
-                margin-top: 0.5rem;
+                margin-top: 0.6rem;
             }
             .sn-chip {
                 display: inline-flex;
                 align-items: center;
-                padding: 0.16rem 0.56rem;
+                gap: 0.25rem;
+                padding: 0.18rem 0.58rem;
                 border-radius: 999px;
-                border: 1px solid rgba(15,23,42,0.08);
-                background: rgba(255,255,255,0.92);
-                font-size: 0.82rem;
-            }
-            .sn-overlay {
-                position: sticky;
-                top: 0.75rem;
-                z-index: 10;
-                border-radius: 22px;
-                padding: 0.9rem 1rem 0.5rem;
-                border: 1px solid rgba(29,78,216,0.18);
-                background: linear-gradient(135deg, rgba(239,246,255,0.96), rgba(255,255,255,0.96));
-                box-shadow: 0 18px 42px rgba(15,23,42,0.10);
-                margin-bottom: 1rem;
+                background: rgba(15,23,42,0.05);
+                border: 1px solid rgba(15,23,42,0.09);
+                font-size: 0.81rem;
             }
             .sn-ref {
                 position: relative;
                 display: inline-flex;
                 align-items: center;
                 gap: 0.25rem;
+                padding: 0.08rem 0.46rem;
                 margin: 0 0.12rem;
-                padding: 0.10rem 0.46rem;
                 border-radius: 999px;
-                border: 1px solid rgba(29,78,216,0.18);
-                background: rgba(219,234,254,0.70);
-                color: #1d4ed8;
+                border: 1px solid rgba(15,23,42,0.10);
+                background: rgba(255,255,255,0.72);
+                color: var(--sn-indigo);
                 font-weight: 600;
                 cursor: help;
                 text-decoration: none;
+            }
+            .sn-ref:hover {
+                background: rgba(224,231,255,0.88);
+                border-color: rgba(67,56,202,0.22);
             }
             .sn-ref .sn-tooltip {
                 display: none;
                 position: absolute;
                 left: 0;
-                top: calc(100% + 8px);
-                z-index: 9999;
-                width: 360px;
-                max-width: 80vw;
-                padding: 0.72rem 0.80rem;
+                top: calc(100% + 10px);
+                min-width: 320px;
+                max-width: 420px;
+                padding: 0.72rem 0.78rem;
                 border-radius: 16px;
-                border: 1px solid rgba(15,23,42,0.10);
-                background: rgba(255,255,255,0.98);
-                color: #0f172a;
-                box-shadow: 0 18px 40px rgba(15,23,42,0.18);
-                white-space: normal;
+                background: rgba(15,23,42,0.96);
+                color: #f8fafc;
                 font-weight: 400;
+                line-height: 1.45;
+                z-index: 9999;
+                box-shadow: 0 18px 48px rgba(15,23,42,0.35);
             }
-            .sn-ref:hover .sn-tooltip { display: block; }
+            .sn-ref:hover .sn-tooltip {
+                display: block;
+            }
+            .sn-tooltip-title {
+                font-weight: 700;
+                margin-bottom: 0.28rem;
+                color: white;
+            }
+            .sn-tooltip-meta {
+                color: rgba(226,232,240,0.88);
+                font-size: 0.81rem;
+                margin-bottom: 0.38rem;
+            }
+            .sn-list li {
+                margin-bottom: 0.36rem;
+            }
+            .sn-overlay {
+                position: fixed;
+                right: 22px;
+                bottom: 22px;
+                width: min(440px, calc(100vw - 38px));
+                background: rgba(15,23,42,0.96);
+                color: #f8fafc;
+                border: 1px solid rgba(148,163,184,0.20);
+                border-radius: 22px;
+                box-shadow: 0 30px 80px rgba(15,23,42,0.42);
+                padding: 1rem 1rem 0.85rem 1rem;
+                z-index: 9998;
+                backdrop-filter: blur(14px);
+            }
+            .sn-overlay h4 {
+                margin: 0 0 0.25rem 0;
+                font-size: 1rem;
+                color: #fff;
+            }
+            .sn-overlay-meta {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 0.6rem;
+                margin: 0.7rem 0 0.65rem 0;
+            }
+            .sn-overlay-metric {
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+                padding: 0.55rem 0.6rem;
+            }
+            .sn-overlay-metric-label {
+                color: rgba(226,232,240,0.75);
+                font-size: 0.72rem;
+                margin-bottom: 0.1rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+            }
+            .sn-overlay-metric-value {
+                font-size: 1rem;
+                font-weight: 700;
+                color: white;
+            }
+            .sn-progress-track {
+                width: 100%;
+                height: 10px;
+                border-radius: 999px;
+                background: rgba(255,255,255,0.10);
+                overflow: hidden;
+                margin: 0.5rem 0 0.75rem 0;
+            }
+            .sn-progress-fill {
+                height: 100%;
+                border-radius: 999px;
+                background: linear-gradient(90deg, #38bdf8, #34d399);
+            }
+            .sn-activity {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 16px;
+                padding: 0.55rem 0.65rem;
+                max-height: 210px;
+                overflow-y: auto;
+            }
+            .sn-activity-item {
+                padding: 0.42rem 0;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+            }
+            .sn-activity-item:last-child {
+                border-bottom: none;
+            }
+            .sn-kpi-grid {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 0.8rem;
+            }
+            .sn-kpi {
+                background: rgba(255,255,255,0.76);
+                border: 1px solid var(--sn-border);
+                border-radius: 20px;
+                padding: 0.9rem 1rem;
+                box-shadow: 0 16px 40px rgba(15, 23, 42, 0.04);
+            }
+            .sn-kpi-label {
+                color: #64748b;
+                font-size: 0.78rem;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                margin-bottom: 0.25rem;
+            }
+            .sn-kpi-value {
+                font-size: 1.45rem;
+                font-weight: 700;
+                color: #0f172a;
+            }
+            @media (max-width: 900px) {
+                .sn-kpi-grid {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                }
+                .sn-overlay-meta {
+                    grid-template-columns: 1fr 1fr;
+                }
+            }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def get_secret(*keys: str, default: str = "") -> str:
+# ----------------------------
+# Generic helpers
+# ----------------------------
+def get_secret(name: str) -> str:
     try:
-        cur: Any = st.secrets
-        for key in keys:
-            cur = cur[key]
-        return str(cur).strip()
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+        if "openai" in st.secrets and name in st.secrets["openai"]:
+            return str(st.secrets["openai"][name]).strip()
     except Exception:
-        return default
-
-
-def get_bv_config() -> Dict[str, str]:
-    host = get_secret("bazaarvoice", "api_host", default="") or get_secret("BAZAARVOICE_API_HOST", default="") or BV_DEFAULT_HOST
-    env = (get_secret("bazaarvoice", "environment", default="") or "").strip().lower()
-    if env == "stg":
-        host = "stg.api.bazaarvoice.com"
-    elif env == "prod":
-        host = BV_DEFAULT_HOST
-    return {
-        "passkey": get_secret("bazaarvoice", "passkey", default="") or get_secret("BAZAARVOICE_PASSKEY", default=""),
-        "api_version": get_secret("bazaarvoice", "api_version", default="") or BV_DEFAULT_API_VERSION,
-        "api_host": host,
-        "locale": get_secret("bazaarvoice", "locale", default="") or DEFAULT_LOCALE,
-        "bv_header_version": get_secret("bazaarvoice", "bv_header_version", default="") or BV_DEFAULT_HEADER_VERSION,
-    }
-
-
-def get_openai_api_key() -> str:
-    return get_secret("openai", "OPENAI_API_KEY", default="") or get_secret("OPENAI_API_KEY", default="")
+        return ""
+    return ""
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def compact_text(value: Any, limit: int = 220) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+def normalize_url(url: str) -> str:
+    value = (url or "").strip()
+    if not value:
+        return ""
+    if not value.lower().startswith(("http://", "https://")):
+        value = "https://" + value
+    return value
+
+
+def host_candidates(host: str) -> List[str]:
+    host = host.lower().split(":")[0]
+    parts = host.split(".")
+    return [".".join(parts[i:]) for i in range(len(parts)) if ".".join(parts[i:])]
+
+
+def is_sharkninja_url(url: str) -> bool:
+    try:
+        host = urlparse(normalize_url(url)).netloc.lower()
+    except Exception:
+        return False
+    return any(candidate.endswith(ALLOWED_HOSTS) for candidate in host_candidates(host))
+
+
+def pick(item: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in item and item.get(key) not in (None, "", [], {}):
+            return item.get(key)
+    return None
+
+
+def slugify(value: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", value or "").strip("-").lower()
+    return value[:80] or "snapshot"
+
+
+def safe_sheet_name(name: str) -> str:
+    return re.sub(r"[:\\/?*\[\]]", "_", name)[:31]
 
 
 def safe_float(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
-    if isinstance(value, (int, float)):
+    try:
         return float(value)
-    match = re.search(r"-?\d+(?:\.\d+)?", str(value))
-    return float(match.group()) if match else None
-
-
-def safe_int(value: Any) -> Optional[int]:
-    num = safe_float(value)
-    return int(round(num)) if num is not None else None
-
-
-def normalize_url(raw: str) -> str:
-    raw = (raw or "").strip()
-    if not raw:
-        return ""
-    if not raw.startswith(("http://", "https://")):
-        raw = "https://" + raw
-    parsed = urlparse(raw)
-    return urlunparse(("https", parsed.netloc.lower(), parsed.path, parsed.params, parsed.query, ""))
-
-
-def is_sharkninja_url(url: str) -> bool:
-    try:
-        host = urlparse(url).netloc.lower()
-        return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_HOSTS)
     except Exception:
-        return False
+        match = re.search(r"(\d+(?:\.\d+)?)", str(value))
+        return float(match.group(1)) if match else None
 
 
-def sanitize_candidate_id(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    candidate = re.sub(r"[^A-Za-z0-9_-]", "", str(value).strip()).upper()
-    if len(candidate) < 3 or len(candidate) > 40 or not re.search(r"\d", candidate):
-        return None
-    return candidate
-
-
-def unique_keep_order(values: Iterable[str]) -> List[str]:
-    seen: set[str] = set()
-    out: List[str] = []
-    for value in values:
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
-
-
-def family_variants(code: str) -> List[str]:
-    code = sanitize_candidate_id(code) or ""
-    if not code:
-        return []
-    variants = [code]
-    if "-" in code:
-        variants.append(code.split("-")[0])
-    match = re.match(r"([A-Z]+[0-9]+)", code)
-    if match and match.group(1) != code:
-        variants.append(match.group(1))
-    match2 = re.match(r"([A-Z]+[0-9]+[A-Z]+)\d+$", code)
-    if match2 and match2.group(1) != code:
-        variants.append(match2.group(1))
-    return unique_keep_order(v for v in variants if v)
-
-
-def similarity(a: str, b: str) -> float:
-    a_norm = re.sub(r"[^a-z0-9]+", " ", (a or "").lower()).strip()
-    b_norm = re.sub(r"[^a-z0-9]+", " ", (b or "").lower()).strip()
-    if not a_norm or not b_norm:
-        return 0.0
-    return SequenceMatcher(None, a_norm, b_norm).ratio()
-
-
-def redact_passkey(url: str) -> str:
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return url
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    if "passkey" in query:
-        query["passkey"] = ["***"]
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query, doseq=True), parsed.fragment))
-
-
-def safe_sheet_name(name: str) -> str:
-    name = re.sub(r"[:\\/?*\[\]]", "_", name)
-    return name[:31] if len(name) > 31 else name
-
-
-def format_seconds(sec: Optional[float]) -> str:
-    if sec is None:
+def format_seconds(seconds: Optional[float]) -> str:
+    if seconds is None:
         return "—"
-    sec = max(0.0, float(sec))
-    if sec < 60:
-        return f"{sec:.0f}s"
-    minutes = int(sec // 60)
-    seconds = int(sec % 60)
-    return f"{minutes}m {seconds:02d}s"
-
-class BazaarvoiceClient:
-    def __init__(self, passkey: str, api_host: str, api_version: str, locale: str, bv_header_version: str) -> None:
-        self.passkey = passkey.strip()
-        self.api_host = api_host.strip() or BV_DEFAULT_HOST
-        self.api_version = api_version.strip() or BV_DEFAULT_API_VERSION
-        self.locale = locale.strip() or DEFAULT_LOCALE
-        self.bv_header_version = bv_header_version.strip() or BV_DEFAULT_HEADER_VERSION
-        self.base_url = f"https://{self.api_host}/data"
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "bv-version": self.bv_header_version,
-            }
-        )
-
-    def _request(self, endpoint: str, params: Any, timeout: int = 30) -> Dict[str, Any]:
-        payload: Any
-        if isinstance(params, list):
-            payload = [("apiversion", self.api_version), ("passkey", self.passkey), *params]
-        else:
-            payload = {"apiversion": self.api_version, "passkey": self.passkey, **params}
-        url = f"{self.base_url}/{endpoint}.json"
-        response = self.session.get(url, params=payload, timeout=timeout)
-        try:
-            data = response.json()
-        except Exception:
-            data = {"raw_text": compact_text(response.text, 1500)}
-        errors: List[str] = []
-        if isinstance(data, dict):
-            for error in data.get("Errors", []) or []:
-                code = str(error.get("Code") or "ERROR")
-                message = str(error.get("Message") or "")
-                errors.append(f"{code}: {message}".strip())
-            if data.get("HasErrors") and not errors:
-                errors.append("Bazaarvoice returned HasErrors=true")
-        return {
-            "endpoint": endpoint,
-            "request_url": redact_passkey(response.url),
-            "http_status": response.status_code,
-            "data": data,
-            "errors": errors,
-            "ok": response.ok and not errors,
-        }
-
-    def products_by_ids(self, product_ids: Sequence[str]) -> Dict[str, Any]:
-        ids = unique_keep_order(sanitize_candidate_id(pid) for pid in product_ids if pid)
-        if not ids:
-            return {"endpoint": "products", "request_url": "", "http_status": 0, "data": {"Results": []}, "errors": [], "ok": True}
-        return self._request("products", {"Filter": f"id:{','.join(ids[:100])}", "Stats": "Reviews"})
-
-    def products_search(self, query: str, limit: int = 10) -> Dict[str, Any]:
-        query = (query or "").strip()
-        if not query:
-            return {"endpoint": "products", "request_url": "", "http_status": 0, "data": {"Results": []}, "errors": [], "ok": True}
-        return self._request("products", {"Search": query, "Limit": max(1, min(limit, 100)), "Stats": "Reviews"})
-
-    def statistics(self, product_ids: Sequence[str]) -> Dict[str, Any]:
-        ids = unique_keep_order(sanitize_candidate_id(pid) for pid in product_ids if pid)
-        if not ids:
-            return {"endpoint": "statistics", "request_url": "", "http_status": 0, "data": {"Results": []}, "errors": [], "ok": True}
-        return self._request("statistics", {"Filter": f"ProductId:eq:{','.join(ids[:100])}", "Stats": "Reviews"})
-
-    def reviews_page(
-        self,
-        product_id: str,
-        limit: int,
-        offset: int,
-        sort: str,
-        exclude_family: Optional[bool] = None,
-        content_locale: Optional[str] = None,
-        with_stats: bool = False,
-    ) -> Dict[str, Any]:
-        ordered_params: List[Tuple[str, Any]] = [
-            ("Limit", max(1, min(limit, 100))),
-            ("Offset", max(0, offset)),
-            ("Sort", sort),
-            ("Include", "Products,Authors"),
-            ("Filter", f"ProductId:{product_id}"),
-        ]
-        if content_locale:
-            ordered_params.append(("Filter", f"ContentLocale:eq:{content_locale}"))
-        if exclude_family is not None:
-            ordered_params.append(("ExcludeFamily", str(bool(exclude_family)).lower()))
-        if with_stats:
-            ordered_params.append(("Stats", "Reviews"))
-        return self._request("reviews", ordered_params)
-
-
-def normalize_api_errors(response: Dict[str, Any]) -> List[str]:
-    errors = list(response.get("errors") or [])
-    data = response.get("data") or {}
-    if not errors and isinstance(data, dict) and data.get("HasErrors"):
-        errors.append("Bazaarvoice returned HasErrors=true")
-    return errors
-
-
-def build_page_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-        }
-    )
-    return session
-
-
-def fetch_page_html(url: str) -> Tuple[str, str, int]:
-    session = build_page_session()
-    response = session.get(url, timeout=30, allow_redirects=True)
-    response.raise_for_status()
-    return response.text, response.url, response.status_code
-
-
-def extract_page_signals(html_text: str, source_url: str, final_url: str) -> PageSignals:
-    soup = BeautifulSoup(html_text, "lxml")
-    title = ""
-    h1 = soup.find("h1")
-    if h1:
-        title = h1.get_text(" ", strip=True)
-    if not title and soup.title:
-        title = soup.title.get_text(" ", strip=True)
-    if not title:
-        og = soup.find("meta", attrs={"property": "og:title"})
-        if og:
-            title = (og.get("content") or "").strip()
-
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    hints: Dict[str, Any] = {}
-    raw_codes: List[str] = []
-
-    path_match = re.search(r"/([^/]+)\.html$", urlparse(final_url).path)
-    if path_match:
-        raw_codes.append(path_match.group(1))
-        hints["path_model_code"] = path_match.group(1)
-
-    for key in parse_qs(urlparse(final_url).query).keys():
-        match = re.match(r"dwvar_([A-Za-z0-9_-]+)_", key)
-        if match:
-            raw_codes.append(match.group(1))
-            hints.setdefault("query_model_codes", []).append(match.group(1))
-
-    raw_codes.extend(HTML_CODE_RE.findall(text))
-
-    for tag in soup.find_all(True):
-        for attr_name, attr_value in tag.attrs.items():
-            if not any(token in str(attr_name).lower() for token in ["pid", "product", "sku", "item", "model"]):
-                continue
-            values = attr_value if isinstance(attr_value, list) else [attr_value]
-            for value in values:
-                raw_codes.extend(MODEL_CODE_RE.findall(str(value)))
-
-    raw_codes.extend(SCRIPT_KV_RE.findall(html_text))
-    raw_codes.extend(MODEL_CODE_RE.findall(text))
-    raw_codes.extend(MODEL_CODE_RE.findall(html_text))
-
-    item_numbers = unique_keep_order(sanitize_candidate_id(code) for code in raw_codes if sanitize_candidate_id(code))
-    family_codes = unique_keep_order(
-        family for code in item_numbers for family in family_variants(code) if family != code
-    )
-
-    visible_rating = None
-    visible_review_count = None
-    for pattern in [
-        r"(\d(?:\.\d)?)\s*out\s*of\s*5\s*Customer Rating",
-        r"Overall Rating\s*(\d(?:\.\d)?)",
-        r"Rated\s*(\d(?:\.\d)?)\s*out\s*of\s*5",
-    ]:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            visible_rating = safe_float(match.group(1))
-            break
-    for pattern in [
-        r"(\d+)\s+Reviews",
-        r"(\d+)\s+out\s+of\s+\d+.*?reviewers",
-        r"Rating Snapshot.*?5 stars\s+(\d+)",
-    ]:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            visible_review_count = safe_int(match.group(1))
-            break
-
-    return PageSignals(
-        source_url=source_url,
-        final_url=final_url,
-        title=title,
-        item_numbers=item_numbers,
-        family_codes=family_codes,
-        visible_rating=visible_rating,
-        visible_review_count=visible_review_count,
-        raw_hints=hints,
-        text_excerpt=compact_text(text, 1200),
-    )
-
-
-def build_candidate_map(signals: PageSignals, manual_product_id: str) -> Dict[str, CandidateProbe]:
-    probes: Dict[str, CandidateProbe] = {}
-
-    def add(candidate_id: Optional[str], reason: str) -> None:
-        cid = sanitize_candidate_id(candidate_id)
-        if not cid:
-            return
-        if cid not in probes:
-            probes[cid] = CandidateProbe(candidate_id=cid)
-        if reason not in probes[cid].reasons:
-            probes[cid].reasons.append(reason)
-
-    manual = sanitize_candidate_id(manual_product_id)
-    if manual:
-        add(manual, "Manual override")
-    for code in signals.item_numbers:
-        add(code, "Exact model or item code from page")
-        for family in family_variants(code):
-            if family != code:
-                add(family, f"Family candidate derived from {code}")
-    return probes
-
-
-def build_search_queries(signals: PageSignals, manual_search_query: str) -> List[str]:
-    queries: List[str] = []
-    if manual_search_query.strip():
-        queries.append(manual_search_query.strip())
-    queries.extend(signals.item_numbers[:6])
-    queries.extend(signals.family_codes[:6])
-    if signals.title:
-        queries.append(signals.title)
-        short_title = re.sub(r"\b(SharkNinja|Shark|Ninja)\b", "", signals.title, flags=re.IGNORECASE).strip()
-        if short_title and short_title != signals.title:
-            queries.append(short_title)
-        if signals.item_numbers:
-            queries.append(f"{signals.title} {signals.item_numbers[0]}")
-    return unique_keep_order(q for q in queries if q)[:8]
-
-
-def extract_review_stats(obj: Dict[str, Any]) -> Tuple[Optional[int], Optional[float]]:
-    candidates = [
-        obj.get("ReviewStatistics"),
-        obj.get("NativeReviewStatistics"),
-        (obj.get("ProductStatistics") or {}).get("ReviewStatistics"),
-        (obj.get("Statistics") or {}).get("ReviewStatistics"),
-    ]
-    for block in candidates:
-        if not isinstance(block, dict):
-            continue
-        count = None
-        for key in ["TotalReviewCount", "ReviewCount", "TotalReviews", "Count"]:
-            if key in block:
-                count = safe_int(block.get(key))
-                break
-        avg = None
-        for key in ["AverageOverallRating", "AverageRating", "OverallRating", "Rating"]:
-            if key in block:
-                avg = safe_float(block.get(key))
-                break
-        if count is not None or avg is not None:
-            return count, avg
-    return None, None
-
-
-def extract_product_result_id(result: Dict[str, Any]) -> Optional[str]:
-    for key in ["Id", "ProductId", "ExternalId", "SKU", "Sku"]:
-        candidate = sanitize_candidate_id(result.get(key))
-        if candidate:
-            return candidate
-    candidate = sanitize_candidate_id((result.get("ProductStatistics") or {}).get("ProductId"))
-    return candidate
-
-
-def extract_product_name(result: Dict[str, Any]) -> str:
-    for key in ["Name", "ProductName", "Title"]:
-        value = result.get(key)
-        if value:
-            return str(value)
-    return ""
-
-
-def extract_statistics_map(stats_payload: Dict[str, Any]) -> Dict[str, Dict[str, Optional[float]]]:
-    mapping: Dict[str, Dict[str, Optional[float]]] = {}
-    for result in stats_payload.get("Results", []) or []:
-        if not isinstance(result, dict):
-            continue
-        product_stats = result.get("ProductStatistics") if isinstance(result.get("ProductStatistics"), dict) else result
-        product_id = sanitize_candidate_id((product_stats or {}).get("ProductId")) or extract_product_result_id(result)
-        if not product_id:
-            continue
-        count, avg = extract_review_stats(product_stats or result)
-        mapping[product_id] = {"review_count": count, "average_rating": avg}
-    return mapping
-
-
-def resolve_product(
-    client: BazaarvoiceClient,
-    signals: PageSignals,
-    manual_product_id: str,
-    manual_search_query: str,
-    progress: Callable[[str, str, float], None],
-) -> Tuple[Optional[ResolvedProduct], List[CandidateProbe], List[Dict[str, Any]]]:
-    api_log: List[Dict[str, Any]] = []
-    probes = build_candidate_map(signals, manual_product_id)
-    search_queries = build_search_queries(signals, manual_search_query)
-
-    progress("Resolve product", "Probing exact candidate IDs with Product Display and Statistics Display", 0.25)
-
-    if probes:
-        product_lookup = client.products_by_ids(list(probes))
-        api_log.append(product_lookup)
-        for result in (product_lookup.get("data") or {}).get("Results", []) or []:
-            if not isinstance(result, dict):
-                continue
-            pid = extract_product_result_id(result)
-            if not pid or pid not in probes:
-                continue
-            probe = probes[pid]
-            probe.product_found = True
-            probe.product_name = extract_product_name(result)
-            count, avg = extract_review_stats(result)
-            if count is not None:
-                probe.stats_review_count = count
-            if avg is not None:
-                probe.stats_average_rating = avg
-            probe.notes.append("Matched by Product Display exact ID lookup")
-        for error in normalize_api_errors(product_lookup):
-            for probe in probes.values():
-                probe.errors.append(error)
-
-        stats_lookup = client.statistics(list(probes))
-        api_log.append(stats_lookup)
-        for pid, stats in extract_statistics_map(stats_lookup.get("data") or {}).items():
-            if pid not in probes:
-                probes[pid] = CandidateProbe(candidate_id=pid, reasons=["Returned by Statistics Display"])
-            probe = probes[pid]
-            if stats.get("review_count") is not None:
-                probe.stats_review_count = safe_int(stats.get("review_count"))
-            if stats.get("average_rating") is not None:
-                probe.stats_average_rating = safe_float(stats.get("average_rating"))
-            probe.notes.append("Returned by Statistics Display")
-        for error in normalize_api_errors(stats_lookup):
-            for probe in probes.values():
-                probe.errors.append(error)
-
-    progress("Resolve product", "Running Product Display search queries for title/model fallbacks", 0.38)
-    for query in search_queries[:6]:
-        response = client.products_search(query, limit=10)
-        api_log.append(response)
-        errors = normalize_api_errors(response)
-        if any("ERROR_PARAM_INVALID_SEARCH_ATTRIBUTE" in error for error in errors):
-            continue
-        for result in (response.get("data") or {}).get("Results", []) or []:
-            if not isinstance(result, dict):
-                continue
-            pid = extract_product_result_id(result)
-            if not pid:
-                continue
-            if pid not in probes:
-                probes[pid] = CandidateProbe(candidate_id=pid)
-            probe = probes[pid]
-            probe.product_found = True
-            if not probe.product_name:
-                probe.product_name = extract_product_name(result)
-            count, avg = extract_review_stats(result)
-            if count is not None and probe.stats_review_count is None:
-                probe.stats_review_count = count
-            if avg is not None and probe.stats_average_rating is None:
-                probe.stats_average_rating = avg
-            reason = f"Product Display search: {query}"
-            if reason not in probe.reasons:
-                probe.reasons.append(reason)
-        for error in errors:
-            for probe in probes.values():
-                probe.notes.append(f"Search query '{query}' returned error: {error}")
-
-    progress("Resolve product", "Verifying top candidates against Review Display", 0.52)
-    probe_order = sorted(
-        probes.values(),
-        key=lambda probe: (
-            0 if probe.product_found else 1,
-            -(probe.stats_review_count or 0),
-            0 if any("Exact model" in reason or "Manual" in reason for reason in probe.reasons) else 1,
-            probe.candidate_id,
-        ),
-    )
-    for probe in probe_order[:8]:
-        response = client.reviews_page(
-            product_id=probe.candidate_id,
-            limit=1,
-            offset=0,
-            sort=SORT_OPTIONS["Most recent"],
-            with_stats=True,
-        )
-        api_log.append(response)
-        data = response.get("data") or {}
-        probe.review_probe_total = safe_int(data.get("TotalResults"))
-        includes_products = (data.get("Includes") or {}).get("Products") or {}
-        if not probe.product_name and isinstance(includes_products, dict):
-            product = includes_products.get(probe.candidate_id)
-            if isinstance(product, dict):
-                probe.product_name = extract_product_name(product)
-        for error in normalize_api_errors(response):
-            probe.errors.append(error)
-
-    title = signals.title
-    primary_codes = set(signals.item_numbers)
-    primary_families = set(signals.family_codes)
-    manual = sanitize_candidate_id(manual_product_id)
-    for probe in probes.values():
-        score = 0.0
-        if manual and probe.candidate_id == manual:
-            score += 1000.0
-        if probe.candidate_id in primary_codes:
-            score += 180.0
-        if probe.candidate_id in primary_families:
-            score += 120.0
-        if probe.product_found:
-            score += 140.0
-        if probe.stats_review_count is not None:
-            score += 250.0 + min(200.0, float(probe.stats_review_count))
-        if probe.review_probe_total is not None:
-            score += 350.0 + min(250.0, float(probe.review_probe_total))
-        if probe.product_name:
-            probe.similarity_score = similarity(title, probe.product_name)
-            score += probe.similarity_score * 140.0
-        if probe.stats_average_rating is not None and signals.visible_rating is not None:
-            score += max(0.0, 25.0 - abs(probe.stats_average_rating - signals.visible_rating) * 25.0)
-        if probe.errors:
-            score -= min(50.0, 5.0 * len(probe.errors))
-        probe.final_score = score
-
-    ordered = sorted(probes.values(), key=lambda probe: (-probe.final_score, probe.candidate_id))
-    best = ordered[0] if ordered else None
-    if not best:
-        return None, ordered, api_log
-
-    resolved = ResolvedProduct(
-        product_id=best.candidate_id,
-        product_name=best.product_name or signals.title or best.candidate_id,
-        review_count=best.review_probe_total if best.review_probe_total is not None else best.stats_review_count,
-        average_rating=best.stats_average_rating,
-        source=", ".join(best.reasons[:3]) or "Resolution score",
-    )
-    return resolved, ordered, api_log
-
-
-def review_dedupe_key(review: Dict[str, Any]) -> str:
-    for key in ["Id", "ReviewId", "SubmissionId"]:
-        if review.get(key):
-            return f"{key}:{review.get(key)}"
-    return json.dumps(review, sort_keys=True, default=str)
-
-
-def fetch_reviews_for_product(
-    client: BazaarvoiceClient,
-    resolved: ResolvedProduct,
-    requested_reviews: int,
-    sort: str,
-    exact_product_only: bool,
-    content_locale: str,
-    progress: Callable[[str, str, float], None],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    pages: List[Dict[str, Any]] = []
-    reviews: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    page_size = min(100, requested_reviews)
-    offset = 0
-    total_expected = resolved.review_count or requested_reviews
-    fetch_started = time.time()
-
-    while len(reviews) < requested_reviews:
-        progress_fraction = 0.60 + 0.35 * min(1.0, offset / max(requested_reviews, 1))
-        progress("Fetch reviews", f"Product {resolved.product_id} · offset {offset} · {len(reviews)}/{requested_reviews} collected", progress_fraction)
-        response = client.reviews_page(
-            product_id=resolved.product_id,
-            limit=page_size,
-            offset=offset,
-            sort=sort,
-            exclude_family=True if exact_product_only else None,
-            content_locale=content_locale or None,
-            with_stats=(offset == 0),
-        )
-        pages.append(response)
-        data = response.get("data") or {}
-        batch = data.get("Results", []) or []
-        errors = normalize_api_errors(response)
-        if errors and not batch:
-            break
-        if not batch:
-            break
-        for review in batch:
-            if not isinstance(review, dict):
-                continue
-            key = review_dedupe_key(review)
-            if key in seen:
-                continue
-            seen.add(key)
-            reviews.append(review)
-            if len(reviews) >= requested_reviews:
-                break
-        if len(batch) < page_size:
-            break
-        offset += len(batch)
-        if offset >= min(requested_reviews, total_expected or requested_reviews, 300000):
-            break
-
-    return reviews[:requested_reviews], pages, {
-        "elapsed_fetch_seconds": time.time() - fetch_started,
-        "total_results_reported": pages[0].get("data", {}).get("TotalResults") if pages else None,
-    }
-
-
-def normalize_reviews(raw_reviews: Sequence[Dict[str, Any]], resolved: ResolvedProduct, source_url: str) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for idx, review in enumerate(raw_reviews, start=1):
-        rows.append(
-            {
-                "Reference": f"R{idx:03d}",
-                "ReviewId": review.get("Id") or review.get("ReviewId") or "",
-                "SubmissionId": review.get("SubmissionId") or "",
-                "ProductId": review.get("ProductId") or resolved.product_id,
-                "ProductName": resolved.product_name,
-                "Rating": safe_float(review.get("Rating")),
-                "Title": review.get("Title") or "",
-                "ReviewText": review.get("ReviewText") or "",
-                "Author": review.get("UserNickname") or "",
-                "AuthorId": review.get("AuthorId") or "",
-                "UserLocation": review.get("UserLocation") or "",
-                "SubmissionTime": review.get("SubmissionTime") or "",
-                "LastModificationTime": review.get("LastModificationTime") or "",
-                "IsRecommended": review.get("IsRecommended"),
-                "IsSyndicated": review.get("IsSyndicated"),
-                "Helpfulness": safe_float(review.get("Helpfulness")),
-                "TotalFeedbackCount": safe_int(review.get("TotalFeedbackCount")),
-                "TotalPositiveFeedbackCount": safe_int(review.get("TotalPositiveFeedbackCount")),
-                "TotalNegativeFeedbackCount": safe_int(review.get("TotalNegativeFeedbackCount")),
-                "TotalCommentCount": safe_int(review.get("TotalCommentCount")),
-                "ContentLocale": review.get("ContentLocale") or "",
-                "ModerationStatus": review.get("ModerationStatus") or "",
-                "Pros": review.get("Pros") or "",
-                "Cons": review.get("Cons") or "",
-                "PhotoCount": len(review.get("Photos") or []),
-                "VideoCount": len(review.get("Videos") or []),
-                "EvidencePreview": compact_text(review.get("ReviewText") or review.get("Title") or "", 240),
-                "SourceProductURL": source_url,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def build_overview_df(df: pd.DataFrame, meta: Dict[str, Any]) -> pd.DataFrame:
-    rows = [
-        {"Metric": "Requested reviews", "Value": meta.get("requested_reviews")},
-        {"Metric": "Fetched reviews", "Value": len(df)},
-        {"Metric": "Resolved product ID", "Value": meta.get("resolved_product_id")},
-        {"Metric": "Resolved product name", "Value": meta.get("resolved_product_name")},
-        {"Metric": "Bazaarvoice reported total", "Value": meta.get("resolved_review_count")},
-        {"Metric": "Average rating", "Value": meta.get("resolved_average_rating")},
-        {"Metric": "Resolution source", "Value": meta.get("resolution_source")},
-        {"Metric": "Sort", "Value": meta.get("sort_label")},
-        {"Metric": "Exact product only", "Value": meta.get("exact_product_only")},
-        {"Metric": "Locale filter", "Value": meta.get("content_locale")},
-        {"Metric": "Fetched at", "Value": meta.get("fetched_at")},
-    ]
-    return pd.DataFrame(rows)
-
-
-def build_excel_bytes(reviews_df: pd.DataFrame, overview_df: pd.DataFrame, probes_df: pd.DataFrame, api_log_df: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        overview_df.to_excel(writer, sheet_name="Overview", index=False)
-        reviews_df.to_excel(writer, sheet_name=safe_sheet_name("Reviews"), index=False)
-        probes_df.to_excel(writer, sheet_name=safe_sheet_name("Candidate Probes"), index=False)
-        api_log_df.to_excel(writer, sheet_name=safe_sheet_name("API Log"), index=False)
-    buffer.seek(0)
-    return buffer.read()
-
-
-def allocate_snapshot_dir(slug_hint: str) -> Path:
-    LOCAL_STORE_ROOT.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = re.sub(r"[^a-z0-9]+", "-", slug_hint.lower()).strip("-")[:40] or "snapshot"
-    target = LOCAL_STORE_ROOT / f"{stamp}_{slug}"
-    target.mkdir(parents=True, exist_ok=True)
-    return target
-
-
-def persist_snapshot(artifact: FetchArtifact) -> None:
-    artifact.snapshot_dir.mkdir(parents=True, exist_ok=True)
-    artifact.reviews_df.to_csv(artifact.snapshot_dir / "reviews.csv", index=False)
-    artifact.overview_df.to_csv(artifact.snapshot_dir / "overview.csv", index=False)
-    artifact.probes_df.to_csv(artifact.snapshot_dir / "candidate_probes.csv", index=False)
-    artifact.api_log_df.to_csv(artifact.snapshot_dir / "api_log.csv", index=False)
-    (artifact.snapshot_dir / "meta.json").write_text(json.dumps(artifact.meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-
-
-def list_snapshots() -> List[Path]:
-    if not LOCAL_STORE_ROOT.exists():
-        return []
-    return sorted([path for path in LOCAL_STORE_ROOT.iterdir() if path.is_dir()], reverse=True)
-
-
-def load_snapshot(snapshot_dir: Path) -> Optional[FetchArtifact]:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def compact_text(value: Any, limit: int = 280) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def infer_model_code(url: str, html_text: str = "") -> str:
+    path = urlparse(url).path or ""
+    basename = Path(path).name.replace(".html", "")
+    if basename and MODEL_CODE_RE.fullmatch(basename):
+        return basename.upper()
+    search_space = " ".join([path, html_text])
+    match = MODEL_CODE_RE.search(search_space)
+    return match.group(0).upper() if match else ""
+
+
+def parse_date(value: Any) -> Any:
     try:
-        return FetchArtifact(
-            reviews_df=pd.read_csv(snapshot_dir / "reviews.csv"),
-            overview_df=pd.read_csv(snapshot_dir / "overview.csv"),
-            probes_df=pd.read_csv(snapshot_dir / "candidate_probes.csv"),
-            api_log_df=pd.read_csv(snapshot_dir / "api_log.csv"),
-            meta=json.loads((snapshot_dir / "meta.json").read_text(encoding="utf-8")),
-            snapshot_dir=snapshot_dir,
-        )
+        return pd.to_datetime(value, errors="coerce")
     except Exception:
+        return pd.NaT
+
+
+def classify_sentiment(rating: Any) -> str:
+    score = safe_float(rating)
+    if score is None:
+        return "Unknown"
+    if score >= 4:
+        return "Positive"
+    if score <= 2:
+        return "Negative"
+    return "Mixed"
+
+
+def review_dedupe_key(item: Dict[str, Any]) -> str:
+    for key in ("ReviewId", "review_id", "Id", "id", "ExternalId"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return f"id::{value}"
+    title = str(item.get("Title") or "").strip()
+    text = str(item.get("ReviewText") or "").strip()
+    author = str(item.get("Author") or "").strip()
+    date = str(item.get("ReviewDate") or "").strip()
+    rating = str(item.get("RatingValue") or "").strip()
+    raw = " | ".join([title, text, author, date, rating])
+    return "fp::" + hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def dedupe_reviews(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    output: List[Dict[str, Any]] = []
+    for item in items:
+        key = review_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(dict(item))
+    return output
+
+
+def compatible_model_dump_json(model: BaseModel) -> str:
+    if hasattr(model, "model_dump_json"):
+        return model.model_dump_json(indent=2)
+    return model.json(indent=2)
+
+
+def compatible_model_dump(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return json.loads(model.json())
+
+
+# ----------------------------
+# JSON / API parsing helpers
+# ----------------------------
+def extract_balanced_json(text: str) -> Optional[str]:
+    if not text:
         return None
-
-
-def get_openai_client() -> OpenAI:
-    api_key = get_openai_api_key()
-    if not api_key:
-        raise RuntimeError("Missing OpenAI API key in st.secrets.")
-    return OpenAI(api_key=api_key)
-
-
-def build_review_context(df: pd.DataFrame, max_reviews: int = 80, max_chars: int = 40000) -> str:
-    if df.empty:
-        return ""
-    lines: List[str] = []
-    used = 0
-    for _, row in df.head(max_reviews).iterrows():
-        line = (
-            f"{row.get('Reference')} | rating={row.get('Rating')} | title={row.get('Title')} | "
-            f"text={row.get('ReviewText')} | author={row.get('Author')} | "
-            f"recommended={row.get('IsRecommended')} | helpful={row.get('TotalFeedbackCount')}"
-        )
-        line = compact_text(line, 600)
-        if used + len(line) > max_chars:
-            break
-        lines.append(line)
-        used += len(line)
-    return "\n".join(lines)
-
-
-def response_text(response: Any) -> str:
-    if hasattr(response, "output_text"):
-        return str(response.output_text)
-    parts: List[str] = []
-    for item in getattr(response, "output", []) or []:
-        for content in getattr(item, "content", []) or []:
-            if getattr(content, "type", None) in {"output_text", "text"}:
-                parts.append(getattr(content, "text", ""))
-    return "\n".join(part for part in parts if part)
-
-
-def extract_json_object(text: str) -> Optional[str]:
-    text = (text or "").strip()
     start = text.find("{")
-    if start < 0:
+    if start == -1:
         return None
     depth = 0
     in_string = False
@@ -1040,523 +554,1682 @@ def extract_json_object(text: str) -> Optional[str]:
                 escape = True
             elif char == '"':
                 in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : idx + 1]
+        else:
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
     return None
 
 
-def generate_product_report(df: pd.DataFrame, artifact: FetchArtifact, model: str) -> ProductIntelReport:
-    client = get_openai_client()
-    context = build_review_context(df)
-    if not context:
-        raise RuntimeError("No reviews available for AI analysis.")
-    schema = ProductIntelReport.model_json_schema()
-    prompt = f"""
-You are a SharkNinja product intelligence analyst.
-Use only the evidence provided. Cite supporting reviews with Reference IDs like R001.
-Return strict JSON matching this schema:\n{json.dumps(schema, ensure_ascii=False)}
+def parse_json_like(raw: str) -> Optional[Any]:
+    text = (raw or "").strip()
+    if not text:
+        return None
 
-Product metadata:
-- Product name: {artifact.meta.get('resolved_product_name')}
-- Product id: {artifact.meta.get('resolved_product_id')}
-- Reviews analyzed: {len(df)}
+    candidates = [text]
+    match = JSONP_RE.match(text)
+    if match:
+        candidates.insert(0, match.group(1).strip())
 
-Evidence corpus:
-{context}
-""".strip()
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": "Return valid JSON only."}]},
-            {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
-        ],
+    balanced = extract_balanced_json(text)
+    if balanced and balanced not in candidates:
+        candidates.append(balanced)
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def looks_like_review_dict(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    keys = {k.lower() for k in item.keys()}
+    signal_keys = {
+        "reviewtext",
+        "title",
+        "rating",
+        "submissiontime",
+        "reviewid",
+        "usernickname",
+        "author",
+        "reviewdate",
+    }
+    return bool(keys & signal_keys)
+
+
+def walk_review_payloads(data: Any, trail: str = "root") -> List[Tuple[str, Dict[str, Any]]]:
+    results: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(data, dict):
+        payload_results = data.get("Results")
+        if isinstance(payload_results, list):
+            if not payload_results or any(looks_like_review_dict(x) for x in payload_results if isinstance(x, dict)):
+                results.append((trail, data))
+        batched = data.get("BatchedResults")
+        if isinstance(batched, dict):
+            for key, value in batched.items():
+                results.extend(walk_review_payloads(value, f"{trail}.BatchedResults.{key}"))
+        for key, value in data.items():
+            if key in {"Results", "BatchedResults"}:
+                continue
+            results.extend(walk_review_payloads(value, f"{trail}.{key}"))
+    elif isinstance(data, list):
+        for idx, value in enumerate(data):
+            results.extend(walk_review_payloads(value, f"{trail}[{idx}]"))
+    return results
+
+
+def extract_ld_json_objects(html_text: str) -> List[Any]:
+    soup = BeautifulSoup(html_text or "", "lxml")
+    objects: List[Any] = []
+    for script in soup.find_all("script"):
+        script_type = (script.get("type") or "").lower()
+        if "ld+json" not in script_type:
+            continue
+        raw = script.string or script.get_text(" ", strip=False)
+        data = parse_json_like(raw)
+        if data is not None:
+            objects.append(data)
+    return objects
+
+
+def extract_product_ld_meta(ld_objects: Sequence[Any]) -> Dict[str, Any]:
+    for obj in ld_objects:
+        candidates: List[Dict[str, Any]] = []
+        if isinstance(obj, dict):
+            if obj.get("@type") == "Product":
+                candidates.append(obj)
+            graph = obj.get("@graph")
+            if isinstance(graph, list):
+                candidates.extend([x for x in graph if isinstance(x, dict) and x.get("@type") == "Product"])
+        elif isinstance(obj, list):
+            candidates.extend([x for x in obj if isinstance(x, dict) and x.get("@type") == "Product"])
+
+        for product in candidates:
+            aggregate = product.get("aggregateRating") or {}
+            return {
+                "product_title": product.get("name") or "",
+                "sku": product.get("sku") or product.get("mpn") or "",
+                "brand": (product.get("brand") or {}).get("name") if isinstance(product.get("brand"), dict) else product.get("brand") or "",
+                "site_average_rating": safe_float(aggregate.get("ratingValue")),
+                "site_review_count": int(float(aggregate.get("reviewCount"))) if aggregate.get("reviewCount") not in (None, "") else None,
+            }
+    return {}
+
+
+def standardize_bazaarvoice_item(item: Dict[str, Any], source_url: str, source_method: str, product_url: str) -> Optional[Dict[str, Any]]:
+    title = pick(item, "Title", "title") or ""
+    text = pick(item, "ReviewText", "reviewText", "Text", "text") or ""
+    if not title and not text:
+        return None
+
+    badges = pick(item, "Badges", "badges")
+    badge_labels: List[str] = []
+    if isinstance(badges, dict):
+        badge_labels = [str(k) for k in badges.keys()]
+
+    photo_count = 0
+    video_count = 0
+    for key in ("Photos", "photos", "PhotoUrls", "photoUrls"):
+        value = item.get(key)
+        if isinstance(value, list):
+            photo_count = max(photo_count, len(value))
+    for key in ("Videos", "videos", "VideoUrls", "videoUrls"):
+        value = item.get(key)
+        if isinstance(value, list):
+            video_count = max(video_count, len(value))
+
+    recommended = pick(item, "IsRecommended", "isRecommended")
+    if isinstance(recommended, str):
+        recommended = recommended.strip().lower() in {"true", "yes", "1"}
+
+    review = {
+        "ReviewId": pick(item, "Id", "ReviewId", "id") or "",
+        "Title": title,
+        "ReviewText": text,
+        "Author": pick(item, "UserNickname", "Author", "author", "Nickname") or "",
+        "AuthorLocation": pick(item, "UserLocation", "userLocation") or "",
+        "ReviewDate": pick(item, "SubmissionTime", "ReviewDate", "LastModificationTime") or "",
+        "RatingValue": safe_float(pick(item, "Rating", "rating", "OverallRating")),
+        "RatingText": pick(item, "Rating", "rating") or "",
+        "HelpfulYes": pick(item, "TotalPositiveFeedbackCount", "HelpfulVoteCount") or 0,
+        "HelpfulNo": pick(item, "TotalNegativeFeedbackCount") or 0,
+        "Recommended": recommended,
+        "Variant": pick(item, "OriginalProductName", "ProductName", "productName", "Variation") or "",
+        "ProductId": pick(item, "ProductId", "productId") or "",
+        "SourceClient": pick(item, "SourceClient", "sourceClient") or "",
+        "SyndicationSource": pick(item, "SyndicationSource", "SyndicationSourceName") or "",
+        "Badges": ", ".join(badge_labels),
+        "PhotoCount": photo_count,
+        "VideoCount": video_count,
+        "SourceMethod": source_method,
+        "SourceUrl": source_url,
+        "ProductUrl": product_url,
+        "VerifiedPurchase": any("verified" in label.lower() for label in badge_labels),
+    }
+    return review
+
+
+def standardize_ld_review(item: Dict[str, Any], product_url: str) -> Optional[Dict[str, Any]]:
+    rating_value = None
+    if isinstance(item.get("reviewRating"), dict):
+        rating_value = safe_float(item["reviewRating"].get("ratingValue"))
+    if rating_value is None:
+        rating_value = safe_float(item.get("ratingValue"))
+
+    author = ""
+    if isinstance(item.get("author"), dict):
+        author = str(item["author"].get("name") or "").strip()
+    else:
+        author = str(item.get("author") or "").strip()
+
+    title = str(item.get("name") or item.get("headline") or "").strip()
+    body = str(item.get("reviewBody") or item.get("description") or "").strip()
+    if not title and not body:
+        return None
+
+    return {
+        "ReviewId": str(item.get("@id") or "").strip(),
+        "Title": title,
+        "ReviewText": body,
+        "Author": author,
+        "AuthorLocation": "",
+        "ReviewDate": str(item.get("datePublished") or "").strip(),
+        "RatingValue": rating_value,
+        "RatingText": rating_value if rating_value is not None else "",
+        "HelpfulYes": "",
+        "HelpfulNo": "",
+        "Recommended": None,
+        "Variant": "",
+        "ProductId": "",
+        "SourceClient": "schema_org",
+        "SyndicationSource": "",
+        "Badges": "",
+        "PhotoCount": 0,
+        "VideoCount": 0,
+        "SourceMethod": "ld_json",
+        "SourceUrl": product_url,
+        "ProductUrl": product_url,
+        "VerifiedPurchase": None,
+    }
+
+
+def extract_ld_reviews(ld_objects: Sequence[Any], product_url: str) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if obj.get("@type") == "Review":
+                parsed = standardize_ld_review(obj, product_url)
+                if parsed:
+                    collected.append(parsed)
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    for obj in ld_objects:
+        walk(obj)
+    return collected
+
+
+# ----------------------------
+# DOM / browser scraping helpers
+# ----------------------------
+def accept_cookie_banner(page: Any) -> None:
+    patterns = [
+        re.compile(r"accept", re.I),
+        re.compile(r"allow", re.I),
+        re.compile(r"got it", re.I),
+    ]
+    for pattern in patterns:
+        for role in ("button", "link"):
+            try:
+                locator = page.get_by_role(role, name=pattern)
+                if locator.count() > 0:
+                    locator.first.click(timeout=2000)
+                    page.wait_for_timeout(600)
+                    return
+            except Exception:
+                continue
+
+
+def open_review_panel(page: Any) -> None:
+    patterns = [
+        re.compile(r"read\s+\d*\s*reviews", re.I),
+        re.compile(r"customer reviews", re.I),
+        re.compile(r"reviews", re.I),
+        re.compile(r"rating snapshot", re.I),
+    ]
+
+    for _ in range(2):
+        try:
+            page.mouse.wheel(0, 2400)
+            page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+    for pattern in patterns:
+        for role in ("link", "button"):
+            try:
+                locator = page.get_by_role(role, name=pattern)
+                if locator.count() > 0:
+                    locator.first.click(timeout=2500)
+                    page.wait_for_timeout(1200)
+                    return
+            except Exception:
+                continue
+    try:
+        locator = page.get_by_text(re.compile(r"reviews", re.I))
+        if locator.count() > 0:
+            locator.first.click(timeout=2000)
+            page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+
+def get_first_text(node: Any, selectors: Sequence[str]) -> str:
+    for selector in selectors:
+        try:
+            found = node.select_one(selector)
+        except Exception:
+            found = None
+        if found:
+            text = found.get_text(" ", strip=True)
+            if text:
+                return text
+    return ""
+
+
+def get_attr_match(node: Any, attrs: Iterable[str]) -> str:
+    for candidate in node.find_all(True):
+        for attr in attrs:
+            value = candidate.get(attr)
+            if value and isinstance(value, str):
+                match = re.search(r"(\d+(?:\.\d+)?)\s*out of\s*5", value, flags=re.I)
+                if match:
+                    return match.group(1)
+    return ""
+
+
+def parse_reviews_from_dom_html(html_text: str, product_url: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html_text or "", "lxml")
+    selectors = [
+        "[class*='bv-content-review']",
+        "[data-bv-v='review']",
+        "[itemprop='review']",
+        "article[class*='review']",
+        "li[class*='review']",
+        "div[class*='review']",
+    ]
+    candidates = []
+    seen_signatures = set()
+    for selector in selectors:
+        try:
+            found = soup.select(selector)
+        except Exception:
+            found = []
+        for node in found:
+            signature = hashlib.sha1(str(node).encode("utf-8", errors="ignore")).hexdigest()
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            candidates.append(node)
+
+    parsed_rows: List[Dict[str, Any]] = []
+    for node in candidates:
+        title = get_first_text(
+            node,
+            [
+                ".bv-content-title",
+                ".bv-content-review-title",
+                "[class*='review-title']",
+                "[itemprop='name']",
+                "[data-bv-v='review-title']",
+            ],
+        )
+        body = get_first_text(
+            node,
+            [
+                ".bv-content-review-body-text",
+                ".bv-content-review-body",
+                "[class*='review-body']",
+                "[class*='review-text']",
+                "[itemprop='reviewBody']",
+                "[data-bv-v='review-text']",
+            ],
+        )
+        author = get_first_text(
+            node,
+            [
+                ".bv-content-author-name",
+                "[class*='author']",
+                "[itemprop='author']",
+                "[data-bv-v='author']",
+            ],
+        )
+        date = get_first_text(
+            node,
+            [
+                ".bv-content-datetime-stamp",
+                "time",
+                "[itemprop='datePublished']",
+                "[data-bv-v='submission-time']",
+                "[class*='date']",
+            ],
+        )
+        rating_text = get_first_text(
+            node,
+            [
+                ".bv-content-rating-rating",
+                "[itemprop='ratingValue']",
+                "[data-bv-v='rating']",
+                "[class*='rating']",
+            ],
+        ) or get_attr_match(node, ["aria-label", "title"])
+
+        full_text = node.get_text(" ", strip=True)
+        if not body and len(full_text) < 40:
+            continue
+        if not title and not body:
+            continue
+
+        parsed_rows.append(
+            {
+                "ReviewId": "",
+                "Title": title,
+                "ReviewText": body or compact_text(full_text, limit=600),
+                "Author": author,
+                "AuthorLocation": "",
+                "ReviewDate": date,
+                "RatingValue": safe_float(rating_text),
+                "RatingText": rating_text,
+                "HelpfulYes": "",
+                "HelpfulNo": "",
+                "Recommended": None,
+                "Variant": "",
+                "ProductId": "",
+                "SourceClient": "dom",
+                "SyndicationSource": "",
+                "Badges": "",
+                "PhotoCount": 0,
+                "VideoCount": 0,
+                "SourceMethod": "dom",
+                "SourceUrl": product_url,
+                "ProductUrl": product_url,
+                "VerifiedPurchase": None,
+            }
+        )
+    return parsed_rows
+
+
+def append_bvstate(url: str, page_num: int) -> str:
+    parsed = urlparse(url)
+    pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() != "bvstate"]
+    pairs.append(("bvstate", f"pg:{page_num}/ct:r"))
+    return urlunparse(parsed._replace(query=urlencode(pairs, doseq=True)))
+
+
+def replace_query_params(url: str, updates: Dict[str, Optional[str]]) -> str:
+    parsed = urlparse(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    filtered: List[Tuple[str, str]] = []
+    update_keys = {k.lower() for k in updates.keys()}
+    for key, value in pairs:
+        if key.lower() in update_keys:
+            continue
+        if key.lower() == "callback":
+            continue
+        filtered.append((key, value))
+    for key, value in updates.items():
+        if value is None:
+            continue
+        filtered.append((key, value))
+    return urlunparse(parsed._replace(query=urlencode(filtered, doseq=True)))
+
+
+def choose_best_api_url(request_urls: Sequence[str]) -> Optional[str]:
+    ranked = []
+    for url in request_urls:
+        lowered = url.lower()
+        score = 0
+        if "reviews.json" in lowered:
+            score += 100
+        if "bazaarvoice" in lowered:
+            score += 50
+        if "filter=productid" in lowered:
+            score += 25
+        if "sort=" in lowered:
+            score += 10
+        if "statistics" in lowered:
+            score -= 40
+        if score > 0:
+            ranked.append((score, url))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    return ranked[0][1]
+
+
+def fetch_reviews_from_bazaarvoice_api(
+    api_url: str,
+    product_url: str,
+    target_reviews: int,
+    sort_key: str,
+    progress_cb: Callable[[str, str, float, int], None],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+        }
     )
-    text = response_text(response)
-    blob = extract_json_object(text)
-    if not blob:
-        raise RuntimeError("The model did not return valid JSON for the AI report.")
-    return ProductIntelReport.model_validate(json.loads(blob))
 
+    limit = min(100, target_reviews)
+    preferred_sort = SORT_TO_BAZAARVOICE.get(sort_key)
+    urls_to_try = [replace_query_params(api_url, {"Limit": str(limit), "Offset": "0"})]
+    if preferred_sort:
+        urls_to_try.insert(0, replace_query_params(api_url, {"Limit": str(limit), "Offset": "0", "Sort": preferred_sort}))
 
-def ask_chatbot(df: pd.DataFrame, artifact: FetchArtifact, messages: List[Dict[str, str]], model: str, lenses: List[str]) -> str:
-    client = get_openai_client()
-    context = build_review_context(df, max_reviews=60, max_chars=30000)
-    if not context:
-        raise RuntimeError("No reviews available for chat.")
-    conversation = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-    lens_text = ", ".join(lenses) if lenses else "Product Development"
-    prompt = f"""
-You are a SharkNinja product intelligence chatbot.
-Primary lenses: {lens_text}.
-Answer only from the evidence below. If you are unsure, say so.
-Whenever you make a concrete claim, cite the supporting review references like R001.
-Keep answers crisp and useful.
+    raw_payloads: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+    total_results: Optional[int] = None
+    used_url = None
 
-Product: {artifact.meta.get('resolved_product_name')} ({artifact.meta.get('resolved_product_id')})
+    for initial_url in urls_to_try:
+        try:
+            response = session.get(initial_url, timeout=30)
+            parsed = parse_json_like(response.text)
+            if parsed is None:
+                continue
+            payload_candidates = walk_review_payloads(parsed)
+            if not payload_candidates:
+                continue
+            raw_payloads.append({"source": "api", "url": initial_url, "status_code": response.status_code, "data": parsed})
+            trail, payload = payload_candidates[0]
+            total_results = int(float(payload.get("TotalResults"))) if payload.get("TotalResults") not in (None, "") else None
+            for item in payload.get("Results", []):
+                normalized = standardize_bazaarvoice_item(item, initial_url, "bazaarvoice_api", product_url)
+                if normalized:
+                    rows.append(normalized)
+            used_url = initial_url
+            break
+        except Exception:
+            continue
 
-Evidence corpus:
-{context}
+    if not rows:
+        return [], raw_payloads, {"api_url": None, "total_results": None, "pages_fetched": 0}
 
-Conversation so far:
-{conversation}
-""".strip()
-    response = client.responses.create(
-        model=model,
-        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+    pages_fetched = 1
+    progress_cb(
+        "Fast review feed",
+        f"Fetched page 1 from the SharkNinja review feed. {len(rows)} review(s) collected.",
+        0.58,
+        len(dedupe_reviews(rows)),
     )
-    return response_text(response).strip()
+
+    if total_results is None:
+        total_results = len(rows)
+
+    while len(dedupe_reviews(rows)) < min(target_reviews, total_results):
+        offset = pages_fetched * limit
+        next_url = replace_query_params(used_url or api_url, {"Limit": str(limit), "Offset": str(offset)})
+        try:
+            response = session.get(next_url, timeout=30)
+            parsed = parse_json_like(response.text)
+            if parsed is None:
+                break
+            raw_payloads.append({"source": "api", "url": next_url, "status_code": response.status_code, "data": parsed})
+            payload_candidates = walk_review_payloads(parsed)
+            if not payload_candidates:
+                break
+            _, payload = payload_candidates[0]
+            batch_rows = []
+            for item in payload.get("Results", []):
+                normalized = standardize_bazaarvoice_item(item, next_url, "bazaarvoice_api", product_url)
+                if normalized:
+                    batch_rows.append(normalized)
+            if not batch_rows:
+                break
+            rows.extend(batch_rows)
+            pages_fetched += 1
+            page_total = max(1, math.ceil(min(target_reviews, total_results) / limit))
+            progress = min(0.83, 0.58 + 0.22 * (pages_fetched / page_total))
+            progress_cb(
+                "Fast review feed",
+                f"Fetched page {pages_fetched} from the SharkNinja review feed. {len(dedupe_reviews(rows))} review(s) collected.",
+                progress,
+                len(dedupe_reviews(rows)),
+            )
+        except Exception:
+            break
+
+    return dedupe_reviews(rows)[:target_reviews], raw_payloads, {
+        "api_url": used_url or api_url,
+        "total_results": total_results,
+        "pages_fetched": pages_fetched,
+    }
 
 
-def build_evidence_map(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
-    evidence: Dict[str, Dict[str, str]] = {}
+def scrape_sharkninja_reviews(
+    product_url: str,
+    target_reviews: int,
+    sort_key: str,
+    headless: bool,
+    progress_cb: Callable[[str, str, float, int], None],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    normalized_url = normalize_url(product_url)
+    captured_request_urls: List[str] = []
+    raw_payloads: List[Dict[str, Any]] = []
+    network_rows: List[Dict[str, Any]] = []
+    meta: Dict[str, Any] = {
+        "product_url": normalized_url,
+        "source_method": "unknown",
+        "site_review_count": None,
+        "site_average_rating": None,
+    }
+
+    progress_cb("Browser setup", "Launching local browser engine for SharkNinja...", 0.08, 0)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(viewport={"width": 1440, "height": 1600})
+        page = context.new_page()
+
+        def on_request(request: Any) -> None:
+            lowered = request.url.lower()
+            if "bazaarvoice" in lowered or "reviews.json" in lowered:
+                captured_request_urls.append(request.url)
+
+        def on_response(response: Any) -> None:
+            lowered = response.url.lower()
+            if not ("bazaarvoice" in lowered or "reviews.json" in lowered or "review" in lowered):
+                return
+            try:
+                body_text = response.text()
+            except Exception:
+                return
+            data = parse_json_like(body_text)
+            if data is None:
+                return
+            payloads = walk_review_payloads(data)
+            if not payloads:
+                return
+            raw_payloads.append({"source": "network", "url": response.url, "data": data})
+            for _, payload in payloads:
+                if payload.get("TotalResults") not in (None, ""):
+                    try:
+                        meta["site_review_count"] = max(int(float(payload.get("TotalResults"))), meta.get("site_review_count") or 0)
+                    except Exception:
+                        pass
+                for item in payload.get("Results", []):
+                    normalized = standardize_bazaarvoice_item(item, response.url, "network_capture", normalized_url)
+                    if normalized:
+                        network_rows.append(normalized)
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        try:
+            progress_cb("Open product page", "Opening the SharkNinja product page...", 0.16, 0)
+            page.goto(normalized_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1800)
+            accept_cookie_banner(page)
+            progress_cb("Inspect page", "Inspecting the page and opening the review area...", 0.26, len(dedupe_reviews(network_rows)))
+            open_review_panel(page)
+            page.wait_for_timeout(1800)
+            for _ in range(2):
+                page.mouse.wheel(0, 2000)
+                page.wait_for_timeout(700)
+        except PlaywrightTimeoutError as exc:
+            browser.close()
+            raise RuntimeError(f"Timed out loading the SharkNinja page: {exc}") from exc
+        except PlaywrightError as exc:
+            browser.close()
+            raise RuntimeError(f"Browser automation failed while loading the SharkNinja page: {exc}") from exc
+
+        html_text = page.content()
+        ld_objects = extract_ld_json_objects(html_text)
+        ld_meta = extract_product_ld_meta(ld_objects)
+        ld_rows = extract_ld_reviews(ld_objects, normalized_url)
+        dom_rows = parse_reviews_from_dom_html(html_text, normalized_url)
+
+        meta["product_title"] = ld_meta.get("product_title") or page.title().split("|")[0].strip() or "SharkNinja product"
+        meta["model_code"] = ld_meta.get("sku") or infer_model_code(normalized_url, html_text)
+        meta["brand"] = ld_meta.get("brand") or "SharkNinja"
+        meta["site_average_rating"] = ld_meta.get("site_average_rating") or meta.get("site_average_rating")
+        if ld_meta.get("site_review_count"):
+            meta["site_review_count"] = ld_meta.get("site_review_count")
+
+        progress_cb(
+            "Initial capture",
+            f"Initial page capture done. Found {len(dedupe_reviews(network_rows + ld_rows + dom_rows))} candidate review(s).",
+            0.40,
+            len(dedupe_reviews(network_rows + ld_rows + dom_rows)),
+        )
+
+        api_rows: List[Dict[str, Any]] = []
+        api_meta: Dict[str, Any] = {}
+        api_url = choose_best_api_url(captured_request_urls)
+        if api_url:
+            progress_cb("Fast review feed", "Bazaarvoice review feed detected. Switching to the faster feed path...", 0.48, len(dedupe_reviews(network_rows + ld_rows + dom_rows)))
+            api_rows, api_raw, api_meta = fetch_reviews_from_bazaarvoice_api(
+                api_url=api_url,
+                product_url=normalized_url,
+                target_reviews=target_reviews,
+                sort_key=sort_key,
+                progress_cb=progress_cb,
+            )
+            raw_payloads.extend(api_raw)
+            if api_meta.get("total_results"):
+                meta["site_review_count"] = api_meta.get("total_results")
+
+        merged = dedupe_reviews(api_rows + network_rows + ld_rows + dom_rows)
+
+        if len(merged) < target_reviews:
+            progress_cb(
+                "Fallback pagination",
+                "Fast feed was not enough. Walking SharkNinja review pages directly for more reviews...",
+                0.68,
+                len(merged),
+            )
+            fallback_rows: List[Dict[str, Any]] = []
+            max_pages = max(2, math.ceil(target_reviews / 8) + 2)
+            for page_num in range(1, max_pages + 1):
+                page_url = append_bvstate(normalized_url, page_num)
+                try:
+                    page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(1200)
+                    html_page = page.content()
+                    batch = parse_reviews_from_dom_html(html_page, page_url)
+                    batch += extract_ld_reviews(extract_ld_json_objects(html_page), page_url)
+                    batch = dedupe_reviews(batch)
+                    if not batch:
+                        if page_num > 1:
+                            break
+                        continue
+                    before = len(dedupe_reviews(fallback_rows))
+                    fallback_rows.extend(batch)
+                    after = len(dedupe_reviews(fallback_rows))
+                    progress = min(0.86, 0.68 + 0.18 * (page_num / max_pages))
+                    progress_cb(
+                        "Fallback pagination",
+                        f"Processed SharkNinja review page {page_num}. Collected {after} direct-page review(s).",
+                        progress,
+                        len(dedupe_reviews(merged + fallback_rows)),
+                    )
+                    if after == before and page_num > 1:
+                        break
+                    merged = dedupe_reviews(api_rows + network_rows + ld_rows + dom_rows + fallback_rows)
+                    if len(merged) >= target_reviews:
+                        break
+                except Exception:
+                    if page_num == 1:
+                        continue
+                    break
+
+        browser.close()
+
+    merged = dedupe_reviews(merged)[:target_reviews]
+    if not merged:
+        raise RuntimeError(
+            "No reviews could be extracted from this SharkNinja page. Try a product page that visibly shows reviews, or run again with the page fully public and accessible."
+        )
+
+    if api_rows:
+        meta["source_method"] = "bazaarvoice_api + page fallback"
+    elif network_rows:
+        meta["source_method"] = "network capture + dom"
+    else:
+        meta["source_method"] = "dom / ld_json fallback"
+
+    meta["captured_api_url"] = api_url
+    meta["captured_request_count"] = len(captured_request_urls)
+    return merged, raw_payloads, meta
+
+
+# ----------------------------
+# Snapshot / dataframe / exports
+# ----------------------------
+def reviews_to_dataframe(rows: Sequence[Dict[str, Any]], meta: Dict[str, Any]) -> pd.DataFrame:
+    cleaned = dedupe_reviews(rows)
+    for idx, row in enumerate(cleaned, start=1):
+        row["ReviewRef"] = f"R{idx:03d}"
+        row["ReviewDateParsed"] = parse_date(row.get("ReviewDate"))
+        row["SentimentBucket"] = classify_sentiment(row.get("RatingValue"))
+        row["ProductTitle"] = meta.get("product_title") or ""
+        row["ModelCode"] = meta.get("model_code") or ""
+        row["Brand"] = meta.get("brand") or "SharkNinja"
+    frame = pd.DataFrame(cleaned)
+    preferred_cols = [
+        "ReviewRef",
+        "RatingValue",
+        "SentimentBucket",
+        "ReviewDate",
+        "Title",
+        "ReviewText",
+        "Author",
+        "AuthorLocation",
+        "HelpfulYes",
+        "Recommended",
+        "VerifiedPurchase",
+        "Variant",
+        "ProductId",
+        "ModelCode",
+        "Brand",
+        "SourceMethod",
+        "SourceUrl",
+        "ProductUrl",
+    ]
+    extra_cols = [col for col in frame.columns if col not in preferred_cols]
+    return frame[[col for col in preferred_cols if col in frame.columns] + extra_cols]
+
+
+def summarize_overview(df: pd.DataFrame, meta: Dict[str, Any]) -> pd.DataFrame:
+    avg_rating_sample = float(df["RatingValue"].dropna().mean()) if "RatingValue" in df.columns and not df["RatingValue"].dropna().empty else None
+    positive_share = float((df["RatingValue"].fillna(0) >= 4).mean()) if "RatingValue" in df.columns and not df.empty else None
+    negative_share = float((df["RatingValue"].fillna(0) <= 2).mean()) if "RatingValue" in df.columns and not df.empty else None
+
+    date_min = None
+    date_max = None
+    if "ReviewDateParsed" in df.columns:
+        valid_dates = df["ReviewDateParsed"].dropna()
+        if not valid_dates.empty:
+            date_min = str(valid_dates.min().date())
+            date_max = str(valid_dates.max().date())
+
+    star_distribution: Dict[str, int] = {}
+    if "RatingValue" in df.columns and not df["RatingValue"].dropna().empty:
+        counts = df["RatingValue"].dropna().round(0).astype(int).value_counts().sort_index()
+        star_distribution = {f"{int(star)} star": int(count) for star, count in counts.items()}
+
+    note = ""
+    site_total = meta.get("site_review_count")
+    if site_total and int(site_total) < len(df):
+        site_total = len(df)
+    if site_total and int(site_total) < meta.get("target_reviews", len(df)):
+        note = f"The page/feed exposed {site_total} review(s) during scraping, so the requested cap could not be fully reached."
+    elif len(df) < meta.get("target_reviews", len(df)):
+        note = "The requested cap was not reached because the page exposed fewer distinct reviews than requested or additional pages were not available."
+
+    overview = {
+        "GeneratedAt": now_str(),
+        "ProductTitle": meta.get("product_title") or "",
+        "Brand": meta.get("brand") or "SharkNinja",
+        "ModelCode": meta.get("model_code") or "",
+        "SourceUrl": meta.get("product_url") or "",
+        "SnapshotDir": meta.get("snapshot_dir") or "",
+        "ReviewsCollected": int(len(df)),
+        "RequestedReviews": int(meta.get("target_reviews") or len(df)),
+        "SiteReviewCount": int(site_total) if site_total not in (None, "") else None,
+        "AverageRatingOnSite": round(float(meta.get("site_average_rating")), 2) if meta.get("site_average_rating") not in (None, "") else None,
+        "AverageRatingInSample": round(avg_rating_sample, 2) if avg_rating_sample is not None else None,
+        "PositiveShare": round(positive_share * 100, 1) if positive_share is not None else None,
+        "NegativeShare": round(negative_share * 100, 1) if negative_share is not None else None,
+        "ReviewDateMin": date_min,
+        "ReviewDateMax": date_max,
+        "SourceMethod": meta.get("source_method") or "",
+        "CapturedApiUrl": meta.get("captured_api_url") or "",
+        "StarDistributionJSON": json.dumps(star_distribution, ensure_ascii=False),
+        "RetrievalNote": note,
+    }
+    return pd.DataFrame([overview])
+
+
+def report_to_frames(report: ProductIntelReport) -> Dict[str, pd.DataFrame]:
+    executive = pd.DataFrame(
+        [
+            {
+                "ExecutiveSummary": report.executive_summary,
+                "ConfidenceNote": report.confidence_note,
+                "ExecutiveTakeaways": " | ".join(report.executive_takeaways),
+                "JobsToBeDone": " | ".join(report.jobs_to_be_done),
+            }
+        ]
+    )
+
+    theme = lambda items: pd.DataFrame(
+        [
+            {
+                "Theme": item.theme,
+                "Summary": item.summary,
+                "SupportingReviews": ", ".join(item.supporting_reviews),
+            }
+            for item in items
+        ]
+    )
+
+    risks = pd.DataFrame(
+        [
+            {
+                "Issue": item.issue,
+                "Severity": item.severity,
+                "WhyItMatters": item.why_it_matters,
+                "SupportingReviews": ", ".join(item.supporting_reviews),
+                "SuggestedOwner": item.suggested_owner,
+            }
+            for item in report.quality_risks
+        ]
+    )
+
+    requests_df = pd.DataFrame(
+        [
+            {
+                "Request": item.request,
+                "Rationale": item.rationale,
+                "SupportingReviews": ", ".join(item.supporting_reviews),
+                "SuggestedOwner": item.suggested_owner,
+            }
+            for item in report.feature_requests
+        ]
+    )
+
+    actions = pd.DataFrame(
+        [{"Audience": "Product Development", "Action": x} for x in report.actions_for_product_development]
+        + [{"Audience": "Quality Engineer", "Action": x} for x in report.actions_for_quality_engineering]
+        + [{"Audience": "Consumer Insights", "Action": x} for x in report.actions_for_consumer_insights]
+    )
+
+    return {
+        "AI_Executive": executive,
+        "AI_Themes": theme(report.top_themes),
+        "AI_Delighters": theme(report.delighters),
+        "AI_Detractors": theme(report.detractors),
+        "AI_Quality_Risks": risks,
+        "AI_Feature_Requests": requests_df,
+        "AI_Actions": actions,
+    }
+
+
+def build_excel_bytes(reviews_df: pd.DataFrame, overview_df: pd.DataFrame, report: Optional[ProductIntelReport]) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        overview_df.to_excel(writer, sheet_name="Overview", index=False)
+        reviews_df.to_excel(writer, sheet_name="Reviews", index=False)
+        if report:
+            for sheet_name, frame in report_to_frames(report).items():
+                frame.to_excel(writer, sheet_name=safe_sheet_name(sheet_name), index=False)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def snapshot_metadata(meta: Dict[str, Any], overview_df: pd.DataFrame) -> Dict[str, Any]:
+    overview = overview_df.iloc[0].to_dict() if overview_df is not None and not overview_df.empty else {}
+    output = dict(meta)
+    output["overview"] = overview
+    return output
+
+
+def allocate_snapshot_dir(meta: Dict[str, Any]) -> Path:
+    LOCAL_STORE_ROOT.mkdir(parents=True, exist_ok=True)
+    folder_name = slugify(f"{meta.get('product_title') or 'product'}-{meta.get('model_code') or 'snapshot'}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_dir = LOCAL_STORE_ROOT / folder_name / timestamp
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    return snapshot_dir
+
+
+def persist_snapshot(
+    reviews_df: pd.DataFrame,
+    overview_df: pd.DataFrame,
+    raw_payloads: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+    report: Optional[ProductIntelReport] = None,
+    snapshot_dir: Optional[str | Path] = None,
+) -> Path:
+    if snapshot_dir:
+        snapshot_dir = Path(snapshot_dir)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        snapshot_dir = allocate_snapshot_dir(meta)
+
+    reviews_df.to_csv(snapshot_dir / "reviews.csv", index=False, encoding="utf-8-sig")
+    reviews_df.to_json(snapshot_dir / "reviews.json", orient="records", force_ascii=False, indent=2)
+    overview_df.to_json(snapshot_dir / "overview.json", orient="records", force_ascii=False, indent=2)
+    with open(snapshot_dir / "raw_payloads.json", "w", encoding="utf-8") as f:
+        json.dump(raw_payloads, f, ensure_ascii=False, indent=2)
+    with open(snapshot_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(snapshot_metadata(meta, overview_df), f, ensure_ascii=False, indent=2)
+    if report:
+        with open(snapshot_dir / "ai_report.json", "w", encoding="utf-8") as f:
+            json.dump(compatible_model_dump(report), f, ensure_ascii=False, indent=2)
+    elif (snapshot_dir / "ai_report.json").exists():
+        # Keep previous AI work unless a new report is explicitly written.
+        pass
+
+    workbook_bytes = build_excel_bytes(reviews_df, overview_df, report)
+    with open(snapshot_dir / "review_intelligence.xlsx", "wb") as f:
+        f.write(workbook_bytes)
+    return snapshot_dir
+
+
+def list_local_snapshots() -> pd.DataFrame:
+    records: List[Dict[str, Any]] = []
+    if not LOCAL_STORE_ROOT.exists():
+        return pd.DataFrame()
+    for metadata_file in sorted(LOCAL_STORE_ROOT.glob("**/metadata.json"), reverse=True):
+        try:
+            payload = json.loads(metadata_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        overview = payload.get("overview") or {}
+        records.append(
+            {
+                "SnapshotDir": str(metadata_file.parent),
+                "ProductTitle": payload.get("product_title") or overview.get("ProductTitle") or "",
+                "ModelCode": payload.get("model_code") or overview.get("ModelCode") or "",
+                "ReviewsCollected": overview.get("ReviewsCollected"),
+                "SiteReviewCount": overview.get("SiteReviewCount"),
+                "GeneratedAt": overview.get("GeneratedAt") or metadata_file.parent.name,
+                "SourceUrl": payload.get("product_url") or overview.get("SourceUrl") or "",
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def load_snapshot(snapshot_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[ProductIntelReport], Dict[str, Any], List[Dict[str, Any]]]:
+    base = Path(snapshot_dir)
+    reviews_df = pd.read_csv(base / "reviews.csv")
+    overview_payload = json.loads((base / "overview.json").read_text(encoding="utf-8"))
+    overview_df = pd.DataFrame(overview_payload)
+    metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+    raw_payloads = json.loads((base / "raw_payloads.json").read_text(encoding="utf-8"))
+
+    report = None
+    report_path = base / "ai_report.json"
+    if report_path.exists():
+        report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+        report = ProductIntelReport(**report_payload)
+    return reviews_df, overview_df, report, metadata, raw_payloads
+
+
+# ----------------------------
+# AI helpers
+# ----------------------------
+def build_review_context(df: pd.DataFrame, overview_df: pd.DataFrame, max_chars_per_review: int = 650) -> str:
+    overview = overview_df.iloc[0].to_dict()
+    header_lines = [
+        f"Product title: {overview.get('ProductTitle')}",
+        f"Brand: {overview.get('Brand')}",
+        f"Model code: {overview.get('ModelCode')}",
+        f"Source URL: {overview.get('SourceUrl')}",
+        f"Reviews analyzed: {overview.get('ReviewsCollected')}",
+        f"Site review count (if exposed): {overview.get('SiteReviewCount')}",
+        f"Average rating on site: {overview.get('AverageRatingOnSite')}",
+        f"Average rating in sample: {overview.get('AverageRatingInSample')}",
+        f"Positive share %: {overview.get('PositiveShare')}",
+        f"Negative share %: {overview.get('NegativeShare')}",
+        f"Review date window: {overview.get('ReviewDateMin')} to {overview.get('ReviewDateMax')}",
+        f"Retrieval note: {overview.get('RetrievalNote')}",
+        f"Star distribution JSON: {overview.get('StarDistributionJSON')}",
+    ]
+
+    review_lines = []
     for _, row in df.iterrows():
-        ref = str(row.get("Reference") or "").strip()
+        body = compact_text(row.get("ReviewText"), limit=max_chars_per_review)
+        review_lines.append(
+            "\n".join(
+                [
+                    f"[{row.get('ReviewRef')}] {row.get('RatingValue')} stars | date={row.get('ReviewDate')} | author={row.get('Author')}",
+                    f"Title: {row.get('Title')}",
+                    f"Review: {body}",
+                ]
+            )
+        )
+    return "\n\n".join(header_lines + ["", "Reviews:"] + review_lines)
+
+
+def reasoning_effort(model_name: str, task: str) -> str:
+    if model_name.endswith("-pro"):
+        return "high"
+    if task == "chat":
+        return "medium"
+    return "medium"
+
+
+def generate_product_intel_report(
+    openai_api_key: str,
+    model_name: str,
+    reviews_df: pd.DataFrame,
+    overview_df: pd.DataFrame,
+) -> ProductIntelReport:
+    client = OpenAI(api_key=openai_api_key)
+    context = build_review_context(reviews_df, overview_df)
+    system_prompt = (
+        "You are a senior product intelligence analyst helping Product Development, Quality Engineers, "
+        "and Consumer Insights teams understand SharkNinja direct-to-consumer product reviews. "
+        "Use only the supplied review evidence. Never invent facts, counts, review IDs, or consumer claims. "
+        "Cite evidence only using the provided ReviewRef values like R001. Distinguish true delighters from detractors. "
+        "Treat durability, reliability, breakage, defect patterns, packaging issues, cleaning difficulty, performance inconsistency, "
+        "and safety-adjacent complaints as quality risks. Keep the executive summary sharp and decision-ready. "
+        "If evidence is thin, mixed, or possibly biased by sample size, say so in confidence_note."
+    )
+    user_prompt = (
+        "Analyze this SharkNinja review dataset and produce a structured product intelligence report. "
+        "Make it useful for Product Development, Quality Engineer, and Consumer Insights stakeholders.\n\n"
+        f"{context}"
+    )
+
+    response = client.responses.parse(
+        model=model_name,
+        reasoning={"effort": reasoning_effort(model_name, "report")},
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        text_format=ProductIntelReport,
+    )
+    if not response.output_parsed:
+        raise RuntimeError("The AI report came back empty.")
+    return response.output_parsed
+
+
+def ask_product_chatbot(
+    openai_api_key: str,
+    model_name: str,
+    reviews_df: pd.DataFrame,
+    overview_df: pd.DataFrame,
+    report: Optional[ProductIntelReport],
+    chat_history: List[Dict[str, str]],
+    user_message: str,
+    stakeholder_lens: str,
+) -> str:
+    client = OpenAI(api_key=openai_api_key)
+    context = build_review_context(reviews_df, overview_df, max_chars_per_review=500)
+    report_json = compatible_model_dump_json(report) if report else "{}"
+
+    system_prompt = (
+        "You are Product Intelligence Copilot for SharkNinja review analysis. "
+        "Answer only from the supplied review dataset and the structured report. "
+        "Cite review refs in square brackets like [R014] whenever you make a factual claim. "
+        "If the review set does not support a conclusion, say that directly. Tailor the answer to the stakeholder lens."
+    )
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "system",
+            "content": f"Stakeholder lens: {stakeholder_lens}\n\nStructured report JSON:\n{report_json}\n\nReview dataset:\n{context}",
+        },
+    ]
+    messages.extend(chat_history[-10:])
+    messages.append({"role": "user", "content": user_message})
+
+    response = client.responses.create(
+        model=model_name,
+        reasoning={"effort": reasoning_effort(model_name, "chat")},
+        text={"verbosity": "medium"},
+        input=messages,
+    )
+    return (response.output_text or "").strip()
+
+
+# ----------------------------
+# Evidence rendering helpers
+# ----------------------------
+def build_evidence_map(df: pd.DataFrame) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        ref = str(row.get("ReviewRef") or "").strip()
         if not ref:
             continue
-        evidence[ref] = {
-            "title": compact_text(row.get("Title") or "", 120),
-            "text": compact_text(row.get("ReviewText") or "", 260),
-            "author": compact_text(row.get("Author") or "", 60),
-            "rating": "" if pd.isna(row.get("Rating")) else str(row.get("Rating")),
-        }
-    return evidence
-
-
-def annotate_refs(text: str, evidence_map: Dict[str, Dict[str, str]]) -> str:
-    def repl(match: re.Match[str]) -> str:
-        ref = match.group(0)
-        evidence = evidence_map.get(ref)
-        if not evidence:
-            return ref
-        tooltip = f"<div><strong>{ref}</strong></div>"
-        if evidence.get("rating"):
-            tooltip += f"<div style='color:#475569'>Rating: {html.escape(evidence['rating'])}</div>"
-        if evidence.get("author"):
-            tooltip += f"<div style='color:#475569'>Author: {html.escape(evidence['author'])}</div>"
-        if evidence.get("title"):
-            tooltip += f"<div><strong>{html.escape(evidence['title'])}</strong></div>"
-        if evidence.get("text"):
-            tooltip += f"<div style='margin-top:0.35rem'>{html.escape(evidence['text'])}</div>"
-        return f"<span class='sn-ref'>{ref}<span class='sn-tooltip'>{tooltip}</span></span>"
-
-    escaped = html.escape(text or "").replace("\n", "<br>")
-    return REF_RE.sub(repl, escaped)
-
-
-def render_rich_text(text: str, evidence_map: Dict[str, Dict[str, str]]) -> None:
-    st.markdown(annotate_refs(text, evidence_map), unsafe_allow_html=True)
-
-
-def scrape_via_bazaarvoice(
-    url: str,
-    requested_reviews: int,
-    sort_label: str,
-    manual_product_id: str,
-    manual_search_query: str,
-    exact_product_only: bool,
-    content_locale: str,
-    progress: Callable[[str, str, float, Optional[float]], None],
-) -> FetchArtifact:
-    started = time.time()
-    config = get_bv_config()
-    if not config["passkey"]:
-        raise RuntimeError("Missing Bazaarvoice passkey in st.secrets. Add [bazaarvoice].passkey first.")
-
-    normalized_url = normalize_url(url)
-    if not is_sharkninja_url(normalized_url):
-        raise RuntimeError("Paste a public SharkNinja or SharkClean product URL.")
-
-    progress("Fetch page", "Loading the SharkNinja product page and extracting model signals", 0.08, None)
-    html_text, final_url, page_status = fetch_page_html(normalized_url)
-    signals = extract_page_signals(html_text, normalized_url, final_url)
-
-    client = BazaarvoiceClient(
-        passkey=config["passkey"],
-        api_host=config["api_host"],
-        api_version=config["api_version"],
-        locale=config["locale"],
-        bv_header_version=config["bv_header_version"],
-    )
-
-    resolved, probes, api_log = resolve_product(
-        client=client,
-        signals=signals,
-        manual_product_id=manual_product_id,
-        manual_search_query=manual_search_query,
-        progress=lambda stage, detail, frac: progress(stage, detail, frac, time.time() - started),
-    )
-
-    if resolved is None:
-        meta = {
-            "status": "failed",
-            "error": "Could not resolve a Bazaarvoice product ID from the page signals.",
-            "requested_reviews": requested_reviews,
-            "sort_label": sort_label,
-            "content_locale": content_locale,
-            "exact_product_only": exact_product_only,
-            "fetched_at": now_str(),
-            "page_http_status": page_status,
-            "signals": asdict(signals),
-        }
-        artifact = FetchArtifact(
-            reviews_df=pd.DataFrame(),
-            overview_df=build_overview_df(pd.DataFrame(), meta),
-            probes_df=pd.DataFrame([asdict(probe) for probe in probes]) if probes else pd.DataFrame(),
-            api_log_df=pd.DataFrame(
-                [{
-                    "Endpoint": entry.get("endpoint"),
-                    "HTTP status": entry.get("http_status"),
-                    "Request URL": entry.get("request_url"),
-                    "Errors": " | ".join(entry.get("errors") or []),
-                } for entry in api_log]
-            ),
-            meta=meta,
-            snapshot_dir=allocate_snapshot_dir(signals.item_numbers[0] if signals.item_numbers else "unresolved"),
+        title = html.escape(str(row.get("Title") or "No title"))
+        meta = " · ".join(
+            [
+                f"{row.get('RatingValue')}★" if row.get("RatingValue") not in (None, "") else "Rating n/a",
+                str(row.get("ReviewDate") or "Date n/a"),
+                compact_text(row.get("Author") or "Anonymous", limit=36),
+            ]
         )
-        persist_snapshot(artifact)
-        return artifact
-
-    progress("Fetch reviews", f"Resolved {resolved.product_id}. Paging through Review Display", 0.60, time.time() - started)
-    raw_reviews, review_pages, fetch_meta = fetch_reviews_for_product(
-        client=client,
-        resolved=resolved,
-        requested_reviews=requested_reviews,
-        sort=SORT_OPTIONS[sort_label],
-        exact_product_only=exact_product_only,
-        content_locale=content_locale,
-        progress=lambda stage, detail, frac: progress(stage, detail, frac, time.time() - started),
-    )
-    api_log.extend(review_pages)
-
-    reviews_df = normalize_reviews(raw_reviews, resolved, final_url)
-    meta = {
-        "status": "ok" if not reviews_df.empty else "no_reviews",
-        "requested_reviews": requested_reviews,
-        "fetched_reviews": len(reviews_df),
-        "resolved_product_id": resolved.product_id,
-        "resolved_product_name": resolved.product_name,
-        "resolved_review_count": resolved.review_count,
-        "resolved_average_rating": resolved.average_rating,
-        "resolution_source": resolved.source,
-        "sort_label": sort_label,
-        "content_locale": content_locale,
-        "exact_product_only": exact_product_only,
-        "source_url": normalized_url,
-        "final_url": final_url,
-        "page_http_status": page_status,
-        "fetched_at": now_str(),
-        "elapsed_total_seconds": time.time() - started,
-        "signals": asdict(signals),
-        **fetch_meta,
-    }
-    artifact = FetchArtifact(
-        reviews_df=reviews_df,
-        overview_df=build_overview_df(reviews_df, meta),
-        probes_df=pd.DataFrame([asdict(probe) for probe in probes]),
-        api_log_df=pd.DataFrame(
-            [{
-                "Endpoint": entry.get("endpoint"),
-                "HTTP status": entry.get("http_status"),
-                "Request URL": entry.get("request_url"),
-                "Errors": " | ".join(entry.get("errors") or []),
-            } for entry in api_log]
-        ),
-        meta=meta,
-        snapshot_dir=allocate_snapshot_dir(resolved.product_id or (signals.item_numbers[0] if signals.item_numbers else "product")),
-    )
-    persist_snapshot(artifact)
-    progress("Complete", f"Done. Retrieved {len(reviews_df)} reviews.", 1.0, time.time() - started)
-    return artifact
+        body = html.escape(compact_text(row.get("ReviewText") or "", limit=360))
+        mapping[ref] = (
+            f"<div class='sn-tooltip-title'>{title}</div>"
+            f"<div class='sn-tooltip-meta'>{html.escape(meta)}</div>"
+            f"<div>{body}</div>"
+        )
+    return mapping
 
 
-def render_progress_panel(stage: str, detail: str, fraction: float, elapsed: Optional[float]) -> None:
+def ref_chip_html(ref: str, evidence_map: Dict[str, str]) -> str:
+    escaped_ref = html.escape(ref)
+    tooltip = evidence_map.get(ref)
+    if not tooltip:
+        return f"<span class='sn-chip'>{escaped_ref}</span>"
+    return f"<span class='sn-ref'>{escaped_ref}<span class='sn-tooltip'>{tooltip}</span></span>"
+
+
+def refs_to_html(refs: Sequence[str], evidence_map: Dict[str, str]) -> str:
+    return "".join(ref_chip_html(ref, evidence_map) for ref in refs)
+
+
+def annotate_text_with_evidence(text: str, evidence_map: Dict[str, str]) -> str:
+    safe = html.escape(text or "")
+    safe = safe.replace("\n", "<br>")
+    return REF_RE.sub(lambda match: ref_chip_html(match.group(0), evidence_map), safe)
+
+
+def render_rich_text(text: str, evidence_map: Dict[str, str]) -> None:
+    st.markdown(f"<div>{annotate_text_with_evidence(text, evidence_map)}</div>", unsafe_allow_html=True)
+
+
+def render_theme_cards(items: List[ThemeEvidence], evidence_map: Dict[str, str], empty_message: str) -> None:
+    if not items:
+        st.info(empty_message)
+        return
+    for item in items:
+        st.markdown(
+            f"""
+            <div class="sn-card">
+                <h5>{html.escape(item.theme)}</h5>
+                <div>{annotate_text_with_evidence(item.summary, evidence_map)}</div>
+                <div class="sn-chip-row">{refs_to_html(item.supporting_reviews, evidence_map)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_quality_cards(items: List[QualityRisk], evidence_map: Dict[str, str], empty_message: str) -> None:
+    if not items:
+        st.info(empty_message)
+        return
+    for item in items:
+        st.markdown(
+            f"""
+            <div class="sn-card">
+                <h5>{html.escape(item.issue)}</h5>
+                <div class="sn-muted">Severity: {html.escape(item.severity)} · Owner: {html.escape(item.suggested_owner)}</div>
+                <div style="margin-top:0.35rem;">{annotate_text_with_evidence(item.why_it_matters, evidence_map)}</div>
+                <div class="sn-chip-row">{refs_to_html(item.supporting_reviews, evidence_map)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_request_cards(items: List[FeatureRequest], evidence_map: Dict[str, str], empty_message: str) -> None:
+    if not items:
+        st.info(empty_message)
+        return
+    for item in items:
+        st.markdown(
+            f"""
+            <div class="sn-card">
+                <h5>{html.escape(item.request)}</h5>
+                <div class="sn-muted">Owner: {html.escape(item.suggested_owner)}</div>
+                <div style="margin-top:0.35rem;">{annotate_text_with_evidence(item.rationale, evidence_map)}</div>
+                <div class="sn-chip-row">{refs_to_html(item.supporting_reviews, evidence_map)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_action_list(title: str, actions: Sequence[str], evidence_map: Dict[str, str], empty_message: str) -> None:
+    st.markdown(f"### {title}")
+    if not actions:
+        st.info(empty_message)
+        return
+    html_items = "".join(f"<li>{annotate_text_with_evidence(action, evidence_map)}</li>" for action in actions)
+    st.markdown(f"<div class='sn-card'><ul class='sn-list'>{html_items}</ul></div>", unsafe_allow_html=True)
+
+
+# ----------------------------
+# Progress overlay
+# ----------------------------
+def render_progress_overlay(event_log: List[ProgressEvent], current_stage: str, current_detail: str) -> None:
+    if not event_log:
+        return
+    latest = event_log[-1]
+    start_ts = event_log[0].ts
+    elapsed = latest.ts - start_ts
+    progress = max(0.01, min(1.0, latest.progress))
+    eta = elapsed * (1 - progress) / progress if progress > 0.04 else None
+
+    activity_html = ""
+    for event in reversed(event_log[-6:]):
+        activity_html += (
+            f"<div class='sn-activity-item'>"
+            f"<div style='font-weight:600'>{html.escape(event.stage)}</div>"
+            f"<div style='color:rgba(226,232,240,0.82); font-size:0.88rem'>{html.escape(event.detail)}</div>"
+            f"</div>"
+        )
+
     st.markdown(
         f"""
         <div class="sn-overlay">
-            <div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;">
-                <div>
-                    <div style="font-weight:700;">{html.escape(stage)}</div>
-                    <div style="color:#475569;">{html.escape(detail)}</div>
+            <h4>Scraping SharkNinja reviews</h4>
+            <div style="color:rgba(226,232,240,0.82); font-size:0.93rem">{html.escape(current_stage)} · {html.escape(current_detail)}</div>
+            <div class="sn-overlay-meta">
+                <div class="sn-overlay-metric">
+                    <div class="sn-overlay-metric-label">Collected</div>
+                    <div class="sn-overlay-metric-value">{latest.collected}</div>
                 </div>
-                <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">Elapsed: {html.escape(format_seconds(elapsed))}</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.progress(int(max(0.0, min(1.0, fraction)) * 100))
-
-
-def render_hero() -> None:
-    st.markdown(
-        f"""
-        <div class="sn-hero">
-            <div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;flex-wrap:wrap;">
-                <div>
-                    <div style="text-transform:uppercase;letter-spacing:0.08em;font-size:0.78rem;color:#64748b;">Ground-up Bazaarvoice rebuild</div>
-                    <h2 style="margin:0.15rem 0 0.35rem 0;">{APP_TITLE}</h2>
-                    <div style="color:#475569;">{APP_TAGLINE}</div>
+                <div class="sn-overlay-metric">
+                    <div class="sn-overlay-metric-label">Elapsed</div>
+                    <div class="sn-overlay-metric-value">{html.escape(format_seconds(elapsed))}</div>
                 </div>
-                <div class="sn-chip-row">
-                    <span class="sn-chip">SharkNinja only</span>
-                    <span class="sn-chip">Products → stats → reviews</span>
-                    <span class="sn-chip">Local snapshots</span>
-                    <span class="sn-chip">Evidence-grounded AI</span>
+                <div class="sn-overlay-metric">
+                    <div class="sn-overlay-metric-label">ETA</div>
+                    <div class="sn-overlay-metric-value">{html.escape(format_seconds(eta))}</div>
                 </div>
             </div>
+            <div class="sn-progress-track"><div class="sn-progress-fill" style="width:{progress * 100:.1f}%"></div></div>
+            <div class="sn-activity">{activity_html}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_kpis(artifact: FetchArtifact) -> None:
-    meta = artifact.meta
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Fetched reviews", len(artifact.reviews_df))
-    c2.metric("Resolved product", meta.get("resolved_product_id") or "—")
-    c3.metric("BV total", meta.get("resolved_review_count") or "—")
-    c4.metric("Avg rating", meta.get("resolved_average_rating") or "—")
-
-
-def render_summary(artifact: FetchArtifact) -> None:
-    meta = artifact.meta
-    st.markdown('<div class="sn-card">', unsafe_allow_html=True)
-    st.subheader("Summary")
-    st.write(meta.get("resolved_product_name") or "Resolved product unavailable")
-    chips = [
-        f"Product ID: {meta.get('resolved_product_id') or '—'}",
-        f"Resolution: {meta.get('resolution_source') or '—'}",
-        f"Sort: {meta.get('sort_label')}",
-        f"Locale: {meta.get('content_locale') or 'All'}",
-        f"Snapshot: {artifact.snapshot_dir.name}",
-    ]
-    chip_html = "".join(f"<span class='sn-chip'>{html.escape(str(chip))}</span>" for chip in chips)
-    st.markdown(f"<div class='sn-chip-row'>{chip_html}</div>", unsafe_allow_html=True)
-    if not artifact.reviews_df.empty and "Rating" in artifact.reviews_df.columns:
-        dist = artifact.reviews_df["Rating"].value_counts(dropna=False).sort_index()
-        st.bar_chart(dist)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_report(report: ProductIntelReport, evidence_map: Dict[str, Dict[str, str]]) -> None:
-    st.markdown('<div class="sn-card">', unsafe_allow_html=True)
-    st.subheader("Executive summary")
-    render_rich_text(report.executive_summary, evidence_map)
-    if report.executive_takeaways:
-        st.markdown("**Executive takeaways**")
-        for item in report.executive_takeaways:
-            render_rich_text(f"- {item}", evidence_map)
-    for title, items in [
-        ("Delighters", report.delighters),
-        ("Detractors", report.detractors),
-        ("Quality watchouts", report.quality_watchouts),
-        ("Consumer insights", report.consumer_insights),
-    ]:
-        if not items:
-            continue
-        st.markdown(f"**{title}**")
-        for item in items:
-            refs = ", ".join(item.supporting_reviews)
-            render_rich_text(f"**{item.theme}** — {item.summary} {refs}".strip(), evidence_map)
-    for title, items in [
-        ("Actions for Product Development", report.actions_for_product_development),
-        ("Actions for Quality Engineering", report.actions_for_quality_engineering),
-        ("Actions for Consumer Insights", report.actions_for_consumer_insights),
-    ]:
-        if not items:
-            continue
-        st.markdown(f"**{title}**")
-        for item in items:
-            render_rich_text(f"- {item}", evidence_map)
-    st.caption(report.confidence_note)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
+# ----------------------------
+# Main app
+# ----------------------------
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
     inject_css()
-    render_hero()
-    config = get_bv_config()
+
+    st.markdown(
+        f"""
+        <div class="sn-hero">
+            <h2>{APP_TITLE}</h2>
+            <div class="sn-muted">{APP_TAGLINE}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     with st.sidebar:
-        st.subheader("Configuration")
-        if config["passkey"]:
-            st.success(f"Bazaarvoice passkey loaded · host={config['api_host']} · v{config['api_version']}")
-        else:
-            st.error("Missing Bazaarvoice passkey in st.secrets")
-        if get_openai_api_key():
-            st.success("OpenAI API key loaded")
-        else:
-            st.info("OpenAI API key not configured")
+        st.subheader("OpenAI")
+        openai_secret = get_secret("OPENAI_API_KEY")
+        use_secrets = st.checkbox("Use Streamlit secrets when available", value=True)
+        openai_api_key = st.text_input(
+            "OpenAI API key",
+            type="password",
+            value="" if not (use_secrets and openai_secret) else openai_secret,
+        ).strip()
+
         st.divider()
-        nav = st.radio("Workspace", ["Studio", "Snapshots"], index=0 if st.session_state.nav == "Studio" else 1)
-        st.session_state.nav = nav
-        ai_model = st.selectbox("AI model", AI_MODELS, index=0)
-        lenses = st.multiselect("AI lenses", LENS_OPTIONS, default=LENS_OPTIONS)
+        st.subheader("Scrape settings")
+        target_reviews = st.slider("Reviews to collect", min_value=10, max_value=MAX_REVIEWS_CAP, value=100, step=10)
+        sort_label = st.selectbox("Review sort", options=list(SORT_OPTIONS.keys()), index=0)
+        headless = st.toggle("Run browser headless", value=True)
+        accept_sharkclean = st.toggle("Allow SharkClean URLs that redirect to SharkNinja", value=True)
 
-    if st.session_state.nav == "Snapshots":
-        st.subheader("Local snapshots")
-        snapshots = list_snapshots()
-        if not snapshots:
-            st.info("No local snapshots yet.")
-            return
-        options = {path.name: path for path in snapshots}
-        selected = st.selectbox("Choose snapshot", list(options))
-        if st.button("Load snapshot", use_container_width=True):
-            artifact = load_snapshot(options[selected])
-            if artifact is None:
-                st.error("Could not load snapshot.")
-            else:
-                st.session_state.artifact = artifact
-                st.session_state.report = None
-                st.session_state.chat_messages = []
-                st.success(f"Loaded {selected}")
-        return
+        st.divider()
+        st.subheader("AI settings")
+        report_model = st.selectbox("AI report model", options=AI_REPORT_MODELS, index=0)
+        chat_model = st.selectbox("Chatbot model", options=CHAT_MODELS, index=0)
+        default_lens = st.selectbox("Default stakeholder lens", options=LENS_OPTIONS, index=0)
 
-    st.subheader("Fetch reviews")
-    with st.form("fetch_form"):
-        url = st.text_input(
-            "SharkNinja product URL",
-            value=st.session_state.last_url,
-            placeholder="https://www.sharkninja.com/shark-silkipro-straight-wet-to-dry-straightener-rapid-blow-dryer-plum-satin/HT400PU.html?dwvar_HT400PU_color=A875B3",
-        )
-        c1, c2, c3 = st.columns(3)
-        requested_reviews = c1.number_input("Reviews to pull", min_value=1, max_value=MAX_REVIEWS_CAP, value=100, step=10)
-        sort_label = c2.selectbox("Sort", list(SORT_OPTIONS.keys()), index=0)
-        content_locale = c3.text_input("Content locale filter", value=config.get("locale") or DEFAULT_LOCALE)
-        c4, c5 = st.columns(2)
-        manual_product_id = c4.text_input("Manual Bazaarvoice product ID override", value="")
-        manual_search_query = c5.text_input("Manual Product Display search query", value="")
-        exact_product_only = st.checkbox("Exact product only (ExcludeFamily=true)", value=False)
-        submitted = st.form_submit_button("Fetch reviews", type="primary", use_container_width=True)
-
-    if submitted:
-        st.session_state.last_url = url
-        status_box = st.empty()
-        status_log = st.empty()
-        events: List[Dict[str, Any]] = []
-
-        def progress(stage: str, detail: str, fraction: float, elapsed: Optional[float]) -> None:
-            with status_box.container():
-                render_progress_panel(stage, detail, fraction, elapsed)
-            events.append({
-                "Time": now_str(),
-                "Stage": stage,
-                "Detail": detail,
-                "Progress": f"{int(fraction * 100)}%",
-                "Elapsed": format_seconds(elapsed),
-            })
-            status_log.dataframe(pd.DataFrame(events).tail(12), use_container_width=True, hide_index=True)
-
-        try:
-            artifact = scrape_via_bazaarvoice(
-                url=url,
-                requested_reviews=int(requested_reviews),
-                sort_label=sort_label,
-                manual_product_id=manual_product_id,
-                manual_search_query=manual_search_query,
-                exact_product_only=exact_product_only,
-                content_locale=content_locale,
-                progress=progress,
+        with st.expander("Install note", expanded=False):
+            st.code(
+                "pip install -r requirements.txt\npython -m playwright install chromium",
+                language="bash",
             )
-            st.session_state.artifact = artifact
-            st.session_state.report = None
-            st.session_state.chat_messages = []
-            if artifact.reviews_df.empty:
-                st.warning(
-                    "Bazaarvoice did not return review rows for the resolved candidate. "
-                    "Check Candidate Probes and API Log below, or try a manual product ID override."
+
+    product_url = st.text_input(
+        "SharkNinja product URL",
+        value=st.session_state.get("last_product_url", ""),
+        placeholder="https://www.sharkninja.com/shark-navigator-lift-away-adv-with-self-cleaning-brushroll/LA362.html",
+    )
+
+    normalized_url = normalize_url(product_url)
+    domain_hint = urlparse(normalized_url).netloc if normalized_url else ""
+    status_cols = st.columns([1.2, 1, 1], vertical_alignment="center")
+    status_cols[0].caption(domain_hint or "Paste a SharkNinja product page URL to begin")
+    status_cols[1].caption(f"Target reviews: {target_reviews}")
+    status_cols[2].caption(f"Sort: {sort_label}")
+
+    action_cols = st.columns([1.25, 1.05, 1.05], vertical_alignment="center")
+    scrape_clicked = action_cols[0].button("Scrape SharkNinja reviews", type="primary", width="stretch")
+    report_clicked = action_cols[1].button(
+        "Generate AI report",
+        width="stretch",
+        disabled=st.session_state.get("reviews_df") is None,
+    )
+    clear_clicked = action_cols[2].button("Clear session", width="stretch")
+
+    if clear_clicked:
+        for key in ["reviews_df", "overview_df", "report", "product_meta", "raw_payloads", "chat_messages", "last_product_url", "snapshot_dir"]:
+            st.session_state[key] = None if key not in {"chat_messages", "last_product_url", "snapshot_dir"} else ([] if key == "chat_messages" else "")
+        st.rerun()
+
+    if scrape_clicked:
+        if not normalized_url:
+            st.error("Paste a SharkNinja product URL first.")
+        elif not is_sharkninja_url(normalized_url):
+            st.error("Use a SharkNinja/Shark product page URL. Amazon has been removed from this build.")
+        elif not accept_sharkclean and "sharkclean.com" in domain_hint:
+            st.error("This build is focused on SharkNinja-hosted pages. Re-enable SharkClean redirects or use the final SharkNinja URL.")
+        else:
+            overlay_placeholder = st.empty()
+            log: List[ProgressEvent] = []
+
+            def progress_cb(stage: str, detail: str, progress: float, collected: int) -> None:
+                event = ProgressEvent(ts=time.time(), stage=stage, detail=detail, progress=progress, collected=collected)
+                log.append(event)
+                with overlay_placeholder.container():
+                    render_progress_overlay(log, stage, detail)
+
+            try:
+                rows, raw_payloads, meta = scrape_sharkninja_reviews(
+                    product_url=normalized_url,
+                    target_reviews=target_reviews,
+                    sort_key=SORT_OPTIONS[sort_label],
+                    headless=headless,
+                    progress_cb=progress_cb,
                 )
-            else:
-                st.success(f"Retrieved {len(artifact.reviews_df)} reviews for {artifact.meta.get('resolved_product_id')}.")
-        except Exception as exc:
-            st.session_state.artifact = None
-            st.error(str(exc))
+                meta["target_reviews"] = target_reviews
+                reviews_df = reviews_to_dataframe(rows, meta)
+                snapshot_dir = allocate_snapshot_dir(meta)
+                meta["snapshot_dir"] = str(snapshot_dir)
+                overview_df = summarize_overview(reviews_df, meta)
+                persist_snapshot(reviews_df, overview_df, raw_payloads, meta, snapshot_dir=snapshot_dir)
 
-    artifact: Optional[FetchArtifact] = st.session_state.artifact
-    if artifact is None:
-        st.info("Paste a SharkNinja product URL and fetch reviews.")
-        return
+                st.session_state["reviews_df"] = reviews_df
+                st.session_state["overview_df"] = overview_df
+                st.session_state["report"] = None
+                st.session_state["product_meta"] = meta
+                st.session_state["raw_payloads"] = raw_payloads
+                st.session_state["chat_messages"] = []
+                st.session_state["last_product_url"] = normalized_url
+                st.session_state["snapshot_dir"] = str(snapshot_dir)
+                overlay_placeholder.empty()
+                st.success(f"Collected {len(reviews_df)} SharkNinja review(s) and saved a local snapshot.")
+            except Exception as exc:
+                overlay_placeholder.empty()
+                st.error(str(exc))
 
-    render_kpis(artifact)
-    render_summary(artifact)
-
-    excel_bytes = build_excel_bytes(artifact.reviews_df, artifact.overview_df, artifact.probes_df, artifact.api_log_df)
-    csv_bytes = artifact.reviews_df.to_csv(index=False).encode("utf-8") if not artifact.reviews_df.empty else b""
-    d1, d2 = st.columns(2)
-    d1.download_button(
-        "Download Excel",
-        data=excel_bytes,
-        file_name=f"sharkninja_reviews_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    d2.download_button(
-        "Download CSV",
-        data=csv_bytes,
-        file_name=f"sharkninja_reviews_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        disabled=artifact.reviews_df.empty,
-        use_container_width=True,
-    )
-
-    tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Reviews", "Diagnostics", "AI"])
-    with tab1:
-        st.dataframe(artifact.overview_df, use_container_width=True, hide_index=True)
-        with st.expander("Page signals", expanded=False):
-            st.json(artifact.meta.get("signals") or {})
-    with tab2:
-        if artifact.reviews_df.empty:
-            st.info("No reviews in this snapshot.")
+    if report_clicked:
+        if st.session_state.get("reviews_df") is None or st.session_state.get("overview_df") is None:
+            st.error("Scrape reviews first.")
+        elif not openai_api_key:
+            st.error("Add your OpenAI API key in the sidebar.")
         else:
-            st.dataframe(artifact.reviews_df, use_container_width=True, hide_index=True)
-    with tab3:
-        st.markdown("**Candidate probes**")
-        st.dataframe(artifact.probes_df, use_container_width=True, hide_index=True)
-        st.markdown("**API log**")
-        st.dataframe(artifact.api_log_df, use_container_width=True, hide_index=True)
-        if artifact.meta.get("status") != "ok":
-            st.error(artifact.meta.get("error") or "No Bazaarvoice reviews returned.")
-    with tab4:
-        if artifact.reviews_df.empty:
-            st.info("Fetch reviews before running AI analysis.")
-        else:
-            evidence_map = build_evidence_map(artifact.reviews_df)
-            if st.button("Generate AI report", use_container_width=True):
+            with st.spinner("Generating SharkNinja product intelligence report..."):
                 try:
-                    st.session_state.report = generate_product_report(artifact.reviews_df, artifact, ai_model)
-                    st.success("AI report generated.")
+                    report = generate_product_intel_report(
+                        openai_api_key=openai_api_key,
+                        model_name=report_model,
+                        reviews_df=st.session_state["reviews_df"],
+                        overview_df=st.session_state["overview_df"],
+                    )
+                    st.session_state["report"] = report
+                    if st.session_state.get("snapshot_dir"):
+                        persist_snapshot(
+                            st.session_state["reviews_df"],
+                            st.session_state["overview_df"],
+                            st.session_state.get("raw_payloads") or [],
+                            st.session_state.get("product_meta") or {},
+                            report,
+                            snapshot_dir=st.session_state.get("snapshot_dir") or None,
+                        )
+                    st.success("AI report ready.")
                 except Exception as exc:
                     st.error(str(exc))
-            if st.session_state.report is not None:
-                render_report(st.session_state.report, evidence_map)
-            st.markdown("---")
-            st.subheader("Chat with the reviews")
-            question = st.text_input("Ask a question", placeholder="What are the top quality complaints?")
-            if st.button("Send", use_container_width=True):
-                if not question.strip():
-                    st.warning("Enter a question first.")
+
+    reviews_df: Optional[pd.DataFrame] = st.session_state.get("reviews_df")
+    overview_df: Optional[pd.DataFrame] = st.session_state.get("overview_df")
+    report: Optional[ProductIntelReport] = st.session_state.get("report")
+    product_meta: Dict[str, Any] = st.session_state.get("product_meta") or {}
+    evidence_map = build_evidence_map(reviews_df) if reviews_df is not None else {}
+
+    nav = st.radio(
+        "",
+        options=["Studio", "AI Report", "Chatbot", "Downloads", "Local Library", "Help"],
+        horizontal=True,
+        key="nav",
+        label_visibility="collapsed",
+    )
+
+    if reviews_df is not None and overview_df is not None:
+        overview = overview_df.iloc[0].to_dict()
+        st.markdown(
+            f"""
+            <div class="sn-kpi-grid">
+                <div class="sn-kpi"><div class="sn-kpi-label">Reviews collected</div><div class="sn-kpi-value">{int(overview.get('ReviewsCollected') or 0)}</div></div>
+                <div class="sn-kpi"><div class="sn-kpi-label">Avg rating in sample</div><div class="sn-kpi-value">{overview.get('AverageRatingInSample') or '—'}</div></div>
+                <div class="sn-kpi"><div class="sn-kpi-label">Site review count</div><div class="sn-kpi-value">{overview.get('SiteReviewCount') or '—'}</div></div>
+                <div class="sn-kpi"><div class="sn-kpi-label">Snapshot</div><div class="sn-kpi-value">{html.escape(Path(st.session_state.get('snapshot_dir') or '').name or '—')}</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+    if nav == "Studio":
+        if reviews_df is None or overview_df is None:
+            st.info("Scrape a SharkNinja product page to populate the studio.")
+        else:
+            overview = overview_df.iloc[0].to_dict()
+            c1, c2 = st.columns([1.1, 1], vertical_alignment="top")
+            with c1:
+                st.markdown(
+                    f"""
+                    <div class="sn-card">
+                        <h4>{html.escape(product_meta.get('product_title') or 'SharkNinja product')}</h4>
+                        <div class="sn-muted">{html.escape(product_meta.get('product_url') or '')}</div>
+                        <div style="margin-top:0.55rem; line-height:1.6;">
+                            <strong>Model:</strong> {html.escape(product_meta.get('model_code') or '—')}<br>
+                            <strong>Brand:</strong> {html.escape(product_meta.get('brand') or 'SharkNinja')}<br>
+                            <strong>Source method:</strong> {html.escape(product_meta.get('source_method') or '—')}<br>
+                            <strong>Retrieval note:</strong> {html.escape(overview.get('RetrievalNote') or '—')}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                star_json = overview.get("StarDistributionJSON") or "{}"
+                try:
+                    star_data = json.loads(star_json)
+                except Exception:
+                    star_data = {}
+                if star_data:
+                    star_df = pd.DataFrame({"Star": list(star_data.keys()), "Reviews": list(star_data.values())})
+                    st.bar_chart(star_df.set_index("Star"))
                 else:
-                    st.session_state.chat_messages.append({"role": "user", "content": question.strip()})
-                    try:
-                        answer = ask_chatbot(artifact.reviews_df, artifact, st.session_state.chat_messages, ai_model, lenses)
-                        st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-                    except Exception as exc:
-                        st.error(str(exc))
-            for message in st.session_state.chat_messages:
+                    st.info("No star distribution available.")
+
+            preview_cols = [
+                "ReviewRef",
+                "RatingValue",
+                "SentimentBucket",
+                "ReviewDate",
+                "Title",
+                "ReviewText",
+                "Author",
+                "SourceMethod",
+            ]
+            st.markdown("### Review table")
+            render_dataframe(reviews_df[[col for col in preview_cols if col in reviews_df.columns]], hide_index=True)
+
+    elif nav == "AI Report":
+        if reviews_df is None:
+            st.info("Scrape SharkNinja reviews first.")
+        elif not openai_api_key:
+            st.info("Add your OpenAI API key in the sidebar to generate the AI report.")
+        elif report is None:
+            st.info("Generate the AI report to unlock the intelligence view.")
+        else:
+            st.markdown("### Executive summary")
+            st.markdown("<div class='sn-card'>", unsafe_allow_html=True)
+            render_rich_text(report.executive_summary, evidence_map)
+            if report.executive_takeaways:
+                takeaways_html = "".join(f"<li>{annotate_text_with_evidence(item, evidence_map)}</li>" for item in report.executive_takeaways)
+                st.markdown(f"<ul class='sn-list'>{takeaways_html}</ul>", unsafe_allow_html=True)
+            st.markdown(f"<div class='sn-muted'>{html.escape(report.confidence_note)}</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            col1, col2 = st.columns(2, vertical_alignment="top")
+            with col1:
+                st.markdown("### Delighters")
+                render_theme_cards(report.delighters, evidence_map, "No strong delighters identified.")
+                st.markdown("### Top themes")
+                render_theme_cards(report.top_themes, evidence_map, "No top themes identified.")
+            with col2:
+                st.markdown("### Detractors")
+                render_theme_cards(report.detractors, evidence_map, "No clear detractors identified.")
+                st.markdown("### Quality risks")
+                render_quality_cards(report.quality_risks, evidence_map, "No clear quality risks identified.")
+
+            st.markdown("### Feature requests")
+            render_request_cards(report.feature_requests, evidence_map, "No clear feature requests identified.")
+
+            action_cols = st.columns(3, vertical_alignment="top")
+            with action_cols[0]:
+                render_action_list("Actions for Product Development", report.actions_for_product_development, evidence_map, "No product-development actions generated.")
+            with action_cols[1]:
+                render_action_list("Actions for Quality Engineer", report.actions_for_quality_engineering, evidence_map, "No quality actions generated.")
+            with action_cols[2]:
+                render_action_list("Actions for Consumer Insights", report.actions_for_consumer_insights, evidence_map, "No consumer-insights actions generated.")
+
+    elif nav == "Chatbot":
+        if reviews_df is None or overview_df is None:
+            st.info("Scrape SharkNinja reviews first.")
+        elif not openai_api_key:
+            st.info("Add your OpenAI API key in the sidebar to use the chatbot.")
+        else:
+            st.caption(f"Grounded chatbot lens: {default_lens}")
+            for message in st.session_state.get("chat_messages", []):
                 with st.chat_message(message["role"]):
-                    render_rich_text(message["content"], evidence_map)
+                    if message["role"] == "assistant":
+                        st.markdown(annotate_text_with_evidence(message["content"], evidence_map), unsafe_allow_html=True)
+                    else:
+                        st.markdown(html.escape(message["content"]), unsafe_allow_html=True)
+
+            prompt = st.chat_input("Ask about delighters, breakage patterns, quality risks, consumer language, or feature gaps...")
+            if prompt:
+                st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(html.escape(prompt), unsafe_allow_html=True)
+                with st.chat_message("assistant"):
+                    with st.spinner("Analyzing the review evidence..."):
+                        try:
+                            answer = ask_product_chatbot(
+                                openai_api_key=openai_api_key,
+                                model_name=chat_model,
+                                reviews_df=reviews_df,
+                                overview_df=overview_df,
+                                report=report,
+                                chat_history=st.session_state["chat_messages"][:-1],
+                                user_message=prompt,
+                                stakeholder_lens=default_lens,
+                            )
+                            st.markdown(annotate_text_with_evidence(answer, evidence_map), unsafe_allow_html=True)
+                            st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+                        except Exception as exc:
+                            st.error(str(exc))
+
+    elif nav == "Downloads":
+        if reviews_df is None or overview_df is None:
+            st.info("Nothing to download yet.")
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            excel_bytes = build_excel_bytes(reviews_df, overview_df, report)
+            csv_bytes = reviews_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            json_bytes = reviews_df.to_json(orient="records", force_ascii=False, indent=2).encode("utf-8")
+
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                st.download_button(
+                    "Download Excel workbook",
+                    data=excel_bytes,
+                    file_name=f"sharkninja_review_intelligence_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                )
+            with d2:
+                st.download_button(
+                    "Download review CSV",
+                    data=csv_bytes,
+                    file_name=f"sharkninja_reviews_{timestamp}.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+            with d3:
+                st.download_button(
+                    "Download review JSON",
+                    data=json_bytes,
+                    file_name=f"sharkninja_reviews_{timestamp}.json",
+                    mime="application/json",
+                    width="stretch",
+                )
+
+            st.markdown(
+                f"""
+                <div class="sn-card">
+                    <h4>Local snapshot</h4>
+                    <div class="sn-muted">Every scrape is saved locally so the reviews remain available even after you close the app.</div>
+                    <div style="margin-top:0.5rem;"><strong>Snapshot path:</strong> {html.escape(st.session_state.get('snapshot_dir') or '—')}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    elif nav == "Local Library":
+        snapshots_df = list_local_snapshots()
+        if snapshots_df.empty:
+            st.info("No local SharkNinja snapshots have been saved yet.")
+        else:
+            render_dataframe(snapshots_df, hide_index=True)
+            selected_dir = st.selectbox("Load a saved snapshot", options=snapshots_df["SnapshotDir"].tolist())
+            if st.button("Load selected snapshot", width="content"):
+                try:
+                    reviews_df, overview_df, report, metadata, raw_payloads = load_snapshot(selected_dir)
+                    st.session_state["reviews_df"] = reviews_df
+                    st.session_state["overview_df"] = overview_df
+                    st.session_state["report"] = report
+                    st.session_state["product_meta"] = metadata
+                    st.session_state["raw_payloads"] = raw_payloads
+                    st.session_state["snapshot_dir"] = selected_dir
+                    st.session_state["last_product_url"] = metadata.get("product_url") or ""
+                    st.success("Snapshot loaded into the studio.")
+                except Exception as exc:
+                    st.error(f"Failed to load snapshot: {exc}")
+
+    elif nav == "Help":
+        st.markdown("### What changed")
+        st.markdown(
+            """
+            - Amazon and Apify are fully removed.
+            - The scraper now targets SharkNinja product pages only.
+            - Reviews are collected locally through a browser-assisted SharkNinja scraper.
+            - Each scrape is stored locally as a snapshot with CSV, JSON, and Excel artifacts.
+            - The AI layer is tuned for Product Development, Quality Engineer, and Consumer Insights teams.
+            - Review references like R001 show hover evidence in the AI report and chatbot.
+            """
+        )
+        st.markdown("### Scrape strategy")
+        st.markdown(
+            """
+            1. Open the public SharkNinja product page.
+            2. Capture review traffic and page content.
+            3. If a faster review feed is exposed, pull reviews from that feed directly.
+            4. If needed, fall back to walking SharkNinja review pages directly.
+            5. Save everything locally.
+            """
+        )
+        st.markdown("### Notes")
+        st.markdown(
+            """
+            - If a product page only exposes 8 or 12 reviews publicly, the app will tell you that the visible feed was smaller than your requested cap.
+            - Install Playwright's Chromium browser once on the machine that runs the app.
+            - Use public product pages only and make sure you comply with the site's terms and internal data-governance rules.
+            """
+        )
 
 
 if __name__ == "__main__":
     main()
-
