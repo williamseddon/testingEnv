@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import io
 import json
 import math
@@ -4113,6 +4114,960 @@ def main() -> None:
             summary=summary,
             filter_description=filter_description,
         )
+
+
+# -----------------------------------------------------------------------------
+# V7 UX polish overrides
+# -----------------------------------------------------------------------------
+
+
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+            .block-container {
+                padding-top: 1.05rem;
+                padding-bottom: 2rem;
+                max-width: 1480px;
+            }
+            .hero-card {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 18px;
+                padding: 1.1rem 1.2rem;
+                background: linear-gradient(180deg, rgba(250,250,252,0.96), rgba(245,247,250,0.96));
+                margin-bottom: 1rem;
+            }
+            .hero-kicker {
+                font-size: 0.78rem;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #6b7280;
+                margin-bottom: 0.35rem;
+            }
+            .hero-title {
+                font-size: 1.5rem;
+                font-weight: 700;
+                color: #16213e;
+                margin-bottom: 0.3rem;
+            }
+            .hero-subtitle {
+                color: #4b5563;
+                font-size: 0.98rem;
+                line-height: 1.4;
+            }
+            .metric-card {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 16px;
+                padding: 0.95rem 1rem;
+                background: rgba(250, 250, 252, 0.92);
+                min-height: 152px;
+                height: 152px;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+            }
+            .metric-label {
+                color: #6b7280;
+                font-size: 0.82rem;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                margin-bottom: 0.45rem;
+            }
+            .metric-value {
+                color: #16213e;
+                font-size: clamp(1.55rem, 2vw, 2rem);
+                font-weight: 700;
+                line-height: 1.05;
+                margin-bottom: 0.25rem;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .metric-sub {
+                color: #4b5563;
+                font-size: 0.83rem;
+                line-height: 1.3;
+                min-height: 2.6em;
+                overflow: hidden;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+            }
+            .section-subtitle {
+                color: #6b7280;
+                font-size: 0.96rem;
+                margin-bottom: 0.85rem;
+            }
+            .review-shell {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 18px;
+                padding: 1rem 1rem 0.9rem 1rem;
+                background: rgba(255,255,255,0.98);
+                margin-bottom: 0.9rem;
+            }
+            .report-card {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 16px;
+                padding: 1rem 1rem 0.9rem 1rem;
+                background: rgba(250, 250, 252, 0.92);
+                min-height: 180px;
+            }
+            .tiny-note {
+                color: #6b7280;
+                font-size: 0.85rem;
+            }
+            .review-ref-shelf {
+                margin-top: 0.45rem;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.35rem;
+                align-items: center;
+            }
+            .review-ref-hint {
+                color: #6b7280;
+                font-size: 0.74rem;
+                margin-right: 0.12rem;
+            }
+            .review-ref-chip {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.15rem;
+                border: 1px solid rgba(49, 51, 63, 0.14);
+                border-radius: 999px;
+                padding: 0.18rem 0.48rem;
+                background: rgba(245, 247, 250, 0.98);
+                color: #16213e;
+                font-size: 0.74rem;
+                line-height: 1.15;
+                cursor: help;
+                white-space: nowrap;
+            }
+            .thinking-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(15, 23, 42, 0.30);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 99999;
+            }
+            .thinking-card {
+                width: min(430px, 92vw);
+                background: rgba(255,255,255,0.98);
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 20px;
+                box-shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+                padding: 1.2rem 1.3rem;
+                text-align: center;
+            }
+            .thinking-spinner {
+                width: 40px;
+                height: 40px;
+                border: 4px solid rgba(17, 24, 39, 0.14);
+                border-top-color: #111827;
+                border-radius: 50%;
+                margin: 0 auto 0.8rem auto;
+                animation: thinking-spin 0.9s linear infinite;
+            }
+            .thinking-title {
+                color: #16213e;
+                font-weight: 700;
+                font-size: 1.08rem;
+                margin-bottom: 0.3rem;
+            }
+            .thinking-sub {
+                color: #4b5563;
+                font-size: 0.95rem;
+                line-height: 1.35;
+            }
+            div[data-testid="stChatMessage"] {
+                padding-top: 0.1rem;
+                padding-bottom: 0.1rem;
+            }
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] p,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] li,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] td,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] th,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] blockquote {
+                font-size: 0.92rem !important;
+                line-height: 1.45 !important;
+                margin-bottom: 0.38rem !important;
+            }
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] ul,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] ol {
+                margin-top: 0.2rem !important;
+                margin-bottom: 0.35rem !important;
+            }
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] h1,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] h2,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] h3,
+            div[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] h4 {
+                font-size: 1.0rem !important;
+                line-height: 1.25 !important;
+                margin-top: 0.35rem !important;
+                margin-bottom: 0.35rem !important;
+            }
+            @keyframes thinking-spin {
+                to { transform: rotate(360deg); }
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+GENERAL_ANALYST_INSTRUCTIONS = textwrap.dedent(
+    """
+    You are SharkNinja Review Analyst, an internal voice-of-customer assistant.
+    Help product development, quality engineering, and consumer insights teams understand the review base.
+    Prioritize the supplied review text over generic product assumptions.
+
+    Ground every material claim in the supplied review dataset.
+    Base most of the narrative on the supplied review text evidence, using the metrics only as supporting context.
+    Do not invent counts, quotes, or trends that are not supported by the evidence pack.
+    When evidence is mixed or weak, say so clearly.
+    Use markdown.
+    Cite supporting review IDs in parentheses, for example: (review_ids: 12345, 67890).
+    Prefer short sections and bullets over long prose.
+    Default to a lean answer unless the user explicitly asks for depth.
+    End with practical actions whenever possible.
+    """
+).strip()
+
+
+def build_report_instructions(persona_name: Optional[str] = None) -> str:
+    if not persona_name:
+        return GENERAL_ANALYST_INSTRUCTIONS
+    persona = PERSONAS[persona_name]
+    return textwrap.dedent(
+        f"""
+        {persona['instructions']}
+
+        Ground every important finding in the supplied review dataset.
+        Prioritize the supplied review text evidence and use the metrics only as supporting context.
+        Do not invent facts, counts, or quotes that are not supported by the evidence pack.
+        If evidence is mixed or weak, say so explicitly.
+        Use markdown.
+        Cite supporting review IDs in parentheses, for example: (review_ids: 12345, 67890).
+        Keep the report compact and decision-ready.
+        Prefer bullets and short subheads over long paragraphs.
+        By default, stay within about 6-8 bullets total plus up to 3 actions unless the user asks for more detail.
+        End with a short action list tailored to the audience.
+        """
+    ).strip()
+
+
+
+def call_openai_analyst(
+    *,
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    question: str,
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+    chat_history: Sequence[Dict[str, str]],
+    persona_name: Optional[str] = None,
+) -> str:
+    client = get_openai_client(api_key)
+    instructions = build_report_instructions(persona_name)
+    ai_context = build_ai_context(
+        overall_df=overall_df,
+        filtered_df=filtered_df,
+        summary=summary,
+        filter_description=filter_description,
+        question=question,
+    )
+
+    input_messages: List[Dict[str, Any]] = []
+    for message in chat_history[-8:]:
+        input_messages.append({"role": message["role"], "content": message["content"]})
+
+    user_payload = textwrap.dedent(
+        f"""
+        User request:
+        {question}
+
+        Review dataset context (JSON):
+        {ai_context}
+        """
+    ).strip()
+    input_messages.append({"role": "user", "content": user_payload})
+
+    response = create_openai_response(
+        client,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        instructions=instructions,
+        input=input_messages,
+        max_output_tokens=1100,
+        truncation="auto",
+    )
+    output_text = (getattr(response, "output_text", None) or "").strip()
+    if not output_text:
+        raise ReviewDownloaderError("OpenAI returned an empty answer.")
+    return output_text
+
+
+
+def render_top_metrics(overall_df: pd.DataFrame, filtered_df: pd.DataFrame) -> None:
+    metrics = compute_metrics(filtered_df)
+    cards = [
+        ("Reviews in view", f"{metrics['review_count']:,}", f"of {len(overall_df):,} loaded"),
+        ("Avg rating", format_metric_number(metrics["avg_rating"]), "Filtered view"),
+        (
+            "Avg rating (organic)",
+            format_metric_number(metrics["avg_rating_non_incentivized"]),
+            f"{metrics['non_incentivized_count']:,} organic reviews",
+        ),
+        ("% 1-2 star", format_pct(metrics["pct_low_star"]), f"{metrics['low_star_count']:,} low-star reviews"),
+        ("% incentivized", format_pct(metrics["pct_incentivized"]), "Current view share"),
+    ]
+    cols = st.columns(len(cards))
+    for col, (label, value, subtext) in zip(cols, cards):
+        with col:
+            render_metric_card(label, value, subtext)
+
+
+
+def prepare_avg_rating_over_time(
+    df: pd.DataFrame,
+    *,
+    group_column: Optional[str],
+    trend_mode: str,
+    smoothing_days: int,
+    top_groups: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if df.empty or "submission_time" not in df.columns or "rating" not in df.columns:
+        empty = pd.DataFrame(columns=["day", "group_value", "review_count", "rating_sum", "avg_rating", "display_rating"])
+        return empty, empty, pd.DataFrame(columns=["day", "review_count"])
+
+    working = df.copy()
+    working["submission_time"] = pd.to_datetime(working["submission_time"], errors="coerce")
+    working["rating"] = pd.to_numeric(working["rating"], errors="coerce")
+    working = working.dropna(subset=["submission_time", "rating"]).copy()
+    if working.empty:
+        empty = pd.DataFrame(columns=["day", "group_value", "review_count", "rating_sum", "avg_rating", "display_rating"])
+        return empty, empty, pd.DataFrame(columns=["day", "review_count"])
+
+    working["day"] = working["submission_time"].dt.floor("D")
+    if group_column:
+        working["group_value"] = working[group_column].map(normalize_breakout_value)
+        ranking = working.groupby("group_value").size().sort_values(ascending=False)
+        selected_groups = ranking.head(max(int(top_groups), 1)).index.tolist()
+        working = working[working["group_value"].isin(selected_groups)].copy()
+    else:
+        working["group_value"] = "Overall"
+        selected_groups = ["Overall"]
+
+    if working.empty:
+        empty = pd.DataFrame(columns=["day", "group_value", "review_count", "rating_sum", "avg_rating", "display_rating"])
+        return empty, empty, pd.DataFrame(columns=["day", "review_count"])
+
+    daily = (
+        working.groupby(["day", "group_value"], as_index=False)
+        .agg(review_count=("review_id", "count"), rating_sum=("rating", "sum"), avg_rating=("rating", "mean"))
+    )
+    daily_volume = working.groupby("day", as_index=False).agg(review_count=("review_id", "count"))
+    full_days = pd.date_range(daily["day"].min(), daily["day"].max(), freq="D")
+
+    def _series_for_group(source_df: pd.DataFrame, group_value: str) -> pd.DataFrame:
+        group_df = source_df[source_df["group_value"] == group_value].set_index("day").reindex(full_days)
+        group_df.index.name = "day"
+        group_df["group_value"] = group_value
+        group_df["review_count"] = pd.to_numeric(group_df["review_count"], errors="coerce").fillna(0).astype(int)
+        group_df["rating_sum"] = pd.to_numeric(group_df["rating_sum"], errors="coerce").fillna(0.0)
+        denom = group_df["review_count"].replace(0, pd.NA)
+        group_df["avg_rating"] = group_df["rating_sum"] / denom
+        if trend_mode == "Rolling average":
+            window = max(int(smoothing_days), 1)
+            rolling_count = group_df["review_count"].rolling(window=window, min_periods=1).sum().replace(0, pd.NA)
+            rolling_sum = group_df["rating_sum"].rolling(window=window, min_periods=1).sum()
+            group_df["display_rating"] = rolling_sum / rolling_count
+        else:
+            cumulative_count = group_df["review_count"].cumsum().replace(0, pd.NA)
+            cumulative_sum = group_df["rating_sum"].cumsum()
+            group_df["display_rating"] = cumulative_sum / cumulative_count
+        return group_df.reset_index()
+
+    breakout_frames = [_series_for_group(daily, group_value) for group_value in selected_groups]
+    breakout_df = pd.concat(breakout_frames, ignore_index=True) if breakout_frames else pd.DataFrame()
+
+    overall_daily = (
+        working.groupby("day", as_index=False)
+        .agg(review_count=("review_id", "count"), rating_sum=("rating", "sum"), avg_rating=("rating", "mean"))
+    )
+    overall_daily["group_value"] = "Overall"
+    overall_df = _series_for_group(overall_daily, "Overall")
+    return breakout_df, overall_df, daily_volume
+
+
+
+def build_avg_rating_over_time_figure(
+    breakout_df: pd.DataFrame,
+    overall_df: pd.DataFrame,
+    volume_df: pd.DataFrame,
+    *,
+    title: str,
+    show_overall: bool,
+    show_volume_bars: bool,
+    zoom_mode: str,
+) -> go.Figure:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    if show_volume_bars and not volume_df.empty:
+        fig.add_trace(
+            go.Bar(
+                x=volume_df["day"],
+                y=volume_df["review_count"],
+                name="Daily volume",
+                opacity=0.14,
+                hovertemplate="%{x|%Y-%m-%d}<br>Reviews: %{y}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+
+    for group_value in breakout_df["group_value"].dropna().astype(str).unique().tolist():
+        group_df = breakout_df[breakout_df["group_value"] == group_value].copy()
+        fig.add_trace(
+            go.Scatter(
+                x=group_df["day"],
+                y=group_df["display_rating"],
+                mode="lines",
+                name=group_value,
+                hovertemplate="%{x|%Y-%m-%d}<br>Avg rating: %{y:.2f}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+
+    existing_labels = set(breakout_df.get("group_value", pd.Series(dtype="object")).dropna().astype(str).tolist())
+    if show_overall and not overall_df.empty and "Overall" not in existing_labels:
+        fig.add_trace(
+            go.Scatter(
+                x=overall_df["day"],
+                y=overall_df["display_rating"],
+                mode="lines",
+                name="Overall",
+                line={"width": 4},
+                hovertemplate="%{x|%Y-%m-%d}<br>Overall avg: %{y:.2f}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+
+    all_y = pd.concat(
+        [
+            breakout_df.get("display_rating", pd.Series(dtype="float64")),
+            overall_df.get("display_rating", pd.Series(dtype="float64")),
+        ],
+        ignore_index=True,
+    ).dropna()
+    y_range = None
+    if zoom_mode == "Zoomed-in" and not all_y.empty:
+        y_min = max(1.0, math.floor((float(all_y.min()) - 0.05) * 20) / 20)
+        y_max = min(5.0, math.ceil((float(all_y.max()) + 0.05) * 20) / 20)
+        if y_max - y_min < 0.15:
+            y_min = max(1.0, y_min - 0.1)
+            y_max = min(5.0, y_max + 0.1)
+        y_range = [y_min, y_max]
+    elif zoom_mode == "Full scale":
+        y_range = [1, 5]
+
+    fig.update_layout(
+        title=title,
+        height=585,
+        margin=dict(l=24, r=24, t=68, b=24),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+        bargap=0.05,
+    )
+    fig.update_xaxes(title_text="Date", showgrid=False)
+    fig.update_yaxes(title_text="Reviews/day", showgrid=False, rangemode="tozero", secondary_y=False)
+    fig.update_yaxes(title_text="Average rating", range=y_range, secondary_y=True)
+
+    if zoom_mode == "Zoomed-in" and y_range and y_range[0] > 1.05:
+        for y0, y1 in [(0.03, 0.05), (0.055, 0.075)]:
+            fig.add_shape(
+                type="line",
+                xref="paper",
+                yref="paper",
+                x0=0.982,
+                x1=0.995,
+                y0=y0,
+                y1=y1,
+                line=dict(color="rgba(100,116,139,0.9)", width=2),
+            )
+    return fig
+
+
+
+def render_dashboard(filtered_df: pd.DataFrame) -> None:
+    st.subheader("Dashboard")
+    st.markdown(
+        '<div class="section-subtitle">Lead with average rating over time, then scan rating mix, review volume, and the strongest performance splits.</div>',
+        unsafe_allow_html=True,
+    )
+
+    chart_scope = st.radio(
+        "Dashboard scope",
+        options=["All matching reviews", "Organic only"],
+        horizontal=True,
+        key="dashboard_chart_scope",
+    )
+    chart_df = filtered_df.copy()
+    if chart_scope == "Organic only":
+        chart_df = chart_df[~chart_df["incentivized_review"].fillna(False)].reset_index(drop=True)
+
+    if chart_df.empty:
+        st.info("No reviews match the current dashboard scope.")
+        return
+
+    dim_options = available_time_series_dimensions(chart_df)
+    with st.container(border=True):
+        control_cols = st.columns([1.2, 1.25, 0.95, 0.9, 1.0, 1.0, 1.1])
+        trend_mode = control_cols[0].selectbox("Trend", options=["Cumulative average", "Rolling average"], index=0, key="dash_trend_mode")
+        breakout_label = control_cols[1].selectbox("Breakout", options=list(dim_options.keys()), index=0, key="dash_breakout")
+        smoothing_label = control_cols[2].selectbox("Smoothing", options=["7-day", "14-day", "30-day"], index=0, key="dash_smoothing")
+        top_groups = control_cols[3].selectbox("Top lines", options=[4, 5, 6, 8], index=2, key="dash_top_groups")
+        show_overall = control_cols[4].checkbox("Show overall", value=True, key="dash_show_overall")
+        show_volume_bars = control_cols[5].checkbox("Show volume bars", value=True, key="dash_show_volume")
+        zoom_mode = control_cols[6].radio("Y-axis view", options=["Zoomed-in", "Full scale"], index=0, horizontal=True, key="dash_zoom_mode")
+        st.caption("Review volume uses the left axis. Average rating uses the right axis. In zoomed mode the rating axis shows a break marker.")
+
+        smoothing_days = int(smoothing_label.split("-")[0])
+        breakout_df, overall_line_df, daily_volume_df = prepare_avg_rating_over_time(
+            chart_df,
+            group_column=dim_options.get(breakout_label),
+            trend_mode=trend_mode,
+            smoothing_days=smoothing_days,
+            top_groups=int(top_groups),
+        )
+
+        if breakout_df.empty:
+            st.info("No dated ratings are available for the average-rating trend.")
+        else:
+            if trend_mode == "Cumulative average":
+                title = "Average rating over time"
+            else:
+                title = "Rolling average rating over time"
+            if dim_options.get(breakout_label):
+                title += f" by {breakout_label}"
+            fig = build_avg_rating_over_time_figure(
+                breakout_df,
+                overall_line_df,
+                daily_volume_df,
+                title=title,
+                show_overall=show_overall,
+                show_volume_bars=show_volume_bars,
+                zoom_mode=zoom_mode,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    rating_df = rating_distribution(chart_df)
+    rating_df["rating_label"] = rating_df["rating"].map(lambda value: f"{int(value)}★")
+    rating_df["count_pct_label"] = rating_df.apply(lambda row: f"{int(row['review_count']):,} · {format_pct(row['share'])}", axis=1)
+    monthly_df = monthly_trend(chart_df)
+
+    chart_cols = st.columns([1.05, 1.15])
+    with chart_cols[0]:
+        with st.container(border=True):
+            fig = px.bar(
+                rating_df,
+                x="rating_label",
+                y="review_count",
+                text="count_pct_label",
+                title="Rating distribution",
+                category_orders={"rating_label": ["1★", "2★", "3★", "4★", "5★"]},
+                hover_data={"share": ':.1%', "review_count": True},
+            )
+            fig.update_traces(textposition="outside", cliponaxis=False)
+            fig.update_layout(margin=dict(l=24, r=24, t=60, b=20), xaxis_title="Star rating", yaxis_title="Review count")
+            st.plotly_chart(fig, use_container_width=True)
+    with chart_cols[1]:
+        with st.container(border=True):
+            if monthly_df.empty:
+                st.info("No dated reviews are available for the review-volume chart.")
+            else:
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_trace(
+                    go.Bar(x=monthly_df["month_start"], y=monthly_df["review_count"], name="Review count", opacity=0.62),
+                    secondary_y=False,
+                )
+                fig.add_trace(
+                    go.Scatter(x=monthly_df["month_start"], y=monthly_df["avg_rating"], name="Avg rating", mode="lines+markers"),
+                    secondary_y=True,
+                )
+                fig.update_layout(title="Review volume over time", margin=dict(l=24, r=24, t=60, b=20), hovermode="x unified")
+                fig.update_xaxes(title_text="Month")
+                fig.update_yaxes(title_text="Review count", secondary_y=False)
+                fig.update_yaxes(title_text="Avg rating", range=[1, 5], secondary_y=True)
+                st.plotly_chart(fig, use_container_width=True)
+
+    lower_cols = st.columns(2)
+    sku_df = summarize_group_avg_rating(chart_df, "product_or_sku", top_n=12)
+    with lower_cols[0]:
+        with st.container(border=True):
+            if len(sku_df) <= 1:
+                st.info("Average rating by SKU / product ID will appear when multiple products are in scope.")
+            else:
+                sorted_sku = sku_df.sort_values(["avg_rating", "review_count"], ascending=[True, True])
+                fig = px.bar(
+                    sorted_sku,
+                    x="avg_rating",
+                    y="product_or_sku",
+                    orientation="h",
+                    text=sorted_sku.apply(lambda row: f"{row['avg_rating']:.2f} · {int(row['review_count'])}", axis=1),
+                    title="Average rating by SKU / product ID",
+                    hover_data={"review_count": True, "avg_rating": ':.2f'},
+                )
+                fig.update_layout(margin=dict(l=24, r=24, t=60, b=20), xaxis_title="Average rating", yaxis_title="")
+                fig.update_xaxes(range=[0, 5])
+                st.plotly_chart(fig, use_container_width=True)
+    age_df = summarize_group_avg_rating(chart_df, "age_group", top_n=12)
+    with lower_cols[1]:
+        with st.container(border=True):
+            if len(age_df) <= 1:
+                st.info("Average rating by age group will appear when age-group data is available in the review source.")
+            else:
+                sorted_age = age_df.sort_values(["avg_rating", "review_count"], ascending=[True, True])
+                fig = px.bar(
+                    sorted_age,
+                    x="avg_rating",
+                    y="age_group",
+                    orientation="h",
+                    text=sorted_age.apply(lambda row: f"{row['avg_rating']:.2f} · {int(row['review_count'])}", axis=1),
+                    title="Average rating by age group",
+                    hover_data={"review_count": True, "avg_rating": ':.2f'},
+                )
+                fig.update_layout(margin=dict(l=24, r=24, t=60, b=20), xaxis_title="Average rating", yaxis_title="")
+                fig.update_xaxes(range=[0, 5])
+                st.plotly_chart(fig, use_container_width=True)
+
+
+
+def extract_referenced_review_ids(answer_text: str, valid_ids: Optional[Iterable[str]] = None, limit: int = 12) -> List[str]:
+    valid_set = {str(v) for v in valid_ids} if valid_ids is not None else None
+    hits: List[str] = []
+    seen = set()
+    for block in re.findall(r"review_ids?\s*:\s*([^\)\]\n]+)", safe_text(answer_text), flags=re.IGNORECASE):
+        for token in re.findall(r"[A-Za-z0-9_-]+", block):
+            if valid_set is not None and token not in valid_set:
+                continue
+            if token not in seen:
+                hits.append(token)
+                seen.add(token)
+            if len(hits) >= limit:
+                return hits
+    return hits
+
+
+
+def build_review_reference_lookup(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    lookup: Dict[str, Dict[str, str]] = {}
+    if df.empty or "review_id" not in df.columns:
+        return lookup
+    deduped = df.drop_duplicates(subset=["review_id"], keep="first")
+    for _, row in deduped.iterrows():
+        review_id = safe_text(row.get("review_id"))
+        if not review_id:
+            continue
+        rating = safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else 0
+        title = safe_text(row.get("title"), "No title") or "No title"
+        snippet = truncate_text(safe_text(row.get("review_text"), "No written review text."), 220)
+        date_label = safe_text(row.get("submission_date")) or safe_text(row.get("submission_time"))
+        locale = safe_text(row.get("content_locale"))
+        retailer = safe_text(row.get("retailer"))
+        tooltip_parts = []
+        if rating:
+            tooltip_parts.append(f"{rating}★")
+        if date_label:
+            tooltip_parts.append(date_label)
+        if locale:
+            tooltip_parts.append(locale)
+        if retailer:
+            tooltip_parts.append(retailer)
+        tooltip_header = " · ".join(tooltip_parts)
+        tooltip = "\n".join(part for part in [tooltip_header, title, snippet] if part)
+        lookup[review_id] = {
+            "tooltip": tooltip,
+            "title": title,
+            "snippet": snippet,
+        }
+    return lookup
+
+
+
+def render_review_reference_shelf(answer_text: str, review_lookup: Dict[str, Dict[str, str]]) -> None:
+    if not review_lookup:
+        return
+    review_ids = extract_referenced_review_ids(answer_text, valid_ids=review_lookup.keys(), limit=12)
+    if not review_ids:
+        return
+    chips = []
+    for review_id in review_ids:
+        meta = review_lookup.get(review_id)
+        if not meta:
+            continue
+        tooltip = html.escape(meta.get("tooltip", "")).replace("\n", "&#10;")
+        chips.append(f'<span class="review-ref-chip" title="{tooltip}">#{html.escape(review_id)}</span>')
+    if not chips:
+        return
+    st.markdown(
+        f"<div class='review-ref-shelf'><span class='review-ref-hint'>Hover a cited review:</span>{''.join(chips)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+
+def render_review_pager(total_rows: int, per_page: int, *, state_prefix: str = "review_explorer") -> int:
+    page_count = max(1, math.ceil(total_rows / max(per_page, 1)))
+    page_key = f"{state_prefix}_page"
+    input_key = f"{state_prefix}_page_input"
+    initial_page = int(st.session_state.get(page_key, 1))
+    current_page = max(1, min(initial_page, page_count))
+
+    pager_cols = st.columns([0.9, 0.9, 2.3, 1.0, 0.9, 0.9])
+    if pager_cols[0].button("⏮ First", use_container_width=True, disabled=current_page <= 1, key=f"{state_prefix}_first"):
+        current_page = 1
+    if pager_cols[1].button("← Prev", use_container_width=True, disabled=current_page <= 1, key=f"{state_prefix}_prev"):
+        current_page = max(1, current_page - 1)
+    pager_cols[2].markdown(
+        f"<div style='text-align:center; font-weight:700; padding-top:0.6rem;'>Page {current_page} of {page_count:,} • Showing {(current_page - 1) * per_page + 1:,}-{min(current_page * per_page, total_rows):,} of {total_rows:,}</div>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get(input_key) != current_page:
+        st.session_state[input_key] = current_page
+    current_page = int(
+        pager_cols[3].number_input(
+            "Page",
+            min_value=1,
+            max_value=page_count,
+            value=current_page,
+            step=1,
+            key=input_key,
+            label_visibility="collapsed",
+        )
+    )
+    if pager_cols[4].button("Next →", use_container_width=True, disabled=current_page >= page_count, key=f"{state_prefix}_next"):
+        current_page = min(page_count, current_page + 1)
+    if pager_cols[5].button("Last ⏭", use_container_width=True, disabled=current_page >= page_count, key=f"{state_prefix}_last"):
+        current_page = page_count
+
+    current_page = max(1, min(current_page, page_count))
+    st.session_state[page_key] = current_page
+    if current_page != initial_page:
+        st.rerun()
+    return current_page
+
+
+
+def render_review_explorer(
+    *,
+    summary: ReviewBatchSummary,
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    prompt_artifacts: Optional[Dict[str, Any]],
+) -> None:
+    st.subheader("Review explorer")
+    st.markdown(
+        f'<div class="section-subtitle">A cleaner website-style stream for the current filter set. Showing {len(filtered_df):,} reviews out of {len(overall_df):,} loaded.</div>',
+        unsafe_allow_html=True,
+    )
+
+    bundle = get_master_export_bundle(summary, overall_df, prompt_artifacts)
+    top_controls = st.columns([1.3, 1.35, 1.0, 2.05])
+    top_controls[0].download_button(
+        label="Download all reviews",
+        data=bundle["excel_bytes"],
+        file_name=bundle["excel_name"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="review_explorer_download_all",
+    )
+    sort_mode = top_controls[1].selectbox(
+        "Sort reviews",
+        options=["Newest", "Oldest", "Highest rating", "Lowest rating", "Most helpful", "Longest"],
+        key="review_explorer_sort",
+    )
+    per_page = int(
+        top_controls[2].selectbox(
+            "Reviews per page",
+            options=[10, 20, 30, 50],
+            key="review_explorer_per_page",
+        )
+    )
+    top_controls[3].caption("Use the sidebar filters to narrow the review stream, then page through the results from the bottom of the review list.")
+
+    ordered_df = sort_reviews_for_explorer(filtered_df, sort_mode).reset_index(drop=True)
+    if ordered_df.empty:
+        st.info("No reviews match the current filters.")
+        return
+
+    page_count = max(1, math.ceil(len(ordered_df) / max(per_page, 1)))
+    current_page = int(st.session_state.get("review_explorer_page", 1))
+    current_page = max(1, min(current_page, page_count))
+    st.session_state["review_explorer_page"] = current_page
+    start = (current_page - 1) * per_page
+    end = start + per_page
+    page_df = ordered_df.iloc[start:end]
+
+    for _, row in page_df.iterrows():
+        render_review_card(row)
+
+    st.markdown("<div style='height:0.2rem'></div>", unsafe_allow_html=True)
+    render_review_pager(len(ordered_df), per_page, state_prefix="review_explorer")
+
+
+
+def render_ai_tab(
+    *,
+    settings: Dict[str, Any],
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+) -> None:
+    st.subheader("AI — Product & Consumer Insights")
+    st.markdown(
+        '<div class="section-subtitle">Ask anything. The assistant is grounded in the currently filtered review text, stays in one continuous thread, and now surfaces cited review previews on hover.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if filtered_df.empty:
+        st.info("The current filters return no reviews. Adjust the filters before using AI analyst.")
+        return
+
+    review_lookup = build_review_reference_lookup(filtered_df)
+
+    scope_signature = json.dumps(
+        {
+            "product_id": summary.product_id,
+            "filter_description": filter_description,
+            "review_count": int(len(filtered_df)),
+            "source_type": st.session_state.get("analysis_dataset", {}).get("source_type", "bazaarvoice"),
+        },
+        sort_keys=True,
+    )
+    if st.session_state.get("chat_scope_signature") != scope_signature:
+        if st.session_state.get("chat_messages"):
+            st.session_state["chat_messages"] = []
+            st.session_state["chat_scope_notice"] = "AI chat was cleared so it stays aligned with the latest filtered review scope."
+        st.session_state["chat_scope_signature"] = scope_signature
+
+    notice = st.session_state.pop("chat_scope_notice", None)
+    if notice:
+        st.info(notice)
+
+    with st.container(border=True):
+        status_cols = st.columns([1.3, 1.0, 1.6])
+        with status_cols[0]:
+            st.markdown("**🟢 Remote AI ready**" if get_openai_api_key() else "**AI setup needed**")
+            st.caption("The analyst stays anchored in review text first and uses metrics as supporting context.")
+        with status_cols[1]:
+            st.metric("Reviews in scope", f"{len(filtered_df):,}")
+            organic_reviews = int((~filtered_df["incentivized_review"].fillna(False)).sum())
+            st.caption(f"Organic reviews · {organic_reviews:,}")
+        with status_cols[2]:
+            ai_runtime = render_ai_settings_controls("ai_tab", include_batch_size=False, expander_label="Advanced AI settings")
+            st.caption(f"Model: {ai_runtime['model']} · Reasoning: {ai_runtime['reasoning_effort']}")
+
+    api_key = ai_runtime.get("api_key")
+    if not api_key:
+        st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable preset reports and chat.")
+        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
+        return
+
+    quick_actions = {
+        "Executive summary": {
+            "prompt": "Create a concise executive summary of the filtered reviews. Lead with the biggest strengths, biggest risks, key consumer insight, and the top 3 actions.",
+            "help": "Leadership-ready readout with strengths, risks, and top actions.",
+            "persona": None,
+        },
+        "Product Development": {
+            "prompt": PERSONAS["Product Development"]["prompt"],
+            "help": PERSONAS["Product Development"]["blurb"],
+            "persona": "Product Development",
+        },
+        "Quality Engineer": {
+            "prompt": PERSONAS["Quality Engineer"]["prompt"],
+            "help": PERSONAS["Quality Engineer"]["blurb"],
+            "persona": "Quality Engineer",
+        },
+        "Consumer Insights": {
+            "prompt": PERSONAS["Consumer Insights"]["prompt"],
+            "help": PERSONAS["Consumer Insights"]["blurb"],
+            "persona": "Consumer Insights",
+        },
+    }
+
+    quick_trigger: Optional[Tuple[Optional[str], str, str]] = None
+    with st.container(border=True):
+        st.markdown("**Quick reports**")
+        action_cols = st.columns(4)
+        for col, (label, config) in zip(action_cols, quick_actions.items()):
+            if col.button(label, use_container_width=True, help=config["help"], key=f"ai_quick_{slugify_column_name(label, fallback='quick')}"):
+                quick_trigger = (config["persona"], label, config["prompt"])
+        st.caption("Hover the cited review chips under an answer to preview the underlying source review.")
+
+    chat_container = get_scroll_container(height=560, border=True)
+    with chat_container:
+        if not st.session_state["chat_messages"]:
+            st.info(
+                "Start with a quick report above, or ask a direct question such as: What are the biggest improvement opportunities? What is driving 1-star reviews? What language should marketing avoid or lean into?"
+            )
+        for message in st.session_state["chat_messages"]:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                if message["role"] == "assistant":
+                    render_review_reference_shelf(message["content"], review_lookup)
+
+    helper_cols = st.columns([1.8, 1.1, 1.1])
+    helper_cols[0].caption(f"Current scope: {filter_description}")
+    if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat"):
+        st.session_state["chat_messages"] = []
+        st.rerun()
+    helper_cols[2].caption("Compact view enabled")
+
+    user_message = st.chat_input(
+        "Ask about complaint drivers, product opportunities, quality risks, sentiment drivers, unmet needs, or voice-of-customer themes...",
+        key="ai_chat_input",
+    )
+
+    prompt_to_send: Optional[str] = None
+    visible_user_message: Optional[str] = None
+    persona_name: Optional[str] = None
+    if quick_trigger:
+        persona_name, visible_user_message, prompt_to_send = quick_trigger
+    elif user_message:
+        prompt_to_send = user_message
+        visible_user_message = user_message
+
+    if prompt_to_send and visible_user_message:
+        prior_chat_history = list(st.session_state["chat_messages"])
+        st.session_state["chat_messages"].append({"role": "user", "content": visible_user_message})
+        overlay = show_thinking_overlay("Reviewing the filtered review text and building a grounded answer...")
+        try:
+            answer = call_openai_analyst(
+                api_key=api_key,
+                model=ai_runtime["model"],
+                reasoning_effort=ai_runtime["reasoning_effort"],
+                question=prompt_to_send,
+                overall_df=overall_df,
+                filtered_df=filtered_df,
+                summary=summary,
+                filter_description=filter_description,
+                chat_history=prior_chat_history,
+                persona_name=persona_name,
+            )
+            if persona_name:
+                answer = f"## {persona_name} report\n\n{answer}"
+        except Exception as exc:
+            answer = f"OpenAI request failed: {exc}"
+        finally:
+            overlay.empty()
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+        st.rerun()
 
 
 if __name__ == "__main__":
