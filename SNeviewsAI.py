@@ -5070,5 +5070,1326 @@ def render_ai_tab(
         st.rerun()
 
 
+
+# -----------------------------------------------------------------------------
+# V8 AI experience, workspace switching, and evidence UX overrides
+# -----------------------------------------------------------------------------
+
+
+def initialize_v8_session_state() -> None:
+    st.session_state.setdefault("stored_product_knowledge", None)
+    st.session_state.setdefault("workspace_notice", None)
+    st.session_state.setdefault("workspace_upload_nonce", 0)
+    st.session_state.setdefault("last_workspace_source_mode", st.session_state.get("workspace_source_mode", "SharkNinja product URL"))
+    st.session_state.setdefault("ai_focus_open", True)
+    st.session_state.setdefault("ai_question_draft", "")
+    st.session_state.setdefault("ai_composer_nonce", 0)
+    st.session_state.setdefault("_ai_settings_knowledge_context", None)
+
+
+
+def reset_workspace_runtime(*, clear_dataset: bool = False, clear_knowledge: bool = False) -> None:
+    keys_to_clear = [
+        "master_export_bundle",
+        "prompt_run_artifacts",
+        "prompt_run_notice",
+        "chat_messages",
+        "chat_scope_signature",
+        "chat_scope_notice",
+        "review_explorer_page",
+        "review_explorer_page_input",
+        "review_explorer_sort",
+        "review_explorer_per_page",
+        "prompt_result_view",
+        "analysis_dataset_source_signature",
+        "ai_focus_open",
+        "ai_question_draft",
+        "workspace_view_selector",
+        "active_main_view",
+        "_ai_settings_knowledge_context",
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
+    prefixes = (
+        "prompt_labels_",
+        "prompt_chart_active_",
+        "prompt_source_",
+        "prompt_rating_mode_",
+        "prompt_preview_rows_",
+        "ai_quick_",
+    )
+    exact_filter_keys = {
+        "sidebar_rating_mode",
+        "sidebar_custom_ratings",
+        "sidebar_review_source",
+        "sidebar_product_groups",
+        "sidebar_locales",
+        "sidebar_recommendation",
+        "sidebar_date_range",
+        "sidebar_text_query",
+        "dashboard_chart_scope",
+        "dash_trend_mode",
+        "dash_breakout",
+        "dash_smoothing",
+        "dash_top_groups",
+        "dash_show_overall",
+        "dash_show_volume",
+        "dash_zoom_mode",
+    }
+    for key in list(st.session_state.keys()):
+        if key in exact_filter_keys or any(key.startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
+
+    if clear_dataset:
+        st.session_state["analysis_dataset"] = None
+    if clear_knowledge:
+        st.session_state["stored_product_knowledge"] = None
+    st.session_state["ai_focus_open"] = True
+    st.session_state["workspace_view_selector"] = "Dashboard"
+    st.session_state["active_main_view"] = "Dashboard"
+
+
+
+def current_workspace_signature(summary: ReviewBatchSummary) -> str:
+    dataset = st.session_state.get("analysis_dataset") or {}
+    payload = {
+        "product_id": safe_text(summary.product_id),
+        "source_type": safe_text(dataset.get("source_type"), "bazaarvoice"),
+        "source_label": safe_text(dataset.get("source_label")),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+
+def build_stored_product_knowledge_packet(
+    *,
+    summary: ReviewBatchSummary,
+    overall_df: pd.DataFrame,
+    filter_description: str,
+) -> Dict[str, Any]:
+    metrics = compute_metrics(overall_df)
+    rating_mix = rating_distribution(overall_df).to_dict(orient="records")
+    monthly = monthly_trend(overall_df).tail(12).to_dict(orient="records")
+    relevant = select_relevant_reviews(overall_df, "product knowledge strengths weaknesses complaint drivers unmet needs", max_reviews=20)
+    low_star_terms = top_terms(overall_df[overall_df["rating"].isin([1, 2])]["title_and_text"].fillna(""), top_n=10).to_dict(orient="records")
+    high_star_terms = top_terms(overall_df[overall_df["rating"].isin([4, 5])]["title_and_text"].fillna(""), top_n=10).to_dict(orient="records")
+    return {
+        "stored_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "source_signature": current_workspace_signature(summary),
+        "product": {
+            "product_id": summary.product_id,
+            "product_name": product_display_name(summary, overall_df),
+            "product_url": summary.product_url,
+        },
+        "scope": {
+            "captured_from": "all_loaded_reviews",
+            "captured_review_count": int(len(overall_df)),
+            "active_filter_snapshot_when_saved": filter_description,
+        },
+        "metric_snapshot": {
+            "avg_rating": metrics.get("avg_rating"),
+            "avg_rating_non_incentivized": metrics.get("avg_rating_non_incentivized"),
+            "pct_low_star": metrics.get("pct_low_star"),
+            "pct_incentivized": metrics.get("pct_incentivized"),
+            "rating_distribution": rating_mix,
+            "monthly_trend": monthly,
+        },
+        "signal_snapshot": {
+            "top_positive_terms": high_star_terms,
+            "top_negative_terms": low_star_terms,
+        },
+        "evidence_pack": review_snippet_rows(relevant, max_reviews=20),
+    }
+
+
+
+def get_matching_stored_product_knowledge(summary: ReviewBatchSummary) -> Optional[Dict[str, Any]]:
+    stored = st.session_state.get("stored_product_knowledge")
+    if not stored:
+        return None
+    if stored.get("source_signature") != current_workspace_signature(summary):
+        return None
+    return stored
+
+
+
+def store_current_product_knowledge(summary: ReviewBatchSummary, overall_df: pd.DataFrame, filter_description: str) -> None:
+    st.session_state["stored_product_knowledge"] = build_stored_product_knowledge_packet(
+        summary=summary,
+        overall_df=overall_df,
+        filter_description=filter_description,
+    )
+    st.session_state["workspace_notice"] = f"Stored product knowledge for {summary.product_id} from {len(overall_df):,} reviews."
+
+
+
+def sanitize_tooltip_text(text: str, max_chars: int = 340) -> str:
+    cleaned = re.sub(r"\s+", " ", safe_text(text)).strip()
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 3].rstrip() + "..."
+    return cleaned
+
+
+
+def build_review_reference_chip_html(review_id: str, review_lookup: Dict[str, Dict[str, str]], *, compact: bool = False) -> str:
+    meta = review_lookup.get(review_id) or {}
+    tooltip = sanitize_tooltip_text(meta.get("tooltip", ""))
+    chip_class = "inline-evidence-chip compact" if compact else "inline-evidence-chip"
+    return (
+        f"<span class=\"{chip_class}\" data-tooltip=\"{html.escape(tooltip, quote=True)}\">"
+        f"#{html.escape(review_id)}</span>"
+    )
+
+
+REVIEW_CITATION_PATTERN = re.compile(r"\(review_ids?\s*:\s*([^\)\]\n]+)\)", flags=re.IGNORECASE)
+
+
+
+def apply_basic_inline_markdown(escaped_text: str) -> str:
+    text = escaped_text
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", text)
+    return text
+
+
+
+def render_inline_markdown_with_evidence(raw_text: str, review_lookup: Dict[str, Dict[str, str]]) -> str:
+    pieces: List[str] = []
+    cursor = 0
+    valid_ids = set(review_lookup.keys())
+    for match in REVIEW_CITATION_PATTERN.finditer(safe_text(raw_text)):
+        prefix = safe_text(raw_text)[cursor:match.start()]
+        pieces.append(apply_basic_inline_markdown(html.escape(prefix)))
+        ids: List[str] = []
+        for token in re.findall(r"[A-Za-z0-9_-]+", match.group(1)):
+            if token in valid_ids and token not in ids:
+                ids.append(token)
+        if ids:
+            chip_html = "".join(build_review_reference_chip_html(review_id, review_lookup) for review_id in ids)
+            pieces.append(f" <span class=\"inline-evidence-group\"><span class=\"inline-evidence-label\">Evidence</span>{chip_html}</span>")
+        else:
+            pieces.append(apply_basic_inline_markdown(html.escape(match.group(0))))
+        cursor = match.end()
+    pieces.append(apply_basic_inline_markdown(html.escape(safe_text(raw_text)[cursor:])))
+    return "".join(pieces)
+
+
+
+def markdown_to_compact_html(raw_text: str, review_lookup: Dict[str, Dict[str, str]]) -> str:
+    lines = safe_text(raw_text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    output: List[str] = []
+    list_mode: Optional[str] = None
+
+    def close_list() -> None:
+        nonlocal list_mode
+        if list_mode:
+            output.append(f"</{list_mode}>")
+            list_mode = None
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            close_list()
+            continue
+        heading_match = re.match(r"^(#{1,4})\s+(.*)$", stripped)
+        bullet_match = re.match(r"^[-*]\s+(.*)$", stripped)
+        ordered_match = re.match(r"^\d+\.\s+(.*)$", stripped)
+        if heading_match:
+            close_list()
+            level = min(len(heading_match.group(1)) + 1, 4)
+            body = render_inline_markdown_with_evidence(heading_match.group(2), review_lookup)
+            output.append(f"<h{level}>{body}</h{level}>")
+            continue
+        if bullet_match:
+            if list_mode != "ul":
+                close_list()
+                output.append("<ul>")
+                list_mode = "ul"
+            body = render_inline_markdown_with_evidence(bullet_match.group(1), review_lookup)
+            output.append(f"<li>{body}</li>")
+            continue
+        if ordered_match:
+            if list_mode != "ol":
+                close_list()
+                output.append("<ol>")
+                list_mode = "ol"
+            body = render_inline_markdown_with_evidence(ordered_match.group(1), review_lookup)
+            output.append(f"<li>{body}</li>")
+            continue
+        close_list()
+        body = render_inline_markdown_with_evidence(stripped, review_lookup)
+        output.append(f"<p>{body}</p>")
+    close_list()
+    return "\n".join(output)
+
+
+
+def render_ai_answer_content(answer_text: str, review_lookup: Dict[str, Dict[str, str]], *, empty_message: Optional[str] = None) -> None:
+    if not safe_text(answer_text):
+        if empty_message:
+            st.info(empty_message)
+        return
+    answer_html = markdown_to_compact_html(answer_text, review_lookup)
+    st.markdown(f"<div class='ai-response-html'>{answer_html}</div>", unsafe_allow_html=True)
+
+
+
+def latest_assistant_index(messages: Sequence[Dict[str, str]]) -> Optional[int]:
+    for idx in range(len(messages) - 1, -1, -1):
+        if safe_text(messages[idx].get("role")) == "assistant":
+            return idx
+    return None
+
+
+
+def split_chat_for_focus(messages: Sequence[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    assistant_idx = latest_assistant_index(messages)
+    if assistant_idx is None:
+        return list(messages), []
+    focus_start = assistant_idx
+    for idx in range(assistant_idx - 1, -1, -1):
+        if safe_text(messages[idx].get("role")) == "user":
+            focus_start = idx
+            break
+    return list(messages[:focus_start]), list(messages[focus_start:])
+
+
+
+def get_focus_pair(messages: Sequence[Dict[str, str]]) -> Tuple[Optional[str], Optional[str]]:
+    archive, focus = split_chat_for_focus(messages)
+    user_text = None
+    assistant_text = None
+    for message in focus:
+        if safe_text(message.get("role")) == "user":
+            user_text = safe_text(message.get("content"))
+        elif safe_text(message.get("role")) == "assistant":
+            assistant_text = safe_text(message.get("content"))
+    return user_text, assistant_text
+
+
+
+def markdown_to_plain_text(markdown_text: str) -> str:
+    text = REVIEW_CITATION_PATTERN.sub(lambda m: f"(review_ids: {m.group(1)})", safe_text(markdown_text))
+    lines: List[str] = []
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^[-*]\s+", "- ", line)
+        line = re.sub(r"^\d+\.\s+", "- ", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+        line = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", line)
+        lines.append(line)
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+
+def build_ai_report_pdf_bytes(
+    *,
+    report_title: str,
+    question: Optional[str],
+    answer_text: str,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+    review_lookup: Dict[str, Dict[str, str]],
+) -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except ImportError as exc:  # pragma: no cover
+        raise ReviewDownloaderError("reportlab is required to export PDF reports.") from exc
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=LETTER,
+        topMargin=0.7 * inch,
+        bottomMargin=0.65 * inch,
+        leftMargin=0.72 * inch,
+        rightMargin=0.72 * inch,
+        title=report_title,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#16213e"),
+        spaceAfter=12,
+    )
+    meta_style = ParagraphStyle(
+        "Meta",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#4b5563"),
+        spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=10,
+        leading=13,
+        spaceAfter=6,
+    )
+    heading_style = ParagraphStyle(
+        "Heading",
+        parent=styles["Heading2"],
+        fontSize=12,
+        leading=15,
+        textColor=colors.HexColor("#16213e"),
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+    story = [
+        Paragraph(html.escape(report_title), title_style),
+        Paragraph(html.escape(f"Product: {summary.product_id}"), meta_style),
+        Paragraph(html.escape(f"Generated: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"), meta_style),
+        Paragraph(html.escape(f"Scope: {filter_description}"), meta_style),
+        Spacer(1, 0.08 * inch),
+    ]
+    if safe_text(question):
+        story.append(Paragraph("Question", heading_style))
+        story.append(Paragraph(html.escape(safe_text(question)), body_style))
+        story.append(Spacer(1, 0.04 * inch))
+
+    story.append(Paragraph("AI response", heading_style))
+    plain_text = markdown_to_plain_text(answer_text)
+    for line in plain_text.split("\n"):
+        if not line.strip():
+            story.append(Spacer(1, 0.06 * inch))
+            continue
+        if line.startswith("- "):
+            bullet = html.escape(line[2:].strip())
+            story.append(Paragraph(f"• {bullet}", body_style))
+        else:
+            story.append(Paragraph(html.escape(line), body_style))
+
+    cited_review_ids = extract_referenced_review_ids(answer_text, valid_ids=review_lookup.keys(), limit=10)
+    if cited_review_ids:
+        story.append(Spacer(1, 0.12 * inch))
+        story.append(Paragraph("Referenced review appendix", heading_style))
+        for review_id in cited_review_ids:
+            meta = review_lookup.get(review_id) or {}
+            title = safe_text(meta.get("title"), "No title")
+            snippet = safe_text(meta.get("snippet"), "No snippet available")
+            story.append(Paragraph(html.escape(f"#{review_id} - {title}"), body_style))
+            story.append(Paragraph(html.escape(snippet), meta_style))
+            story.append(Spacer(1, 0.04 * inch))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
+def render_ai_focus_panel(
+    *,
+    messages: Sequence[Dict[str, str]],
+    review_lookup: Dict[str, Dict[str, str]],
+    summary: ReviewBatchSummary,
+    filter_description: str,
+) -> None:
+    latest_question, latest_answer = get_focus_pair(messages)
+    if not latest_answer:
+        return
+
+    if not st.session_state.get("ai_focus_open", True):
+        reopen_cols = st.columns([1.1, 3.6])
+        if reopen_cols[0].button("Open latest response", use_container_width=True, key="ai_reopen_focus"):
+            st.session_state["ai_focus_open"] = True
+            st.rerun()
+        reopen_cols[1].caption("The latest AI response is collapsed. Reopen it to review the most recent answer and export it to PDF.")
+        return
+
+    with st.container(border=True):
+        header_cols = st.columns([3.2, 1.2, 0.9])
+        with header_cols[0]:
+            st.markdown("**Current response**")
+            if latest_question:
+                st.caption(truncate_text(latest_question, 180))
+        pdf_bytes = build_ai_report_pdf_bytes(
+            report_title=f"{summary.product_id} AI response",
+            question=latest_question,
+            answer_text=latest_answer,
+            summary=summary,
+            filter_description=filter_description,
+            review_lookup=review_lookup,
+        )
+        header_cols[1].download_button(
+            "Extract to PDF",
+            data=pdf_bytes,
+            file_name=f"{summary.product_id}_ai_response_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="ai_response_pdf",
+        )
+        if header_cols[2].button("✕", use_container_width=True, key="ai_focus_close"):
+            st.session_state["ai_focus_open"] = False
+            st.rerun()
+        response_shell = get_scroll_container(height=430, border=False)
+        with response_shell:
+            render_ai_answer_content(latest_answer, review_lookup)
+
+
+
+def render_ai_archive(messages: Sequence[Dict[str, str]], review_lookup: Dict[str, Dict[str, str]]) -> None:
+    archive_messages, _ = split_chat_for_focus(messages)
+    assistant_archive = [
+        {
+            "question": safe_text(archive_messages[idx - 1].get("content")) if idx > 0 and safe_text(archive_messages[idx - 1].get("role")) == "user" else "",
+            "answer": safe_text(message.get("content")),
+        }
+        for idx, message in enumerate(archive_messages)
+        if safe_text(message.get("role")) == "assistant"
+    ]
+    if not assistant_archive:
+        return
+    with st.expander(f"Previous responses ({len(assistant_archive)})", expanded=False):
+        archive_shell = get_scroll_container(height=360, border=False)
+        with archive_shell:
+            for idx, item in enumerate(reversed(assistant_archive[-8:]), start=1):
+                with st.container(border=True):
+                    st.caption(f"Archived response {idx}")
+                    if item["question"]:
+                        st.markdown(f"**Question** · {html.escape(truncate_text(item['question'], 150))}", unsafe_allow_html=True)
+                    render_ai_answer_content(item["answer"], review_lookup)
+
+
+
+def render_review_pager(total_rows: int, per_page: int, *, state_prefix: str = "review_explorer") -> int:
+    page_count = max(1, math.ceil(total_rows / max(per_page, 1)))
+    page_key = f"{state_prefix}_page"
+    input_key = f"{state_prefix}_page_input"
+    initial_page = int(st.session_state.get(page_key, 1))
+    current_page = max(1, min(initial_page, page_count))
+
+    with st.container(border=True):
+        pager_cols = st.columns([0.9, 0.9, 2.55, 0.9, 0.95, 0.95])
+        if pager_cols[0].button("⏮", use_container_width=True, disabled=current_page <= 1, key=f"{state_prefix}_first"):
+            current_page = 1
+        if pager_cols[1].button("←", use_container_width=True, disabled=current_page <= 1, key=f"{state_prefix}_prev"):
+            current_page = max(1, current_page - 1)
+        pager_cols[2].markdown(
+            (
+                "<div class='compact-pager-status'>"
+                f"Page {current_page} of {page_count:,}"
+                f"<span class='compact-pager-sub'>Showing {(current_page - 1) * per_page + 1:,}-{min(current_page * per_page, total_rows):,} of {total_rows:,}</span>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        if st.session_state.get(input_key) != current_page:
+            st.session_state[input_key] = current_page
+        current_page = int(
+            pager_cols[3].number_input(
+                "Page",
+                min_value=1,
+                max_value=page_count,
+                value=current_page,
+                step=1,
+                key=input_key,
+                label_visibility="collapsed",
+            )
+        )
+        if pager_cols[4].button("→", use_container_width=True, disabled=current_page >= page_count, key=f"{state_prefix}_next"):
+            current_page = min(page_count, current_page + 1)
+        if pager_cols[5].button("⏭", use_container_width=True, disabled=current_page >= page_count, key=f"{state_prefix}_last"):
+            current_page = page_count
+
+    current_page = max(1, min(current_page, page_count))
+    st.session_state[page_key] = current_page
+    if current_page != initial_page:
+        st.rerun()
+    return current_page
+
+
+
+def render_ai_settings_controls(
+    prefix: str,
+    *,
+    include_batch_size: bool = False,
+    expander_label: str = "Advanced AI settings",
+) -> Dict[str, Any]:
+    api_key = get_openai_api_key()
+    normalize_ai_settings_prefix(prefix)
+    stored = st.session_state.get("stored_product_knowledge")
+    knowledge_context = st.session_state.get("_ai_settings_knowledge_context") or {}
+
+    with st.expander(expander_label, expanded=False):
+        status_cols = st.columns([1.1, 1.0, 1.2])
+        with status_cols[0]:
+            if api_key:
+                st.success("OpenAI API key loaded")
+            else:
+                st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable AI features")
+        with status_cols[1]:
+            st.selectbox(
+                "Model",
+                options=MODEL_OPTIONS,
+                key=f"{prefix}_model",
+                help="Use a GPT-5 reasoning model for grounded review analysis and row-level tagging.",
+            )
+        current_model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
+        supported_efforts = reasoning_options_for_model(current_model)
+        effort_key = f"{prefix}_reasoning_effort"
+        if st.session_state.get(effort_key) not in supported_efforts:
+            st.session_state[effort_key] = sanitize_reasoning_effort(current_model, st.session_state.get(effort_key))
+        with status_cols[2]:
+            st.selectbox(
+                "Reasoning effort",
+                options=supported_efforts,
+                key=effort_key,
+                help="Higher effort can improve depth, while lower effort is faster and cheaper.",
+            )
+        if include_batch_size:
+            st.slider(
+                "Review Prompt batch size",
+                min_value=5,
+                max_value=30,
+                step=1,
+                key=f"{prefix}_prompt_batch_size",
+                help="Larger batches reduce API calls but make each request heavier.",
+            )
+        action_cols = st.columns([1.2, 1.05, 2.35])
+        can_store = bool(knowledge_context.get("summary") and isinstance(knowledge_context.get("overall_df"), pd.DataFrame))
+        if action_cols[0].button(
+            "Store product knowledge",
+            use_container_width=True,
+            disabled=not can_store,
+            key=f"{prefix}_store_product_knowledge",
+        ):
+            store_current_product_knowledge(
+                knowledge_context["summary"],
+                knowledge_context["overall_df"],
+                knowledge_context.get("filter_description", "All reviews"),
+            )
+            st.rerun()
+        if action_cols[1].button(
+            "Clear knowledge",
+            use_container_width=True,
+            disabled=not bool(stored),
+            key=f"{prefix}_clear_product_knowledge",
+        ):
+            st.session_state["stored_product_knowledge"] = None
+            st.session_state["workspace_notice"] = "Cleared stored product knowledge."
+            st.rerun()
+        knowledge_caption = "No stored product knowledge yet."
+        if stored:
+            knowledge_caption = (
+                f"Stored knowledge: {safe_text(((stored.get('product') or {}).get('product_id')))} · "
+                f"{safe_int(((stored.get('scope') or {}).get('captured_review_count')), 0):,} reviews · "
+                f"{safe_text(stored.get('stored_at_utc'))}"
+            )
+        action_cols[2].caption(knowledge_caption)
+
+    return save_ai_settings_from_prefix(prefix)
+
+
+
+def call_openai_analyst(
+    *,
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    question: str,
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+    chat_history: Sequence[Dict[str, str]],
+    persona_name: Optional[str] = None,
+) -> str:
+    client = get_openai_client(api_key)
+    instructions = build_report_instructions(persona_name)
+    instructions += "\n\nDefault to a crisp response. Stay under roughly 375 words unless the user explicitly asks for a deep dive."
+    ai_context = build_ai_context(
+        overall_df=overall_df,
+        filtered_df=filtered_df,
+        summary=summary,
+        filter_description=filter_description,
+        question=question,
+    )
+    stored_knowledge = get_matching_stored_product_knowledge(summary)
+
+    input_messages: List[Dict[str, Any]] = []
+    for message in chat_history[-8:]:
+        input_messages.append({"role": message["role"], "content": message["content"]})
+
+    user_payload = textwrap.dedent(
+        f"""
+        User request:
+        {question}
+
+        Review dataset context (JSON):
+        {ai_context}
+        """
+    ).strip()
+    if stored_knowledge:
+        user_payload += textwrap.dedent(
+            f"""
+
+            Stored product knowledge snapshot (JSON).
+            Use this as reusable background context only. If it conflicts with the current filtered scope, the current filtered scope wins.
+            {json.dumps(stored_knowledge, ensure_ascii=False, indent=2, default=str)}
+            """
+        ).strip()
+    input_messages.append({"role": "user", "content": user_payload})
+
+    response = create_openai_response(
+        client,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        instructions=instructions,
+        input=input_messages,
+        max_output_tokens=950,
+        truncation="auto",
+    )
+    output_text = (getattr(response, "output_text", None) or "").strip()
+    if not output_text:
+        raise ReviewDownloaderError("OpenAI returned an empty answer.")
+    return output_text
+
+
+
+def render_ai_tab(
+    *,
+    settings: Dict[str, Any],
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+) -> None:
+    st.subheader("AI — Product & Consumer Insights")
+    st.markdown(
+        '<div class="section-subtitle">A cleaner analyst workspace: one active response, archived history tucked away, inline evidence chips at the point of the insight, and PDF export for the latest readout.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if filtered_df.empty:
+        st.info("The current filters return no reviews. Adjust the filters before using AI analyst.")
+        return
+
+    st.session_state["_ai_settings_knowledge_context"] = {
+        "summary": summary,
+        "overall_df": overall_df,
+        "filtered_df": filtered_df,
+        "filter_description": filter_description,
+    }
+    st.session_state.setdefault("ai_focus_open", True)
+    st.session_state.setdefault("ai_question_draft", "")
+
+    review_lookup = build_review_reference_lookup(filtered_df)
+    stored = get_matching_stored_product_knowledge(summary)
+
+    scope_signature = json.dumps(
+        {
+            "product_id": summary.product_id,
+            "filter_description": filter_description,
+            "review_count": int(len(filtered_df)),
+            "source_type": (st.session_state.get("analysis_dataset") or {}).get("source_type", "bazaarvoice"),
+        },
+        sort_keys=True,
+    )
+    if st.session_state.get("chat_scope_signature") != scope_signature:
+        if st.session_state.get("chat_messages"):
+            st.session_state["chat_messages"] = []
+            st.session_state["chat_scope_notice"] = "AI chat was cleared so it stays aligned with the latest filtered review scope."
+        st.session_state["chat_scope_signature"] = scope_signature
+        st.session_state["ai_focus_open"] = True
+
+    notice = st.session_state.pop("chat_scope_notice", None)
+    if notice:
+        st.info(notice)
+
+    with st.container(border=True):
+        status_cols = st.columns([1.2, 1.0, 1.0, 1.8])
+        status_cols[0].metric("Reviews in scope", f"{len(filtered_df):,}")
+        organic_reviews = int((~filtered_df["incentivized_review"].fillna(False)).sum())
+        status_cols[1].metric("Organic reviews", f"{organic_reviews:,}")
+        status_cols[2].metric("Model", settings.get("openai_model") or st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL))
+        scope_text = f"Scope: {filter_description}"
+        if stored:
+            scope_text += " · Stored product knowledge active"
+        status_cols[3].caption(scope_text)
+
+    with st.container(border=True):
+        quick_cols = st.columns([1.0, 1.0, 1.0, 1.0])
+        quick_actions = {
+            "Executive summary": {
+                "prompt": "Create a concise executive summary of the filtered reviews. Lead with the biggest strengths, biggest risks, key consumer insight, and the top 3 actions.",
+                "help": "Leadership-ready readout with strengths, risks, and top actions.",
+                "persona": None,
+            },
+            "Product Development": {
+                "prompt": PERSONAS["Product Development"]["prompt"],
+                "help": PERSONAS["Product Development"]["blurb"],
+                "persona": "Product Development",
+            },
+            "Quality Engineer": {
+                "prompt": PERSONAS["Quality Engineer"]["prompt"],
+                "help": PERSONAS["Quality Engineer"]["blurb"],
+                "persona": "Quality Engineer",
+            },
+            "Consumer Insights": {
+                "prompt": PERSONAS["Consumer Insights"]["prompt"],
+                "help": PERSONAS["Consumer Insights"]["blurb"],
+                "persona": "Consumer Insights",
+            },
+        }
+        quick_trigger: Optional[Tuple[Optional[str], str, str]] = None
+        for col, (label, config) in zip(quick_cols, quick_actions.items()):
+            if col.button(label, use_container_width=True, help=config["help"], key=f"ai_quick_v8_{slugify_column_name(label, fallback='quick')}"):
+                quick_trigger = (config["persona"], label, config["prompt"])
+        st.caption("Inline evidence chips appear exactly where the model cites a review. Hover a chip to preview the review behind the claim.")
+
+        ai_runtime = render_ai_settings_controls("ai_tab", include_batch_size=False, expander_label="Advanced AI settings")
+
+    api_key = ai_runtime.get("api_key")
+    if not api_key:
+        st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable preset reports and chat.")
+        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
+        return
+
+    with st.container(border=True):
+        composer_cols = st.columns([4.1, 0.9])
+        question_text = composer_cols[0].text_area(
+            "Ask a question",
+            value=st.session_state.get("ai_question_draft", ""),
+            placeholder="Ask about strengths, risks, unmet needs, complaint drivers, voice-of-customer language, or action opportunities...",
+            key=f"ai_question_draft_{st.session_state.get('ai_composer_nonce', 0)}",
+            height=92,
+            label_visibility="collapsed",
+        )
+        st.session_state["ai_question_draft"] = question_text
+        with composer_cols[1]:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            send_clicked = st.button("Send", type="primary", use_container_width=True, key="ai_send_button_v8")
+        composer_hint = st.columns([3.3, 1.7])
+        composer_hint[0].caption(f"Current scope · {filter_description}")
+        composer_hint[1].caption("History is tucked into Previous responses once a new answer arrives.")
+
+    prompt_to_send: Optional[str] = None
+    visible_user_message: Optional[str] = None
+    persona_name: Optional[str] = None
+    if quick_trigger:
+        persona_name, visible_user_message, prompt_to_send = quick_trigger
+        st.session_state["ai_question_draft"] = ""
+        st.session_state["ai_composer_nonce"] = safe_int(st.session_state.get("ai_composer_nonce"), 0) + 1
+    elif send_clicked and safe_text(question_text):
+        prompt_to_send = safe_text(question_text)
+        visible_user_message = safe_text(question_text)
+        st.session_state["ai_question_draft"] = ""
+        st.session_state["ai_composer_nonce"] = safe_int(st.session_state.get("ai_composer_nonce"), 0) + 1
+
+    if prompt_to_send and visible_user_message:
+        prior_chat_history = list(st.session_state.get("chat_messages", []))
+        st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": visible_user_message})
+        overlay = show_thinking_overlay("Reviewing the filtered review text and building a grounded answer...")
+        try:
+            answer = call_openai_analyst(
+                api_key=api_key,
+                model=ai_runtime["model"],
+                reasoning_effort=ai_runtime["reasoning_effort"],
+                question=prompt_to_send,
+                overall_df=overall_df,
+                filtered_df=filtered_df,
+                summary=summary,
+                filter_description=filter_description,
+                chat_history=prior_chat_history,
+                persona_name=persona_name,
+            )
+            if persona_name:
+                answer = f"## {persona_name} report\n\n{answer}"
+        except Exception as exc:
+            answer = f"OpenAI request failed: {exc}"
+        finally:
+            overlay.empty()
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+        st.session_state["ai_focus_open"] = True
+        st.rerun()
+
+    messages = list(st.session_state.get("chat_messages", []))
+    if not messages:
+        st.info(
+            "Start with a quick report above, or ask a direct question such as: What are the biggest improvement opportunities? What is driving 1-star reviews? What should product development prioritize next?"
+        )
+        return
+
+    render_ai_focus_panel(
+        messages=messages,
+        review_lookup=review_lookup,
+        summary=summary,
+        filter_description=filter_description,
+    )
+    render_ai_archive(messages, review_lookup)
+
+    helper_cols = st.columns([2.5, 1.0, 1.0])
+    latest_question, _ = get_focus_pair(messages)
+    helper_cols[0].caption(
+        f"Most recent prompt · {truncate_text(latest_question or 'Quick report', 140)}"
+    )
+    if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat_v8"):
+        st.session_state["chat_messages"] = []
+        st.session_state["ai_focus_open"] = True
+        st.rerun()
+    helper_cols[2].caption("Compact reading mode")
+
+
+
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+            .block-container {
+                padding-top: 0.95rem;
+                padding-bottom: 2rem;
+                max-width: 1480px;
+            }
+            .hero-card {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 18px;
+                padding: 1.1rem 1.2rem;
+                background: linear-gradient(180deg, rgba(250,250,252,0.96), rgba(245,247,250,0.96));
+                margin-bottom: 1rem;
+            }
+            .hero-kicker {
+                font-size: 0.78rem;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #6b7280;
+                margin-bottom: 0.35rem;
+            }
+            .hero-title {
+                font-size: 1.5rem;
+                font-weight: 700;
+                color: #16213e;
+                margin-bottom: 0.3rem;
+            }
+            .hero-subtitle {
+                color: #4b5563;
+                font-size: 0.98rem;
+                line-height: 1.4;
+            }
+            .metric-card {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 16px;
+                padding: 0.95rem 1rem;
+                background: rgba(250, 250, 252, 0.92);
+                min-height: 152px;
+                height: 152px;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+            }
+            .metric-label {
+                color: #6b7280;
+                font-size: 0.82rem;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                margin-bottom: 0.45rem;
+            }
+            .metric-value {
+                color: #16213e;
+                font-size: clamp(1.55rem, 2vw, 2rem);
+                font-weight: 700;
+                line-height: 1.05;
+                margin-bottom: 0.25rem;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .metric-sub {
+                color: #4b5563;
+                font-size: 0.83rem;
+                line-height: 1.3;
+                min-height: 2.6em;
+                overflow: hidden;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+            }
+            .section-subtitle {
+                color: #6b7280;
+                font-size: 0.96rem;
+                margin-bottom: 0.85rem;
+            }
+            .review-shell {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 18px;
+                padding: 1rem 1rem 0.9rem 1rem;
+                background: rgba(255,255,255,0.98);
+                margin-bottom: 0.9rem;
+            }
+            .report-card {
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 16px;
+                padding: 1rem 1rem 0.9rem 1rem;
+                background: rgba(250, 250, 252, 0.92);
+                min-height: 180px;
+            }
+            .tiny-note {
+                color: #6b7280;
+                font-size: 0.85rem;
+            }
+            .compact-pager-status {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 0.55rem;
+                font-weight: 700;
+                color: #16213e;
+                padding-top: 0.45rem;
+                font-size: 0.96rem;
+            }
+            .compact-pager-sub {
+                color: #6b7280;
+                font-weight: 500;
+                font-size: 0.84rem;
+            }
+            .inline-evidence-group {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.28rem;
+                flex-wrap: wrap;
+                margin-left: 0.18rem;
+                vertical-align: baseline;
+            }
+            .inline-evidence-label {
+                font-size: 0.71rem;
+                color: #6b7280;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                margin-right: 0.1rem;
+            }
+            .inline-evidence-chip {
+                position: relative;
+                display: inline-flex;
+                align-items: center;
+                border: 1px solid rgba(49, 51, 63, 0.14);
+                border-radius: 999px;
+                padding: 0.12rem 0.44rem;
+                background: rgba(245, 247, 250, 0.98);
+                color: #16213e;
+                font-size: 0.73rem;
+                line-height: 1.18;
+                cursor: help;
+                white-space: nowrap;
+                margin-right: 0.1rem;
+            }
+            .inline-evidence-chip.compact {
+                font-size: 0.68rem;
+                padding: 0.1rem 0.38rem;
+            }
+            .inline-evidence-chip:hover::after,
+            .inline-evidence-chip:focus::after {
+                content: attr(data-tooltip);
+                position: absolute;
+                left: 50%;
+                top: calc(100% + 9px);
+                transform: translateX(-50%);
+                width: min(340px, 72vw);
+                background: rgba(17, 24, 39, 0.96);
+                color: #f9fafb;
+                border-radius: 12px;
+                padding: 0.65rem 0.75rem;
+                font-size: 0.75rem;
+                line-height: 1.32;
+                box-shadow: 0 16px 34px rgba(15, 23, 42, 0.26);
+                white-space: normal;
+                z-index: 1000;
+                text-align: left;
+            }
+            .inline-evidence-chip:hover::before,
+            .inline-evidence-chip:focus::before {
+                content: "";
+                position: absolute;
+                left: 50%;
+                top: calc(100% + 3px);
+                transform: translateX(-50%);
+                border-left: 6px solid transparent;
+                border-right: 6px solid transparent;
+                border-bottom: 6px solid rgba(17, 24, 39, 0.96);
+                z-index: 1001;
+            }
+            .ai-response-html {
+                color: #16213e;
+                font-size: 0.86rem;
+                line-height: 1.5;
+            }
+            .ai-response-html h2,
+            .ai-response-html h3,
+            .ai-response-html h4 {
+                font-size: 0.97rem;
+                line-height: 1.25;
+                margin: 0.4rem 0 0.32rem 0;
+                color: #16213e;
+            }
+            .ai-response-html p,
+            .ai-response-html li {
+                font-size: 0.86rem;
+                line-height: 1.48;
+                margin-bottom: 0.38rem;
+                color: #16213e;
+            }
+            .ai-response-html ul,
+            .ai-response-html ol {
+                padding-left: 1.08rem;
+                margin: 0.1rem 0 0.35rem 0;
+            }
+            .ai-response-html code {
+                font-size: 0.8rem;
+                padding: 0.08rem 0.26rem;
+                border-radius: 6px;
+                background: rgba(226, 232, 240, 0.7);
+            }
+            .thinking-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(15, 23, 42, 0.30);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 99999;
+            }
+            .thinking-card {
+                width: min(430px, 92vw);
+                background: rgba(255,255,255,0.98);
+                border: 1px solid rgba(49, 51, 63, 0.12);
+                border-radius: 20px;
+                box-shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+                padding: 1.2rem 1.3rem;
+                text-align: center;
+            }
+            .thinking-spinner {
+                width: 40px;
+                height: 40px;
+                border: 4px solid rgba(17, 24, 39, 0.14);
+                border-top-color: #111827;
+                border-radius: 50%;
+                margin: 0 auto 0.8rem auto;
+                animation: thinking-spin 0.9s linear infinite;
+            }
+            .thinking-title {
+                color: #16213e;
+                font-weight: 700;
+                font-size: 1.08rem;
+                margin-bottom: 0.3rem;
+            }
+            .thinking-sub {
+                color: #4b5563;
+                font-size: 0.95rem;
+                line-height: 1.35;
+            }
+            div[data-testid="stChatMessage"] {
+                padding-top: 0.1rem;
+                padding-bottom: 0.1rem;
+            }
+            div[data-testid="stTextArea"] textarea {
+                line-height: 1.35 !important;
+            }
+            @keyframes thinking-spin {
+                to { transform: rotate(360deg); }
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    inject_css()
+    initialize_session_state()
+    initialize_v8_session_state()
+
+    st.title(APP_TITLE)
+    st.caption(
+        "Build a review workspace from a SharkNinja product URL or an uploaded review export, then filter the voice of customer, explore review cards, chat with an AI analyst, and create row-level AI tags."
+    )
+
+    workspace_notice = st.session_state.pop("workspace_notice", None)
+    if workspace_notice:
+        st.success(workspace_notice)
+
+    dataset = st.session_state.get("analysis_dataset")
+    if dataset:
+        current_source_cols = st.columns([4.2, 1.0])
+        current_source_cols[0].caption(
+            f"Current workspace · {safe_text(dataset.get('source_type', 'bazaarvoice')).replace('_', ' ').title()} · {safe_text(dataset.get('source_label', ''))}"
+        )
+        if current_source_cols[1].button("Clear workspace", use_container_width=True, key="workspace_clear_button"):
+            reset_workspace_runtime(clear_dataset=True, clear_knowledge=True)
+            st.session_state["workspace_notice"] = "Cleared the current workspace. Load a new URL or file to start fresh."
+            st.session_state["workspace_upload_nonce"] = safe_int(st.session_state.get("workspace_upload_nonce"), 0) + 1
+            st.rerun()
+
+    source_mode = st.radio(
+        "Workspace source",
+        options=["SharkNinja product URL", "Uploaded review file"],
+        horizontal=True,
+        key="workspace_source_mode",
+    )
+
+    last_source_mode = st.session_state.get("last_workspace_source_mode")
+    if last_source_mode != source_mode and st.session_state.get("analysis_dataset") is not None:
+        reset_workspace_runtime(clear_dataset=True, clear_knowledge=True)
+        st.session_state["workspace_notice"] = f"Switched workspace source to {source_mode}. Previous data was cleared so you can load a fresh source cleanly."
+        st.session_state["workspace_upload_nonce"] = safe_int(st.session_state.get("workspace_upload_nonce"), 0) + 1
+        st.session_state["last_workspace_source_mode"] = source_mode
+        st.rerun()
+    st.session_state["last_workspace_source_mode"] = source_mode
+
+    if source_mode == "SharkNinja product URL":
+        product_url = st.text_input(
+            "Product URL",
+            value="https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
+            help="Example: https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
+            key="workspace_product_url_input",
+        )
+        if dataset and safe_text(dataset.get("source_type")) == "bazaarvoice" and safe_text(dataset.get("source_label")) != normalize_product_url(product_url):
+            st.info("Building this URL will replace the current workspace and clear prior AI/report state.")
+        build_clicked = st.button("Build review workspace", type="primary", key="workspace_build_from_url")
+        if build_clicked:
+            try:
+                new_dataset = load_product_reviews(product_url)
+                reset_workspace_runtime(clear_dataset=False, clear_knowledge=True)
+                st.session_state["analysis_dataset"] = new_dataset
+                st.session_state["workspace_notice"] = f"Loaded {new_dataset['summary'].reviews_downloaded:,} reviews for {new_dataset['summary'].product_id}."
+                st.rerun()
+            except requests.HTTPError as exc:
+                st.error(f"HTTP error: {exc}")
+            except ReviewDownloaderError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.exception(exc)
+    else:
+        uploader_key = f"workspace_upload_{safe_int(st.session_state.get('workspace_upload_nonce'), 0)}"
+        uploaded_files = st.file_uploader(
+            "Upload review export files",
+            type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            help="Supports Axion-style exports and similar CSV/XLSX review files.",
+            key=uploader_key,
+        )
+        st.caption("Mapped columns include Opened date, Base SKU, SKU Item, Product Name, Review Text, Title, Rating (num), Seeded Flag, Syndicated Flag, Retailer, Location, and Event Id.")
+        if dataset and safe_text(dataset.get("source_type")) == "uploaded" and uploaded_files:
+            current_names = sorted(safe_text(name) for name in (dataset.get("source_files") or []))
+            next_names = sorted(safe_text(file.name) for file in uploaded_files)
+            if current_names != next_names:
+                st.info("Building these files will replace the current workspace and clear prior AI/report state.")
+        build_clicked = st.button("Build review workspace from file", type="primary", key="workspace_build_from_file")
+        if build_clicked:
+            try:
+                new_dataset = load_uploaded_review_files(uploaded_files or [])
+                new_dataset["source_files"] = [safe_text(file.name) for file in (uploaded_files or [])]
+                reset_workspace_runtime(clear_dataset=False, clear_knowledge=True)
+                st.session_state["analysis_dataset"] = new_dataset
+                st.session_state["workspace_notice"] = f"Loaded {new_dataset['summary'].reviews_downloaded:,} uploaded reviews into the workspace."
+                st.rerun()
+            except ReviewDownloaderError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.exception(exc)
+
+    dataset = st.session_state.get("analysis_dataset")
+    settings = render_sidebar_controls(dataset["reviews_df"] if dataset else None)
+    if not dataset:
+        st.info("Build a review workspace to unlock the dashboard, review explorer, AI analyst, and Review Prompt tagging.")
+        return
+
+    summary: ReviewBatchSummary = dataset["summary"]
+    overall_df: pd.DataFrame = dataset["reviews_df"]
+    source_type = dataset.get("source_type", "bazaarvoice")
+    source_label = dataset.get("source_label", "")
+
+    filtered_df = apply_filters(
+        overall_df,
+        selected_ratings=settings["selected_ratings"],
+        incentivized_mode=map_review_source_mode(settings["review_source_mode"]),
+        selected_products=settings["selected_products"],
+        selected_locales=settings["selected_locales"],
+        recommendation_mode=settings["recommendation_mode"],
+        syndicated_mode="All",
+        media_mode="All",
+        date_range=settings["date_range"],
+        text_query=settings["text_query"],
+    )
+    filter_description = describe_current_filters(
+        selected_ratings=settings["selected_ratings"],
+        selected_products=settings["selected_products"],
+        review_source_mode=settings["review_source_mode"],
+        selected_locales=settings["selected_locales"],
+        recommendation_mode=settings["recommendation_mode"],
+        date_range=settings["date_range"],
+        text_query=settings["text_query"],
+    )
+    st.session_state["_ai_settings_knowledge_context"] = {
+        "summary": summary,
+        "overall_df": overall_df,
+        "filtered_df": filtered_df,
+        "filter_description": filter_description,
+    }
+
+    render_workspace_header(
+        summary,
+        overall_df,
+        st.session_state.get("prompt_run_artifacts"),
+        source_type=source_type,
+        source_label=source_label,
+    )
+    render_top_metrics(overall_df, filtered_df)
+    st.caption(f"Filter status: {filter_description}. Showing {len(filtered_df):,} of {len(overall_df):,} reviews.")
+
+    if st.session_state.get("workspace_view_selector") not in ["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"]:
+        st.session_state["workspace_view_selector"] = st.session_state.get("active_main_view", "Dashboard")
+    st.radio(
+        "Workspace view",
+        options=["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"],
+        horizontal=True,
+        key="workspace_view_selector",
+    )
+    st.session_state["active_main_view"] = st.session_state.get("workspace_view_selector", "Dashboard")
+
+    active_view = st.session_state.get("active_main_view", "Dashboard")
+    if active_view == "Dashboard":
+        render_dashboard(filtered_df)
+    elif active_view == "Review Explorer":
+        render_review_explorer(
+            summary=summary,
+            overall_df=overall_df,
+            filtered_df=filtered_df,
+            prompt_artifacts=st.session_state.get("prompt_run_artifacts"),
+        )
+    elif active_view == "AI Analyst":
+        render_ai_tab(
+            settings=settings,
+            overall_df=overall_df,
+            filtered_df=filtered_df,
+            summary=summary,
+            filter_description=filter_description,
+        )
+    else:
+        render_review_prompt_tab(
+            settings=settings,
+            overall_df=overall_df,
+            filtered_df=filtered_df,
+            summary=summary,
+            filter_description=filter_description,
+        )
+
 if __name__ == "__main__":
     main()
