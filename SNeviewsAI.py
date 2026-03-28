@@ -684,10 +684,67 @@ def ensure_columns(df: pd.DataFrame, required_columns: Sequence[str]) -> pd.Data
 
 
 
+def is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple, set, dict, pd.Series, pd.DataFrame, pd.Index)):
+        return False
+    try:
+        missing = pd.isna(value)
+    except Exception:
+        return False
+    return bool(missing) if isinstance(missing, (bool, int)) else False
+
+
+
+def safe_text(value: Any, default: str = "") -> str:
+    if is_missing_value(value):
+        return default
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null", "<na>"}:
+        return default
+    return text
+
+
+
+def safe_bool(value: Any, default: bool = False) -> bool:
+    if is_missing_value(value):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if pd.isna(value):
+                return default
+        except Exception:
+            pass
+        return bool(value)
+    text = safe_text(value).lower()
+    if text in {"true", "1", "yes", "y", "t"}:
+        return True
+    if text in {"false", "0", "no", "n", "f", ""}:
+        return False
+    return default
+
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    if is_missing_value(value):
+        return default
+    try:
+        return int(float(value))
+    except Exception:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+
+
 
 
 def parse_flag_text(value: Any, *, positive_tokens: Sequence[str], negative_tokens: Sequence[str]) -> Any:
-    text = str(value or "").strip().lower()
+    text = safe_text(value).lower()
     if text in {"", "nan", "none", "null", "n/a"}:
         return pd.NA
     if any(text == token.lower() for token in negative_tokens):
@@ -722,7 +779,7 @@ def extract_age_group_from_context_json(value: Any) -> Optional[str]:
         candidate = raw
         if isinstance(raw, dict):
             candidate = raw.get("Value") or raw.get("value") or raw.get("Label") or raw.get("label")
-        candidate = str(candidate or "").strip()
+        candidate = safe_text(candidate)
         if candidate and candidate.lower() not in {"nan", "none", "null", "unknown", "prefer not to say"}:
             return candidate
     return None
@@ -1061,7 +1118,7 @@ def locale_distribution(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_text_for_search(text: str) -> str:
-    text = str(text or "").lower()
+    text = safe_text(text).lower()
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -1548,7 +1605,7 @@ def call_openai_json(
 
 
 def truncate_text(text: str, max_chars: int = 420) -> str:
-    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    text = re.sub(r"\s+", " ", safe_text(text)).strip()
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3].rstrip() + "..."
@@ -1556,13 +1613,13 @@ def truncate_text(text: str, max_chars: int = 420) -> str:
 
 
 def humanize_column_name(name: str) -> str:
-    cleaned = re.sub(r"[_\-]+", " ", str(name or "")).strip()
+    cleaned = re.sub(r"[_\-]+", " ", safe_text(name)).strip()
     return cleaned.title() if cleaned else "Custom prompt"
 
 
 
 def slugify_column_name(text: str, *, fallback: str = "custom_prompt") -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", str(text or "").strip().lower())
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", safe_text(text).lower())
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
     if not cleaned:
         cleaned = fallback
@@ -1576,7 +1633,7 @@ def first_non_empty(series: pd.Series) -> str:
     if series.empty:
         return ""
     for value in series.astype(str):
-        value = value.strip()
+        value = safe_text(value)
         if value and value.lower() != "nan":
             return value
     return ""
@@ -1613,7 +1670,8 @@ def select_relevant_reviews(df: pd.DataFrame, question: str, max_reviews: int = 
         if any(token in {"love", "best", "favorite", "positive", "strength", "delight"} for token in query_tokens):
             if pd.notna(rating):
                 score += max(0, float(rating) - 2)
-        if row.get("incentivized_review") is False:
+        incentivized_value = row.get("incentivized_review")
+        if not is_missing_value(incentivized_value) and not safe_bool(incentivized_value, False):
             score += 0.5
         if pd.notna(row.get("review_length_words")):
             score += min(float(row.get("review_length_words", 0)) / 60, 2)
@@ -1641,14 +1699,14 @@ def review_snippet_rows(df: pd.DataFrame, *, max_reviews: int = 18) -> List[Dict
     for _, row in df.head(max_reviews).iterrows():
         rows.append(
             {
-                "review_id": str(row.get("review_id", "")),
-                "rating": row.get("rating"),
-                "incentivized_review": bool(row.get("incentivized_review", False)),
-                "content_locale": row.get("content_locale"),
-                "retailer": row.get("retailer"),
-                "age_group": row.get("age_group"),
-                "product_or_sku": row.get("product_or_sku"),
-                "submission_date": str(row.get("submission_date") or ""),
+                "review_id": safe_text(row.get("review_id")),
+                "rating": safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else None,
+                "incentivized_review": safe_bool(row.get("incentivized_review"), False),
+                "content_locale": safe_text(row.get("content_locale")),
+                "retailer": safe_text(row.get("retailer")),
+                "age_group": safe_text(row.get("age_group")),
+                "product_or_sku": safe_text(row.get("product_or_sku")),
+                "submission_date": safe_text(row.get("submission_date")),
                 "title": truncate_text(row.get("title", ""), 120),
                 "snippet": truncate_text(row.get("review_text", ""), 520),
             }
@@ -1816,13 +1874,13 @@ def add_prompt_rows(prompt_df: pd.DataFrame, rows: Sequence[Dict[str, str]]) -> 
     existing = {str(value).strip().lower() for value in base.get("column_name", pd.Series(dtype="object")).fillna("").astype(str)}
     new_rows = []
     for row in rows:
-        name = str(row.get("column_name", "")).strip().lower()
+        name = safe_text(row.get("column_name")).lower()
         if name and name in existing:
             continue
         new_rows.append({
-            "column_name": row.get("column_name", ""),
-            "prompt": row.get("prompt", ""),
-            "labels": row.get("labels", ""),
+            "column_name": safe_text(row.get("column_name")),
+            "prompt": safe_text(row.get("prompt")),
+            "labels": safe_text(row.get("labels")),
         })
         if name:
             existing.add(name)
@@ -1841,9 +1899,9 @@ def normalize_prompt_definitions(prompt_df: pd.DataFrame, existing_columns: Sequ
     existing_set = {str(col) for col in existing_columns}
 
     for _, row in prompt_df.fillna("").iterrows():
-        raw_prompt = str(row.get("prompt", "")).strip()
-        raw_labels = str(row.get("labels", "")).strip()
-        raw_column = str(row.get("column_name", "")).strip()
+        raw_prompt = safe_text(row.get("prompt"))
+        raw_labels = safe_text(row.get("labels"))
+        raw_column = safe_text(row.get("column_name"))
 
         if not raw_prompt and not raw_labels and not raw_column:
             continue
@@ -2026,13 +2084,13 @@ def build_review_tagging_input(
     for _, row in chunk_df.iterrows():
         reviews_payload.append(
             {
-                "review_id": str(row.get("review_id", "")),
-                "rating": row.get("rating"),
+                "review_id": safe_text(row.get("review_id")),
+                "rating": safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else None,
                 "title": truncate_text(row.get("title", ""), 200),
                 "review_text": truncate_text(row.get("review_text", ""), 1000),
-                "incentivized_review": bool(row.get("incentivized_review", False)),
-                "submission_date": str(row.get("submission_date") or ""),
-                "content_locale": row.get("content_locale"),
+                "incentivized_review": safe_bool(row.get("incentivized_review"), False),
+                "submission_date": safe_text(row.get("submission_date")),
+                "content_locale": safe_text(row.get("content_locale")),
             }
         )
 
@@ -2498,9 +2556,11 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("reasoning_effort", DEFAULT_REASONING_EFFORT)
     st.session_state.setdefault("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)
     st.session_state.setdefault("active_main_view", "Dashboard")
+    st.session_state.setdefault("workspace_view_selector", st.session_state["active_main_view"])
     st.session_state.setdefault("review_explorer_sort", "Newest")
     st.session_state.setdefault("review_explorer_per_page", 20)
     st.session_state.setdefault("review_explorer_page", 1)
+    st.session_state.setdefault("review_explorer_page_input", 1)
     st.session_state.setdefault("prompt_result_view", "")
     for prefix in ["ai_tab", "prompt_tab"]:
         st.session_state.setdefault(f"{prefix}_model", st.session_state["openai_model"])
@@ -2555,12 +2615,16 @@ def rating_values_for_mode(mode: str, custom_values: Optional[Sequence[int]] = N
 def normalize_ai_settings_prefix(prefix: str) -> None:
     model = st.session_state.get(f"{prefix}_model", st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL))
     if model not in MODEL_OPTIONS:
-        model = DEFAULT_OPENAI_MODEL
+        fallback_model = st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL)
+        model = fallback_model if fallback_model in MODEL_OPTIONS else DEFAULT_OPENAI_MODEL
     effort = sanitize_reasoning_effort(
         model,
         st.session_state.get(f"{prefix}_reasoning_effort", st.session_state.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
     )
-    batch_size = int(st.session_state.get(f"{prefix}_prompt_batch_size", st.session_state.get("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)))
+    batch_size = safe_int(
+        st.session_state.get(f"{prefix}_prompt_batch_size", st.session_state.get("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)),
+        DEFAULT_PROMPT_BATCH_SIZE,
+    )
     batch_size = max(5, min(batch_size, 30))
     st.session_state[f"{prefix}_model"] = model
     st.session_state[f"{prefix}_reasoning_effort"] = effort
@@ -2568,26 +2632,28 @@ def normalize_ai_settings_prefix(prefix: str) -> None:
 
 
 
-def mirror_ai_settings_from(prefix: str) -> None:
-    normalize_ai_settings_prefix(prefix)
-    model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
-    effort = st.session_state.get(f"{prefix}_reasoning_effort", DEFAULT_REASONING_EFFORT)
-    batch_size = int(st.session_state.get(f"{prefix}_prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE))
+def save_ai_settings_from_prefix(prefix: str) -> Dict[str, Any]:
+    model = st.session_state.get(f"{prefix}_model", st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL))
+    if model not in MODEL_OPTIONS:
+        model = DEFAULT_OPENAI_MODEL
+    effort = sanitize_reasoning_effort(model, st.session_state.get(f"{prefix}_reasoning_effort", DEFAULT_REASONING_EFFORT))
+    batch_size = safe_int(st.session_state.get(f"{prefix}_prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE), DEFAULT_PROMPT_BATCH_SIZE)
+    batch_size = max(5, min(batch_size, 30))
     st.session_state["openai_model"] = model
     st.session_state["reasoning_effort"] = effort
     st.session_state["prompt_batch_size"] = batch_size
-    for other in ["ai_tab", "prompt_tab"]:
-        st.session_state[f"{other}_model"] = model
-        st.session_state[f"{other}_reasoning_effort"] = sanitize_reasoning_effort(model, effort)
-        st.session_state[f"{other}_prompt_batch_size"] = batch_size
+    return {
+        "api_key": get_openai_api_key(),
+        "model": model,
+        "reasoning_effort": effort,
+        "prompt_batch_size": batch_size,
+    }
 
 
 
 def render_ai_settings_controls(prefix: str, *, include_batch_size: bool = False, expander_label: str = "Advanced AI settings") -> Dict[str, Any]:
     api_key = get_openai_api_key()
     normalize_ai_settings_prefix(prefix)
-    current_model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
-    supported_efforts = reasoning_options_for_model(current_model)
 
     with st.expander(expander_label, expanded=False):
         if api_key:
@@ -2598,21 +2664,18 @@ def render_ai_settings_controls(prefix: str, *, include_batch_size: bool = False
             "Model",
             options=MODEL_OPTIONS,
             key=f"{prefix}_model",
-            on_change=mirror_ai_settings_from,
-            args=(prefix,),
             help="Use a GPT-5 reasoning model for grounded review analysis and row-level tagging.",
         )
-        normalize_ai_settings_prefix(prefix)
+
         current_model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
         supported_efforts = reasoning_options_for_model(current_model)
-        if st.session_state.get(f"{prefix}_reasoning_effort") not in supported_efforts:
-            st.session_state[f"{prefix}_reasoning_effort"] = sanitize_reasoning_effort(current_model, st.session_state.get(f"{prefix}_reasoning_effort"))
+        effort_key = f"{prefix}_reasoning_effort"
+        if st.session_state.get(effort_key) not in supported_efforts:
+            st.session_state[effort_key] = sanitize_reasoning_effort(current_model, st.session_state.get(effort_key))
         st.selectbox(
             "Reasoning effort",
             options=supported_efforts,
-            key=f"{prefix}_reasoning_effort",
-            on_change=mirror_ai_settings_from,
-            args=(prefix,),
+            key=effort_key,
             help="Higher effort can improve depth, while lower effort is faster and cheaper.",
         )
         if include_batch_size:
@@ -2622,18 +2685,10 @@ def render_ai_settings_controls(prefix: str, *, include_batch_size: bool = False
                 max_value=30,
                 step=1,
                 key=f"{prefix}_prompt_batch_size",
-                on_change=mirror_ai_settings_from,
-                args=(prefix,),
                 help="Larger batches reduce API calls but make each request heavier.",
             )
 
-    mirror_ai_settings_from(prefix)
-    return {
-        "api_key": api_key,
-        "model": st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL),
-        "reasoning_effort": st.session_state.get("reasoning_effort", DEFAULT_REASONING_EFFORT),
-        "prompt_batch_size": int(st.session_state.get("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)),
-    }
+    return save_ai_settings_from_prefix(prefix)
 
 
 
@@ -2922,7 +2977,7 @@ def available_time_series_dimensions(df: pd.DataFrame) -> Dict[str, Optional[str
 
 
 def normalize_breakout_value(value: Any) -> str:
-    cleaned = str(value or "").strip()
+    cleaned = safe_text(value)
     if not cleaned or cleaned.lower() in {"nan", "none"}:
         return "Unknown"
     return cleaned
@@ -3239,30 +3294,36 @@ def sort_reviews_for_explorer(df: pd.DataFrame, sort_mode: str) -> pd.DataFrame:
 
 
 def render_review_card(row: pd.Series) -> None:
-    rating_value = int(row.get("rating") or 0) if pd.notna(row.get("rating")) else 0
+    rating_value = safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else 0
     filled_stars = "&#9733;" * max(0, min(rating_value, 5))
     empty_stars = "&#9734;" * max(0, 5 - rating_value)
     star_label = f"{rating_value}/5" if rating_value else "No rating"
-    title = str(row.get("title") or "").strip() or "No title"
-    review_text = str(row.get("review_text") or "").strip() or "No written review text."
+    title = safe_text(row.get("title"), "No title") or "No title"
+    review_text = safe_text(row.get("review_text"), "No written review text.") or "No written review text."
 
     meta_bits = []
-    if str(row.get("submission_date") or "").strip():
-        meta_bits.append(str(row.get("submission_date")))
-    if str(row.get("content_locale") or "").strip():
-        meta_bits.append(str(row.get("content_locale")))
-    if str(row.get("retailer") or "").strip():
-        meta_bits.append(str(row.get("retailer")))
-    if str(row.get("product_or_sku") or "").strip():
-        meta_bits.append(str(row.get("product_or_sku")))
+    submission_date = safe_text(row.get("submission_date"))
+    content_locale = safe_text(row.get("content_locale"))
+    retailer = safe_text(row.get("retailer"))
+    product_or_sku = safe_text(row.get("product_or_sku"))
+    if submission_date:
+        meta_bits.append(submission_date)
+    if content_locale:
+        meta_bits.append(content_locale)
+    if retailer:
+        meta_bits.append(retailer)
+    if product_or_sku:
+        meta_bits.append(product_or_sku)
 
-    chips = ["Organic" if not bool(row.get("incentivized_review", False)) else "Incentivized"]
-    if row.get("is_recommended") is True:
-        chips.append("Recommended")
-    elif row.get("is_recommended") is False:
-        chips.append("Not recommended")
-    if bool(row.get("has_photos", False)):
-        chips.append(f"Photos: {int(row.get('photos_count') or 0)}")
+    chips = ["Organic" if not safe_bool(row.get("incentivized_review"), False) else "Incentivized"]
+    recommended_value = row.get("is_recommended")
+    if not is_missing_value(recommended_value):
+        if safe_bool(recommended_value, False):
+            chips.append("Recommended")
+        else:
+            chips.append("Not recommended")
+    if safe_bool(row.get("has_photos"), False):
+        chips.append(f"Photos: {safe_int(row.get('photos_count'), 0)}")
 
     with st.container(border=True):
         top_cols = st.columns([4.6, 1.6])
@@ -3275,10 +3336,12 @@ def render_review_card(row: pd.Series) -> None:
             st.caption(" | ".join(chips))
         st.write(review_text)
         footer_bits = []
-        if str(row.get("review_id") or "").strip():
-            footer_bits.append(f"Review ID: {row.get('review_id')}")
-        if str(row.get("user_location") or "").strip():
-            footer_bits.append(str(row.get("user_location")))
+        review_id = safe_text(row.get("review_id"))
+        user_location = safe_text(row.get("user_location"))
+        if review_id:
+            footer_bits.append(f"Review ID: {review_id}")
+        if user_location:
+            footer_bits.append(user_location)
         if footer_bits:
             st.caption(" | ".join(footer_bits))
 
@@ -3330,7 +3393,7 @@ def render_review_explorer(
     current_page = int(st.session_state.get("review_explorer_page", 1))
     current_page = max(1, min(current_page, page_count))
 
-    pager_cols = st.columns([0.9, 0.9, 2.6, 0.9, 0.9])
+    pager_cols = st.columns([0.9, 0.9, 2.15, 1.05, 0.9, 0.9])
     if pager_cols[0].button("⏮ First", use_container_width=True, disabled=current_page <= 1, key="reviews_first_page"):
         current_page = 1
     if pager_cols[1].button("← Prev", use_container_width=True, disabled=current_page <= 1, key="reviews_prev_page"):
@@ -3339,9 +3402,22 @@ def render_review_explorer(
         f"<div style='text-align:center; font-weight:700; padding-top:0.6rem;'>Page {current_page} of {page_count:,} • Showing {(current_page - 1) * per_page + 1:,}-{min(current_page * per_page, len(ordered_df)):,} of {len(ordered_df):,}</div>",
         unsafe_allow_html=True,
     )
-    if pager_cols[3].button("Next →", use_container_width=True, disabled=current_page >= page_count, key="reviews_next_page"):
+    if st.session_state.get("review_explorer_page_input") != current_page:
+        st.session_state["review_explorer_page_input"] = current_page
+    current_page = int(
+        pager_cols[3].number_input(
+            "Page",
+            min_value=1,
+            max_value=page_count,
+            value=current_page,
+            step=1,
+            key="review_explorer_page_input",
+            label_visibility="collapsed",
+        )
+    )
+    if pager_cols[4].button("Next →", use_container_width=True, disabled=current_page >= page_count, key="reviews_next_page"):
         current_page = min(page_count, current_page + 1)
-    if pager_cols[4].button("Last ⏭", use_container_width=True, disabled=current_page >= page_count, key="reviews_last_page"):
+    if pager_cols[5].button("Last ⏭", use_container_width=True, disabled=current_page >= page_count, key="reviews_last_page"):
         current_page = page_count
 
     st.session_state["review_explorer_page"] = max(1, min(current_page, page_count))
@@ -3923,6 +3999,7 @@ def main() -> None:
                 st.session_state["prompt_run_artifacts"] = None
                 st.session_state["prompt_run_notice"] = None
                 st.session_state["active_main_view"] = "Dashboard"
+                st.session_state["workspace_view_selector"] = "Dashboard"
                 st.success(f"Loaded {dataset['summary'].reviews_downloaded:,} reviews for {dataset['summary'].product_id}.")
             except requests.HTTPError as exc:
                 st.error(f"HTTP error: {exc}")
@@ -3950,6 +4027,7 @@ def main() -> None:
                 st.session_state["prompt_run_artifacts"] = None
                 st.session_state["prompt_run_notice"] = None
                 st.session_state["active_main_view"] = "Dashboard"
+                st.session_state["workspace_view_selector"] = "Dashboard"
                 st.success(f"Loaded {dataset['summary'].reviews_downloaded:,} uploaded reviews into the workspace.")
             except ReviewDownloaderError as exc:
                 st.error(str(exc))
@@ -3999,12 +4077,15 @@ def main() -> None:
     render_top_metrics(overall_df, filtered_df)
     st.caption(f"Filter status: {filter_description}. Showing {len(filtered_df):,} of {len(overall_df):,} reviews.")
 
+    if st.session_state.get("workspace_view_selector") not in ["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"]:
+        st.session_state["workspace_view_selector"] = st.session_state.get("active_main_view", "Dashboard")
     st.radio(
         "Workspace view",
         options=["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"],
         horizontal=True,
-        key="active_main_view",
+        key="workspace_view_selector",
     )
+    st.session_state["active_main_view"] = st.session_state.get("workspace_view_selector", "Dashboard")
 
     active_view = st.session_state.get("active_main_view", "Dashboard")
     if active_view == "Dashboard":
