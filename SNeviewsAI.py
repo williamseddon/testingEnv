@@ -5392,6 +5392,144 @@ def markdown_to_plain_text(markdown_text: str) -> str:
 
 
 
+
+
+def _minimal_pdf_safe_text(value: Any) -> str:
+    text = safe_text(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+
+def _minimal_pdf_escape_text(value: Any) -> str:
+    text = _minimal_pdf_safe_text(value)
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+
+def build_minimal_ai_report_pdf_bytes(
+    *,
+    report_title: str,
+    question: Optional[str],
+    answer_text: str,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+    review_lookup: Dict[str, Dict[str, str]],
+) -> bytes:
+    page_width = 612
+    page_height = 792
+    left_margin = 54
+    top_margin = 56
+    bottom_margin = 54
+    leading = 13
+    wrap_width = 96
+    max_lines_per_page = max(20, int((page_height - top_margin - bottom_margin) / leading))
+
+    plain_text = markdown_to_plain_text(answer_text)
+    sections: List[str] = [
+        report_title,
+        f"Product: {summary.product_id}",
+        f"Generated: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Scope: {filter_description}",
+        "",
+    ]
+    if safe_text(question):
+        sections.extend(["Question", safe_text(question), ""])
+    sections.extend(["AI response", plain_text])
+
+    cited_review_ids = extract_referenced_review_ids(answer_text, valid_ids=review_lookup.keys(), limit=10)
+    if cited_review_ids:
+        sections.extend(["", "Referenced review appendix"])
+        for review_id in cited_review_ids:
+            meta = review_lookup.get(review_id) or {}
+            title = safe_text(meta.get("title"), "No title")
+            snippet = safe_text(meta.get("snippet"), "No snippet available")
+            sections.extend([f"#{review_id} - {title}", snippet, ""])
+
+    wrapped_lines: List[str] = []
+    for block in sections:
+        block_text = _minimal_pdf_safe_text(block)
+        if not block_text.strip():
+            wrapped_lines.append("")
+            continue
+        for raw_line in block_text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                wrapped_lines.append("")
+                continue
+            pieces = textwrap.wrap(
+                line,
+                width=wrap_width,
+                break_long_words=True,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            ) or [line]
+            wrapped_lines.extend(pieces)
+
+    if not wrapped_lines:
+        wrapped_lines = ["No content available."]
+
+    pages: List[List[str]] = []
+    for start in range(0, len(wrapped_lines), max_lines_per_page):
+        pages.append(wrapped_lines[start : start + max_lines_per_page])
+
+    objects: List[Optional[bytes]] = [None]
+
+    def reserve_obj() -> int:
+        objects.append(b"")
+        return len(objects) - 1
+
+    catalog_id = reserve_obj()
+    pages_id = reserve_obj()
+    font_id = reserve_obj()
+    page_pairs: List[Tuple[int, int]] = []
+    for _ in pages:
+        page_pairs.append((reserve_obj(), reserve_obj()))
+
+    objects[font_id] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+
+    for page_lines, (page_id, content_id) in zip(pages, page_pairs):
+        y_start = page_height - top_margin
+        stream_lines = ["BT", "/F1 10 Tf", f"{left_margin} {y_start} Td"]
+        for idx, line in enumerate(page_lines):
+            if idx > 0:
+                stream_lines.append(f"0 -{leading} Td")
+            stream_lines.append(f"({_minimal_pdf_escape_text(line)}) Tj")
+        stream_lines.append("ET")
+        stream = "\n".join(stream_lines).encode("latin-1", "replace")
+        objects[content_id] = b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream"
+        objects[page_id] = (
+            f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+        ).encode("ascii")
+
+    kids = " ".join(f"{page_id} 0 R" for page_id, _ in page_pairs)
+    objects[pages_id] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_pairs)} >>".encode("ascii")
+    objects[catalog_id] = f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode("ascii")
+
+    buffer = io.BytesIO()
+    buffer.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for obj_id in range(1, len(objects)):
+        offsets.append(buffer.tell())
+        buffer.write(f"{obj_id} 0 obj\n".encode("ascii"))
+        buffer.write(objects[obj_id] or b"<<>>")
+        buffer.write(b"\nendobj\n")
+
+    xref_start = buffer.tell()
+    buffer.write(f"xref\n0 {len(objects)}\n".encode("ascii"))
+    buffer.write(b"0000000000 65535 f \n")
+    for obj_id in range(1, len(objects)):
+        buffer.write(f"{offsets[obj_id]:010d} 00000 n \n".encode("ascii"))
+    buffer.write(
+        (
+            f"trailer\n<< /Size {len(objects)} /Root {catalog_id} 0 R >>\n"
+            f"startxref\n{xref_start}\n%%EOF"
+        ).encode("ascii")
+    )
+    return buffer.getvalue()
+
 def build_ai_report_pdf_bytes(
     *,
     report_title: str,
@@ -5407,8 +5545,15 @@ def build_ai_report_pdf_bytes(
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import inch
         from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
-    except ImportError as exc:  # pragma: no cover
-        raise ReviewDownloaderError("reportlab is required to export PDF reports.") from exc
+    except ImportError:  # pragma: no cover
+        return build_minimal_ai_report_pdf_bytes(
+            report_title=report_title,
+            question=question,
+            answer_text=answer_text,
+            summary=summary,
+            filter_description=filter_description,
+            review_lookup=review_lookup,
+        )
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
