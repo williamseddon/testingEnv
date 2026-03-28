@@ -16,8 +16,10 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
+from plotly.subplots import make_subplots
 from bs4 import BeautifulSoup
 from openpyxl.utils import get_column_letter
 
@@ -41,7 +43,12 @@ DEFAULT_CONTENT_LOCALES = (
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_REASONING_EFFORT = "low"
 MODEL_OPTIONS = ["gpt-5.4-mini", "gpt-5.4", "gpt-5-mini"]
-REASONING_OPTIONS = ["minimal", "low", "medium", "high"]
+REASONING_OPTIONS = ["none", "minimal", "low", "medium", "high", "xhigh"]
+MODEL_REASONING_SUPPORT = {
+    "gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
+    "gpt-5.4": ["none", "minimal", "low", "medium", "high", "xhigh"],
+    "gpt-5-mini": ["none", "low", "medium", "high"],
+}
 BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
 
 THEME_KEYWORDS: Dict[str, List[str]] = {
@@ -1401,6 +1408,7 @@ GENERAL_ANALYST_INSTRUCTIONS = textwrap.dedent(
     Prioritize the supplied review text over generic product assumptions.
 
     Ground every material claim in the supplied review dataset.
+    Base most of the narrative on the supplied review text evidence, using the metrics only as supporting context.
     Do not invent counts, quotes, or trends that are not supported by the evidence pack.
     When evidence is mixed or weak, say so clearly.
     Use markdown.
@@ -1440,6 +1448,61 @@ def get_openai_client(api_key: str) -> Any:
 
 
 
+def reasoning_options_for_model(model: str) -> List[str]:
+    return list(MODEL_REASONING_SUPPORT.get(model, REASONING_OPTIONS))
+
+
+def default_reasoning_effort_for_model(model: str) -> str:
+    supported = reasoning_options_for_model(model)
+    for candidate in [DEFAULT_REASONING_EFFORT, "low", "medium", "none"]:
+        if candidate in supported:
+            return candidate
+    return supported[0] if supported else DEFAULT_REASONING_EFFORT
+
+
+def sanitize_reasoning_effort(model: str, reasoning_effort: Optional[str]) -> str:
+    supported = reasoning_options_for_model(model)
+    effort = str(reasoning_effort or "").strip().lower()
+    if effort in supported:
+        return effort
+    if effort == "minimal" and "low" in supported:
+        return "low"
+    if effort == "none" and "low" in supported:
+        return "low"
+    if effort == "xhigh" and "high" in supported:
+        return "high"
+    return default_reasoning_effort_for_model(model)
+
+
+def build_reasoning_kwargs(model: str, reasoning_effort: Optional[str]) -> Dict[str, Any]:
+    effort = sanitize_reasoning_effort(model, reasoning_effort)
+    if not effort:
+        return {}
+    return {"reasoning": {"effort": effort}}
+
+
+def create_openai_response(client: Any, *, model: str, reasoning_effort: Optional[str], **kwargs: Any) -> Any:
+    request_kwargs = {"model": model, **build_reasoning_kwargs(model, reasoning_effort), **kwargs}
+    try:
+        return client.responses.create(**request_kwargs)
+    except Exception as exc:
+        message = str(exc)
+        if "reasoning.effort" not in message and "unsupported_value" not in message:
+            raise
+
+        fallback_effort = default_reasoning_effort_for_model(model)
+        current_effort = (((request_kwargs.get("reasoning") or {}).get("effort")) if isinstance(request_kwargs.get("reasoning"), dict) else None)
+
+        if fallback_effort and fallback_effort != current_effort:
+            retry_kwargs = dict(request_kwargs)
+            retry_kwargs["reasoning"] = {"effort": fallback_effort}
+            return client.responses.create(**retry_kwargs)
+
+        retry_kwargs = dict(request_kwargs)
+        retry_kwargs.pop("reasoning", None)
+        return client.responses.create(**retry_kwargs)
+
+
 def parse_openai_json_response(response: Any) -> Dict[str, Any]:
     output_text = (getattr(response, "output_text", None) or "").strip()
     if not output_text:
@@ -1463,9 +1526,10 @@ def call_openai_json(
     max_output_tokens: int = 3500,
 ) -> Dict[str, Any]:
     client = get_openai_client(api_key)
-    response = client.responses.create(
+    response = create_openai_response(
+        client,
         model=model,
-        reasoning={"effort": reasoning_effort},
+        reasoning_effort=reasoning_effort,
         instructions=instructions,
         input=input_payload,
         text={
@@ -1581,9 +1645,12 @@ def review_snippet_rows(df: pd.DataFrame, *, max_reviews: int = 18) -> List[Dict
                 "rating": row.get("rating"),
                 "incentivized_review": bool(row.get("incentivized_review", False)),
                 "content_locale": row.get("content_locale"),
+                "retailer": row.get("retailer"),
+                "age_group": row.get("age_group"),
+                "product_or_sku": row.get("product_or_sku"),
                 "submission_date": str(row.get("submission_date") or ""),
                 "title": truncate_text(row.get("title", ""), 120),
-                "snippet": truncate_text(row.get("review_text", ""), 360),
+                "snippet": truncate_text(row.get("review_text", ""), 520),
             }
         )
     return rows
@@ -1642,6 +1709,7 @@ def build_report_instructions(persona_name: Optional[str] = None) -> str:
         {persona['instructions']}
 
         Ground every important finding in the supplied review dataset.
+        Prioritize the supplied review text evidence and use the metrics only as supporting context.
         Do not invent facts, counts, or quotes that are not supported by the evidence pack.
         If evidence is mixed or weak, say so explicitly.
         Use markdown.
@@ -1691,9 +1759,10 @@ def call_openai_analyst(
     ).strip()
     input_messages.append({"role": "user", "content": user_payload})
 
-    response = client.responses.create(
+    response = create_openai_response(
+        client,
         model=model,
-        reasoning={"effort": reasoning_effort},
+        reasoning_effort=reasoning_effort,
         instructions=instructions,
         input=input_messages,
         max_output_tokens=1600,
@@ -1712,16 +1781,55 @@ def call_openai_analyst(
 
 
 
+REVIEW_PROMPT_STARTER_ROWS: List[Dict[str, str]] = [
+    {
+        "column_name": "perceived_loudness",
+        "prompt": "How is product loudness described? Use Positive, Negative, Neutral, or Not Mentioned.",
+        "labels": "Positive, Negative, Neutral, Not Mentioned",
+    },
+    {
+        "column_name": "usage_session_bucket",
+        "prompt": "What level of hands-on use is explicitly described? Use 1 Session, 2-5 Sessions, 6+ Sessions, Long-Term Use, or Not Mentioned.",
+        "labels": "1 Session, 2-5 Sessions, 6+ Sessions, Long-Term Use, Not Mentioned",
+    },
+    {
+        "column_name": "safety_risk_level",
+        "prompt": "Does the review mention a safety risk? Use High Risk, Medium Risk, Low Risk, or No Risk Mentioned.",
+        "labels": "High Risk, Medium Risk, Low Risk, No Risk Mentioned",
+    },
+    {
+        "column_name": "reliability_risk_signal",
+        "prompt": "Does the review mention a product reliability or durability risk? Use Risk Mentioned, Positive Reliability, or Not Mentioned.",
+        "labels": "Risk Mentioned, Positive Reliability, Not Mentioned",
+    },
+]
+
+
+
 def default_prompt_definitions() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "column_name": "perceived_loudness",
-                "prompt": "How is loudness described in this review? Label Positive, Negative, Neutral, or Not Mentioned using only the review text.",
-                "labels": "Positive, Negative, Neutral, Not Mentioned",
-            }
-        ]
-    )
+    return pd.DataFrame([REVIEW_PROMPT_STARTER_ROWS[0]])
+
+
+
+def add_prompt_rows(prompt_df: pd.DataFrame, rows: Sequence[Dict[str, str]]) -> pd.DataFrame:
+    base = prompt_df.copy() if prompt_df is not None else pd.DataFrame(columns=["column_name", "prompt", "labels"])
+    existing = {str(value).strip().lower() for value in base.get("column_name", pd.Series(dtype="object")).fillna("").astype(str)}
+    new_rows = []
+    for row in rows:
+        name = str(row.get("column_name", "")).strip().lower()
+        if name and name in existing:
+            continue
+        new_rows.append({
+            "column_name": row.get("column_name", ""),
+            "prompt": row.get("prompt", ""),
+            "labels": row.get("labels", ""),
+        })
+        if name:
+            existing.add(name)
+    if not new_rows:
+        return base.reset_index(drop=True)
+    return pd.concat([base, pd.DataFrame(new_rows)], ignore_index=True)
+
 
 
 def normalize_prompt_definitions(prompt_df: pd.DataFrame, existing_columns: Sequence[str]) -> List[Dict[str, Any]]:
@@ -1836,10 +1944,10 @@ def call_openai_prompt_builder(
         """
         You design row-level review-tagging prompts for SharkNinja internal analysts.
         Draft one short prompt.
-        Keep the prompt to one sentence and under 24 words.
-        Avoid examples, long explanations, and multi-step rules.
+        Keep the prompt to one sentence and under 16 words.
+        Avoid examples, long explanations, extra caveats, and multi-step rules.
         Make the column name snake_case.
-        Return labels in business-friendly title case.
+        Prefer 3 to 5 labels in business-friendly title case.
         Include Not Mentioned when the signal may be absent.
         Keep why_it_matters to one short phrase.
         """
@@ -1864,7 +1972,7 @@ def call_openai_prompt_builder(
         input_payload=input_payload,
         schema_name="review_prompt_builder",
         schema=build_prompt_builder_schema(),
-        max_output_tokens=650,
+        max_output_tokens=360,
     )
     result["column_name"] = slugify_column_name(result.get("column_name", "") or goal)
     labels = result.get("labels") or []
@@ -1876,8 +1984,8 @@ def call_openai_prompt_builder(
     if "Not Mentioned" not in cleaned_labels and len(cleaned_labels) <= 7:
         cleaned_labels.append("Not Mentioned")
     result["labels"] = cleaned_labels or ["Positive", "Negative", "Neutral", "Not Mentioned"]
-    result["prompt"] = truncate_text(str(result.get("prompt", "")).replace("\n", " "), 180)
-    result["why_it_matters"] = truncate_text(str(result.get("why_it_matters", "")).replace("\n", " "), 80)
+    result["prompt"] = truncate_text(str(result.get("prompt", "")).replace("\n", " "), 120)
+    result["why_it_matters"] = truncate_text(str(result.get("why_it_matters", "")).replace("\n", " "), 60)
     return result
 
 
@@ -2276,9 +2384,13 @@ def inject_css() -> None:
             .metric-card {
                 border: 1px solid rgba(49, 51, 63, 0.12);
                 border-radius: 16px;
-                padding: 0.9rem 1rem;
+                padding: 0.95rem 1rem;
                 background: rgba(250, 250, 252, 0.92);
-                min-height: 122px;
+                min-height: 146px;
+                height: 146px;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
             }
             .metric-label {
                 color: #6b7280;
@@ -2296,8 +2408,10 @@ def inject_css() -> None:
             }
             .metric-sub {
                 color: #4b5563;
-                font-size: 0.88rem;
-                line-height: 1.35;
+                font-size: 0.84rem;
+                line-height: 1.3;
+                min-height: 2.5em;
+                overflow: hidden;
             }
             .section-subtitle {
                 color: #6b7280;
@@ -2383,10 +2497,16 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("openai_model", DEFAULT_OPENAI_MODEL)
     st.session_state.setdefault("reasoning_effort", DEFAULT_REASONING_EFFORT)
     st.session_state.setdefault("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)
+    st.session_state.setdefault("active_main_view", "Dashboard")
+    st.session_state.setdefault("review_explorer_sort", "Newest")
+    st.session_state.setdefault("review_explorer_per_page", 20)
+    st.session_state.setdefault("review_explorer_page", 1)
+    st.session_state.setdefault("prompt_result_view", "")
     for prefix in ["ai_tab", "prompt_tab"]:
         st.session_state.setdefault(f"{prefix}_model", st.session_state["openai_model"])
         st.session_state.setdefault(f"{prefix}_reasoning_effort", st.session_state["reasoning_effort"])
         st.session_state.setdefault(f"{prefix}_prompt_batch_size", st.session_state["prompt_batch_size"])
+        normalize_ai_settings_prefix(prefix)
 
 
 
@@ -2432,29 +2552,69 @@ def rating_values_for_mode(mode: str, custom_values: Optional[Sequence[int]] = N
 
 
 
-def mirror_ai_settings_from(prefix: str) -> None:
+def normalize_ai_settings_prefix(prefix: str) -> None:
     model = st.session_state.get(f"{prefix}_model", st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL))
-    effort = st.session_state.get(f"{prefix}_reasoning_effort", st.session_state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+    if model not in MODEL_OPTIONS:
+        model = DEFAULT_OPENAI_MODEL
+    effort = sanitize_reasoning_effort(
+        model,
+        st.session_state.get(f"{prefix}_reasoning_effort", st.session_state.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
+    )
     batch_size = int(st.session_state.get(f"{prefix}_prompt_batch_size", st.session_state.get("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)))
+    batch_size = max(5, min(batch_size, 30))
+    st.session_state[f"{prefix}_model"] = model
+    st.session_state[f"{prefix}_reasoning_effort"] = effort
+    st.session_state[f"{prefix}_prompt_batch_size"] = batch_size
+
+
+
+def mirror_ai_settings_from(prefix: str) -> None:
+    normalize_ai_settings_prefix(prefix)
+    model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
+    effort = st.session_state.get(f"{prefix}_reasoning_effort", DEFAULT_REASONING_EFFORT)
+    batch_size = int(st.session_state.get(f"{prefix}_prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE))
     st.session_state["openai_model"] = model
     st.session_state["reasoning_effort"] = effort
     st.session_state["prompt_batch_size"] = batch_size
     for other in ["ai_tab", "prompt_tab"]:
         st.session_state[f"{other}_model"] = model
-        st.session_state[f"{other}_reasoning_effort"] = effort
+        st.session_state[f"{other}_reasoning_effort"] = sanitize_reasoning_effort(model, effort)
         st.session_state[f"{other}_prompt_batch_size"] = batch_size
 
 
 
-def render_ai_settings_controls(prefix: str, *, include_batch_size: bool = False) -> Dict[str, Any]:
+def render_ai_settings_controls(prefix: str, *, include_batch_size: bool = False, expander_label: str = "Advanced AI settings") -> Dict[str, Any]:
     api_key = get_openai_api_key()
-    with st.expander("AI settings", expanded=False):
+    normalize_ai_settings_prefix(prefix)
+    current_model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
+    supported_efforts = reasoning_options_for_model(current_model)
+
+    with st.expander(expander_label, expanded=False):
         if api_key:
             st.success("OpenAI API key loaded")
         else:
             st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable AI features")
-        st.selectbox("Model", options=MODEL_OPTIONS, key=f"{prefix}_model", on_change=mirror_ai_settings_from, args=(prefix,))
-        st.selectbox("Reasoning effort", options=REASONING_OPTIONS, key=f"{prefix}_reasoning_effort", on_change=mirror_ai_settings_from, args=(prefix,))
+        st.selectbox(
+            "Model",
+            options=MODEL_OPTIONS,
+            key=f"{prefix}_model",
+            on_change=mirror_ai_settings_from,
+            args=(prefix,),
+            help="Use a GPT-5 reasoning model for grounded review analysis and row-level tagging.",
+        )
+        normalize_ai_settings_prefix(prefix)
+        current_model = st.session_state.get(f"{prefix}_model", DEFAULT_OPENAI_MODEL)
+        supported_efforts = reasoning_options_for_model(current_model)
+        if st.session_state.get(f"{prefix}_reasoning_effort") not in supported_efforts:
+            st.session_state[f"{prefix}_reasoning_effort"] = sanitize_reasoning_effort(current_model, st.session_state.get(f"{prefix}_reasoning_effort"))
+        st.selectbox(
+            "Reasoning effort",
+            options=supported_efforts,
+            key=f"{prefix}_reasoning_effort",
+            on_change=mirror_ai_settings_from,
+            args=(prefix,),
+            help="Higher effort can improve depth, while lower effort is faster and cheaper.",
+        )
         if include_batch_size:
             st.slider(
                 "Review Prompt batch size",
@@ -2466,6 +2626,8 @@ def render_ai_settings_controls(prefix: str, *, include_batch_size: bool = False
                 args=(prefix,),
                 help="Larger batches reduce API calls but make each request heavier.",
             )
+
+    mirror_ai_settings_from(prefix)
     return {
         "api_key": api_key,
         "model": st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL),
@@ -2703,15 +2865,15 @@ def render_workspace_header(
 def render_top_metrics(overall_df: pd.DataFrame, filtered_df: pd.DataFrame) -> None:
     metrics = compute_metrics(filtered_df)
     cards = [
-        ("Reviews in view", f"{metrics['review_count']:,}", f"{len(overall_df):,} reviews loaded"),
-        ("Avg rating", format_metric_number(metrics["avg_rating"]), "Current filtered view"),
+        ("Reviews in view", f"{metrics['review_count']:,}", f"Loaded base · {len(overall_df):,} reviews"),
+        ("Avg rating", format_metric_number(metrics["avg_rating"]), "Filtered review set"),
         (
             "Avg rating (organic)",
             format_metric_number(metrics["avg_rating_non_incentivized"]),
-            f"{metrics['non_incentivized_count']:,} non-incentivized reviews",
+            f"Organic base · {metrics['non_incentivized_count']:,} reviews",
         ),
-        ("% 1-2 star", format_pct(metrics["pct_low_star"]), f"{metrics['low_star_count']:,} low-star reviews"),
-        ("% incentivized", format_pct(metrics["pct_incentivized"]), "Share of current filtered view"),
+        ("% 1-2 star", format_pct(metrics["pct_low_star"]), f"Low-star base · {metrics['low_star_count']:,} reviews"),
+        ("% incentivized", format_pct(metrics["pct_incentivized"]), "Share of current view"),
     ]
     cols = st.columns(len(cards))
     for col, (label, value, subtext) in zip(cols, cards):
@@ -2738,15 +2900,194 @@ def summarize_group_avg_rating(df: pd.DataFrame, group_column: str, top_n: int =
 
 
 
+def available_time_series_dimensions(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    options: Dict[str, Optional[str]] = {"Overall only": None}
+    for label, column in [
+        ("Market / locale", "content_locale"),
+        ("Retailer / POS", "retailer"),
+        ("Age group", "age_group"),
+        ("SKU / product ID", "product_or_sku"),
+    ]:
+        if column not in df.columns:
+            continue
+        values = {
+            str(value).strip()
+            for value in df[column].dropna().astype(str)
+            if str(value).strip() and str(value).strip().lower() not in {"nan", "none", "unknown"}
+        }
+        if len(values) > 1:
+            options[label] = column
+    return options
+
+
+
+def normalize_breakout_value(value: Any) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned or cleaned.lower() in {"nan", "none"}:
+        return "Unknown"
+    return cleaned
+
+
+
+def prepare_avg_rating_over_time(
+    df: pd.DataFrame,
+    *,
+    group_column: Optional[str],
+    trend_mode: str,
+    smoothing_days: int,
+    top_groups: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        empty = pd.DataFrame(columns=["day", "group_value", "review_count", "rating_sum", "avg_rating", "display_rating"])
+        return empty, empty, pd.DataFrame(columns=["day", "review_count"])
+
+    working = df.dropna(subset=["submission_time", "rating"]).copy()
+    if working.empty:
+        empty = pd.DataFrame(columns=["day", "group_value", "review_count", "rating_sum", "avg_rating", "display_rating"])
+        return empty, empty, pd.DataFrame(columns=["day", "review_count"])
+
+    working["day"] = working["submission_time"].dt.floor("D")
+    if group_column:
+        working["group_value"] = working[group_column].map(normalize_breakout_value)
+        ranking = (
+            working.groupby("group_value")
+            .size()
+            .sort_values(ascending=False)
+        )
+        selected_groups = ranking.head(max(int(top_groups), 1)).index.tolist()
+        working = working[working["group_value"].isin(selected_groups)].copy()
+    else:
+        working["group_value"] = "Selected reviews"
+        selected_groups = ["Selected reviews"]
+
+    if working.empty:
+        empty = pd.DataFrame(columns=["day", "group_value", "review_count", "rating_sum", "avg_rating", "display_rating"])
+        return empty, empty, pd.DataFrame(columns=["day", "review_count"])
+
+    daily = (
+        working.groupby(["day", "group_value"], as_index=False)
+        .agg(review_count=("review_id", "count"), rating_sum=("rating", "sum"), avg_rating=("rating", "mean"))
+    )
+    daily_volume = working.groupby("day", as_index=False).agg(review_count=("review_id", "count"))
+    full_days = pd.date_range(daily["day"].min(), daily["day"].max(), freq="D")
+
+    def _series_for_group(source_df: pd.DataFrame, group_value: str) -> pd.DataFrame:
+        group_df = source_df[source_df["group_value"] == group_value].set_index("day").reindex(full_days)
+        group_df.index.name = "day"
+        group_df["group_value"] = group_value
+        group_df["review_count"] = pd.to_numeric(group_df["review_count"], errors="coerce").fillna(0).astype(int)
+        group_df["rating_sum"] = pd.to_numeric(group_df["rating_sum"], errors="coerce").fillna(0.0)
+        denom = group_df["review_count"].replace(0, pd.NA)
+        group_df["avg_rating"] = group_df["rating_sum"] / denom
+        if trend_mode == "Rolling average":
+            window = max(int(smoothing_days), 1)
+            rolling_count = group_df["review_count"].rolling(window=window, min_periods=1).sum().replace(0, pd.NA)
+            rolling_sum = group_df["rating_sum"].rolling(window=window, min_periods=1).sum()
+            group_df["display_rating"] = rolling_sum / rolling_count
+        else:
+            cumulative_count = group_df["review_count"].cumsum().replace(0, pd.NA)
+            cumulative_sum = group_df["rating_sum"].cumsum()
+            group_df["display_rating"] = cumulative_sum / cumulative_count
+        return group_df.reset_index()
+
+    breakout_frames = [_series_for_group(daily, group_value) for group_value in selected_groups]
+    breakout_df = pd.concat(breakout_frames, ignore_index=True) if breakout_frames else pd.DataFrame()
+
+    overall_daily = (
+        working.groupby("day", as_index=False)
+        .agg(review_count=("review_id", "count"), rating_sum=("rating", "sum"), avg_rating=("rating", "mean"))
+    )
+    overall_daily["group_value"] = "Overall"
+    overall_df = _series_for_group(overall_daily, "Overall")
+    return breakout_df, overall_df, daily_volume
+
+
+
+def build_avg_rating_over_time_figure(
+    breakout_df: pd.DataFrame,
+    overall_df: pd.DataFrame,
+    volume_df: pd.DataFrame,
+    *,
+    title: str,
+    show_overall: bool,
+    show_volume_bars: bool,
+    zoom_mode: str,
+) -> go.Figure:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    if show_volume_bars and not volume_df.empty:
+        fig.add_trace(
+            go.Bar(
+                x=volume_df["day"],
+                y=volume_df["review_count"],
+                name="Daily volume",
+                opacity=0.15,
+                hovertemplate="%{x|%Y-%m-%d}<br>Reviews: %{y}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+
+    for group_value in breakout_df["group_value"].dropna().astype(str).unique().tolist():
+        group_df = breakout_df[breakout_df["group_value"] == group_value].copy()
+        fig.add_trace(
+            go.Scatter(
+                x=group_df["day"],
+                y=group_df["display_rating"],
+                mode="lines",
+                name=group_value,
+                hovertemplate="%{x|%Y-%m-%d}<br>Avg rating: %{y:.2f}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+
+    if show_overall and not overall_df.empty and (breakout_df["group_value"].nunique() > 1 or (breakout_df["group_value"].iloc[0] if not breakout_df.empty else "") != "Selected reviews"):
+        fig.add_trace(
+            go.Scatter(
+                x=overall_df["day"],
+                y=overall_df["display_rating"],
+                mode="lines",
+                name="Overall",
+                line={"width": 4},
+                hovertemplate="%{x|%Y-%m-%d}<br>Overall avg: %{y:.2f}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+
+    all_y = pd.concat([breakout_df.get("display_rating", pd.Series(dtype="float64")), overall_df.get("display_rating", pd.Series(dtype="float64"))], ignore_index=True).dropna()
+    y_range = None
+    if zoom_mode == "Zoomed-in" and not all_y.empty:
+        y_min = max(1.0, math.floor((float(all_y.min()) - 0.05) * 20) / 20)
+        y_max = min(5.0, math.ceil((float(all_y.max()) + 0.05) * 20) / 20)
+        if y_max - y_min < 0.15:
+            y_min = max(1.0, y_min - 0.1)
+            y_max = min(5.0, y_max + 0.1)
+        y_range = [y_min, y_max]
+    elif zoom_mode == "Full scale":
+        y_range = [1, 5]
+
+    fig.update_layout(
+        title=title,
+        margin=dict(l=24, r=24, t=65, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+        bargap=0.05,
+    )
+    fig.update_yaxes(title_text="Average rating", range=y_range, secondary_y=False)
+    fig.update_yaxes(title_text="Reviews/day", showgrid=False, secondary_y=True)
+    fig.update_xaxes(title_text="Date")
+    return fig
+
+
+
 def render_dashboard(filtered_df: pd.DataFrame) -> None:
     st.subheader("Dashboard")
     st.markdown(
-        '<div class="section-subtitle">A tighter view focused on rating mix, review volume, and average rating rollups. Use the chart toggle to compare all matching reviews vs organic only.</div>',
+        '<div class="section-subtitle">A sharper decision view for internal SharkNinja teams: lead with average rating over time, then scan rating mix, review volume, and the strongest performance splits.</div>',
         unsafe_allow_html=True,
     )
 
     chart_scope = st.radio(
-        "Chart scope",
+        "Dashboard scope",
         options=["All matching reviews", "Organic only"],
         horizontal=True,
         key="dashboard_chart_scope",
@@ -2756,17 +3097,53 @@ def render_dashboard(filtered_df: pd.DataFrame) -> None:
         chart_df = chart_df[~chart_df["incentivized_review"].fillna(False)].reset_index(drop=True)
 
     if chart_df.empty:
-        st.info("No reviews match the current chart scope.")
+        st.info("No reviews match the current dashboard scope.")
         return
 
+    dim_options = available_time_series_dimensions(chart_df)
+    with st.container(border=True):
+        control_cols = st.columns([1.15, 1.2, 0.9, 0.8, 0.9, 0.9, 0.95])
+        trend_mode = control_cols[0].selectbox("Trend", options=["Cumulative average", "Rolling average"], index=0, key="dash_trend_mode")
+        breakout_label = control_cols[1].selectbox("Breakout", options=list(dim_options.keys()), index=1 if len(dim_options) > 1 else 0, key="dash_breakout")
+        smoothing_label = control_cols[2].selectbox("Smoothing", options=["7-day", "14-day", "30-day"], index=0, key="dash_smoothing")
+        top_groups = control_cols[3].selectbox("Top lines", options=[4, 5, 6, 8], index=2, key="dash_top_groups")
+        show_overall = control_cols[4].checkbox("Show overall", value=True, key="dash_show_overall")
+        show_volume_bars = control_cols[5].checkbox("Show volume bars", value=True, key="dash_show_volume")
+        zoom_mode = control_cols[6].radio("Y-axis view", options=["Zoomed-in", "Full scale"], index=0, horizontal=True, key="dash_zoom_mode")
+        st.caption("The primary chart uses weighted averages from the selected reviews. Volume bars show how many reviews landed on each day.")
+
+        smoothing_days = int(smoothing_label.split("-")[0])
+        breakout_df, overall_line_df, daily_volume_df = prepare_avg_rating_over_time(
+            chart_df,
+            group_column=dim_options.get(breakout_label),
+            trend_mode=trend_mode,
+            smoothing_days=smoothing_days,
+            top_groups=int(top_groups),
+        )
+
+        if breakout_df.empty:
+            st.info("No dated ratings are available for the average-rating trend.")
+        else:
+            title = f"{trend_mode} ★ over time"
+            if dim_options.get(breakout_label):
+                title += f" by {breakout_label}"
+            fig = build_avg_rating_over_time_figure(
+                breakout_df,
+                overall_line_df,
+                daily_volume_df,
+                title=title,
+                show_overall=show_overall,
+                show_volume_bars=show_volume_bars,
+                zoom_mode=zoom_mode,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
     rating_df = rating_distribution(chart_df)
-    rating_df["rating_label"] = rating_df["rating"].map(lambda value: f"{int(value)} star" if int(value) == 1 else f"{int(value)} stars")
-    rating_df["count_pct_label"] = rating_df.apply(
-        lambda row: f"{int(row['review_count']):,} ({format_pct(row['share'])})", axis=1
-    )
+    rating_df["rating_label"] = rating_df["rating"].map(lambda value: f"{int(value)}★")
+    rating_df["count_pct_label"] = rating_df.apply(lambda row: f"{int(row['review_count']):,} · {format_pct(row['share'])}", axis=1)
     monthly_df = monthly_trend(chart_df)
 
-    chart_cols = st.columns([1.15, 1.25])
+    chart_cols = st.columns([1.05, 1.15])
     with chart_cols[0]:
         with st.container(border=True):
             fig = px.bar(
@@ -2775,28 +3152,30 @@ def render_dashboard(filtered_df: pd.DataFrame) -> None:
                 y="review_count",
                 text="count_pct_label",
                 title="Rating distribution",
-                category_orders={"rating_label": ["1 star", "2 stars", "3 stars", "4 stars", "5 stars"]},
+                category_orders={"rating_label": ["1★", "2★", "3★", "4★", "5★"]},
+                hover_data={"share": ':.1%', "review_count": True},
             )
             fig.update_traces(textposition="outside", cliponaxis=False)
-            fig.update_layout(
-                margin=dict(l=20, r=20, t=55, b=20),
-                xaxis_title="Star rating",
-                yaxis_title="Review count",
-            )
+            fig.update_layout(margin=dict(l=24, r=24, t=60, b=20), xaxis_title="Star rating", yaxis_title="Review count")
             st.plotly_chart(fig, use_container_width=True)
     with chart_cols[1]:
         with st.container(border=True):
             if monthly_df.empty:
-                st.info("No dated reviews are available for the trend chart.")
+                st.info("No dated reviews are available for the review-volume chart.")
             else:
-                fig = px.line(
-                    monthly_df,
-                    x="month_start",
-                    y="review_count",
-                    markers=True,
-                    title="Review volume over time",
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_trace(
+                    go.Bar(x=monthly_df["month_start"], y=monthly_df["review_count"], name="Review count", opacity=0.65),
+                    secondary_y=False,
                 )
-                fig.update_layout(margin=dict(l=20, r=20, t=55, b=20), xaxis_title="Month", yaxis_title="Review count")
+                fig.add_trace(
+                    go.Scatter(x=monthly_df["month_start"], y=monthly_df["avg_rating"], name="Avg rating", mode="lines+markers"),
+                    secondary_y=True,
+                )
+                fig.update_layout(title="Review volume over time", margin=dict(l=24, r=24, t=60, b=20), hovermode="x unified")
+                fig.update_xaxes(title_text="Month")
+                fig.update_yaxes(title_text="Review count", secondary_y=False)
+                fig.update_yaxes(title_text="Avg rating", range=[1, 5], secondary_y=True)
                 st.plotly_chart(fig, use_container_width=True)
 
     lower_cols = st.columns(2)
@@ -2806,16 +3185,17 @@ def render_dashboard(filtered_df: pd.DataFrame) -> None:
             if len(sku_df) <= 1:
                 st.info("Average rating by SKU / product ID will appear when multiple products are in scope.")
             else:
+                sorted_sku = sku_df.sort_values(["avg_rating", "review_count"], ascending=[True, True])
                 fig = px.bar(
-                    sku_df.sort_values("avg_rating", ascending=True),
+                    sorted_sku,
                     x="avg_rating",
                     y="product_or_sku",
                     orientation="h",
-                    text=sku_df.sort_values("avg_rating", ascending=True)["avg_rating"].map(lambda x: f"{x:.2f}"),
+                    text=sorted_sku.apply(lambda row: f"{row['avg_rating']:.2f} · {int(row['review_count'])}", axis=1),
                     title="Average rating by SKU / product ID",
                     hover_data={"review_count": True, "avg_rating": ':.2f'},
                 )
-                fig.update_layout(margin=dict(l=20, r=20, t=55, b=20), xaxis_title="Average rating", yaxis_title="")
+                fig.update_layout(margin=dict(l=24, r=24, t=60, b=20), xaxis_title="Average rating", yaxis_title="")
                 fig.update_xaxes(range=[0, 5])
                 st.plotly_chart(fig, use_container_width=True)
     age_df = summarize_group_avg_rating(chart_df, "age_group", top_n=12)
@@ -2824,16 +3204,17 @@ def render_dashboard(filtered_df: pd.DataFrame) -> None:
             if len(age_df) <= 1:
                 st.info("Average rating by age group will appear when age-group data is available in the review source.")
             else:
+                sorted_age = age_df.sort_values(["avg_rating", "review_count"], ascending=[True, True])
                 fig = px.bar(
-                    age_df.sort_values("avg_rating", ascending=True),
+                    sorted_age,
                     x="avg_rating",
                     y="age_group",
                     orientation="h",
-                    text=age_df.sort_values("avg_rating", ascending=True)["avg_rating"].map(lambda x: f"{x:.2f}"),
+                    text=sorted_age.apply(lambda row: f"{row['avg_rating']:.2f} · {int(row['review_count'])}", axis=1),
                     title="Average rating by age group",
                     hover_data={"review_count": True, "avg_rating": ':.2f'},
                 )
-                fig.update_layout(margin=dict(l=20, r=20, t=55, b=20), xaxis_title="Average rating", yaxis_title="")
+                fig.update_layout(margin=dict(l=24, r=24, t=60, b=20), xaxis_title="Average rating", yaxis_title="")
                 fig.update_xaxes(range=[0, 5])
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -2917,8 +3298,8 @@ def render_review_explorer(
     )
 
     bundle = get_master_export_bundle(summary, overall_df, prompt_artifacts)
-    controls = st.columns([1.3, 1.4, 1.1, 1.1])
-    controls[0].download_button(
+    top_controls = st.columns([1.3, 1.4, 1.0, 2.0])
+    top_controls[0].download_button(
         label="Download all reviews",
         data=bundle["excel_bytes"],
         file_name=bundle["excel_name"],
@@ -2926,24 +3307,47 @@ def render_review_explorer(
         use_container_width=True,
         key="review_explorer_download_all",
     )
-    sort_mode = controls[1].selectbox(
+    sort_mode = top_controls[1].selectbox(
         "Sort reviews",
         options=["Newest", "Oldest", "Highest rating", "Lowest rating", "Most helpful", "Longest"],
-        index=0,
+        key="review_explorer_sort",
     )
-    per_page = controls[2].selectbox("Reviews per page", options=[10, 20, 30, 50], index=1)
-    ordered_df = sort_reviews_for_explorer(filtered_df, sort_mode).reset_index(drop=True)
-    page_count = max(1, math.ceil(len(ordered_df) / per_page)) if len(ordered_df) else 1
-    page = controls[3].number_input("Page", min_value=1, max_value=page_count, value=1, step=1)
+    per_page = int(
+        top_controls[2].selectbox(
+            "Reviews per page",
+            options=[10, 20, 30, 50],
+            key="review_explorer_per_page",
+        )
+    )
+    top_controls[3].caption("Use the sidebar filters to narrow the review stream, then page through the results without getting bumped back to Dashboard.")
 
+    ordered_df = sort_reviews_for_explorer(filtered_df, sort_mode).reset_index(drop=True)
     if ordered_df.empty:
         st.info("No reviews match the current filters.")
         return
 
-    start = (int(page) - 1) * int(per_page)
-    end = start + int(per_page)
+    page_count = max(1, math.ceil(len(ordered_df) / max(per_page, 1)))
+    current_page = int(st.session_state.get("review_explorer_page", 1))
+    current_page = max(1, min(current_page, page_count))
+
+    pager_cols = st.columns([0.9, 0.9, 2.6, 0.9, 0.9])
+    if pager_cols[0].button("⏮ First", use_container_width=True, disabled=current_page <= 1, key="reviews_first_page"):
+        current_page = 1
+    if pager_cols[1].button("← Prev", use_container_width=True, disabled=current_page <= 1, key="reviews_prev_page"):
+        current_page = max(1, current_page - 1)
+    pager_cols[2].markdown(
+        f"<div style='text-align:center; font-weight:700; padding-top:0.6rem;'>Page {current_page} of {page_count:,} • Showing {(current_page - 1) * per_page + 1:,}-{min(current_page * per_page, len(ordered_df)):,} of {len(ordered_df):,}</div>",
+        unsafe_allow_html=True,
+    )
+    if pager_cols[3].button("Next →", use_container_width=True, disabled=current_page >= page_count, key="reviews_next_page"):
+        current_page = min(page_count, current_page + 1)
+    if pager_cols[4].button("Last ⏭", use_container_width=True, disabled=current_page >= page_count, key="reviews_last_page"):
+        current_page = page_count
+
+    st.session_state["review_explorer_page"] = max(1, min(current_page, page_count))
+    start = (st.session_state["review_explorer_page"] - 1) * per_page
+    end = start + per_page
     page_df = ordered_df.iloc[start:end]
-    st.caption(f"Showing reviews {start + 1}-{min(end, len(ordered_df))} of {len(ordered_df):,}.")
 
     for _, row in page_df.iterrows():
         render_review_card(row)
@@ -2958,21 +3362,14 @@ def render_ai_tab(
     summary: ReviewBatchSummary,
     filter_description: str,
 ) -> None:
-    st.subheader("AI analyst")
+    st.subheader("AI — Product & Consumer Insights")
     st.markdown(
-        '<div class="section-subtitle">A cleaner ChatGPT-style analyst grounded in the current filtered review text. Generate a cross-functional report, then keep working in one continuous chat.</div>',
+        '<div class="section-subtitle">Ask anything. The assistant is grounded in the currently filtered review text and keeps one continuous chat so context does not drift.</div>',
         unsafe_allow_html=True,
     )
 
     if filtered_df.empty:
         st.info("The current filters return no reviews. Adjust the filters before using AI analyst.")
-        return
-
-    ai_runtime = render_ai_settings_controls("ai_tab", include_batch_size=False)
-    api_key = ai_runtime.get("api_key")
-    if not api_key:
-        st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable preset reports and chat.")
-        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
         return
 
     scope_signature = json.dumps(
@@ -2987,51 +3384,91 @@ def render_ai_tab(
     if st.session_state.get("chat_scope_signature") != scope_signature:
         if st.session_state.get("chat_messages"):
             st.session_state["chat_messages"] = []
-            st.session_state["chat_scope_notice"] = "AI chat was cleared so it stays aligned with the latest review scope."
+            st.session_state["chat_scope_notice"] = "AI chat was cleared so it stays aligned with the latest filtered review scope."
         st.session_state["chat_scope_signature"] = scope_signature
 
     notice = st.session_state.pop("chat_scope_notice", None)
     if notice:
         st.info(notice)
 
-    top_cols = st.columns([2.8, 1.2])
-    with top_cols[0]:
-        st.markdown("#### Preset reports")
-        report_cols = st.columns(3)
-        report_trigger: Optional[Tuple[str, str]] = None
-        for col, persona_name in zip(report_cols, PERSONAS.keys()):
-            persona = PERSONAS[persona_name]
-            with col:
-                with st.container(border=True):
-                    st.markdown(f"**{persona_name}**")
-                    st.caption(persona["blurb"])
-                    if st.button(f"Generate {persona_name} report", use_container_width=True, key=f"report_{persona_name}"):
-                        report_trigger = (persona_name, persona["prompt"])
-    with top_cols[1]:
-        with st.container(border=True):
-            st.markdown("**Current scope**")
+    with st.container(border=True):
+        status_cols = st.columns([1.4, 1.1, 1.5])
+        with status_cols[0]:
+            st.markdown("**🟢 Remote AI ready**" if get_openai_api_key() else "**AI setup needed**")
+            st.caption("The analyst prioritizes the review text, then uses the filtered metrics for context.")
+        with status_cols[1]:
             st.metric("Reviews in scope", f"{len(filtered_df):,}")
-            st.caption(filter_description)
-            if st.button("New chat", use_container_width=True, key="ai_new_chat"):
-                st.session_state["chat_messages"] = []
-                st.rerun()
+            organic_reviews = int((~filtered_df["incentivized_review"].fillna(False)).sum())
+            st.caption(f"Organic reviews · {organic_reviews:,}")
+        with status_cols[2]:
+            ai_runtime = render_ai_settings_controls("ai_tab", include_batch_size=False, expander_label="Advanced AI settings")
+            st.caption(f"Model: {ai_runtime['model']} · Reasoning: {ai_runtime['reasoning_effort']}")
 
-    chat_container = get_scroll_container(height=520, border=True)
+    api_key = ai_runtime.get("api_key")
+    if not api_key:
+        st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable preset reports and chat.")
+        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
+        return
+
+    quick_actions = {
+        "Executive summary": {
+            "prompt": "Create a concise executive summary of the filtered reviews. Lead with the biggest strengths, biggest risks, key consumer insight, and the top 3 actions.",
+            "help": "Leadership-ready readout with strengths, risks, and top actions.",
+            "persona": None,
+        },
+        "Product Development": {
+            "prompt": PERSONAS["Product Development"]["prompt"],
+            "help": PERSONAS["Product Development"]["blurb"],
+            "persona": "Product Development",
+        },
+        "Quality Engineer": {
+            "prompt": PERSONAS["Quality Engineer"]["prompt"],
+            "help": PERSONAS["Quality Engineer"]["blurb"],
+            "persona": "Quality Engineer",
+        },
+        "Consumer Insights": {
+            "prompt": PERSONAS["Consumer Insights"]["prompt"],
+            "help": PERSONAS["Consumer Insights"]["blurb"],
+            "persona": "Consumer Insights",
+        },
+    }
+
+    quick_trigger: Optional[Tuple[Optional[str], str, str]] = None
+    with st.container(border=True):
+        st.markdown("**Quick reports**")
+        action_cols = st.columns(4)
+        for col, (label, config) in zip(action_cols, quick_actions.items()):
+            if col.button(label, use_container_width=True, help=config["help"], key=f"ai_quick_{slugify_column_name(label, fallback='quick')}"):
+                quick_trigger = (config["persona"], label, config["prompt"])
+        st.caption("Each report is grounded in the filtered review text and should cite review IDs for important claims.")
+
+    chat_container = get_scroll_container(height=560, border=True)
     with chat_container:
         if not st.session_state["chat_messages"]:
-            st.info("Use a preset report to get started, or ask a question below about complaints, quality risks, sentiment drivers, unmet needs, or use cases.")
+            st.info(
+                "Start with a quick report above, or ask a direct question such as: What are the biggest improvement opportunities? What is driving 1-star reviews? What language should marketing avoid or lean into?"
+            )
         for message in st.session_state["chat_messages"]:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    user_message = st.chat_input("Ask about complaint drivers, product opportunities, quality risks, unmet needs, or notable review patterns...", key="ai_chat_input")
+    helper_cols = st.columns([1.8, 1.2, 1])
+    helper_cols[0].caption(f"Current scope: {filter_description}")
+    if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat"):
+        st.session_state["chat_messages"] = []
+        st.rerun()
+    helper_cols[2].caption("Chat input stays pinned at the bottom.")
+
+    user_message = st.chat_input(
+        "Ask about complaint drivers, product opportunities, quality risks, sentiment drivers, unmet needs, or voice-of-customer themes...",
+        key="ai_chat_input",
+    )
 
     prompt_to_send: Optional[str] = None
     visible_user_message: Optional[str] = None
     persona_name: Optional[str] = None
-    if report_trigger:
-        persona_name, prompt_to_send = report_trigger
-        visible_user_message = f"Generate the {persona_name} report."
+    if quick_trigger:
+        persona_name, visible_user_message, prompt_to_send = quick_trigger
     elif user_message:
         prompt_to_send = user_message
         visible_user_message = user_message
@@ -3074,11 +3511,32 @@ def render_review_prompt_tab(
 ) -> None:
     st.subheader("Review Prompt")
     st.markdown(
-        '<div class="section-subtitle">Create row-level AI tags that become new review columns. The layout is designed for faster internal SharkNinja insight work: define prompts, optionally draft a cleaner short prompt with AI, then run tagging and inspect the label mix.</div>',
+        '<div class="section-subtitle">Create row-level AI tags that become new review columns. Keep prompts short, specific, and label-driven so the output stays stable and decision-ready.</div>',
         unsafe_allow_html=True,
     )
 
-    ai_runtime = render_ai_settings_controls("prompt_tab", include_batch_size=True)
+    with st.container(border=True):
+        top_cols = st.columns([2.2, 1.3])
+        with top_cols[0]:
+            st.markdown("**Prompt library**")
+            starter_cols = st.columns([1.2, 1.2, 1])
+            if starter_cols[0].button("Add starter pack", use_container_width=True, key="prompt_add_starter_pack"):
+                st.session_state["prompt_definitions_df"] = add_prompt_rows(st.session_state["prompt_definitions_df"], REVIEW_PROMPT_STARTER_ROWS)
+                st.rerun()
+            if starter_cols[1].button("Reset to starter pack", use_container_width=True, key="prompt_reset_starter_pack"):
+                st.session_state["prompt_definitions_df"] = pd.DataFrame(REVIEW_PROMPT_STARTER_ROWS)
+                st.rerun()
+            if starter_cols[2].button("Clear prompts", use_container_width=True, key="prompt_clear_all"):
+                st.session_state["prompt_definitions_df"] = pd.DataFrame(columns=["column_name", "prompt", "labels"])
+                st.session_state["prompt_builder_suggestion"] = None
+                st.rerun()
+            st.caption("Starter pack includes loudness, usage sessions, safety risk level, and reliability risk signals.")
+        with top_cols[1]:
+            ai_runtime = render_ai_settings_controls("prompt_tab", include_batch_size=True, expander_label="Advanced AI settings")
+            st.caption(
+                f"Model: {ai_runtime['model']} · Reasoning: {ai_runtime['reasoning_effort']} · Batch size: {ai_runtime['prompt_batch_size']}"
+            )
+
     api_key = ai_runtime.get("api_key")
 
     st.markdown("#### Prompt definitions")
@@ -3089,25 +3547,25 @@ def render_review_prompt_tab(
         num_rows="dynamic",
         hide_index=True,
         key="prompt_definition_editor",
-        height=420,
+        height=520,
         column_config={
             "column_name": st.column_config.TextColumn("Column name", width="medium", help="Snake case is best, for example perceived_loudness"),
             "prompt": st.column_config.TextColumn("Review prompt", width="large"),
-            "labels": st.column_config.TextColumn("Labels", width="medium", help="Comma-separated, for example Positive, Negative, Neutral, Not Mentioned"),
+            "labels": st.column_config.TextColumn("Labels", width="large", help="Comma-separated, for example Positive, Negative, Neutral, Not Mentioned"),
         },
     )
     st.session_state["prompt_definitions_df"] = edited_df
 
-    with st.container(border=True):
-        st.markdown("#### AI prompt builder")
-        st.caption("Draft a shorter prompt when you want help naming the column or tightening the label set.")
-        builder_cols = st.columns([2.4, 1.4, 1.1])
+    builder_error: Optional[str] = None
+    with st.expander("AI prompt builder", expanded=False):
+        st.caption("Use AI to tighten a prompt. The builder intentionally drafts short prompts to keep tagging stable.")
+        builder_cols = st.columns([2.0, 1.2, 0.9])
         builder_goal = builder_cols[0].text_area(
             "What do you want to detect?",
             value="",
             placeholder="Example: detect whether the product is perceived as loud and classify the mention.",
             key="prompt_builder_goal",
-            height=110,
+            height=120,
         )
         preferred_labels = builder_cols[1].text_input(
             "Preferred labels",
@@ -3116,9 +3574,9 @@ def render_review_prompt_tab(
         )
         with builder_cols[2]:
             st.markdown("&nbsp;", unsafe_allow_html=True)
-            if st.button("Draft with AI", use_container_width=True, disabled=not bool(api_key)):
+            if st.button("Draft with AI", use_container_width=True, disabled=not bool(api_key), key="prompt_builder_run"):
                 if not builder_goal.strip():
-                    st.error("Describe the signal you want to detect before using the AI prompt builder.")
+                    builder_error = "Describe the signal you want to detect before using the AI prompt builder."
                 else:
                     overlay = show_thinking_overlay("Drafting a shorter prompt and label set...")
                     try:
@@ -3132,21 +3590,24 @@ def render_review_prompt_tab(
                             summary=summary,
                         )
                         st.session_state["prompt_builder_suggestion"] = suggestion
+                        st.rerun()
+                    except Exception as exc:
+                        builder_error = f"OpenAI prompt builder failed: {exc}"
                     finally:
                         overlay.empty()
-                    st.rerun()
 
         suggestion = st.session_state.get("prompt_builder_suggestion")
+        if builder_error:
+            st.error(builder_error)
         if suggestion:
-            suggestion_cols = st.columns([3.2, 1.1, 1.1])
+            suggestion_cols = st.columns([3.0, 1.0, 1.0])
             with suggestion_cols[0]:
                 st.markdown(f"**Suggested column** `{suggestion['column_name']}`")
                 st.write(suggestion.get("prompt", ""))
                 st.caption("Labels: " + ", ".join(suggestion.get("labels", [])))
                 if suggestion.get("why_it_matters"):
                     st.caption(suggestion["why_it_matters"])
-            if suggestion_cols[1].button("Add to list", use_container_width=True):
-                current_df = st.session_state["prompt_definitions_df"].copy()
+            if suggestion_cols[1].button("Add to list", use_container_width=True, key="prompt_builder_add"):
                 append_df = pd.DataFrame([
                     {
                         "column_name": suggestion["column_name"],
@@ -3154,10 +3615,10 @@ def render_review_prompt_tab(
                         "labels": ", ".join(suggestion.get("labels", [])),
                     }
                 ])
-                st.session_state["prompt_definitions_df"] = pd.concat([current_df, append_df], ignore_index=True)
+                st.session_state["prompt_definitions_df"] = pd.concat([st.session_state["prompt_definitions_df"], append_df], ignore_index=True)
                 st.session_state["prompt_builder_suggestion"] = None
                 st.rerun()
-            if suggestion_cols[2].button("Dismiss", use_container_width=True):
+            if suggestion_cols[2].button("Dismiss", use_container_width=True, key="prompt_builder_dismiss"):
                 st.session_state["prompt_builder_suggestion"] = None
                 st.rerun()
 
@@ -3167,51 +3628,51 @@ def render_review_prompt_tab(
         st.error(str(exc))
         prompt_definitions = []
 
-    scope_cols = st.columns([1.35, 1, 1, 2.4])
-    tagging_scope = scope_cols[0].selectbox("Tagging scope", options=["Current filtered reviews", "All loaded reviews"], index=0)
-    scope_df = filtered_df if tagging_scope == "Current filtered reviews" else overall_df
-    review_count_in_scope = int(len(scope_df))
-    estimated_calls = math.ceil(review_count_in_scope / max(1, ai_runtime["prompt_batch_size"])) if review_count_in_scope else 0
-    scope_cols[1].metric("Reviews in scope", f"{review_count_in_scope:,}")
-    scope_cols[2].metric("OpenAI requests", f"{estimated_calls:,}")
-    scope_cols[3].caption(
-        f"Current scope: {tagging_scope.lower()}. Filters: {filter_description}. Batch size: {ai_runtime['prompt_batch_size']}."
-    )
-
-    run_disabled = (not api_key) or (not prompt_definitions) or review_count_in_scope == 0
-    if st.button("Run Review Prompt", type="primary", use_container_width=True, disabled=run_disabled):
-        overlay = show_thinking_overlay("Classifying each review with your Review Prompt definitions...")
-        try:
-            prompt_results_df = run_review_prompt_tagging(
-                api_key=api_key,
-                model=ai_runtime["model"],
-                reasoning_effort=ai_runtime["reasoning_effort"],
-                source_df=scope_df.reset_index(drop=True),
-                prompt_definitions=prompt_definitions,
-                chunk_size=ai_runtime["prompt_batch_size"],
-            )
-            updated_overall_df = merge_prompt_results_into_reviews(overall_df, prompt_results_df, prompt_definitions)
-            updated_dataset = dict(st.session_state["analysis_dataset"])
-            updated_dataset["reviews_df"] = updated_overall_df
-            st.session_state["analysis_dataset"] = updated_dataset
-            summary_df = summarize_prompt_results(prompt_results_df, prompt_definitions, source_df=scope_df)
-            st.session_state["prompt_run_artifacts"] = {
-                "definitions": prompt_definitions,
-                "summary_df": summary_df,
-                "scope_label": tagging_scope,
-                "scope_filter_description": filter_description,
-                "scope_review_ids": list(prompt_results_df["review_id"].astype(str)),
-                "definition_signature": prompt_definition_signature(prompt_definitions),
-                "review_count": int(len(prompt_results_df)),
-                "generated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-            }
-            st.session_state["master_export_bundle"] = None
-            st.session_state["prompt_run_notice"] = f"Finished Review Prompt tagging for {len(prompt_results_df):,} reviews across {len(prompt_definitions)} prompts."
-        except Exception as exc:
-            st.error(f"Review Prompt run failed: {exc}")
-        finally:
-            overlay.empty()
-        st.rerun()
+    with st.container(border=True):
+        scope_cols = st.columns([1.35, 1, 1, 2.25])
+        tagging_scope = scope_cols[0].selectbox("Tagging scope", options=["Current filtered reviews", "All loaded reviews"], index=0, key="prompt_tagging_scope")
+        scope_df = filtered_df if tagging_scope == "Current filtered reviews" else overall_df
+        review_count_in_scope = int(len(scope_df))
+        estimated_calls = math.ceil(review_count_in_scope / max(1, ai_runtime["prompt_batch_size"])) if review_count_in_scope else 0
+        scope_cols[1].metric("Reviews in scope", f"{review_count_in_scope:,}")
+        scope_cols[2].metric("OpenAI requests", f"{estimated_calls:,}")
+        scope_cols[3].caption(
+            f"Scope: {tagging_scope.lower()}. Filters: {filter_description}. Batch size: {ai_runtime['prompt_batch_size']}."
+        )
+        run_disabled = (not api_key) or (not prompt_definitions) or review_count_in_scope == 0
+        if st.button("Run Review Prompt", type="primary", use_container_width=True, disabled=run_disabled, key="prompt_run_button"):
+            overlay = show_thinking_overlay("Classifying each review with your Review Prompt definitions...")
+            try:
+                prompt_results_df = run_review_prompt_tagging(
+                    api_key=api_key,
+                    model=ai_runtime["model"],
+                    reasoning_effort=ai_runtime["reasoning_effort"],
+                    source_df=scope_df.reset_index(drop=True),
+                    prompt_definitions=prompt_definitions,
+                    chunk_size=ai_runtime["prompt_batch_size"],
+                )
+                updated_overall_df = merge_prompt_results_into_reviews(overall_df, prompt_results_df, prompt_definitions)
+                updated_dataset = dict(st.session_state["analysis_dataset"])
+                updated_dataset["reviews_df"] = updated_overall_df
+                st.session_state["analysis_dataset"] = updated_dataset
+                summary_df = summarize_prompt_results(prompt_results_df, prompt_definitions, source_df=scope_df)
+                st.session_state["prompt_run_artifacts"] = {
+                    "definitions": prompt_definitions,
+                    "summary_df": summary_df,
+                    "scope_label": tagging_scope,
+                    "scope_filter_description": filter_description,
+                    "scope_review_ids": list(prompt_results_df["review_id"].astype(str)),
+                    "definition_signature": prompt_definition_signature(prompt_definitions),
+                    "review_count": int(len(prompt_results_df)),
+                    "generated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                }
+                st.session_state["master_export_bundle"] = None
+                st.session_state["prompt_run_notice"] = f"Finished Review Prompt tagging for {len(prompt_results_df):,} reviews across {len(prompt_definitions)} prompts."
+            except Exception as exc:
+                st.error(f"Review Prompt run failed: {exc}")
+            finally:
+                overlay.empty()
+            st.rerun()
 
     notice = st.session_state.pop("prompt_run_notice", None)
     if notice:
@@ -3246,61 +3707,131 @@ def render_review_prompt_tab(
         f"Latest Review Prompt run: {prompt_artifacts.get('generated_utc')} | Scope: {prompt_artifacts.get('scope_label')} | Reviews tagged: {prompt_artifacts.get('review_count'):,}"
     )
 
-    prompt_tabs = st.tabs([prompt["display_name"] for prompt in prompt_artifacts["definitions"]])
-    for tab, prompt in zip(prompt_tabs, prompt_artifacts["definitions"]):
-        with tab:
-            prompt_col = prompt["column_name"]
-            base_view_df = result_scope_df[result_scope_df[prompt_col].notna()].copy() if prompt_col in result_scope_df.columns else result_scope_df.iloc[0:0]
-            control_cols = st.columns([2.2, 1.2, 1.2, 1.2])
-            label_options = [str(label) for label in prompt_artifacts["summary_df"][prompt_artifacts["summary_df"]["column_name"] == prompt_col]["label"].tolist()]
-            selected_labels = control_cols[0].multiselect("Labels", options=label_options, default=label_options, key=f"prompt_labels_{prompt_col}")
-            source_mode = control_cols[1].selectbox("Review source", options=["All tagged reviews", "Organic only", "Incentivized only"], key=f"prompt_source_{prompt_col}")
-            rating_mode = control_cols[2].selectbox("Ratings", options=RATING_FILTER_OPTIONS_SIMPLE, key=f"prompt_rating_mode_{prompt_col}")
-            preview_rows = control_cols[3].selectbox("Preview rows", options=[25, 50, 100], index=1, key=f"prompt_preview_rows_{prompt_col}")
+    prompt_lookup = {prompt["display_name"]: prompt for prompt in prompt_artifacts["definitions"]}
+    prompt_names = list(prompt_lookup.keys())
+    if not prompt_names:
+        st.info("No prompt results are available yet.")
+        return
+    if st.session_state.get("prompt_result_view") not in prompt_names:
+        st.session_state["prompt_result_view"] = prompt_names[0]
 
-            preview_df = base_view_df.copy()
-            if selected_labels:
-                preview_df = preview_df[preview_df[prompt_col].isin(selected_labels)]
+    st.markdown("#### Tagged result view")
+    selected_prompt_name = st.radio(
+        "Prompt result view",
+        options=prompt_names,
+        horizontal=True,
+        key="prompt_result_view",
+        label_visibility="collapsed",
+    )
+    prompt = prompt_lookup[selected_prompt_name]
+    prompt_col = prompt["column_name"]
+    base_view_df = result_scope_df[result_scope_df[prompt_col].notna()].copy() if prompt_col in result_scope_df.columns else result_scope_df.iloc[0:0]
+
+    control_cols = st.columns([2.1, 1.1, 1.1, 1.0])
+    label_options = [str(label) for label in prompt_artifacts["summary_df"][prompt_artifacts["summary_df"]["column_name"] == prompt_col]["label"].tolist()]
+    label_key = f"prompt_labels_{prompt_col}"
+    if label_key not in st.session_state or not st.session_state.get(label_key):
+        st.session_state[label_key] = label_options
+    selected_labels = control_cols[0].multiselect("Labels", options=label_options, default=st.session_state[label_key], key=label_key)
+    source_mode = control_cols[1].selectbox("Review source", options=["All tagged reviews", "Organic only", "Incentivized only"], key=f"prompt_source_{prompt_col}")
+    rating_mode = control_cols[2].selectbox("Ratings", options=RATING_FILTER_OPTIONS_SIMPLE, key=f"prompt_rating_mode_{prompt_col}")
+    preview_rows = int(control_cols[3].selectbox("Preview rows", options=[25, 50, 100], index=1, key=f"prompt_preview_rows_{prompt_col}"))
+
+    preview_df = base_view_df.copy()
+    if selected_labels:
+        preview_df = preview_df[preview_df[prompt_col].isin(selected_labels)]
+    else:
+        preview_df = preview_df.iloc[0:0]
+    if source_mode == "Organic only":
+        preview_df = preview_df[~preview_df["incentivized_review"].fillna(False)]
+    elif source_mode == "Incentivized only":
+        preview_df = preview_df[preview_df["incentivized_review"].fillna(False)]
+    selected_ratings = rating_values_for_mode(rating_mode)
+    if selected_ratings:
+        preview_df = preview_df[preview_df["rating"].isin(selected_ratings)]
+
+    prompt_summary = summarize_single_prompt_view(preview_df, prompt)
+
+    def _extract_plotly_selected_labels(selection_event: Any, summary_df: pd.DataFrame) -> Optional[List[str]]:
+        if selection_event is None:
+            return None
+        selection = getattr(selection_event, "selection", None)
+        if selection is None and isinstance(selection_event, dict):
+            selection = selection_event.get("selection")
+        if selection is None:
+            return None
+        points = getattr(selection, "points", None)
+        if points is None and isinstance(selection, dict):
+            points = selection.get("points")
+        if points is None:
+            return None
+        labels: List[str] = []
+        for point in points:
+            point_data = point if isinstance(point, dict) else {}
+            label = point_data.get("label")
+            if label is None:
+                point_number = point_data.get("point_number")
+                if point_number is not None and 0 <= int(point_number) < len(summary_df):
+                    label = str(summary_df.iloc[int(point_number)]["label"])
+            if label is not None and str(label) not in labels:
+                labels.append(str(label))
+        return labels
+
+    chart_col, table_col = st.columns([1.45, 1.05])
+    with chart_col:
+        with st.container(border=True):
+            st.markdown(f"**{prompt['display_name']} distribution**")
+            st.caption("Click a pie slice to filter the summary table and preview below.")
+            if prompt_summary.empty:
+                st.info("No tagged reviews match the current prompt filters.")
             else:
-                preview_df = preview_df.iloc[0:0]
-            if source_mode == "Organic only":
-                preview_df = preview_df[~preview_df["incentivized_review"].fillna(False)]
-            elif source_mode == "Incentivized only":
-                preview_df = preview_df[preview_df["incentivized_review"].fillna(False)]
-            selected_ratings = rating_values_for_mode(rating_mode)
-            if selected_ratings:
-                preview_df = preview_df[preview_df["rating"].isin(selected_ratings)]
+                fig = px.pie(
+                    prompt_summary,
+                    names="label",
+                    values="review_count",
+                    hole=0.42,
+                    title=None,
+                    custom_data=["review_count", "avg_rating", "share"],
+                )
+                fig.update_traces(hovertemplate="%{label}<br>Reviews: %{customdata[0]}<br>Avg rating: %{customdata[1]:.2f}<br>Share: %{customdata[2]:.1%}<extra></extra>")
+                fig.update_layout(margin=dict(l=20, r=20, t=20, b=20))
+                selection_event = None
+                try:
+                    selection_event = st.plotly_chart(fig, use_container_width=True, key=f"prompt_pie_{prompt_col}", on_select="rerun")
+                except TypeError:
+                    st.plotly_chart(fig, use_container_width=True, key=f"prompt_pie_{prompt_col}")
+                selected_from_chart = _extract_plotly_selected_labels(selection_event, prompt_summary)
+                chart_flag_key = f"prompt_chart_active_{prompt_col}"
+                current_labels = list(st.session_state.get(label_key, label_options))
+                if selected_from_chart is not None:
+                    if selected_from_chart and sorted(current_labels) != sorted(selected_from_chart):
+                        st.session_state[label_key] = selected_from_chart
+                        st.session_state[chart_flag_key] = True
+                        st.rerun()
+                    if selected_from_chart == [] and st.session_state.get(chart_flag_key):
+                        st.session_state[label_key] = label_options
+                        st.session_state[chart_flag_key] = False
+                        st.rerun()
+    with table_col:
+        with st.container(border=True):
+            st.markdown(f"**Column name** `{prompt_col}`")
+            st.write(prompt["prompt"])
+            if prompt_summary.empty:
+                st.info("No label counts for the current prompt filters.")
+            else:
+                display_summary = prompt_summary.copy()
+                display_summary["avg_rating"] = display_summary["avg_rating"].map(lambda x: f"{x:.2f}★" if pd.notna(x) else "—")
+                display_summary["share"] = display_summary["share"].map(format_pct)
+                st.dataframe(
+                    display_summary[["label", "review_count", "avg_rating", "share"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=280,
+                )
 
-            prompt_summary = summarize_single_prompt_view(preview_df, prompt)
-            chart_col, table_col = st.columns([1.6, 1])
-            with chart_col:
-                with st.container(border=True):
-                    if prompt_summary.empty:
-                        st.info("No tagged reviews match the current prompt filters.")
-                    else:
-                        fig = px.pie(prompt_summary, names="label", values="review_count", title=f"{prompt['display_name']} distribution")
-                        fig.update_layout(margin=dict(l=20, r=20, t=55, b=20))
-                        st.plotly_chart(fig, use_container_width=True)
-            with table_col:
-                with st.container(border=True):
-                    st.markdown(f"**Column name** `{prompt_col}`")
-                    st.write(prompt["prompt"])
-                    if prompt_summary.empty:
-                        st.info("No label counts for the current prompt filters.")
-                    else:
-                        display_summary = prompt_summary.copy()
-                        display_summary["avg_rating"] = display_summary["avg_rating"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-                        display_summary["share"] = display_summary["share"].map(format_pct)
-                        st.dataframe(
-                            display_summary[["label", "review_count", "avg_rating", "share"]],
-                            use_container_width=True,
-                            hide_index=True,
-                            height=260,
-                        )
-
-            preview_columns = [col for col in ["review_id", "rating", "incentivized_review", "submission_time", "product_or_sku", "title", "review_text", prompt_col] if col in preview_df.columns]
-            st.markdown("**Tagged review preview**")
-            st.dataframe(preview_df[preview_columns].head(int(preview_rows)), use_container_width=True, hide_index=True, height=340)
+    preview_columns = [col for col in ["review_id", "rating", "incentivized_review", "submission_time", "content_locale", "retailer", "product_or_sku", "title", "review_text", prompt_col] if col in preview_df.columns]
+    st.markdown("**Tagged review preview**")
+    st.dataframe(preview_df[preview_columns].head(preview_rows), use_container_width=True, hide_index=True, height=360)
 
 
 # -----------------------------------------------------------------------------
@@ -3391,6 +3922,7 @@ def main() -> None:
                 st.session_state["master_export_bundle"] = None
                 st.session_state["prompt_run_artifacts"] = None
                 st.session_state["prompt_run_notice"] = None
+                st.session_state["active_main_view"] = "Dashboard"
                 st.success(f"Loaded {dataset['summary'].reviews_downloaded:,} reviews for {dataset['summary'].product_id}.")
             except requests.HTTPError as exc:
                 st.error(f"HTTP error: {exc}")
@@ -3417,6 +3949,7 @@ def main() -> None:
                 st.session_state["master_export_bundle"] = None
                 st.session_state["prompt_run_artifacts"] = None
                 st.session_state["prompt_run_notice"] = None
+                st.session_state["active_main_view"] = "Dashboard"
                 st.success(f"Loaded {dataset['summary'].reviews_downloaded:,} uploaded reviews into the workspace.")
             except ReviewDownloaderError as exc:
                 st.error(str(exc))
@@ -3466,17 +3999,24 @@ def main() -> None:
     render_top_metrics(overall_df, filtered_df)
     st.caption(f"Filter status: {filter_description}. Showing {len(filtered_df):,} of {len(overall_df):,} reviews.")
 
-    tabs = st.tabs(["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"])
-    with tabs[0]:
+    st.radio(
+        "Workspace view",
+        options=["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"],
+        horizontal=True,
+        key="active_main_view",
+    )
+
+    active_view = st.session_state.get("active_main_view", "Dashboard")
+    if active_view == "Dashboard":
         render_dashboard(filtered_df)
-    with tabs[1]:
+    elif active_view == "Review Explorer":
         render_review_explorer(
             summary=summary,
             overall_df=overall_df,
             filtered_df=filtered_df,
             prompt_artifacts=st.session_state.get("prompt_run_artifacts"),
         )
-    with tabs[2]:
+    elif active_view == "AI Analyst":
         render_ai_tab(
             settings=settings,
             overall_df=overall_df,
@@ -3484,7 +4024,7 @@ def main() -> None:
             summary=summary,
             filter_description=filter_description,
         )
-    with tabs[3]:
+    else:
         render_review_prompt_tab(
             settings=settings,
             overall_df=overall_df,
