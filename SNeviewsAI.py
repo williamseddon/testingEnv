@@ -6536,5 +6536,784 @@ def main() -> None:
             filter_description=filter_description,
         )
 
+
+# -----------------------------------------------------------------------------
+# v11 upload + product-scope overrides
+# -----------------------------------------------------------------------------
+
+PRODUCT_SCOPE_ALL_LABEL = "All product IDs"
+
+
+def _clean_identifier(value: Any) -> str:
+    return safe_text(value).upper()
+
+
+
+def _unique_identifier_values(series: Optional[pd.Series]) -> List[str]:
+    if series is None:
+        return []
+    values = {_clean_identifier(value) for value in series.tolist()}
+    return sorted(value for value in values if value)
+
+
+
+def _scope_dataframe_to_product_id(df: pd.DataFrame, selected_product_id: Optional[str]) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    if df.empty or not selected_product_id or selected_product_id == PRODUCT_SCOPE_ALL_LABEL or "product_id" not in df.columns:
+        return df.copy()
+    product_key = _clean_identifier(selected_product_id)
+    if not product_key:
+        return df.copy()
+    mask = df["product_id"].map(_clean_identifier).eq(product_key)
+    return df[mask].copy()
+
+
+
+def _uploaded_source_system(df: pd.DataFrame) -> str:
+    columns = {str(column).strip().lower() for column in df.columns}
+    if {"review id", "submission date", "review title", "review text", "product id"}.issubset(columns):
+        return "Bazaarvoice export"
+    if {"event id", "opened date", "review text"}.issubset(columns):
+        return "Axion export"
+    return "Uploaded file"
+
+
+
+def _combine_photo_urls(working: pd.DataFrame) -> pd.Series:
+    photo_columns = [column for column in working.columns if re.fullmatch(r"photo\s+\d+", str(column).strip(), flags=re.IGNORECASE)]
+    if not photo_columns:
+        return pd.Series([pd.NA] * len(working), index=working.index)
+
+    def _pack(row: pd.Series) -> Any:
+        urls = [safe_text(value) for value in row.tolist() if safe_text(value)]
+        return json.dumps(urls, ensure_ascii=False) if urls else pd.NA
+
+    return working[photo_columns].apply(_pack, axis=1)
+
+
+
+def _coerce_optional_bool_series(series: pd.Series) -> pd.Series:
+    return series.map(lambda value: pd.NA if safe_text(value) == "" else safe_bool(value))
+
+
+
+def normalize_uploaded_reviews_dataframe(raw_df: pd.DataFrame, *, source_name: str = "") -> pd.DataFrame:
+    working = raw_df.copy()
+    working.columns = [str(column).strip() for column in working.columns]
+    normalized = pd.DataFrame(index=working.index)
+    source_system = _uploaded_source_system(working)
+
+    normalized["review_id"] = series_from_aliases(working, ["Event Id", "Event ID", "Review ID", "Review Id", "Id"])
+    normalized["product_id"] = series_from_aliases(
+        working,
+        ["Base SKU", "Product ID", "Product Id", "ProductId", "BaseSKU", "Product ID ", "BV_WB_FAMILY"],
+    )
+    normalized["base_sku"] = series_from_aliases(working, ["Base SKU", "BaseSKU", "Product ID", "Product Id", "ProductId"])
+    normalized["sku_item"] = series_from_aliases(
+        working,
+        ["SKU Item", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No", "Product ID", "Product Id", "ProductId"],
+    )
+    normalized["original_product_name"] = series_from_aliases(
+        working,
+        ["Product Name", "Product name", "Product", "Name", "NAME"],
+    )
+    normalized["review_text"] = series_from_aliases(working, ["Review Text", "Review text", "Review", "Body", "Content"])
+    normalized["title"] = series_from_aliases(working, ["Title", "Review Title", "Review title", "Headline"])
+    normalized["post_link"] = series_from_aliases(
+        working,
+        ["Post Link", "URL", "Review URL", "Product URL", "Product page URL", "PRODUCT_PAGE_URL"],
+    )
+    normalized["rating"] = series_from_aliases(working, ["Rating (num)", "Rating", "Stars", "Star Rating"])
+    normalized["submission_time"] = series_from_aliases(
+        working,
+        ["Opened date", "Opened Date", "Submission Time", "Submission date", "Initial publish date", "Review Date", "Date"],
+    )
+    normalized["content_locale"] = series_from_aliases(working, ["Content Locale", "Locale", "Location", "Country"])
+    normalized["retailer"] = series_from_aliases(working, ["Retailer", "Merchant", "Channel", "WhereDidYouPurchase", "Display code"])
+    normalized["age_group"] = series_from_aliases(working, ["Age Group", "Age", "Age Range", "Age Bracket"])
+    normalized["user_location"] = series_from_aliases(working, ["Location", "Country"])
+    normalized["translated_flag"] = series_from_aliases(working, ["Translated Flag", "Translated"])
+    normalized["seeded_flag"] = series_from_aliases(
+        working,
+        ["Seeded Flag", "Seeded", "Incentivized", "Incentivized review", "IncentivizedReview"],
+    )
+    normalized["syndicated_flag"] = series_from_aliases(working, ["Syndicated Flag", "Syndicated"])
+    normalized["consumer_facing_rating"] = series_from_aliases(working, ["Consumer Facing Rating", "Average Rating"])
+    normalized["factory_name"] = series_from_aliases(working, ["Factory Name"])
+    normalized["product_category"] = series_from_aliases(
+        working,
+        ["Product Category", "Category", "Category name", "Top level category"],
+    )
+    normalized["product_sub_category"] = series_from_aliases(
+        working,
+        ["Product Sub Category", "Sub Category", "Subcategory", "Category hierarchy"],
+    )
+    normalized["brand"] = series_from_aliases(working, ["Brand", "Product brand name"])
+    normalized["user_nickname"] = series_from_aliases(working, ["User Nickname", "Nickname", "Reviewer"])
+    normalized["total_positive_feedback_count"] = series_from_aliases(
+        working,
+        ["# Helpful votes", "Helpful votes", "Total Positive Feedback Count"],
+    )
+    normalized["is_recommended"] = _coerce_optional_bool_series(
+        series_from_aliases(working, ["Would recommend", "Would Recommend", "Is Recommended", "Recommended"])
+    )
+    normalized["photos_count"] = pd.to_numeric(
+        series_from_aliases(working, ["# Photos", "Photos Count", "Photo Count"]),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    normalized["photo_urls"] = _combine_photo_urls(working)
+    normalized["source_file"] = source_name or pd.NA
+    normalized["source_system"] = source_system
+    normalized["incentivized_review"] = normalized["seeded_flag"].map(
+        lambda value: parse_flag_text(
+            value,
+            positive_tokens=["seeded", "incentivized", "yes", "true", "1"],
+            negative_tokens=["not seeded", "not incentivized", "no", "false", "0"],
+        )
+    )
+    normalized["is_syndicated"] = normalized["syndicated_flag"].map(
+        lambda value: parse_flag_text(
+            value,
+            positive_tokens=["syndicated", "yes", "true", "1"],
+            negative_tokens=["not syndicated", "no", "false", "0"],
+        )
+    )
+
+    if source_system == "Bazaarvoice export":
+        for column in ["product_id", "base_sku", "sku_item"]:
+            normalized[column] = normalized[column].map(lambda value: safe_text(value).upper() or pd.NA)
+
+    return finalize_reviews_dataframe(normalized)
+
+
+
+def read_uploaded_review_file(uploaded_file: Any) -> pd.DataFrame:
+    file_name = getattr(uploaded_file, "name", "uploaded_file")
+    raw_bytes = uploaded_file.getvalue()
+    suffix = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else "csv"
+
+    if suffix == "csv":
+        raw_df = None
+        last_exc = None
+        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                raw_df = pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, low_memory=False)
+                break
+            except UnicodeDecodeError as exc:
+                last_exc = exc
+        if raw_df is None:
+            raise last_exc or ReviewDownloaderError(f"Unable to decode {file_name}.")
+    elif suffix in {"xlsx", "xls", "xlsm"}:
+        raw_df = pd.read_excel(io.BytesIO(raw_bytes))
+    else:
+        raise ReviewDownloaderError(f"Unsupported upload type for {file_name}. Use CSV or Excel.")
+
+    if raw_df.empty:
+        raise ReviewDownloaderError(f"{file_name} is empty.")
+    return normalize_uploaded_reviews_dataframe(raw_df, source_name=file_name)
+
+
+
+def load_uploaded_review_files(uploaded_files: Sequence[Any]) -> Dict[str, Any]:
+    if not uploaded_files:
+        raise ReviewDownloaderError("Upload at least one CSV or Excel review export to build the workspace.")
+
+    with st.spinner("Reading and mapping the uploaded review files..."):
+        frames = [read_uploaded_review_file(file) for file in uploaded_files]
+
+    combined_df = pd.concat(frames, ignore_index=True)
+    combined_df["review_id"] = combined_df["review_id"].astype(str)
+    combined_df = combined_df.drop_duplicates(subset=["review_id"], keep="first").reset_index(drop=True)
+    combined_df = finalize_reviews_dataframe(combined_df)
+
+    product_ids = _unique_identifier_values(combined_df.get("product_id", pd.Series(dtype="object")))
+    if len(product_ids) == 1:
+        inferred_product_id = product_ids[0]
+    elif len(product_ids) > 1:
+        inferred_product_id = "MULTI_PRODUCT_UPLOAD"
+    else:
+        inferred_product_id = (
+            first_non_empty(combined_df["base_sku"].fillna(""))
+            or first_non_empty(combined_df["product_id"].fillna(""))
+            or "UPLOADED_REVIEWS"
+        )
+
+    file_names = [getattr(file, "name", "uploaded_file") for file in uploaded_files]
+    source_label = file_names[0] if len(file_names) == 1 else f"{len(file_names)} uploaded files"
+    summary = ReviewBatchSummary(
+        product_url="",
+        product_id=inferred_product_id,
+        total_reviews=int(len(combined_df)),
+        page_size=max(int(len(combined_df)), 1),
+        requests_needed=0,
+        reviews_downloaded=int(len(combined_df)),
+    )
+    return {
+        "summary": summary,
+        "reviews_df": combined_df,
+        "source_type": "uploaded",
+        "source_label": source_label,
+        "source_files": file_names,
+        "available_product_ids": product_ids,
+    }
+
+
+
+def build_filter_options(df: pd.DataFrame) -> Dict[str, Any]:
+    valid_dates = df["submission_date"].dropna() if "submission_date" in df.columns else pd.Series(dtype="object")
+    min_date = valid_dates.min() if not valid_dates.empty else None
+    max_date = valid_dates.max() if not valid_dates.empty else None
+
+    product_groups: List[str] = []
+    if "product_or_sku" in df.columns and not df.empty:
+        product_groups = sorted(
+            {
+                str(value).strip()
+                for value in df["product_or_sku"].dropna().astype(str)
+                if str(value).strip() and str(value).strip().lower() not in {"nan", "none"}
+            }
+        )
+
+    product_ids: List[str] = []
+    product_id_counts: Dict[str, int] = {}
+    if "product_id" in df.columns and not df.empty:
+        cleaned = df["product_id"].map(_clean_identifier)
+        cleaned = cleaned[cleaned.ne("")]
+        if not cleaned.empty:
+            counts = cleaned.value_counts()
+            product_ids = sorted(str(index) for index in counts.index.tolist())
+            product_id_counts = {str(index): int(value) for index, value in counts.items()}
+    elif "base_sku" in df.columns and not df.empty:
+        product_ids = _unique_identifier_values(df["base_sku"])
+        product_id_counts = {value: int(df["base_sku"].map(_clean_identifier).eq(value).sum()) for value in product_ids}
+
+    return {
+        "ratings": [1, 2, 3, 4, 5],
+        "product_ids": product_ids,
+        "product_id_counts": product_id_counts,
+        "product_groups": product_groups,
+        "locales": sorted(str(locale) for locale in df["content_locale"].dropna().unique()) if not df.empty else [],
+        "min_date": min_date,
+        "max_date": max_date,
+    }
+
+
+
+def render_sidebar_controls(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    api_key = get_openai_api_key()
+    selected_product_id: Optional[str] = None
+    selected_ratings = [1, 2, 3, 4, 5]
+    selected_products: List[str] = []
+    review_source_mode = "All reviews"
+    selected_locales: List[str] = []
+    recommendation_mode = "All"
+    date_range: Optional[Tuple[date, date]] = None
+    text_query = ""
+
+    with st.sidebar:
+        st.header("Review filters")
+        st.caption("These filters drive the dashboard, review explorer, AI analyst, and Review Prompt.")
+        if df is None:
+            st.info("Build a workspace from a product URL or uploaded review file to unlock the filters.")
+        else:
+            options = build_filter_options(df)
+            scoped_df = df
+            if options["product_ids"] and len(options["product_ids"]) > 1:
+                valid_product_options = [PRODUCT_SCOPE_ALL_LABEL] + options["product_ids"]
+                if st.session_state.get("sidebar_product_id") not in valid_product_options:
+                    st.session_state["sidebar_product_id"] = PRODUCT_SCOPE_ALL_LABEL
+                selected_value = st.selectbox(
+                    "Product ID",
+                    options=valid_product_options,
+                    key="sidebar_product_id",
+                    format_func=lambda value: PRODUCT_SCOPE_ALL_LABEL if value == PRODUCT_SCOPE_ALL_LABEL else f"{value} ({options['product_id_counts'].get(value, 0):,})",
+                )
+                if selected_value != PRODUCT_SCOPE_ALL_LABEL:
+                    selected_product_id = selected_value
+                    scoped_df = _scope_dataframe_to_product_id(df, selected_product_id)
+                    st.caption(f"Scoped to {len(scoped_df):,} reviews for {selected_product_id}.")
+                    options = build_filter_options(scoped_df)
+
+            rating_mode = st.selectbox("Ratings", options=RATING_FILTER_OPTIONS, index=0, key="sidebar_rating_mode")
+            custom_ratings = None
+            if rating_mode == "Custom":
+                st.session_state["sidebar_custom_ratings"] = [
+                    value for value in st.session_state.get("sidebar_custom_ratings", options["ratings"]) if value in options["ratings"]
+                ]
+                custom_ratings = st.multiselect(
+                    "Custom ratings",
+                    options=options["ratings"],
+                    default=options["ratings"],
+                    key="sidebar_custom_ratings",
+                )
+            selected_ratings = rating_values_for_mode(rating_mode, custom_ratings)
+
+            review_source_mode = st.selectbox(
+                "Review source",
+                options=["All reviews", "Organic only", "Incentivized only"],
+                index=0,
+                key="sidebar_review_source",
+            )
+
+            if options["product_groups"] and len(options["product_groups"]) > 1:
+                valid_selected_products = [
+                    value for value in st.session_state.get("sidebar_product_groups", []) if value in options["product_groups"]
+                ]
+                if st.session_state.get("sidebar_product_groups") != valid_selected_products:
+                    st.session_state["sidebar_product_groups"] = valid_selected_products
+                with st.expander("Advanced SKU / variant filter", expanded=False):
+                    selected_products = st.multiselect(
+                        "SKU / product group",
+                        options=options["product_groups"],
+                        default=valid_selected_products,
+                        key="sidebar_product_groups",
+                    )
+
+            if options["locales"]:
+                valid_selected_locales = [
+                    value for value in st.session_state.get("sidebar_locales", []) if value in options["locales"]
+                ]
+                if st.session_state.get("sidebar_locales") != valid_selected_locales:
+                    st.session_state["sidebar_locales"] = valid_selected_locales
+                selected_locales = st.multiselect(
+                    "Market / locale",
+                    options=options["locales"],
+                    default=valid_selected_locales,
+                    key="sidebar_locales",
+                )
+
+            recommendation_mode = st.selectbox(
+                "Recommendation status",
+                options=["All", "Recommended only", "Not recommended only"],
+                index=0,
+                key="sidebar_recommendation",
+            )
+
+            if options["min_date"] and options["max_date"]:
+                current_range = st.session_state.get("sidebar_date_range")
+                if not (
+                    isinstance(current_range, tuple)
+                    and len(current_range) == 2
+                    and current_range[0] is not None
+                    and current_range[1] is not None
+                    and options["min_date"] <= current_range[0] <= options["max_date"]
+                    and options["min_date"] <= current_range[1] <= options["max_date"]
+                ):
+                    st.session_state["sidebar_date_range"] = (options["min_date"], options["max_date"])
+                picked = st.date_input(
+                    "Submission date range",
+                    value=st.session_state.get("sidebar_date_range", (options["min_date"], options["max_date"])),
+                    min_value=options["min_date"],
+                    max_value=options["max_date"],
+                    key="sidebar_date_range",
+                )
+                if isinstance(picked, tuple) and len(picked) == 2:
+                    date_range = (picked[0], picked[1])
+
+            text_query = st.text_input(
+                "Text contains",
+                value=st.session_state.get("sidebar_text_query", ""),
+                key="sidebar_text_query",
+                placeholder="noise, basket, capacity, smell...",
+            )
+        st.divider()
+        if api_key:
+            st.caption("OpenAI analyst is connected through Streamlit secrets.")
+        else:
+            st.caption("Add OPENAI_API_KEY to Streamlit secrets to unlock AI features.")
+
+    return {
+        "selected_product_id": selected_product_id,
+        "selected_ratings": selected_ratings,
+        "selected_products": selected_products,
+        "review_source_mode": review_source_mode,
+        "selected_locales": selected_locales,
+        "recommendation_mode": recommendation_mode,
+        "date_range": date_range,
+        "text_query": text_query,
+        "openai_api_key": api_key,
+        "openai_model": st.session_state.get("openai_model", DEFAULT_OPENAI_MODEL),
+        "reasoning_effort": st.session_state.get("reasoning_effort", DEFAULT_REASONING_EFFORT),
+        "prompt_batch_size": int(st.session_state.get("prompt_batch_size", DEFAULT_PROMPT_BATCH_SIZE)),
+    }
+
+
+
+def describe_current_filters(
+    *,
+    selected_ratings: Sequence[int],
+    selected_products: Sequence[str],
+    review_source_mode: str,
+    selected_locales: Sequence[str],
+    recommendation_mode: str,
+    date_range: Optional[Tuple[date, date]],
+    text_query: str,
+    selected_product_id: Optional[str] = None,
+) -> str:
+    parts: List[str] = []
+    if selected_product_id:
+        parts.append(f"product={selected_product_id}")
+    if selected_ratings and set(selected_ratings) != {1, 2, 3, 4, 5}:
+        parts.append("ratings=" + ", ".join(str(item) for item in selected_ratings))
+    if selected_products:
+        preview = ", ".join(selected_products[:4]) + ("..." if len(selected_products) > 4 else "")
+        parts.append("sku/product=" + preview)
+    if review_source_mode != "All reviews":
+        parts.append(f"source={review_source_mode.lower()}")
+    if selected_locales:
+        parts.append("locales=" + ", ".join(selected_locales))
+    if recommendation_mode != "All":
+        parts.append(f"recommendation={recommendation_mode.lower()}")
+    if date_range and date_range[0] and date_range[1]:
+        parts.append(f"dates={date_range[0]} to {date_range[1]}")
+    if text_query.strip():
+        parts.append(f'text contains="{text_query.strip()}"')
+    return "; ".join(parts) if parts else "No active filters"
+
+
+
+def product_display_name(summary: ReviewBatchSummary, reviews_df: pd.DataFrame) -> str:
+    if reviews_df is None or reviews_df.empty:
+        return summary.product_id
+    unique_product_ids = _unique_identifier_values(reviews_df.get("product_id", pd.Series(dtype="object")))
+    if len(unique_product_ids) > 1:
+        return f"Multi-product workspace ({len(unique_product_ids)} product IDs)"
+    if "original_product_name" in reviews_df.columns:
+        names = [safe_text(value) for value in reviews_df["original_product_name"].tolist() if safe_text(value)]
+        unique_names = []
+        seen = set()
+        for name in names:
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique_names.append(name)
+        if len(unique_names) == 1:
+            return unique_names[0]
+        if unique_names:
+            return unique_names[0]
+    if len(unique_product_ids) == 1:
+        return unique_product_ids[0]
+    return summary.product_id
+
+
+
+def render_workspace_header(
+    summary: ReviewBatchSummary,
+    overall_df: pd.DataFrame,
+    prompt_artifacts: Optional[Dict[str, Any]],
+    *,
+    source_type: str,
+    source_label: str,
+) -> None:
+    bundle = get_master_export_bundle(summary, overall_df, prompt_artifacts)
+    product_name = product_display_name(summary, overall_df)
+    organic_count = int((~overall_df["incentivized_review"].fillna(False)).sum()) if not overall_df.empty else 0
+    unique_products = int(overall_df["product_id"].dropna().map(_clean_identifier).replace("", pd.NA).dropna().nunique()) if "product_id" in overall_df.columns else 0
+    review_count = int(len(overall_df))
+
+    if source_type == "uploaded":
+        subtitle_bits = [f"Source: {source_label}", f"{review_count:,} reviews in scope", f"{organic_count:,} organic reviews"]
+        if safe_text(summary.product_id) and safe_text(summary.product_id) not in {"UPLOADED_REVIEWS", "MULTI_PRODUCT_UPLOAD"}:
+            subtitle_bits.insert(0, f"Product ID {summary.product_id}")
+        elif unique_products > 1:
+            subtitle_bits.append(f"{unique_products:,} product IDs")
+        subtitle = " | ".join(subtitle_bits)
+    else:
+        subtitle = f"Product ID {summary.product_id} | {summary.reviews_downloaded:,} reviews downloaded | {organic_count:,} organic reviews | {summary.requests_needed} Bazaarvoice requests"
+
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <div class="hero-kicker">Review workspace ready</div>
+            <div class="hero-title">{product_name}</div>
+            <div class="hero-subtitle">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    action_cols = st.columns([1.2, 1.2, 4])
+    action_cols[0].download_button(
+        label="Download all reviews",
+        data=bundle["excel_bytes"],
+        file_name=bundle["excel_name"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    action_cols[1].download_button(
+        label="Download SQLite DB",
+        data=build_sqlite_database(summary, overall_df),
+        file_name=f"{summary.product_id}_reviews.db",
+        mime="application/x-sqlite3",
+        use_container_width=True,
+    )
+    action_cols[2].caption("The workspace export includes the Summary sheet, Reviews sheet, and any Review Prompt outputs currently in scope.")
+
+
+
+def reset_workspace_runtime(*, clear_dataset: bool = False, clear_knowledge: bool = False) -> None:
+    keys_to_clear = [
+        "master_export_bundle",
+        "prompt_run_artifacts",
+        "prompt_run_notice",
+        "chat_messages",
+        "chat_scope_signature",
+        "chat_scope_notice",
+        "review_explorer_page",
+        "review_explorer_page_input",
+        "review_explorer_sort",
+        "review_explorer_per_page",
+        "prompt_result_view",
+        "analysis_dataset_source_signature",
+        "ai_focus_open",
+        "ai_question_draft",
+        "workspace_view_selector",
+        "active_main_view",
+        "_ai_settings_knowledge_context",
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
+    prefixes = (
+        "prompt_labels_",
+        "prompt_chart_active_",
+        "prompt_source_",
+        "prompt_rating_mode_",
+        "prompt_preview_rows_",
+        "ai_quick_",
+    )
+    exact_filter_keys = {
+        "sidebar_product_id",
+        "sidebar_rating_mode",
+        "sidebar_custom_ratings",
+        "sidebar_review_source",
+        "sidebar_product_groups",
+        "sidebar_locales",
+        "sidebar_recommendation",
+        "sidebar_date_range",
+        "sidebar_text_query",
+        "dashboard_chart_scope",
+        "dash_trend_mode",
+        "dash_breakout",
+        "dash_smoothing",
+        "dash_top_groups",
+        "dash_show_overall",
+        "dash_show_volume",
+        "dash_zoom_mode",
+    }
+    for key in list(st.session_state.keys()):
+        if key in exact_filter_keys or any(key.startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
+
+    if clear_dataset:
+        st.session_state["analysis_dataset"] = None
+    if clear_knowledge:
+        st.session_state["stored_product_knowledge"] = None
+    st.session_state["ai_focus_open"] = True
+    st.session_state["workspace_view_selector"] = "Dashboard"
+    st.session_state["active_main_view"] = "Dashboard"
+
+
+
+def _summary_for_active_scope(summary: ReviewBatchSummary, scoped_df: pd.DataFrame, selected_product_id: Optional[str]) -> ReviewBatchSummary:
+    if not selected_product_id:
+        return summary
+    return ReviewBatchSummary(
+        product_url=summary.product_url,
+        product_id=selected_product_id,
+        total_reviews=int(len(scoped_df)),
+        page_size=summary.page_size,
+        requests_needed=summary.requests_needed if _clean_identifier(summary.product_id) == _clean_identifier(selected_product_id) else 0,
+        reviews_downloaded=int(len(scoped_df)),
+    )
+
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    inject_css()
+    initialize_session_state()
+    initialize_v8_session_state()
+
+    st.title(APP_TITLE)
+    st.caption(
+        "Build a review workspace from a SharkNinja product URL or an uploaded review export, then filter the voice of customer, explore review cards, chat with an AI analyst, and create row-level AI tags."
+    )
+
+    workspace_notice = st.session_state.pop("workspace_notice", None)
+    if workspace_notice:
+        st.success(workspace_notice)
+
+    dataset = st.session_state.get("analysis_dataset")
+    if dataset:
+        current_source_cols = st.columns([4.2, 1.0])
+        current_source_cols[0].caption(
+            f"Current workspace · {safe_text(dataset.get('source_type', 'bazaarvoice')).replace('_', ' ').title()} · {safe_text(dataset.get('source_label', ''))}"
+        )
+        if current_source_cols[1].button("Clear workspace", use_container_width=True, key="workspace_clear_button"):
+            reset_workspace_runtime(clear_dataset=True, clear_knowledge=True)
+            st.session_state["workspace_notice"] = "Cleared the current workspace. Load a new URL or file to start fresh."
+            st.session_state["workspace_upload_nonce"] = safe_int(st.session_state.get("workspace_upload_nonce"), 0) + 1
+            st.rerun()
+
+    source_mode = st.radio(
+        "Workspace source",
+        options=["SharkNinja product URL", "Uploaded review file"],
+        horizontal=True,
+        key="workspace_source_mode",
+    )
+
+    last_source_mode = st.session_state.get("last_workspace_source_mode")
+    if last_source_mode != source_mode and st.session_state.get("analysis_dataset") is not None:
+        reset_workspace_runtime(clear_dataset=True, clear_knowledge=True)
+        st.session_state["workspace_notice"] = f"Switched workspace source to {source_mode}. Previous data was cleared so you can load a fresh source cleanly."
+        st.session_state["workspace_upload_nonce"] = safe_int(st.session_state.get("workspace_upload_nonce"), 0) + 1
+        st.session_state["last_workspace_source_mode"] = source_mode
+        st.rerun()
+    st.session_state["last_workspace_source_mode"] = source_mode
+
+    if source_mode == "SharkNinja product URL":
+        product_url = st.text_input(
+            "Product URL",
+            value="https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
+            help="Example: https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
+            key="workspace_product_url_input",
+        )
+        if dataset and safe_text(dataset.get("source_type")) == "bazaarvoice" and safe_text(dataset.get("source_label")) != normalize_product_url(product_url):
+            st.info("Building this URL will replace the current workspace and clear prior AI/report state.")
+        build_clicked = st.button("Build review workspace", type="primary", key="workspace_build_from_url")
+        if build_clicked:
+            try:
+                new_dataset = load_product_reviews(product_url)
+                reset_workspace_runtime(clear_dataset=False, clear_knowledge=True)
+                st.session_state["analysis_dataset"] = new_dataset
+                st.session_state["workspace_notice"] = f"Loaded {new_dataset['summary'].reviews_downloaded:,} reviews for {new_dataset['summary'].product_id}."
+                st.rerun()
+            except requests.HTTPError as exc:
+                st.error(f"HTTP error: {exc}")
+            except ReviewDownloaderError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.exception(exc)
+    else:
+        uploader_key = f"workspace_upload_{safe_int(st.session_state.get('workspace_upload_nonce'), 0)}"
+        uploaded_files = st.file_uploader(
+            "Upload review export files",
+            type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            help="Supports Axion-style exports, Bazaarvoice exports, and similar CSV/XLSX review files.",
+            key=uploader_key,
+        )
+        st.caption("Mapped columns include Event Id / Review ID, Base SKU / Product ID, Review Text / Review text, Review Title, Rating, Submission date / Opened date, Incentivized review, Would recommend, Locale, and # Photos.")
+        if dataset and safe_text(dataset.get("source_type")) == "uploaded" and uploaded_files:
+            current_names = sorted(safe_text(name) for name in (dataset.get("source_files") or []))
+            next_names = sorted(safe_text(file.name) for file in uploaded_files)
+            if current_names != next_names:
+                st.info("Building these files will replace the current workspace and clear prior AI/report state.")
+        build_clicked = st.button("Build review workspace from file", type="primary", key="workspace_build_from_file")
+        if build_clicked:
+            try:
+                new_dataset = load_uploaded_review_files(uploaded_files or [])
+                reset_workspace_runtime(clear_dataset=False, clear_knowledge=True)
+                st.session_state["analysis_dataset"] = new_dataset
+                st.session_state["workspace_notice"] = f"Loaded {new_dataset['summary'].reviews_downloaded:,} uploaded reviews into the workspace."
+                st.rerun()
+            except ReviewDownloaderError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.exception(exc)
+
+    dataset = st.session_state.get("analysis_dataset")
+    settings = render_sidebar_controls(dataset["reviews_df"] if dataset else None)
+    if not dataset:
+        st.info("Build a review workspace to unlock the dashboard, review explorer, AI analyst, and Review Prompt tagging.")
+        return
+
+    raw_summary: ReviewBatchSummary = dataset["summary"]
+    raw_overall_df: pd.DataFrame = dataset["reviews_df"]
+    source_type = dataset.get("source_type", "bazaarvoice")
+    source_label = dataset.get("source_label", "")
+
+    overall_df = _scope_dataframe_to_product_id(raw_overall_df, settings.get("selected_product_id"))
+    summary = _summary_for_active_scope(raw_summary, overall_df, settings.get("selected_product_id"))
+
+    filtered_df = apply_filters(
+        overall_df,
+        selected_ratings=settings["selected_ratings"],
+        incentivized_mode=map_review_source_mode(settings["review_source_mode"]),
+        selected_products=settings["selected_products"],
+        selected_locales=settings["selected_locales"],
+        recommendation_mode=settings["recommendation_mode"],
+        syndicated_mode="All",
+        media_mode="All",
+        date_range=settings["date_range"],
+        text_query=settings["text_query"],
+    )
+    filter_description = describe_current_filters(
+        selected_product_id=settings.get("selected_product_id"),
+        selected_ratings=settings["selected_ratings"],
+        selected_products=settings["selected_products"],
+        review_source_mode=settings["review_source_mode"],
+        selected_locales=settings["selected_locales"],
+        recommendation_mode=settings["recommendation_mode"],
+        date_range=settings["date_range"],
+        text_query=settings["text_query"],
+    )
+    st.session_state["_ai_settings_knowledge_context"] = {
+        "summary": summary,
+        "overall_df": overall_df,
+        "filtered_df": filtered_df,
+        "filter_description": filter_description,
+    }
+
+    render_workspace_header(
+        summary,
+        overall_df,
+        st.session_state.get("prompt_run_artifacts"),
+        source_type=source_type,
+        source_label=source_label,
+    )
+    render_top_metrics(overall_df, filtered_df)
+    st.caption(f"Filter status: {filter_description}. Showing {len(filtered_df):,} of {len(overall_df):,} reviews.")
+
+    if st.session_state.get("workspace_view_selector") not in ["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"]:
+        st.session_state["workspace_view_selector"] = st.session_state.get("active_main_view", "Dashboard")
+    st.radio(
+        "Workspace view",
+        options=["Dashboard", "Review Explorer", "AI Analyst", "Review Prompt"],
+        horizontal=True,
+        key="workspace_view_selector",
+    )
+    st.session_state["active_main_view"] = st.session_state.get("workspace_view_selector", "Dashboard")
+
+    active_view = st.session_state.get("active_main_view", "Dashboard")
+    if active_view == "Dashboard":
+        render_dashboard(filtered_df)
+    elif active_view == "Review Explorer":
+        render_review_explorer(
+            summary=summary,
+            overall_df=overall_df,
+            filtered_df=filtered_df,
+            prompt_artifacts=st.session_state.get("prompt_run_artifacts"),
+        )
+    elif active_view == "AI Analyst":
+        render_ai_tab(
+            settings=settings,
+            overall_df=overall_df,
+            filtered_df=filtered_df,
+            summary=summary,
+            filter_description=filter_description,
+        )
+    else:
+        render_review_prompt_tab(
+            settings=settings,
+            overall_df=overall_df,
+            filtered_df=filtered_df,
+            summary=summary,
+            filter_description=filter_description,
+        )
+
 if __name__ == "__main__":
     main()
