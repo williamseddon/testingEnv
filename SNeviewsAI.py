@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
@@ -1368,7 +1369,7 @@ def build_excel_file(
                 "total_reviews": summary.total_reviews,
                 "page_size": summary.page_size,
                 "requests_needed": summary.requests_needed,
-                "reviews_downloaded": summary.reviews_downloaded,
+                "reviews_downloaded": int(len(reviews_df)),
                 "generated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
         ]
@@ -2313,6 +2314,36 @@ def prompt_definitions_to_df(prompt_definitions: Sequence[Dict[str, Any]], scope
 
 
 
+def _normalize_export_hash_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series.dt.strftime("%Y-%m-%dT%H:%M:%S.%f").fillna("")
+    return series.map(lambda value: "" if is_missing_value(value) else safe_text(value))
+
+
+
+def build_export_dataframe_fingerprint(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "empty"
+    normalized = pd.DataFrame({column: _normalize_export_hash_series(df[column]) for column in df.columns})
+    row_hashes = pd.util.hash_pandas_object(normalized, index=False)
+    return hashlib.sha256(row_hashes.to_numpy().tobytes()).hexdigest()
+
+
+
+def prompt_export_data_fingerprint(reviews_df: pd.DataFrame, prompt_artifacts: Optional[Dict[str, Any]]) -> str:
+    if reviews_df is None or reviews_df.empty:
+        return "empty"
+    prompt_definitions = (prompt_artifacts or {}).get("definitions") or []
+    prompt_columns = [prompt["column_name"] for prompt in prompt_definitions if prompt["column_name"] in reviews_df.columns]
+    if not prompt_columns:
+        return ""
+    fingerprint_columns = [column for column in ["review_id", *prompt_columns] if column in reviews_df.columns]
+    if not fingerprint_columns:
+        return ""
+    return build_export_dataframe_fingerprint(reviews_df[fingerprint_columns].copy())
+
+
+
 def build_master_excel_file(
     summary: ReviewBatchSummary,
     reviews_df: pd.DataFrame,
@@ -2400,6 +2431,12 @@ def get_master_export_bundle(
             "columns": sorted(str(col) for col in reviews_df.columns),
             "prompt_signature": (prompt_artifacts or {}).get("definition_signature"),
             "prompt_scope": prompt_scope_label,
+            "prompt_generated_utc": (prompt_artifacts or {}).get("generated_utc"),
+            "prompt_review_count": safe_int((prompt_artifacts or {}).get("review_count"), 0),
+            "prompt_review_count_total": safe_int((prompt_artifacts or {}).get("review_count_total"), 0),
+            "prompt_failed_review_count": safe_int((prompt_artifacts or {}).get("failed_review_count"), 0),
+            "prompt_checkpoint_status": safe_text((prompt_artifacts or {}).get("checkpoint_status")),
+            "prompt_data_fingerprint": prompt_export_data_fingerprint(reviews_df, prompt_artifacts),
         },
         sort_keys=True,
     )
@@ -7339,5 +7376,1375 @@ def main() -> None:
             filter_description=filter_description,
         )
 
+# -----------------------------------------------------------------------------
+# v12 Review Prompt checkpointing, recovery, and stability overrides
+# -----------------------------------------------------------------------------
+
+PROMPT_CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def set_prompt_run_notice(message: str, level: str = "info") -> None:
+    st.session_state["prompt_run_notice"] = safe_text(message)
+    st.session_state["prompt_run_notice_level"] = safe_text(level) or "info"
+
+
+
+def render_prompt_run_notice() -> None:
+    notice = st.session_state.pop("prompt_run_notice", None)
+    if not notice:
+        return
+    level = safe_text(st.session_state.pop("prompt_run_notice_level", "info")).lower()
+    if level == "success":
+        st.success(notice)
+    elif level in {"warning", "warn"}:
+        st.warning(notice)
+    elif level == "error":
+        st.error(notice)
+    else:
+        st.info(notice)
+
+
+
+def quote_sql_identifier(identifier: str) -> str:
+    return '"' + safe_text(identifier).replace('"', '""') + '"'
+
+
+
+def prompt_checkpoint_root() -> str:
+    root = os.path.join(tempfile.gettempdir(), "sneviewsai_prompt_checkpoints")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+
+def prompt_checkpoint_run_id(
+    summary: ReviewBatchSummary,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    scope_label: str,
+) -> str:
+    import hashlib
+
+    hasher = hashlib.sha256()
+    hasher.update(safe_text(summary.product_id).encode("utf-8", "ignore"))
+    hasher.update(b"\n")
+    hasher.update(safe_text(scope_label).encode("utf-8", "ignore"))
+    hasher.update(b"\n")
+    hasher.update(prompt_definition_signature(prompt_definitions).encode("utf-8", "ignore"))
+    hasher.update(b"\n")
+    for review_id in source_df.get("review_id", pd.Series(dtype="object")).astype(str).tolist():
+        hasher.update(review_id.encode("utf-8", "ignore"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()[:24]
+
+
+
+def prompt_checkpoint_descriptor(
+    summary: ReviewBatchSummary,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    scope_label: str,
+) -> Dict[str, Any]:
+    run_id = prompt_checkpoint_run_id(summary, source_df, prompt_definitions, scope_label)
+    path = os.path.join(prompt_checkpoint_root(), f"{run_id}.db")
+    return {"run_id": run_id, "path": path}
+
+
+
+def _checkpoint_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+
+def _checkpoint_load(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+
+def _checkpoint_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return bool(row)
+
+
+
+def _checkpoint_set_metadata(conn: sqlite3.Connection, updates: Dict[str, Any]) -> None:
+    if not updates:
+        return
+    conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    rows = [(str(key), _checkpoint_dump(value)) for key, value in updates.items()]
+    conn.executemany(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        rows,
+    )
+    conn.commit()
+
+
+
+def _checkpoint_get_metadata(conn: sqlite3.Connection) -> Dict[str, Any]:
+    if not _checkpoint_table_exists(conn, "metadata"):
+        return {}
+    rows = conn.execute("SELECT key, value FROM metadata").fetchall()
+    return {str(key): _checkpoint_load(value) for key, value in rows}
+
+
+
+def _prompt_checkpoint_counts(conn: sqlite3.Connection) -> Tuple[int, int, int]:
+    total = 0
+    completed = 0
+    failed = 0
+    if _checkpoint_table_exists(conn, "source_reviews"):
+        total = safe_int(conn.execute("SELECT COUNT(*) FROM source_reviews").fetchone()[0], 0)
+    if _checkpoint_table_exists(conn, "prompt_results"):
+        completed = safe_int(conn.execute("SELECT COUNT(*) FROM prompt_results").fetchone()[0], 0)
+    if _checkpoint_table_exists(conn, "failed_reviews"):
+        failed = safe_int(conn.execute("SELECT COUNT(*) FROM failed_reviews").fetchone()[0], 0)
+    return total, completed, failed
+
+
+
+def _empty_prompt_results_df(prompt_definitions: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(columns=["review_id", *[prompt["column_name"] for prompt in prompt_definitions]])
+
+
+
+def _ensure_prompt_results_table(conn: sqlite3.Connection, prompt_definitions: Sequence[Dict[str, Any]]) -> None:
+    result_columns = [f"{quote_sql_identifier(prompt['column_name'])} TEXT" for prompt in prompt_definitions]
+    result_columns_sql = ", ".join(result_columns)
+    sql = f"CREATE TABLE IF NOT EXISTS prompt_results (review_id TEXT PRIMARY KEY{', ' + result_columns_sql if result_columns_sql else ''})"
+    conn.execute(sql)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS failed_reviews (review_id TEXT PRIMARY KEY, error TEXT, failed_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS prompt_definitions (column_name TEXT PRIMARY KEY, display_name TEXT, prompt TEXT, labels_json TEXT)"
+    )
+    conn.commit()
+
+
+
+def _seed_prompt_checkpoint(
+    conn: sqlite3.Connection,
+    *,
+    summary: ReviewBatchSummary,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    scope_label: str,
+    filter_description: str,
+    model: str,
+    reasoning_effort: str,
+    chunk_size: int,
+    run_id: str,
+) -> None:
+    source_sql_df = source_df.copy()
+    source_sql_df["review_id"] = source_sql_df["review_id"].astype(str)
+    source_sql_df = source_sql_df.drop_duplicates(subset=["review_id"], keep="first").reset_index(drop=True)
+    source_sql_df["_scope_row_order"] = range(len(source_sql_df))
+    dataframe_for_sql(source_sql_df).to_sql("source_reviews", conn, index=False, if_exists="replace")
+
+    prompt_rows = [
+        {
+            "column_name": prompt["column_name"],
+            "display_name": prompt.get("display_name", humanize_column_name(prompt["column_name"])),
+            "prompt": prompt["prompt"],
+            "labels_json": _checkpoint_dump(list(prompt["labels"])),
+        }
+        for prompt in prompt_definitions
+    ]
+    pd.DataFrame(prompt_rows).to_sql("prompt_definitions", conn, index=False, if_exists="replace")
+
+    _ensure_prompt_results_table(conn, prompt_definitions)
+    _checkpoint_set_metadata(
+        conn,
+        {
+            "checkpoint_schema_version": PROMPT_CHECKPOINT_SCHEMA_VERSION,
+            "run_id": run_id,
+            "product_id": summary.product_id,
+            "product_url": summary.product_url,
+            "scope_label": scope_label,
+            "filter_description": filter_description,
+            "prompt_signature": prompt_definition_signature(prompt_definitions),
+            "prompt_definition_count": len(prompt_definitions),
+            "source_review_count": int(len(source_sql_df)),
+            "completed_review_count": 0,
+            "failed_review_count": 0,
+            "status": "initialized",
+            "created_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "updated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "requested_chunk_size": int(chunk_size),
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        },
+    )
+
+
+
+def initialize_prompt_checkpoint(
+    *,
+    summary: ReviewBatchSummary,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    scope_label: str,
+    filter_description: str,
+    model: str,
+    reasoning_effort: str,
+    chunk_size: int,
+) -> Dict[str, Any]:
+    descriptor = prompt_checkpoint_descriptor(summary, source_df, prompt_definitions, scope_label)
+    checkpoint_path = descriptor["path"]
+    run_id = descriptor["run_id"]
+    prompt_signature = prompt_definition_signature(prompt_definitions)
+    source_review_count = int(len(source_df.drop_duplicates(subset=["review_id"], keep="first")))
+
+    reset_checkpoint = False
+    if os.path.exists(checkpoint_path):
+        try:
+            with sqlite3.connect(checkpoint_path) as probe:
+                meta = _checkpoint_get_metadata(probe)
+                total, _, _ = _prompt_checkpoint_counts(probe)
+                if safe_text(meta.get("prompt_signature")) != prompt_signature:
+                    reset_checkpoint = True
+                elif safe_int(meta.get("source_review_count"), -1) != source_review_count:
+                    reset_checkpoint = True
+                elif safe_text(meta.get("scope_label")) != safe_text(scope_label):
+                    reset_checkpoint = True
+                elif total != source_review_count:
+                    reset_checkpoint = True
+        except Exception:
+            reset_checkpoint = True
+
+    if reset_checkpoint:
+        clear_prompt_checkpoint(checkpoint_path)
+
+    conn = sqlite3.connect(checkpoint_path)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    _ensure_prompt_results_table(conn, prompt_definitions)
+
+    if reset_checkpoint or not _checkpoint_table_exists(conn, "source_reviews"):
+        _seed_prompt_checkpoint(
+            conn,
+            summary=summary,
+            source_df=source_df,
+            prompt_definitions=prompt_definitions,
+            scope_label=scope_label,
+            filter_description=filter_description,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            chunk_size=chunk_size,
+            run_id=run_id,
+        )
+    else:
+        _checkpoint_set_metadata(
+            conn,
+            {
+                "updated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "requested_chunk_size": int(chunk_size),
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            },
+        )
+
+    total, completed, failed = _prompt_checkpoint_counts(conn)
+    meta = _checkpoint_get_metadata(conn)
+    return {
+        "path": checkpoint_path,
+        "run_id": run_id,
+        "connection": conn,
+        "metadata": meta,
+        "source_review_count": total,
+        "completed_review_count": completed,
+        "failed_review_count": failed,
+        "processed_review_count": completed + failed,
+        "is_finished": (completed + failed) >= total and total > 0,
+    }
+
+
+
+def load_prompt_checkpoint_info(checkpoint_path: str) -> Optional[Dict[str, Any]]:
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return None
+    try:
+        with sqlite3.connect(checkpoint_path) as conn:
+            meta = _checkpoint_get_metadata(conn)
+            total, completed, failed = _prompt_checkpoint_counts(conn)
+        processed = completed + failed
+        info = dict(meta)
+        info.update(
+            {
+                "path": checkpoint_path,
+                "run_id": os.path.splitext(os.path.basename(checkpoint_path))[0],
+                "source_review_count": total,
+                "completed_review_count": completed,
+                "failed_review_count": failed,
+                "processed_review_count": processed,
+                "is_finished": processed >= total and total > 0,
+                "is_partial": processed < total or failed > 0,
+            }
+        )
+        if info.get("status") in {"initialized", "running"} and processed >= total and total > 0:
+            info["status"] = "completed" if failed == 0 else "completed_with_failures"
+        return info
+    except Exception as exc:
+        return {
+            "path": checkpoint_path,
+            "run_id": os.path.splitext(os.path.basename(checkpoint_path))[0],
+            "status": "corrupt",
+            "last_error": safe_text(exc),
+            "source_review_count": 0,
+            "completed_review_count": 0,
+            "failed_review_count": 0,
+            "processed_review_count": 0,
+            "is_finished": False,
+            "is_partial": False,
+        }
+
+
+
+def load_prompt_results_from_checkpoint(checkpoint_path: str) -> pd.DataFrame:
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return pd.DataFrame()
+    with sqlite3.connect(checkpoint_path) as conn:
+        if not _checkpoint_table_exists(conn, "prompt_results"):
+            return pd.DataFrame()
+        return pd.read_sql_query("SELECT * FROM prompt_results", conn)
+
+
+
+def load_prompt_failed_reviews_from_checkpoint(checkpoint_path: str) -> pd.DataFrame:
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return pd.DataFrame(columns=["review_id", "error", "failed_at"])
+    with sqlite3.connect(checkpoint_path) as conn:
+        if not _checkpoint_table_exists(conn, "failed_reviews"):
+            return pd.DataFrame(columns=["review_id", "error", "failed_at"])
+        return pd.read_sql_query("SELECT review_id, error, failed_at FROM failed_reviews ORDER BY failed_at DESC", conn)
+
+
+
+def load_prompt_source_reviews_from_checkpoint(checkpoint_path: str) -> pd.DataFrame:
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return pd.DataFrame()
+    with sqlite3.connect(checkpoint_path) as conn:
+        if not _checkpoint_table_exists(conn, "source_reviews"):
+            return pd.DataFrame()
+        df = pd.read_sql_query("SELECT * FROM source_reviews ORDER BY _scope_row_order", conn)
+    if "_scope_row_order" in df.columns:
+        df = df.drop(columns=["_scope_row_order"])
+    return finalize_reviews_dataframe(df)
+
+
+
+def _pending_review_ids_from_checkpoint(conn: sqlite3.Connection, limit: int) -> List[str]:
+    if not _checkpoint_table_exists(conn, "source_reviews"):
+        return []
+    query = textwrap.dedent(
+        """
+        SELECT s.review_id
+        FROM source_reviews s
+        LEFT JOIN prompt_results r ON s.review_id = r.review_id
+        LEFT JOIN failed_reviews f ON s.review_id = f.review_id
+        WHERE r.review_id IS NULL AND f.review_id IS NULL
+        ORDER BY s._scope_row_order
+        LIMIT ?
+        """
+    ).strip()
+    rows = conn.execute(query, (int(limit),)).fetchall()
+    return [safe_text(row[0]) for row in rows if safe_text(row[0])]
+
+
+
+def _write_prompt_results_to_checkpoint(
+    conn: sqlite3.Connection,
+    prompt_results_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+) -> None:
+    if prompt_results_df is None or prompt_results_df.empty:
+        return
+    columns = ["review_id", *[prompt["column_name"] for prompt in prompt_definitions]]
+    placeholders = ", ".join(["?"] * len(columns))
+    quoted_columns = ", ".join(quote_sql_identifier(column) for column in columns)
+    update_clause = ", ".join(
+        f"{quote_sql_identifier(column)}=excluded.{quote_sql_identifier(column)}"
+        for column in columns
+        if column != "review_id"
+    )
+    sql = (
+        f"INSERT INTO prompt_results ({quoted_columns}) VALUES ({placeholders}) "
+        f"ON CONFLICT(review_id) DO UPDATE SET {update_clause}"
+    )
+    rows = []
+    for _, row in prompt_results_df.iterrows():
+        rows.append(
+            tuple(None if is_missing_value(row.get(column)) else safe_text(row.get(column)) for column in columns)
+        )
+    conn.executemany(sql, rows)
+    conn.commit()
+
+
+
+def _write_failed_reviews_to_checkpoint(
+    conn: sqlite3.Connection,
+    failed_rows: Sequence[Dict[str, Any]],
+) -> None:
+    if not failed_rows:
+        return
+    stamped_rows = [
+        (
+            safe_text(item.get("review_id")),
+            safe_text(item.get("error")),
+            safe_text(item.get("failed_at")) or pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        )
+        for item in failed_rows
+        if safe_text(item.get("review_id"))
+    ]
+    if not stamped_rows:
+        return
+    conn.executemany(
+        "INSERT INTO failed_reviews(review_id, error, failed_at) VALUES(?, ?, ?) ON CONFLICT(review_id) DO UPDATE SET error=excluded.error, failed_at=excluded.failed_at",
+        stamped_rows,
+    )
+    conn.commit()
+
+
+
+def clear_prompt_checkpoint(checkpoint_path: str) -> None:
+    for suffix in ["", "-wal", "-shm", ".journal"]:
+        candidate = f"{checkpoint_path}{suffix}"
+        try:
+            if candidate and os.path.exists(candidate):
+                os.remove(candidate)
+        except OSError:
+            pass
+
+
+
+def is_transient_prompt_error(exc: Exception) -> bool:
+    message = safe_text(exc).lower()
+    transient_tokens = [
+        "timeout",
+        "timed out",
+        "rate limit",
+        "temporarily unavailable",
+        "connection",
+        "server",
+        "overloaded",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(token in message for token in transient_tokens)
+
+
+
+def build_prompt_run_artifacts_from_results(
+    *,
+    prompt_results_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    source_df: pd.DataFrame,
+    scope_label: str,
+    filter_description: str,
+    generated_utc: Optional[str] = None,
+    failed_review_count: int = 0,
+    checkpoint_status: str = "completed",
+) -> Dict[str, Any]:
+    total_reviews = int(len(source_df))
+    return {
+        "definitions": list(prompt_definitions),
+        "summary_df": summarize_prompt_results(prompt_results_df, prompt_definitions, source_df=source_df),
+        "scope_label": scope_label,
+        "scope_filter_description": filter_description,
+        "scope_review_ids": list(prompt_results_df.get("review_id", pd.Series(dtype="object")).astype(str)),
+        "definition_signature": prompt_definition_signature(prompt_definitions),
+        "review_count": int(len(prompt_results_df)),
+        "review_count_total": total_reviews,
+        "failed_review_count": int(failed_review_count),
+        "generated_utc": generated_utc or pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "is_partial": (int(len(prompt_results_df)) + int(failed_review_count)) < total_reviews or int(failed_review_count) > 0,
+        "checkpoint_status": checkpoint_status,
+    }
+
+
+
+def apply_prompt_results_to_workspace(
+    *,
+    prompt_results_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    source_df: pd.DataFrame,
+    scope_label: str,
+    filter_description: str,
+    generated_utc: Optional[str] = None,
+    failed_review_count: int = 0,
+    checkpoint_status: str = "completed",
+) -> Dict[str, Any]:
+    dataset = dict(st.session_state.get("analysis_dataset") or {})
+    workspace_df = dataset.get("reviews_df")
+    if workspace_df is None:
+        workspace_df = source_df.copy()
+    updated_workspace_df = merge_prompt_results_into_reviews(workspace_df, prompt_results_df, prompt_definitions)
+    dataset["reviews_df"] = updated_workspace_df
+    st.session_state["analysis_dataset"] = dataset
+    artifacts = build_prompt_run_artifacts_from_results(
+        prompt_results_df=prompt_results_df,
+        prompt_definitions=prompt_definitions,
+        source_df=source_df,
+        scope_label=scope_label,
+        filter_description=filter_description,
+        generated_utc=generated_utc,
+        failed_review_count=failed_review_count,
+        checkpoint_status=checkpoint_status,
+    )
+    st.session_state["prompt_run_artifacts"] = artifacts
+    st.session_state["master_export_bundle"] = None
+    return artifacts
+
+
+
+def build_prompt_checkpoint_partial_bundle(
+    *,
+    summary: ReviewBatchSummary,
+    overall_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    prompt_results_df: pd.DataFrame,
+    scope_label: str,
+    filter_description: str,
+    checkpoint_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    updated_view_df = merge_prompt_results_into_reviews(overall_df, prompt_results_df, prompt_definitions)
+    artifacts = build_prompt_run_artifacts_from_results(
+        prompt_results_df=prompt_results_df,
+        prompt_definitions=prompt_definitions,
+        source_df=source_df,
+        scope_label=scope_label,
+        filter_description=filter_description,
+        generated_utc=safe_text(checkpoint_info.get("updated_utc")) or pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        failed_review_count=safe_int(checkpoint_info.get("failed_review_count"), 0),
+        checkpoint_status=safe_text(checkpoint_info.get("status")) or "partial",
+    )
+    excel_bytes = build_master_excel_file(
+        summary,
+        updated_view_df,
+        prompt_definitions=prompt_definitions,
+        prompt_summary_df=artifacts["summary_df"],
+        prompt_scope_label=scope_label,
+    )
+    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    return {
+        "artifacts": artifacts,
+        "excel_bytes": excel_bytes,
+        "excel_name": f"{summary.product_id}_review_prompt_partial_{timestamp}.xlsx",
+        "updated_view_df": updated_view_df,
+    }
+
+
+
+def get_prompt_checkpoint_partial_bundle(
+    *,
+    summary: ReviewBatchSummary,
+    overall_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    prompt_results_df: pd.DataFrame,
+    scope_label: str,
+    filter_description: str,
+    checkpoint_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    cache_key = json.dumps(
+        {
+            "checkpoint_path": safe_text(checkpoint_info.get("path")),
+            "updated_utc": safe_text(checkpoint_info.get("updated_utc")),
+            "completed_review_count": safe_int(checkpoint_info.get("completed_review_count"), 0),
+            "failed_review_count": safe_int(checkpoint_info.get("failed_review_count"), 0),
+            "view_rows": int(len(overall_df)),
+            "prompt_signature": prompt_definition_signature(prompt_definitions),
+        },
+        sort_keys=True,
+    )
+    cached = st.session_state.get("prompt_checkpoint_partial_bundle")
+    if cached and cached.get("key") == cache_key:
+        return cached
+    bundle = build_prompt_checkpoint_partial_bundle(
+        summary=summary,
+        overall_df=overall_df,
+        source_df=source_df,
+        prompt_definitions=prompt_definitions,
+        prompt_results_df=prompt_results_df,
+        scope_label=scope_label,
+        filter_description=filter_description,
+        checkpoint_info=checkpoint_info,
+    )
+    bundle["key"] = cache_key
+    st.session_state["prompt_checkpoint_partial_bundle"] = bundle
+    return bundle
+
+
+
+def classify_review_chunk(
+    *,
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    chunk_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+) -> pd.DataFrame:
+    instructions = textwrap.dedent(
+        """
+        You are a deterministic review-tagging engine.
+        For each review and each prompt definition, return exactly one allowed label.
+        Base each label only on the supplied review content.
+        Do not use product priors or guess beyond the evidence in the review.
+        If the review does not mention the topic, use Not Mentioned when that label is available.
+        """
+    ).strip()
+    prompt_count = max(len(prompt_definitions), 1)
+    estimated_output_tokens = 450 + len(chunk_df) * (18 + 12 * prompt_count)
+    max_output_tokens = int(max(1800, min(12000, estimated_output_tokens)))
+    result = call_openai_json(
+        api_key=api_key,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        instructions=instructions,
+        input_payload=build_review_tagging_input(chunk_df, prompt_definitions),
+        schema_name="review_prompt_tagging",
+        schema=build_review_tagging_schema(prompt_definitions),
+        max_output_tokens=max_output_tokens,
+    )
+    output_rows = result.get("results") or []
+    output_df = pd.DataFrame(output_rows)
+    if output_df.empty:
+        raise ReviewDownloaderError("OpenAI returned no row-level prompt results.")
+    output_df["review_id"] = output_df["review_id"].astype(str)
+
+    expected_review_ids = set(chunk_df["review_id"].astype(str))
+    returned_review_ids = set(output_df["review_id"].astype(str))
+    if expected_review_ids != returned_review_ids:
+        missing = sorted(expected_review_ids - returned_review_ids)
+        extra = sorted(returned_review_ids - expected_review_ids)
+        raise ReviewDownloaderError(
+            "OpenAI returned an incomplete review-tagging batch. "
+            f"Missing review_ids: {missing[:5]} | Extra review_ids: {extra[:5]}"
+        )
+
+    for prompt in prompt_definitions:
+        column_name = prompt["column_name"]
+        if column_name not in output_df.columns:
+            raise ReviewDownloaderError(f"OpenAI omitted the expected Review Prompt column: {column_name}")
+
+    return output_df
+
+
+
+def classify_review_chunk_resilient(
+    *,
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    chunk_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    status_placeholder: Optional[Any] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    import time as _time
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 3):
+        try:
+            return (
+                classify_review_chunk(
+                    api_key=api_key,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    chunk_df=chunk_df,
+                    prompt_definitions=prompt_definitions,
+                ),
+                [],
+            )
+        except Exception as exc:
+            last_exc = exc
+            if is_transient_prompt_error(exc) and attempt < 2:
+                if status_placeholder is not None:
+                    status_placeholder.info("Transient API issue detected. Retrying the current batch...")
+                _time.sleep(min(2 * attempt, 4))
+                continue
+            break
+
+    if last_exc is None:
+        return _empty_prompt_results_df(prompt_definitions), []
+
+    if len(chunk_df) <= 1:
+        if is_transient_prompt_error(last_exc):
+            raise last_exc
+        failed_review_id = safe_text(chunk_df.iloc[0].get("review_id"))
+        return _empty_prompt_results_df(prompt_definitions), [
+            {
+                "review_id": failed_review_id,
+                "error": safe_text(last_exc),
+                "failed_at": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+        ]
+
+    if status_placeholder is not None:
+        status_placeholder.warning(
+            f"Batch of {len(chunk_df):,} reviews hit an error. Retrying as two smaller batches."
+        )
+    split_point = max(1, len(chunk_df) // 2)
+    first_results, first_failures = classify_review_chunk_resilient(
+        api_key=api_key,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        chunk_df=chunk_df.iloc[:split_point].reset_index(drop=True),
+        prompt_definitions=prompt_definitions,
+        status_placeholder=status_placeholder,
+    )
+    second_results, second_failures = classify_review_chunk_resilient(
+        api_key=api_key,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        chunk_df=chunk_df.iloc[split_point:].reset_index(drop=True),
+        prompt_definitions=prompt_definitions,
+        status_placeholder=status_placeholder,
+    )
+    combined_results = pd.concat([first_results, second_results], ignore_index=True)
+    if not combined_results.empty:
+        combined_results = combined_results.drop_duplicates(subset=["review_id"], keep="last")
+    return combined_results, first_failures + second_failures
+
+
+
+def run_review_prompt_tagging(
+    *,
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    source_df: pd.DataFrame,
+    prompt_definitions: Sequence[Dict[str, Any]],
+    chunk_size: int,
+    summary: ReviewBatchSummary,
+    scope_label: str,
+    filter_description: str,
+) -> pd.DataFrame:
+    if source_df.empty:
+        raise ReviewDownloaderError("There are no reviews in the selected scope to classify.")
+
+    checkpoint = initialize_prompt_checkpoint(
+        summary=summary,
+        source_df=source_df,
+        prompt_definitions=prompt_definitions,
+        scope_label=scope_label,
+        filter_description=filter_description,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        chunk_size=chunk_size,
+    )
+    conn: sqlite3.Connection = checkpoint["connection"]
+
+    source_lookup = source_df.copy()
+    source_lookup["review_id"] = source_lookup["review_id"].astype(str)
+    source_lookup = source_lookup.drop_duplicates(subset=["review_id"], keep="first").set_index("review_id", drop=False)
+
+    total_reviews = safe_int(checkpoint.get("source_review_count"), len(source_lookup))
+    completed = safe_int(checkpoint.get("completed_review_count"), 0)
+    failed = safe_int(checkpoint.get("failed_review_count"), 0)
+    processed = completed + failed
+
+    progress = st.progress(
+        processed / max(total_reviews, 1),
+        text=f"Recovered checkpoint · {completed:,} tagged, {failed:,} skipped, {processed:,} processed of {total_reviews:,}",
+    )
+    status = st.empty()
+
+    try:
+        while True:
+            pending_ids = _pending_review_ids_from_checkpoint(conn, max(int(chunk_size), 1))
+            if not pending_ids:
+                break
+
+            chunk_df = source_lookup.loc[pending_ids].reset_index(drop=True)
+            range_start = processed + 1
+            range_end = min(processed + len(chunk_df), total_reviews)
+            status.info(f"Classifying reviews {range_start:,}-{range_end:,} of {total_reviews:,}")
+            _checkpoint_set_metadata(
+                conn,
+                {
+                    "status": "running",
+                    "updated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "last_error": "",
+                },
+            )
+
+            try:
+                chunk_results_df, failed_rows = classify_review_chunk_resilient(
+                    api_key=api_key,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    chunk_df=chunk_df,
+                    prompt_definitions=prompt_definitions,
+                    status_placeholder=status,
+                )
+            except Exception as exc:
+                total_reviews, completed, failed = _prompt_checkpoint_counts(conn)
+                processed = completed + failed
+                _checkpoint_set_metadata(
+                    conn,
+                    {
+                        "status": "failed",
+                        "completed_review_count": completed,
+                        "failed_review_count": failed,
+                        "updated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "last_error": safe_text(exc),
+                    },
+                )
+                raise ReviewDownloaderError(
+                    f"Review Prompt paused after saving {processed:,} of {total_reviews:,} processed reviews. {exc}"
+                ) from exc
+
+            _write_prompt_results_to_checkpoint(conn, chunk_results_df, prompt_definitions)
+            _write_failed_reviews_to_checkpoint(conn, failed_rows)
+            total_reviews, completed, failed = _prompt_checkpoint_counts(conn)
+            processed = completed + failed
+            _checkpoint_set_metadata(
+                conn,
+                {
+                    "completed_review_count": completed,
+                    "failed_review_count": failed,
+                    "updated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "status": "running",
+                },
+            )
+            progress.progress(
+                processed / max(total_reviews, 1),
+                text=f"Checkpoint saved · {completed:,} tagged, {failed:,} skipped, {processed:,} processed of {total_reviews:,}",
+            )
+
+        total_reviews, completed, failed = _prompt_checkpoint_counts(conn)
+        final_status = "completed" if failed == 0 else "completed_with_failures"
+        _checkpoint_set_metadata(
+            conn,
+            {
+                "completed_review_count": completed,
+                "failed_review_count": failed,
+                "updated_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "status": final_status,
+                "last_error": "",
+            },
+        )
+        status.success(
+            f"Finished Review Prompt run. Tagged {completed:,} reviews and skipped {failed:,} after repeated failures."
+        )
+        return load_prompt_results_from_checkpoint(checkpoint["path"])
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+
+def render_review_prompt_tab(
+    *,
+    settings: Dict[str, Any],
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    summary: ReviewBatchSummary,
+    filter_description: str,
+) -> None:
+    st.subheader("Review Prompt")
+    st.markdown(
+        '<div class="section-subtitle">Create row-level AI tags that become new review columns. Larger runs now checkpoint to disk after every batch, so you can resume or download saved progress if a run stops part-way through.</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        top_cols = st.columns([2.2, 1.3])
+        with top_cols[0]:
+            st.markdown("**Prompt library**")
+            starter_cols = st.columns([1.2, 1.2, 1])
+            if starter_cols[0].button("Add starter pack", use_container_width=True, key="prompt_add_starter_pack"):
+                st.session_state["prompt_definitions_df"] = add_prompt_rows(st.session_state["prompt_definitions_df"], REVIEW_PROMPT_STARTER_ROWS)
+                st.rerun()
+            if starter_cols[1].button("Reset to starter pack", use_container_width=True, key="prompt_reset_starter_pack"):
+                st.session_state["prompt_definitions_df"] = pd.DataFrame(REVIEW_PROMPT_STARTER_ROWS)
+                st.rerun()
+            if starter_cols[2].button("Clear prompts", use_container_width=True, key="prompt_clear_all"):
+                st.session_state["prompt_definitions_df"] = pd.DataFrame(columns=["column_name", "prompt", "labels"])
+                st.session_state["prompt_builder_suggestion"] = None
+                st.rerun()
+            st.caption("Starter pack includes loudness, usage sessions, safety risk level, and reliability risk signals.")
+        with top_cols[1]:
+            ai_runtime = render_ai_settings_controls("prompt_tab", include_batch_size=True, expander_label="Advanced AI settings")
+            st.caption(
+                f"Model: {ai_runtime['model']} · Reasoning: {ai_runtime['reasoning_effort']} · Batch size: {ai_runtime['prompt_batch_size']}"
+            )
+
+    render_prompt_run_notice()
+    api_key = ai_runtime.get("api_key")
+
+    st.markdown("#### Prompt definitions")
+    st.caption("Each row creates a new output column in the review file. Keep prompts short and specific to reduce drift.")
+    edited_df = st.data_editor(
+        st.session_state["prompt_definitions_df"],
+        use_container_width=True,
+        num_rows="dynamic",
+        hide_index=True,
+        key="prompt_definition_editor",
+        height=520,
+        column_config={
+            "column_name": st.column_config.TextColumn("Column name", width="medium", help="Snake case is best, for example perceived_loudness"),
+            "prompt": st.column_config.TextColumn("Review prompt", width="large"),
+            "labels": st.column_config.TextColumn("Labels", width="large", help="Comma-separated, for example Positive, Negative, Neutral, Not Mentioned"),
+        },
+    )
+    st.session_state["prompt_definitions_df"] = edited_df
+
+    builder_error: Optional[str] = None
+    with st.expander("AI prompt builder", expanded=False):
+        st.caption("Use AI to tighten a prompt. The builder intentionally drafts short prompts to keep tagging stable.")
+        builder_cols = st.columns([2.0, 1.2, 0.9])
+        builder_goal = builder_cols[0].text_area(
+            "What do you want to detect?",
+            value="",
+            placeholder="Example: detect whether the product is perceived as loud and classify the mention.",
+            key="prompt_builder_goal",
+            height=120,
+        )
+        preferred_labels = builder_cols[1].text_input(
+            "Preferred labels",
+            value="Positive, Negative, Neutral, Not Mentioned",
+            key="prompt_builder_labels",
+        )
+        with builder_cols[2]:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            if st.button("Draft with AI", use_container_width=True, disabled=not bool(api_key), key="prompt_builder_run"):
+                if not builder_goal.strip():
+                    builder_error = "Describe the signal you want to detect before using the AI prompt builder."
+                else:
+                    overlay = show_thinking_overlay("Drafting a shorter prompt and label set...")
+                    try:
+                        suggestion = call_openai_prompt_builder(
+                            api_key=api_key,
+                            model=ai_runtime["model"],
+                            reasoning_effort=ai_runtime["reasoning_effort"],
+                            goal=builder_goal,
+                            preferred_labels=preferred_labels,
+                            filtered_df=filtered_df if not filtered_df.empty else overall_df,
+                            summary=summary,
+                        )
+                        st.session_state["prompt_builder_suggestion"] = suggestion
+                        st.rerun()
+                    except Exception as exc:
+                        builder_error = f"OpenAI prompt builder failed: {exc}"
+                    finally:
+                        overlay.empty()
+
+        suggestion = st.session_state.get("prompt_builder_suggestion")
+        if builder_error:
+            st.error(builder_error)
+        if suggestion:
+            suggestion_cols = st.columns([3.0, 1.0, 1.0])
+            with suggestion_cols[0]:
+                st.markdown(f"**Suggested column** `{suggestion['column_name']}`")
+                st.write(suggestion.get("prompt", ""))
+                st.caption("Labels: " + ", ".join(suggestion.get("labels", [])))
+                if suggestion.get("why_it_matters"):
+                    st.caption(suggestion["why_it_matters"])
+            if suggestion_cols[1].button("Add to list", use_container_width=True, key="prompt_builder_add"):
+                append_df = pd.DataFrame([
+                    {
+                        "column_name": suggestion["column_name"],
+                        "prompt": suggestion["prompt"],
+                        "labels": ", ".join(suggestion.get("labels", [])),
+                    }
+                ])
+                st.session_state["prompt_definitions_df"] = pd.concat([st.session_state["prompt_definitions_df"], append_df], ignore_index=True)
+                st.session_state["prompt_builder_suggestion"] = None
+                st.rerun()
+            if suggestion_cols[2].button("Dismiss", use_container_width=True, key="prompt_builder_dismiss"):
+                st.session_state["prompt_builder_suggestion"] = None
+                st.rerun()
+
+    try:
+        prompt_definitions = normalize_prompt_definitions(st.session_state["prompt_definitions_df"], overall_df.columns)
+    except ReviewDownloaderError as exc:
+        st.error(str(exc))
+        prompt_definitions = []
+
+    with st.container(border=True):
+        scope_cols = st.columns([1.25, 1.0, 1.0, 2.45])
+        tagging_scope = scope_cols[0].selectbox("Tagging scope", options=["Current filtered reviews", "All loaded reviews"], index=0, key="prompt_tagging_scope")
+        scope_df = filtered_df if tagging_scope == "Current filtered reviews" else overall_df
+        review_count_in_scope = int(len(scope_df))
+        estimated_calls = math.ceil(review_count_in_scope / max(1, ai_runtime["prompt_batch_size"])) if review_count_in_scope else 0
+        scope_cols[1].metric("Reviews in scope", f"{review_count_in_scope:,}")
+        scope_cols[2].metric("Planned requests", f"{estimated_calls:,}")
+        scope_cols[3].caption(
+            f"Scope: {tagging_scope.lower()}. Filters: {filter_description}. Batch size: {ai_runtime['prompt_batch_size']}. Every completed batch is checkpointed to disk."
+        )
+
+    checkpoint_desc = prompt_checkpoint_descriptor(summary, scope_df, prompt_definitions, tagging_scope) if prompt_definitions and not scope_df.empty else None
+    checkpoint_info = load_prompt_checkpoint_info(checkpoint_desc["path"]) if checkpoint_desc else None
+    partial_bundle = None
+    partial_results_df = pd.DataFrame()
+    failed_preview_df = pd.DataFrame()
+
+    if checkpoint_info and safe_int(checkpoint_info.get("completed_review_count"), 0) > 0:
+        partial_results_df = load_prompt_results_from_checkpoint(checkpoint_info["path"])
+        partial_bundle = get_prompt_checkpoint_partial_bundle(
+            summary=summary,
+            overall_df=overall_df,
+            source_df=scope_df,
+            prompt_definitions=prompt_definitions,
+            prompt_results_df=partial_results_df,
+            scope_label=tagging_scope,
+            filter_description=filter_description,
+            checkpoint_info=checkpoint_info,
+        )
+    if checkpoint_info and safe_int(checkpoint_info.get("failed_review_count"), 0) > 0:
+        failed_preview_df = load_prompt_failed_reviews_from_checkpoint(checkpoint_info["path"])
+
+    with st.container(border=True):
+        if checkpoint_info and checkpoint_info.get("status") != "corrupt":
+            st.markdown("**Saved progress / recovery**")
+            recovery_cols = st.columns([1.0, 1.0, 1.0, 2.2])
+            recovery_cols[0].metric("Tagged", f"{safe_int(checkpoint_info.get('completed_review_count'), 0):,}")
+            recovery_cols[1].metric("Skipped", f"{safe_int(checkpoint_info.get('failed_review_count'), 0):,}")
+            recovery_cols[2].metric("Processed", f"{safe_int(checkpoint_info.get('processed_review_count'), 0):,} / {safe_int(checkpoint_info.get('source_review_count'), 0):,}")
+            recovery_cols[3].caption(
+                f"Status: {safe_text(checkpoint_info.get('status')).replace('_', ' ')} | Updated: {safe_text(checkpoint_info.get('updated_utc')) or 'n/a'}"
+            )
+        elif checkpoint_info and checkpoint_info.get("status") == "corrupt":
+            st.warning(f"A saved checkpoint exists but could not be read cleanly: {safe_text(checkpoint_info.get('last_error'))}")
+
+        action_cols = st.columns([1.35, 1.25, 1.3, 1.1, 1.1])
+        run_disabled = (not api_key) or (not prompt_definitions) or review_count_in_scope == 0
+        run_label = "Resume Review Prompt" if checkpoint_info and not checkpoint_info.get("is_finished") else "Run Review Prompt"
+        run_clicked = action_cols[0].button(run_label, type="primary", use_container_width=True, disabled=run_disabled, key="prompt_run_button")
+        load_saved_clicked = action_cols[1].button(
+            "Load saved progress",
+            use_container_width=True,
+            disabled=not bool(checkpoint_info and safe_int(checkpoint_info.get("completed_review_count"), 0) > 0),
+            key="prompt_load_saved_progress",
+        )
+        clear_checkpoint_clicked = action_cols[4].button(
+            "Clear saved progress",
+            use_container_width=True,
+            disabled=not bool(checkpoint_info),
+            key="prompt_clear_checkpoint",
+        )
+
+        if partial_bundle:
+            action_cols[2].download_button(
+                label="Download partial file",
+                data=partial_bundle["excel_bytes"],
+                file_name=partial_bundle["excel_name"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="prompt_partial_download",
+            )
+        else:
+            action_cols[2].button(
+                "Download partial file",
+                use_container_width=True,
+                disabled=True,
+                key="prompt_partial_download_disabled",
+            )
+
+        if checkpoint_info:
+            with open(checkpoint_info["path"], "rb") as checkpoint_file:
+                checkpoint_bytes = checkpoint_file.read()
+            action_cols[3].download_button(
+                label="Download checkpoint DB",
+                data=checkpoint_bytes,
+                file_name=f"{summary.product_id}_review_prompt_checkpoint_{checkpoint_info['run_id']}.db",
+                mime="application/x-sqlite3",
+                use_container_width=True,
+                key="prompt_checkpoint_db_download",
+            )
+        else:
+            action_cols[3].button(
+                "Download checkpoint DB",
+                use_container_width=True,
+                disabled=True,
+                key="prompt_checkpoint_db_download_disabled",
+            )
+
+        st.caption("If a run stops, use Resume Review Prompt to continue from the last saved batch, or download the partial file / checkpoint DB immediately.")
+
+        if clear_checkpoint_clicked and checkpoint_info:
+            clear_prompt_checkpoint(checkpoint_info["path"])
+            if st.session_state.get("prompt_run_artifacts", {}).get("definition_signature") == prompt_definition_signature(prompt_definitions):
+                st.session_state["prompt_run_artifacts"] = None
+                st.session_state["master_export_bundle"] = None
+            set_prompt_run_notice("Cleared the saved Review Prompt checkpoint.", "info")
+            st.rerun()
+
+        if load_saved_clicked and checkpoint_info and not partial_results_df.empty:
+            artifacts = apply_prompt_results_to_workspace(
+                prompt_results_df=partial_results_df,
+                prompt_definitions=prompt_definitions,
+                source_df=scope_df,
+                scope_label=tagging_scope,
+                filter_description=filter_description,
+                generated_utc=safe_text(checkpoint_info.get("updated_utc")) or pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                failed_review_count=safe_int(checkpoint_info.get("failed_review_count"), 0),
+                checkpoint_status=safe_text(checkpoint_info.get("status")) or "partial",
+            )
+            tagged = safe_int(artifacts.get("review_count"), 0)
+            skipped = safe_int(artifacts.get("failed_review_count"), 0)
+            total = safe_int(artifacts.get("review_count_total"), 0)
+            if skipped:
+                set_prompt_run_notice(
+                    f"Loaded saved Review Prompt progress: {tagged:,} tagged and {skipped:,} skipped out of {total:,} reviews.",
+                    "warning",
+                )
+            else:
+                set_prompt_run_notice(
+                    f"Loaded saved Review Prompt progress: {tagged:,} tagged reviews restored into the workspace.",
+                    "success",
+                )
+            st.rerun()
+
+        if run_clicked:
+            overlay = show_thinking_overlay("Classifying each review with checkpointing enabled...")
+            try:
+                prompt_results_df = run_review_prompt_tagging(
+                    api_key=api_key,
+                    model=ai_runtime["model"],
+                    reasoning_effort=ai_runtime["reasoning_effort"],
+                    source_df=scope_df.reset_index(drop=True),
+                    prompt_definitions=prompt_definitions,
+                    chunk_size=ai_runtime["prompt_batch_size"],
+                    summary=summary,
+                    scope_label=tagging_scope,
+                    filter_description=filter_description,
+                )
+                post_run_checkpoint = load_prompt_checkpoint_info(checkpoint_desc["path"]) if checkpoint_desc else None
+                failed_count = safe_int((post_run_checkpoint or {}).get("failed_review_count"), 0)
+                status_text = safe_text((post_run_checkpoint or {}).get("status")) or ("completed_with_failures" if failed_count else "completed")
+                artifacts = apply_prompt_results_to_workspace(
+                    prompt_results_df=prompt_results_df,
+                    prompt_definitions=prompt_definitions,
+                    source_df=scope_df,
+                    scope_label=tagging_scope,
+                    filter_description=filter_description,
+                    generated_utc=safe_text((post_run_checkpoint or {}).get("updated_utc")) or pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    failed_review_count=failed_count,
+                    checkpoint_status=status_text,
+                )
+                tagged = safe_int(artifacts.get("review_count"), 0)
+                total = safe_int(artifacts.get("review_count_total"), 0)
+                if failed_count:
+                    set_prompt_run_notice(
+                        f"Finished Review Prompt tagging. Tagged {tagged:,} reviews and skipped {failed_count:,} out of {total:,}. Saved progress remains downloadable.",
+                        "warning",
+                    )
+                else:
+                    set_prompt_run_notice(
+                        f"Finished Review Prompt tagging for {tagged:,} reviews across {len(prompt_definitions)} prompts.",
+                        "success",
+                    )
+            except Exception as exc:
+                post_run_checkpoint = load_prompt_checkpoint_info(checkpoint_desc["path"]) if checkpoint_desc else None
+                processed = safe_int((post_run_checkpoint or {}).get("processed_review_count"), 0)
+                total = safe_int((post_run_checkpoint or {}).get("source_review_count"), review_count_in_scope)
+                set_prompt_run_notice(
+                    f"Review Prompt paused after saving {processed:,} of {total:,} processed reviews. Resume from the saved checkpoint or download the partial file. Details: {exc}",
+                    "warning",
+                )
+            finally:
+                overlay.empty()
+            st.rerun()
+
+    prompt_artifacts = st.session_state.get("prompt_run_artifacts")
+    if not prompt_artifacts:
+        if checkpoint_info and safe_int(checkpoint_info.get("completed_review_count"), 0) > 0:
+            st.info("Saved Review Prompt progress is available above. Load it into the workspace to preview label distributions in the app.")
+        else:
+            st.info("Run Review Prompt to generate new AI columns, export the tagged review file, and inspect the label mix for each prompt.")
+        if not failed_preview_df.empty:
+            st.markdown("**Skipped reviews from the last saved run**")
+            failed_preview_df["error"] = failed_preview_df["error"].map(lambda value: truncate_text(value, 160))
+            st.dataframe(failed_preview_df.head(25), use_container_width=True, hide_index=True, height=240)
+        return
+
+    current_signature = prompt_definition_signature(prompt_definitions) if prompt_definitions else ""
+    if current_signature != prompt_artifacts.get("definition_signature"):
+        st.info("The prompt definitions changed since the last run. Re-run Review Prompt to refresh the results below.")
+    if prompt_artifacts.get("scope_filter_description") != filter_description and prompt_artifacts.get("scope_label") == "Current filtered reviews":
+        st.info("The current filters changed after the last Review Prompt run. Re-run to refresh the current-filter scope.")
+
+    active_display_df = overall_df.copy()
+    review_ids = set(str(item) for item in prompt_artifacts.get("scope_review_ids", []))
+    result_scope_df = active_display_df[active_display_df["review_id"].astype(str).isin(review_ids)].copy()
+    tagged_export_df = result_scope_df.copy() if not result_scope_df.empty else active_display_df.copy()
+    tagged_export_summary = ReviewBatchSummary(
+        product_url=summary.product_url,
+        product_id=summary.product_id,
+        total_reviews=int(len(tagged_export_df)),
+        page_size=summary.page_size,
+        requests_needed=summary.requests_needed,
+        reviews_downloaded=int(len(tagged_export_df)),
+    )
+    tagged_bundle = get_master_export_bundle(tagged_export_summary, tagged_export_df, prompt_artifacts)
+
+    header_cols = st.columns([1.3, 4])
+    header_cols[0].download_button(
+        label="Download tagged review file",
+        data=tagged_bundle["excel_bytes"],
+        file_name=tagged_bundle["excel_name"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="review_prompt_download",
+    )
+    tagged_reviews = safe_int(prompt_artifacts.get("review_count"), 0)
+    total_reviews = safe_int(prompt_artifacts.get("review_count_total"), tagged_reviews)
+    failed_reviews = safe_int(prompt_artifacts.get("failed_review_count"), 0)
+    header_text = (
+        f"Latest Review Prompt run: {prompt_artifacts.get('generated_utc')} | Scope: {prompt_artifacts.get('scope_label')} | Tagged: {tagged_reviews:,} of {total_reviews:,} | Download tagged review file exports the tagged scope rows."
+    )
+    if failed_reviews:
+        header_text += f" | Skipped: {failed_reviews:,}"
+    header_cols[1].caption(header_text)
+
+    if prompt_artifacts.get("is_partial"):
+        st.warning("This Review Prompt result set is partial. Blank prompt cells usually indicate reviews that were not tagged in the saved run.")
+
+    prompt_lookup = {prompt["display_name"]: prompt for prompt in prompt_artifacts["definitions"]}
+    prompt_names = list(prompt_lookup.keys())
+    if not prompt_names:
+        st.info("No prompt results are available yet.")
+        return
+    if st.session_state.get("prompt_result_view") not in prompt_names:
+        st.session_state["prompt_result_view"] = prompt_names[0]
+
+    st.markdown("#### Tagged result view")
+    selected_prompt_name = st.radio(
+        "Prompt result view",
+        options=prompt_names,
+        horizontal=True,
+        key="prompt_result_view",
+        label_visibility="collapsed",
+    )
+    prompt = prompt_lookup[selected_prompt_name]
+    prompt_col = prompt["column_name"]
+    base_view_df = result_scope_df[result_scope_df[prompt_col].notna()].copy() if prompt_col in result_scope_df.columns else result_scope_df.iloc[0:0]
+
+    control_cols = st.columns([2.1, 1.1, 1.1, 1.0])
+    label_options = [str(label) for label in prompt_artifacts["summary_df"][prompt_artifacts["summary_df"]["column_name"] == prompt_col]["label"].tolist()]
+    label_key = f"prompt_labels_{prompt_col}"
+    if label_key not in st.session_state or not st.session_state.get(label_key):
+        st.session_state[label_key] = label_options
+    selected_labels = control_cols[0].multiselect("Labels", options=label_options, default=st.session_state[label_key], key=label_key)
+    source_mode = control_cols[1].selectbox("Review source", options=["All tagged reviews", "Organic only", "Incentivized only"], key=f"prompt_source_{prompt_col}")
+    rating_mode = control_cols[2].selectbox("Ratings", options=RATING_FILTER_OPTIONS_SIMPLE, key=f"prompt_rating_mode_{prompt_col}")
+    preview_rows = int(control_cols[3].selectbox("Preview rows", options=[25, 50, 100], index=1, key=f"prompt_preview_rows_{prompt_col}"))
+
+    preview_df = base_view_df.copy()
+    if selected_labels:
+        preview_df = preview_df[preview_df[prompt_col].isin(selected_labels)]
+    else:
+        preview_df = preview_df.iloc[0:0]
+    if source_mode == "Organic only":
+        preview_df = preview_df[~preview_df["incentivized_review"].fillna(False)]
+    elif source_mode == "Incentivized only":
+        preview_df = preview_df[preview_df["incentivized_review"].fillna(False)]
+    selected_ratings = rating_values_for_mode(rating_mode)
+    if selected_ratings:
+        preview_df = preview_df[preview_df["rating"].isin(selected_ratings)]
+
+    prompt_summary = summarize_single_prompt_view(preview_df, prompt)
+
+    def _extract_plotly_selected_labels(selection_event: Any, summary_df: pd.DataFrame) -> Optional[List[str]]:
+        if selection_event is None:
+            return None
+        selection = getattr(selection_event, "selection", None)
+        if selection is None and isinstance(selection_event, dict):
+            selection = selection_event.get("selection")
+        if selection is None:
+            return None
+        points = getattr(selection, "points", None)
+        if points is None and isinstance(selection, dict):
+            points = selection.get("points")
+        if points is None:
+            return None
+        labels: List[str] = []
+        for point in points:
+            point_data = point if isinstance(point, dict) else {}
+            label = point_data.get("label")
+            if label is None:
+                point_number = point_data.get("point_number")
+                if point_number is not None and 0 <= int(point_number) < len(summary_df):
+                    label = str(summary_df.iloc[int(point_number)]["label"])
+            if label is not None and str(label) not in labels:
+                labels.append(str(label))
+        return labels
+
+    chart_col, table_col = st.columns([1.45, 1.05])
+    with chart_col:
+        with st.container(border=True):
+            st.markdown(f"**{prompt['display_name']} distribution**")
+            st.caption("Click a pie slice to filter the summary table and preview below.")
+            if prompt_summary.empty:
+                st.info("No tagged reviews match the current prompt filters.")
+            else:
+                fig = px.pie(
+                    prompt_summary,
+                    names="label",
+                    values="review_count",
+                    hole=0.42,
+                    title=None,
+                    custom_data=["review_count", "avg_rating", "share"],
+                )
+                fig.update_traces(hovertemplate="%{label}<br>Reviews: %{customdata[0]}<br>Avg rating: %{customdata[1]:.2f}<br>Share: %{customdata[2]:.1%}<extra></extra>")
+                fig.update_layout(margin=dict(l=20, r=20, t=20, b=20))
+                selection_event = None
+                try:
+                    selection_event = st.plotly_chart(fig, use_container_width=True, key=f"prompt_pie_{prompt_col}", on_select="rerun")
+                except TypeError:
+                    st.plotly_chart(fig, use_container_width=True, key=f"prompt_pie_{prompt_col}")
+                selected_from_chart = _extract_plotly_selected_labels(selection_event, prompt_summary)
+                chart_flag_key = f"prompt_chart_active_{prompt_col}"
+                current_labels = list(st.session_state.get(label_key, label_options))
+                if selected_from_chart is not None:
+                    if selected_from_chart and sorted(current_labels) != sorted(selected_from_chart):
+                        st.session_state[label_key] = selected_from_chart
+                        st.session_state[chart_flag_key] = True
+                        st.rerun()
+                    if selected_from_chart == [] and st.session_state.get(chart_flag_key):
+                        st.session_state[label_key] = label_options
+                        st.session_state[chart_flag_key] = False
+                        st.rerun()
+    with table_col:
+        with st.container(border=True):
+            st.markdown(f"**Column name** `{prompt_col}`")
+            st.write(prompt["prompt"])
+            if prompt_summary.empty:
+                st.info("No label counts for the current prompt filters.")
+            else:
+                display_summary = prompt_summary.copy()
+                display_summary["avg_rating"] = display_summary["avg_rating"].map(lambda x: f"{x:.2f}★" if pd.notna(x) else "—")
+                display_summary["share"] = display_summary["share"].map(format_pct)
+                st.dataframe(
+                    display_summary[["label", "review_count", "avg_rating", "share"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=280,
+                )
+
+    preview_columns = [col for col in ["review_id", "rating", "incentivized_review", "submission_time", "content_locale", "retailer", "product_or_sku", "title", "review_text", prompt_col] if col in preview_df.columns]
+    st.markdown("**Tagged review preview**")
+    st.dataframe(preview_df[preview_columns].head(preview_rows), use_container_width=True, hide_index=True, height=360)
+
+    if not failed_preview_df.empty:
+        st.markdown("**Skipped reviews from the last saved run**")
+        failed_preview_df = failed_preview_df.copy()
+        failed_preview_df["error"] = failed_preview_df["error"].map(lambda value: truncate_text(value, 180))
+        st.dataframe(failed_preview_df.head(25), use_container_width=True, hide_index=True, height=240)
+
+
 if __name__ == "__main__":
     main()
+
