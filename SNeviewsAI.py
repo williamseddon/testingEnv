@@ -1411,12 +1411,24 @@ def dataframe_for_sql(df: pd.DataFrame) -> pd.DataFrame:
 def build_sqlite_database(
     summary: ReviewBatchSummary,
     reviews_df: pd.DataFrame,
-    overall_metrics: Dict[str, Any],
-    theme_df: pd.DataFrame,
-    rating_df: pd.DataFrame,
-    monthly_df: pd.DataFrame,
-    locale_df: pd.DataFrame,
+    overall_metrics: Optional[Dict[str, Any]] = None,
+    theme_df: Optional[pd.DataFrame] = None,
+    rating_df: Optional[pd.DataFrame] = None,
+    monthly_df: Optional[pd.DataFrame] = None,
+    locale_df: Optional[pd.DataFrame] = None,
 ) -> bytes:
+    """Build a SQLite export for the current workspace.
+
+    Some callers only have the review dataframe and summary object. When the
+    derived analytical tables are not supplied, compute them here so both the
+    old and new call sites work.
+    """
+    overall_metrics = overall_metrics or compute_metrics(reviews_df)
+    theme_df = theme_df if theme_df is not None else compute_theme_signals(reviews_df)
+    rating_df = rating_df if rating_df is not None else rating_distribution(reviews_df)
+    monthly_df = monthly_df if monthly_df is not None else monthly_trend(reviews_df)
+    locale_df = locale_df if locale_df is not None else locale_distribution(reviews_df)
+
     summary_df = pd.DataFrame(
         [
             {
@@ -1432,21 +1444,33 @@ def build_sqlite_database(
     )
     metrics_df = metrics_table(overall_metrics)
 
+    tables = {
+        "reviews": reviews_df,
+        "metadata": summary_df,
+        "metrics": metrics_df,
+        "theme_signals": theme_df,
+        "rating_distribution": rating_df,
+        "monthly_trend": monthly_df,
+        "locale_distribution": locale_df,
+    }
+
     temp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp.close()
+    conn: Optional[sqlite3.Connection] = None
     try:
         conn = sqlite3.connect(temp.name)
-        dataframe_for_sql(reviews_df).to_sql("reviews", conn, index=False, if_exists="replace")
-        dataframe_for_sql(summary_df).to_sql("metadata", conn, index=False, if_exists="replace")
-        dataframe_for_sql(metrics_df).to_sql("metrics", conn, index=False, if_exists="replace")
-        dataframe_for_sql(theme_df).to_sql("theme_signals", conn, index=False, if_exists="replace")
-        dataframe_for_sql(rating_df).to_sql("rating_distribution", conn, index=False, if_exists="replace")
-        dataframe_for_sql(monthly_df).to_sql("monthly_trend", conn, index=False, if_exists="replace")
-        dataframe_for_sql(locale_df).to_sql("locale_distribution", conn, index=False, if_exists="replace")
+        for table_name, table_df in tables.items():
+            dataframe_for_sql(table_df).to_sql(table_name, conn, index=False, if_exists="replace")
         conn.close()
+        conn = None
         with open(temp.name, "rb") as file:
             return file.read()
     finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
         try:
             os.remove(temp.name)
         except OSError:
