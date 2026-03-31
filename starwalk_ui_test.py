@@ -79,19 +79,67 @@ try:
 except Exception:
     _HAS_RERANKER = False
 
-APP_VERSION = "2026-03-01-master-v21"
+APP_VERSION = "2026-03-25-master-v22"
 
 STARWALK_SHEET_NAME = "Star Walk scrubbed verbatims"
 
-NO_TEMP_MODELS = {"gpt-5", "gpt-5-chat-latest"}
+AI_MODEL_OPTIONS = [
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-nano",
+    "gpt-5-chat-latest",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+]
+
+GPT5_NO_TEMP_MODELS = {"gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-chat-latest"}
+GPT5_TEMP_IF_EFFORT_NONE_PREFIXES = ("gpt-5.4", "gpt-5.2")
 
 
-def model_supports_temperature(model_id: str) -> bool:
-    if not model_id:
+def normalize_model_id(model_id: str) -> str:
+    return str(model_id or "").strip()
+
+
+def is_gpt5_family(model_id: str) -> bool:
+    return normalize_model_id(model_id).startswith("gpt-5")
+
+
+def preferred_openai_api(model_id: str) -> str:
+    return "responses" if is_gpt5_family(model_id) else "chat.completions"
+
+
+def default_reasoning_effort(model_id: str) -> Optional[str]:
+    return "none" if is_gpt5_family(model_id) else None
+
+
+def model_supports_temperature(model_id: str, reasoning_effort: Optional[str] = None) -> bool:
+    model = normalize_model_id(model_id)
+    effort = str(reasoning_effort or "").strip().lower() or None
+    if not model:
         return True
-    if model_id in NO_TEMP_MODELS:
+    if not is_gpt5_family(model):
+        return True
+    if model in GPT5_NO_TEMP_MODELS:
         return False
-    return not model_id.startswith("gpt-5")
+    if model.startswith(GPT5_TEMP_IF_EFFORT_NONE_PREFIXES):
+        return (effort or "none") == "none"
+    return False
+
+
+def model_supports_verbosity(model_id: str) -> bool:
+    return is_gpt5_family(model_id)
+
+
+def clamp_temperature(value: Any, default: float = 0.2) -> float:
+    try:
+        return float(min(1.0, max(0.0, float(value))))
+    except Exception:
+        return float(default)
 
 
 # Timezone
@@ -222,6 +270,44 @@ GLOBAL_CSS = """
   }
 
   .small-muted{ color:var(--muted); font-size:.9rem; }
+
+
+  .ai-settings-card{
+    background:var(--bg-card);
+    border:1.2px solid var(--border);
+    border-radius:14px;
+    padding:12px 14px;
+    margin:8px 0 12px;
+    box-shadow:0 8px 18px var(--shadow);
+  }
+
+  .ai-tip-card{
+    background:var(--bg-card);
+    border:1.2px solid var(--border);
+    border-left:4px solid var(--st-primary);
+    border-radius:14px;
+    padding:12px 14px;
+    margin:10px 0 14px;
+    box-shadow:0 10px 18px var(--shadow);
+  }
+  .ai-tip-title{ font-weight:900; margin-bottom:4px; }
+
+  .ai-floating-toast{
+    position:fixed;
+    top:78px;
+    right:18px;
+    z-index:99999;
+    min-width:min(380px, calc(100vw - 36px));
+    max-width:420px;
+    padding:14px 16px;
+    border-radius:16px;
+    background:var(--bg-card);
+    border:1.4px solid var(--border-strong);
+    box-shadow:0 18px 34px var(--shadow-lg);
+    backdrop-filter: blur(10px);
+  }
+  .ai-floating-toast-title{ font-weight:900; margin-bottom:4px; }
+  .ai-floating-toast-sub{ color:var(--muted); font-size:.92rem; }
 
   /* File uploader */
   [data-testid="stFileUploadDropzone"]{
@@ -4028,54 +4114,29 @@ if view.startswith("📝"):
 # ============================================================
 if view.startswith("🤖"):
     st.markdown("## 🤖 AI — Product & Consumer Insights")
-    st.caption("Ask anything. The assistant is grounded in the **currently filtered** dataset.")
+    st.caption("Every answer is grounded in the current filter selection, so narrowing the lens can produce sharper and more actionable answers.")
 
-    # Sidebar: minimal settings (kept out of the main page)
-    with st.sidebar.expander("🤖 AI Settings", expanded=False):
-        st.session_state.setdefault("ai_model", "gpt-4o-mini")
-        st.session_state.setdefault("ai_temp", 0.2)
-        st.session_state.setdefault("ai_send_quotes", True)
-        st.session_state.setdefault("ai_quote_k", 10)
-        st.session_state.setdefault("ai_cap", 1500)
+    st.session_state.setdefault("ai_model", "gpt-4o-mini")
+    st.session_state.setdefault("ai_temp", 0.2)
+    st.session_state.setdefault("ai_reasoning_effort", "none")
+    st.session_state.setdefault("ai_verbosity", "medium")
+    st.session_state.setdefault("ai_send_quotes", False)
+    st.session_state.setdefault("ai_quote_k", 10)
+    st.session_state.setdefault("ai_cap", 1500)
+    st.session_state.setdefault("_ai_last_q", "")
+    st.session_state.setdefault("_ai_last_answer", "")
+    st.session_state.setdefault("_ai_last_filter_hash", "")
+    st.session_state.setdefault("_ai_last_filter_count", 0)
+    st.session_state.setdefault("_ai_last_scope_hint", "")
+    st.session_state.setdefault("_ai_last_error", "")
 
-        st.selectbox("Model", options=["gpt-4o-mini", "gpt-4o", "gpt-4.1"], key="ai_model")
-        st.slider("Creativity (temperature)", 0.0, 1.0, float(st.session_state.get("ai_temp", 0.2)), 0.1, key="ai_temp")
-        st.toggle("Include evidence quotes (masked)", value=bool(st.session_state.get("ai_send_quotes", True)), key="ai_send_quotes")
-        st.slider("Quotes to retrieve", 4, 18, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
-        st.number_input("Max reviews in retrieval corpus", 200, 8000, int(st.session_state.get("ai_cap", 1500)), 100, key="ai_cap")
-
-    with st.sidebar.expander("🔑 OpenAI API Key", expanded=False):
-        st.text_input("OPENAI_API_KEY override", value="", type="password", key="api_key_override")
-        st.caption("Uses override → secrets → env. Key is never displayed.")
-
-    api_key_override = (st.session_state.get("api_key_override") or "").strip()
-    api_key = api_key_override
-    if not api_key:
+    pending_post_toast = str(st.session_state.pop("_ai_post_toast", "") or "").strip()
+    if pending_post_toast:
         try:
-            api_key = st.secrets["OPENAI_API_KEY"]
+            st.toast(pending_post_toast, icon="✨")
         except Exception:
-            api_key = os.getenv("OPENAI_API_KEY")
+            pass
 
-    remote_ready = bool(api_key)
-    model = str(st.session_state.get("ai_model") or "gpt-4o-mini")
-    temp = float(st.session_state.get("ai_temp") or 0.2)
-    send_quotes = bool(st.session_state.get("ai_send_quotes", True))
-    quote_k = int(st.session_state.get("ai_quote_k", 10))
-    cap = int(st.session_state.get("ai_cap", 1500))
-
-    st.markdown(
-        f"""
-<div class="soft-panel" style="margin-top: 8px;">
-  <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
-    <div style="font-weight:850;">{"🟢 Remote AI ready" if remote_ready else "🟡 Add API key to enable remote AI (local insights still work)"}</div>
-    <div class="small-muted">Model: <b>{_html.escape(model)}</b></div>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    # ---- Local retrieval index (TF-IDF) cached per filter-hash ----
     def _filter_hash_for_ai() -> str:
         try:
             payload = {
@@ -4114,7 +4175,6 @@ if view.startswith("🤖"):
             verb = r.get("Verbatim", "")
             verb = "" if pd.isna(verb) else str(verb)
             verb = _mask_pii(verb)
-            # Light metadata prefix helps retrieval
             star = r.get("Star Rating", "")
             country = r.get("Country", "")
             source = r.get("Source", "")
@@ -4156,14 +4216,12 @@ if view.startswith("🤖"):
         top = np.argsort(-sims)[: max(1, k)]
         out = []
         for rank, idx in enumerate(top, start=1):
-            m = meta[int(idx)]
+            m = dict(meta[int(idx)])
             out.append({"id": f"Q{rank}", "score": float(sims[int(idx)]), **m})
         return out
 
     def _build_knowledge_pack(df_in: pd.DataFrame) -> dict:
-        # Product profile
         prof = infer_product_profile(df_in, source_label)
-        # Key CSAT metrics
         cnt, avg, low = section_stats(df_in)
         seeded_mask_local = df_in["Seeded"].astype("string").str.upper().eq("YES") if "Seeded" in df_in.columns else pd.Series(False, index=df_in.index)
         org_local = df_in[~seeded_mask_local]
@@ -4176,6 +4234,14 @@ if view.startswith("🤖"):
 
         return {
             "product_profile": prof,
+            "filter_context": {
+                "filtered_review_count": int(cnt),
+                "total_review_count": int(len(df_base)),
+                "active_filters": [{"name": str(k), "value": str(v)} for k, v in active_items[:20]],
+                "current_scope_summary": "All reviews" if not active_items else "; ".join([f"{k}: {v}" for k, v in active_items[:8]]),
+                "available_detractor_filters": [str((r or {}).get("Item") or "") for r in det_tbl2[:8] if str((r or {}).get("Item") or "").strip()],
+                "available_delighter_filters": [str((r or {}).get("Item") or "") for r in del_tbl2[:8] if str((r or {}).get("Item") or "").strip()],
+            },
             "csat": {
                 "count": cnt,
                 "avg_star": round(avg, 3),
@@ -4187,32 +4253,244 @@ if view.startswith("🤖"):
             "top_delighters": del_tbl2,
         }
 
-    def _openai_chat_http(api_key: str, model: str, messages: list[dict], temperature: float | None = None, max_tokens: int = 900, timeout_s: int = 60) -> str:
+    def _responses_input_from_messages(messages: list[dict]) -> list[dict]:
+        items: list[dict] = []
+        for msg in messages or []:
+            role = str((msg or {}).get("role") or "user").strip().lower()
+            if role not in {"system", "developer", "user", "assistant"}:
+                role = "user"
+            content = (msg or {}).get("content", "")
+            if isinstance(content, list):
+                text_bits = []
+                for part in content:
+                    if isinstance(part, dict):
+                        text_bits.append(str(part.get("text") or part.get("content") or ""))
+                    else:
+                        text_bits.append(str(part))
+                content = "\n".join([x for x in text_bits if x])
+            items.append({
+                "type": "message",
+                "role": role,
+                "content": str(content or ""),
+            })
+        return items
+
+    def _extract_responses_output_text(data: Any) -> str:
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data.strip()
+        if isinstance(data, dict):
+            top = data.get("output_text")
+            if isinstance(top, str) and top.strip():
+                return top.strip()
+            chunks: list[str] = []
+            for item in data.get("output", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "message":
+                    for part in item.get("content", []) or []:
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = part.get("type")
+                        if ptype in {"output_text", "text"}:
+                            txt = part.get("text")
+                            if txt:
+                                chunks.append(str(txt))
+                        elif ptype == "refusal":
+                            txt = part.get("refusal")
+                            if txt:
+                                chunks.append(str(txt))
+            return "\n".join([c for c in chunks if c]).strip()
+        return ""
+
+    def _maybe_model_to_dict(obj: Any) -> Any:
+        for attr in ("to_dict", "model_dump", "dict"):
+            fn = getattr(obj, attr, None)
+            if callable(fn):
+                try:
+                    return fn()
+                except Exception:
+                    continue
+        return None
+
+    def _openai_responses_sdk(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
+        if not _HAS_OPENAI or OpenAI is None:
+            raise RuntimeError("OpenAI SDK not available for Responses API")
+        client = OpenAI(api_key=api_key, timeout=timeout_s, max_retries=0)
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": _responses_input_from_messages(messages),
+            "max_output_tokens": int(max_tokens),
+        }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": str(reasoning_effort)}
+        if verbosity and model_supports_verbosity(model):
+            payload["text"] = {"verbosity": str(verbosity)}
+        if temperature is not None and model_supports_temperature(model, reasoning_effort):
+            payload["temperature"] = float(temperature)
+
+        resp = client.responses.create(**payload)
+        txt = getattr(resp, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+
+        data = _maybe_model_to_dict(resp)
+        txt = _extract_responses_output_text(data)
+        if txt:
+            return txt
+        raise RuntimeError("Responses API returned no text output.")
+
+    def _openai_responses_http(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
         import requests
-        url = "https://api.openai.com/v1/chat/completions"
+
+        url = "https://api.openai.com/v1/responses"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
-        if temperature is not None and model_supports_temperature(model):
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": _responses_input_from_messages(messages),
+            "max_output_tokens": int(max_tokens),
+        }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": str(reasoning_effort)}
+        if verbosity and model_supports_verbosity(model):
+            payload["text"] = {"verbosity": str(verbosity)}
+        if temperature is not None and model_supports_temperature(model, reasoning_effort):
             payload["temperature"] = float(temperature)
 
         last_err = None
+        stripped_optional_once = False
         for attempt in range(5):
             try:
                 r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
                 if r.status_code in (429, 500, 502, 503, 504):
                     time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
                     continue
+                if r.status_code == 400 and not stripped_optional_once:
+                    stripped_optional_once = True
+                    payload = {
+                        "model": model,
+                        "input": _responses_input_from_messages(messages),
+                        "max_output_tokens": int(max_tokens),
+                    }
+                    continue
                 if r.status_code >= 400:
-                    raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:600]}")
+                    raise RuntimeError(f"OpenAI Responses API error {r.status_code}: {r.text[:600]}")
                 data = r.json()
-                return str(data["choices"][0]["message"]["content"])
+                txt = _extract_responses_output_text(data)
+                if txt:
+                    return txt
+                raise RuntimeError("Responses API returned no text output.")
             except Exception as e:
                 last_err = e
                 time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
-        raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI error")
+        raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI Responses API error")
+
+    def _openai_chat_http(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
+        import requests
+
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
+        if reasoning_effort and is_gpt5_family(model):
+            payload["reasoning_effort"] = str(reasoning_effort)
+        if verbosity and model_supports_verbosity(model):
+            payload["verbosity"] = str(verbosity)
+        if temperature is not None and model_supports_temperature(model, reasoning_effort):
+            payload["temperature"] = float(temperature)
+
+        last_err = None
+        stripped_optional_once = False
+        for attempt in range(5):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(min(8.0, (2 ** attempt) * 0.6 + 0.1))
+                    continue
+                if r.status_code == 400 and not stripped_optional_once:
+                    stripped_optional_once = True
+                    payload = {"model": model, "messages": messages, "max_tokens": int(max_tokens)}
+                    if temperature is not None and not is_gpt5_family(model):
+                        payload["temperature"] = float(temperature)
+                    continue
+                if r.status_code >= 400:
+                    raise RuntimeError(f"OpenAI Chat Completions API error {r.status_code}: {r.text[:600]}")
+                data = r.json()
+                txt = str(data["choices"][0]["message"]["content"] or "").strip()
+                if txt:
+                    return txt
+                raise RuntimeError("Chat Completions API returned no text output.")
+            except Exception as e:
+                last_err = e
+                time.sleep(min(6.0, (2 ** attempt) * 0.35 + 0.1))
+        raise RuntimeError(str(last_err) if last_err else "Unknown OpenAI Chat Completions API error")
+
+    def _openai_resilient_chat(
+        api_key: str,
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int = 900,
+        timeout_s: int = 60,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+    ) -> str:
+        attempts: list[tuple[str, Any]] = []
+
+        if preferred_openai_api(model) == "responses":
+            attempts.extend([
+                ("responses_sdk", lambda: _openai_responses_sdk(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("responses_http", lambda: _openai_responses_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("chat_http", lambda: _openai_chat_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+            ])
+        else:
+            attempts.extend([
+                ("chat_http", lambda: _openai_chat_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("responses_sdk", lambda: _openai_responses_sdk(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+                ("responses_http", lambda: _openai_responses_http(api_key, model, messages, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s, reasoning_effort=reasoning_effort, verbosity=verbosity)),
+            ])
+
+        errors: list[str] = []
+        for name, fn in attempts:
+            try:
+                return fn()
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+
+        raise RuntimeError(" | ".join(errors[-3:]) if errors else "Unknown OpenAI error")
 
     def _local_answer(question: str, knowledge: dict, quotes: list[dict]) -> str:
-        # A simple deterministic fallback using aggregates
         csat = knowledge.get("csat", {})
         prof = knowledge.get("product_profile", {})
         det = knowledge.get("top_detractors", [])[:6]
@@ -4234,34 +4512,230 @@ if view.startswith("🤖"):
             for r in deli:
                 lines.append(f"- {r.get('Item')}: {r.get('Mentions')} mentions • Avg ★ {r.get('Avg Star')}")
         if quotes:
-            lines.append("\n**Most relevant quotes (masked):**")
+            lines.append("\n**Most relevant evidence snippets:**")
             for q in quotes[:5]:
                 lines.append(f"- [{q['id']}] ★{q.get('star')} {q.get('country')} {q.get('source')} {q.get('date')}: {q.get('text','')[:240]}")
         return "\n".join(lines)
 
-    # ---- Main AI interaction ----
-    st.session_state.setdefault("_ai_last_q", "")
-    st.session_state.setdefault("_ai_last_answer", "")
+    def _normalize_lens_text(s: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
 
-    colA, colB = st.columns([1, 0.28])
+    def _selected_values(sel: Any) -> set[str]:
+        if not isinstance(sel, list):
+            return set()
+        out = set()
+        for v in sel:
+            vv = str(v or "").strip()
+            if vv and vv.lower() != "all":
+                out.add(vv)
+        return out
+
+    def _best_matching_filter_label(query: str, candidates: list[str]) -> Optional[str]:
+        q_norm = _normalize_lens_text(query)
+        if not q_norm:
+            return None
+        q_tokens = {tok for tok in q_norm.split() if len(tok) >= 4}
+        best_label = None
+        best_score = 0
+        for cand in candidates or []:
+            label = str(cand or "").strip()
+            if not label:
+                continue
+            c_norm = _normalize_lens_text(label)
+            if not c_norm:
+                continue
+            c_tokens = {tok for tok in c_norm.split() if len(tok) >= 4}
+            score = 0
+            if c_norm in q_norm:
+                score += 5
+            score += sum(1 for tok in c_tokens if tok in q_tokens)
+            if len(c_tokens) == 1 and c_tokens and next(iter(c_tokens)) in q_tokens:
+                score += 2
+            if score > best_score:
+                best_score = score
+                best_label = label
+        return best_label if best_score >= 2 else None
+
+    def _build_filter_refinement_hint_html(question: str, knowledge: dict) -> str:
+        filtered_n = int(len(filtered) or 0)
+        total_n = int(len(df_base) or 0)
+        if filtered_n <= 0 or total_n <= 0:
+            return ""
+
+        selected_det = _selected_values(sel_det)
+        selected_del = _selected_values(sel_del)
+        has_keyword_focus = bool((keyword or "").strip())
+        has_star_focus = isinstance(sr_sel, list) and sr_sel and "All" not in sr_sel
+        ratio = filtered_n / max(total_n, 1)
+        broad_scope = filtered_n >= 400 and (ratio >= 0.14 or len(active_items) <= 1 or not (selected_det or selected_del or has_keyword_focus or has_star_focus))
+
+        top_det = [str((r or {}).get("Item") or "").strip() for r in knowledge.get("top_detractors", []) if str((r or {}).get("Item") or "").strip()]
+        top_del = [str((r or {}).get("Item") or "").strip() for r in knowledge.get("top_delighters", []) if str((r or {}).get("Item") or "").strip()]
+        det_candidates = list(dict.fromkeys(top_det + [str(x).strip() for x in detractor_symptoms_all if str(x).strip()]))
+        del_candidates = list(dict.fromkeys(top_del + [str(x).strip() for x in delighter_symptoms_all if str(x).strip()]))
+
+        matched_det = _best_matching_filter_label(question, det_candidates)
+        matched_del = _best_matching_filter_label(question, del_candidates)
+
+        title = ""
+        body = ""
+        base = f"This answer is using <b>{filtered_n:,}</b> reviews from the current filter selection."
+
+        if matched_det and matched_det not in selected_det and filtered_n >= 200:
+            md = _html.escape(matched_det)
+            title = "Try a tighter issue lens"
+            body = (
+                f"{base} Since your question mentions <b>{md}</b>, try <b>Detractors → {md}</b> and ask the same question again. "
+                f"That isolates the issue-specific slice so you can compare how the story changes."
+            )
+        elif matched_del and matched_del not in selected_del and filtered_n >= 200:
+            md = _html.escape(matched_del)
+            title = "Try a tighter positive lens"
+            body = (
+                f"{base} Since your question points to <b>{md}</b>, try <b>Delighters → {md}</b> and ask the same question again. "
+                f"That will sharpen the answer around that specific strength."
+            )
+        elif broad_scope and not (selected_det or selected_del or has_keyword_focus):
+            title = "Sharper answers come from a narrower lens"
+            body = (
+                f"{base} For more targeted answers, try a relevant <b>Detractor</b>, <b>Delighter</b>, <b>Keyword</b>, or <b>Star rating</b> filter "
+                f"and then rerun the same question."
+            )
+            next_det = next((x for x in top_det if x and x not in selected_det), "")
+            next_del = next((x for x in top_del if x and x not in selected_del), "")
+            if next_det:
+                body += f" A good next drill-down is <b>Detractors → {_html.escape(next_det)}</b>."
+            elif next_del:
+                body += f" A good next drill-down is <b>Delighters → {_html.escape(next_del)}</b>."
+        else:
+            return ""
+
+        return (
+            f"<div class='ai-tip-card'>"
+            f"<div class='ai-tip-title'>{title}</div>"
+            f"<div>{body}</div>"
+            f"</div>"
+        )
+
+    def _floating_notice_html(title: str, subtitle: str) -> str:
+        return f"""
+<div class="ai-floating-toast">
+  <div class="ai-floating-toast-title">{_html.escape(title)}</div>
+  <div class="ai-floating-toast-sub">{_html.escape(subtitle)}</div>
+</div>
+"""
+
+    current_ai_filter_hash = _filter_hash_for_ai()
+
+    colA, colB = st.columns([1, 0.30])
     with colA:
         st.markdown("### Ask a question")
     with colB:
         if st.button("🧾 Executive summary", use_container_width=True):
             st.session_state["ai_user_q"] = "Provide an executive summary of what consumers love, biggest improvement opportunities, and concrete next steps for engineering. Use the filtered dataset."
 
-    # Show latest answer (ONLY)
+    with st.expander("⚙️ AI response settings", expanded=False):
+        st.caption("These settings live with the AI workflow so it is easier to tune responses without leaving the page.")
+        cfg1, cfg2 = st.columns([1.15, 1])
+        with cfg1:
+            model_options = list(dict.fromkeys([normalize_model_id(st.session_state.get("ai_model") or "gpt-4o-mini")] + AI_MODEL_OPTIONS))
+            st.selectbox("Model", options=model_options, key="ai_model")
+
+            _selected_ai_model = normalize_model_id(st.session_state.get("ai_model") or "gpt-4o-mini")
+            if is_gpt5_family(_selected_ai_model):
+                effort_options = ["none", "low", "medium", "high", "xhigh"]
+                if st.session_state.get("ai_reasoning_effort") not in effort_options:
+                    st.session_state["ai_reasoning_effort"] = "none"
+                st.selectbox("Reasoning effort", options=effort_options, key="ai_reasoning_effort")
+
+                verbosity_options = ["low", "medium", "high"]
+                if st.session_state.get("ai_verbosity") not in verbosity_options:
+                    st.session_state["ai_verbosity"] = "medium"
+                st.selectbox("Verbosity", options=verbosity_options, key="ai_verbosity")
+
+                if not model_supports_temperature(_selected_ai_model, st.session_state.get("ai_reasoning_effort")):
+                    st.caption("Temperature will be omitted automatically for this GPT-5 selection to avoid parameter errors.")
+
+            st.slider("Creativity (temperature)", 0.0, 1.0, float(st.session_state.get("ai_temp", 0.2)), 0.1, key="ai_temp")
+            st.toggle(
+                "Add evidence snippets",
+                value=bool(st.session_state.get("ai_send_quotes", False)),
+                key="ai_send_quotes",
+                help="Retrieves short review snippets for grounding. Snippets are masked automatically.",
+            )
+            if st.session_state.get("ai_send_quotes", False):
+                st.slider("Snippets to retrieve", 4, 18, int(st.session_state.get("ai_quote_k", 10)), 1, key="ai_quote_k")
+            else:
+                st.caption("Evidence snippets are off by default for a cleaner first answer.")
+            st.number_input("Max reviews in retrieval corpus", 200, 8000, int(st.session_state.get("ai_cap", 1500)), 100, key="ai_cap")
+
+        with cfg2:
+            st.text_input("OpenAI API key override", value="", type="password", key="api_key_override")
+            st.caption("Uses override → secrets → env. The key is never displayed.")
+            recent_err = str(st.session_state.get("_ai_last_error") or "").strip()
+            if recent_err:
+                st.caption(f"Recent AI fallback: {recent_err[:220]}")
+
+    api_key_override = (st.session_state.get("api_key_override") or "").strip()
+    api_key = api_key_override
+    if not api_key:
+        try:
+            api_key = st.secrets["OPENAI_API_KEY"]
+        except Exception:
+            api_key = os.getenv("OPENAI_API_KEY")
+
+    remote_ready = bool(api_key)
+    model = normalize_model_id(st.session_state.get("ai_model") or "gpt-4o-mini")
+    temp = clamp_temperature(st.session_state.get("ai_temp", 0.2), default=0.2)
+    reasoning_effort = str(st.session_state.get("ai_reasoning_effort") or default_reasoning_effort(model) or "none")
+    verbosity = str(st.session_state.get("ai_verbosity") or "medium")
+    send_quotes = bool(st.session_state.get("ai_send_quotes", False))
+    quote_k = int(st.session_state.get("ai_quote_k", 10))
+    cap = int(st.session_state.get("ai_cap", 1500))
+    api_mode = preferred_openai_api(model)
+    lens_label = "All reviews" if not active_items else f"{len(active_items)} active filter{'s' if len(active_items) != 1 else ''}"
+
+    st.markdown(
+        f"""
+<div class="soft-panel" style="margin-top: 8px;">
+  <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+    <div style="font-weight:850;">{"🟢 Remote AI ready" if remote_ready else "🟡 Add API key to enable remote AI (local insights still work)"}</div>
+    <div class="small-muted">Model: <b>{_html.escape(model)}</b> • API: <b>{_html.escape(api_mode)}</b> • Current AI lens: <b>{len(filtered):,}</b> filtered reviews • <b>{_html.escape(lens_label)}</b></div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
     last_q = (st.session_state.get("_ai_last_q") or "").strip()
     last_a = (st.session_state.get("_ai_last_answer") or "").strip()
+    last_filter_hash = str(st.session_state.get("_ai_last_filter_hash") or "")
+    last_filter_count = int(st.session_state.get("_ai_last_filter_count") or 0)
+    last_scope_hint = str(st.session_state.get("_ai_last_scope_hint") or "")
+
     if last_a:
         st.markdown("### Latest answer")
         if last_q:
             st.markdown(f"**Q:** {esc(last_q)}")
+        if last_filter_hash and last_filter_hash != current_ai_filter_hash:
+            st.info(
+                f"This answer was generated using an earlier filter selection ({last_filter_count:,} reviews). "
+                f"Ask again to refresh it for the current lens ({len(filtered):,} reviews)."
+            )
+        elif last_filter_count:
+            st.caption(f"Grounded in {last_filter_count:,} reviews from the current filter selection.")
         st.markdown(last_a)
+        if last_filter_hash and last_filter_hash == current_ai_filter_hash and last_scope_hint:
+            st.markdown(last_scope_hint, unsafe_allow_html=True)
 
-    # Chat box
-    user_q = st.text_area("Your question", value=st.session_state.get("ai_user_q", ""), height=120, key="ai_user_q", placeholder="E.g., What are the biggest improvement opportunities? What are consumers loving about the product?")
-    send = st.button("➡️ Send", type="primary")
+    user_q = st.text_area(
+        "Your question",
+        value=st.session_state.get("ai_user_q", ""),
+        height=120,
+        key="ai_user_q",
+        placeholder="E.g., What are the biggest improvement opportunities? What are consumers loving about the product?",
+    )
+    send = st.button("➡️ Send", type="primary", use_container_width=True)
     if send:
         q = (user_q or "").strip()
         if not q:
@@ -4269,11 +4743,13 @@ if view.startswith("🤖"):
         else:
             knowledge = _build_knowledge_pack(filtered)
             quotes = _retrieve_quotes(q, filtered, quote_k) if send_quotes else []
-            # Build prompt
+            scope_hint_html = _build_filter_refinement_hint_html(q, knowledge)
             sys_prompt = (
                 "You are a SharkNinja Consumer Insights + Quality Engineering copilot.\n"
                 "You MUST ground your answers in the provided dataset context and retrieved evidence.\n"
                 "Be practical, concise, and insight-driven. Quantify (counts, avg★, %1–2★) when possible.\n"
+                "Make it clear that your answer reflects the current filter context in dataset_context.filter_context.\n"
+                "Only when it would materially sharpen the answer, briefly suggest one useful next filter or lens the user could try.\n"
                 "When you make a claim supported by evidence quotes, cite the quote IDs like [Q3].\n"
                 "If the question is about 'what is this product', infer from model/retailer/source strings and the review text.\n"
                 "Never invent data that isn't in the context.\n"
@@ -4298,20 +4774,43 @@ if view.startswith("🤖"):
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
             ]
 
-            with st.spinner("Thinking…"):
-                if remote_ready:
-                    try:
-                        ans = _openai_chat_http(api_key, model, messages, temperature=temp)
-                    except Exception as e:
-                        st.warning("Remote AI failed; falling back to local insights.")
-                        st.sidebar.caption(f"Last AI error: {str(e)[:200]}")
-                        ans = _local_answer(q, knowledge, quotes)
-                else:
-                    ans = _local_answer(q, knowledge, quotes)
+            thinking_slot = st.empty()
+            toast_handle = None
+            try:
+                thinking_slot.markdown(
+                    _floating_notice_html(
+                        "Thinking through the filtered reviews…",
+                        f"Analyzing {len(filtered):,} reviews in the current lens.",
+                    ),
+                    unsafe_allow_html=True,
+                )
+                try:
+                    toast_handle = st.toast(f"Thinking through {len(filtered):,} filtered reviews…", icon="🤖")
+                except Exception:
+                    toast_handle = None
 
-            # Requested: replace previous response; newest stays on top
+                with st.spinner("Thinking through the filtered reviews…", show_time=True):
+                    if remote_ready:
+                        try:
+                            ans = _openai_resilient_chat(api_key, model, messages, temperature=temp, reasoning_effort=reasoning_effort, verbosity=verbosity)
+                            st.session_state["_ai_last_error"] = ""
+                        except Exception as e:
+                            st.warning("Remote AI failed; falling back to local insights.")
+                            st.session_state["_ai_last_error"] = str(e)[:240]
+                            ans = _local_answer(q, knowledge, quotes)
+                    else:
+                        ans = _local_answer(q, knowledge, quotes)
+            finally:
+                try:
+                    thinking_slot.empty()
+                except Exception:
+                    pass
+
+            ready_msg = f"Answer ready — grounded in {len(filtered):,} filtered reviews."
+            st.session_state["_ai_post_toast"] = ready_msg
             st.session_state["_ai_last_q"] = q
             st.session_state["_ai_last_answer"] = ans
-            # Clear input (optional)
-            # st.session_state["ai_user_q"] = ""
+            st.session_state["_ai_last_filter_hash"] = current_ai_filter_hash
+            st.session_state["_ai_last_filter_count"] = int(len(filtered))
+            st.session_state["_ai_last_scope_hint"] = scope_hint_html
             st.rerun()
