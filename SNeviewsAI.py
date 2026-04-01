@@ -1785,32 +1785,90 @@ def _sort_reviews(df: pd.DataFrame, sort_mode: str) -> pd.DataFrame:
     if sort_mode=="Longest":        return w.sort_values(["review_length_words","submission_time"],ascending=[False,False],na_position="last")
     return w
 
-def _render_review_card(row: pd.Series) -> None:
+def _highlight_evidence(text: str, evidence_items: List[Tuple[str,str]]) -> str:
+    """Wrap evidence substrings in .ev-highlight spans with hover tooltip showing the AI tag."""
+    text_str = str(text)
+    if not evidence_items or not text_str.strip():
+        return f"<div class='review-body'>{html.escape(text_str)}</div>"
+    hits: List[Tuple[int,int,str,str]] = []
+    for ev_text, tag_label in evidence_items:
+        if not ev_text.strip(): continue
+        for m in re.compile(re.escape(ev_text.strip()), re.IGNORECASE).finditer(text_str):
+            hits.append((m.start(), m.end(), tag_label, m.group()))
+    if not hits:
+        return f"<div class='review-body'>{html.escape(text_str)}</div>"
+    hits.sort(key=lambda h: h[0])
+    deduped: List[Tuple[int,int,str,str]] = []; cursor = 0
+    for h in hits:
+        if h[0] >= cursor: deduped.append(h); cursor = h[1]
+    parts: List[str] = []; cursor = 0
+    for start, end, tag_label, matched in deduped:
+        parts.append(html.escape(text_str[cursor:start]))
+        tip = html.escape(f"AI tag: {tag_label}")
+        parts.append(f'<span class="ev-highlight" data-tag="{tip}">{html.escape(matched)}</span>')
+        cursor = end
+    parts.append(html.escape(text_str[cursor:]))
+    return f"<div class='review-body'>{''.join(parts)}</div>"
+
+def _build_evidence_lookup() -> Dict[str, List[Tuple[str,str]]]:
+    """Return {str(row_idx): [(evidence_text, tag_label), ...]} from last Symptomizer run."""
+    processed = st.session_state.get("sym_processed_rows") or []
+    lookup: Dict[str, List[Tuple[str,str]]] = {}
+    for rec in processed:
+        idx = str(rec.get("idx",""))
+        if not idx: continue
+        entries: List[Tuple[str,str]] = []
+        for lab, evs in (rec.get("ev_det",{}) or {}).items():
+            for e in (evs or []):
+                if e and e.strip(): entries.append((e.strip(), lab))
+        for lab, evs in (rec.get("ev_del",{}) or {}).items():
+            for e in (evs or []):
+                if e and e.strip(): entries.append((e.strip(), lab))
+        if entries: lookup[idx] = entries
+    return lookup
+
+def _render_review_card(row: pd.Series, evidence_items: Optional[List[Tuple[str,str]]] = None) -> None:
     rating_val = _safe_int(row.get("rating"),0) if pd.notna(row.get("rating")) else 0
     stars      = "★"*max(0,min(rating_val,5)) + "☆"*max(0,5-rating_val)
     title      = _safe_text(row.get("title"),"No title") or "No title"
     review_text= _safe_text(row.get("review_text"),"—") or "—"
     meta_bits  = [b for b in [_safe_text(row.get("submission_date")),_safe_text(row.get("content_locale")),
                                _safe_text(row.get("retailer")),_safe_text(row.get("product_or_sku"))] if b]
-    chips_html = f"<span class='chip {'green' if not _safe_bool(row.get('incentivized_review'),False) else 'yellow'}'>{'Organic' if not _safe_bool(row.get('incentivized_review'),False) else 'Incentivized'}</span>"
+    is_organic = not _safe_bool(row.get("incentivized_review"),False)
+    chips_html = f"<span class='chip {'green' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
     rec=row.get("is_recommended")
     if not _is_missing(rec):
-        chips_html+=f"<span class='chip {'green' if _safe_bool(rec,False) else 'red'}'>{'Recommended' if _safe_bool(rec,False) else 'Not recommended'}</span>"
+        chips_html += f"<span class='chip {'green' if _safe_bool(rec,False) else 'red'}'>{'Recommended' if _safe_bool(rec,False) else 'Not recommended'}</span>"
     det_tags=[str(row.get(f"AI Symptom Detractor {j}","")) for j in range(1,11) if _is_filled(row.get(f"AI Symptom Detractor {j}"))]
     del_tags=[str(row.get(f"AI Symptom Delighter {j}","")) for j in range(1,11) if _is_filled(row.get(f"AI Symptom Delighter {j}"))]
-    for t in det_tags: chips_html+=f"<span class='chip red'>{_esc(t)}</span>"
-    for t in del_tags: chips_html+=f"<span class='chip green'>{_esc(t)}</span>"
+    for t in det_tags: chips_html += f"<span class='chip red'>{_esc(t)}</span>"
+    for t in del_tags: chips_html += f"<span class='chip green'>{_esc(t)}</span>"
     with st.container(border=True):
-        top_cols=st.columns([5,1.2])
+        top_cols = st.columns([5, 1.5])
         with top_cols[0]:
-            st.markdown(f"<span style='color:#f59e0b;font-size:13px;letter-spacing:-.02em;'>{stars}</span> &nbsp; <span style='font-size:12px;color:#64748b;font-weight:600;'>{rating_val}/5</span>",unsafe_allow_html=True)
-            st.markdown(f"**{_esc(title)}**")
-            if meta_bits: st.caption(" · ".join(meta_bits))
+            st.markdown(
+                f"<span style='color:#f59e0b;letter-spacing:-.01em;'>{stars}</span>"
+                f"&nbsp;<span style='font-size:12px;color:var(--slate-500);font-weight:600;'>{rating_val}/5</span>",
+                unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='font-weight:700;font-size:14.5px;color:var(--navy);margin:3px 0 2px;'>{_esc(title)}</div>",
+                unsafe_allow_html=True)
+            if meta_bits:
+                st.markdown(
+                    f"<div style='font-size:12px;color:var(--slate-400);margin-bottom:4px;'>{' · '.join(_esc(b) for b in meta_bits)}</div>",
+                    unsafe_allow_html=True)
         with top_cols[1]:
-            st.markdown(f"<div class='chip-wrap' style='justify-content:flex-end;margin-top:4px;'>{chips_html}</div>",unsafe_allow_html=True)
-        st.write(review_text)
-        footer=[b for b in [f"ID {_safe_text(row.get('review_id'))}",_safe_text(row.get("user_location"))] if b]
-        if footer: st.caption(" · ".join(footer))
+            st.markdown(
+                f"<div class='chip-wrap' style='justify-content:flex-end;gap:4px;flex-wrap:wrap;padding-top:2px;'>{chips_html}</div>",
+                unsafe_allow_html=True)
+        if evidence_items:
+            st.markdown(_highlight_evidence(review_text, evidence_items), unsafe_allow_html=True)
+            st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
+        else:
+            st.markdown(f"<div class='review-body'>{html.escape(review_text)}</div>", unsafe_allow_html=True)
+        footer = [b for b in [f"ID {_safe_text(row.get('review_id'))}", _safe_text(row.get("user_location"))] if b]
+        if footer:
+            st.markdown(f"<div style='font-size:11.5px;color:var(--slate-400);margin-top:4px;'>{' · '.join(_esc(b) for b in footer)}</div>", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1892,25 +1950,39 @@ def _render_review_explorer(*,summary,overall_df,filtered_df,prompt_artifacts) -
 
     ordered_df=_sort_reviews(filtered_df,sort_mode).reset_index(drop=True)
     if ordered_df.empty: st.info("No reviews match the current filters."); return
-    page_count=max(1,math.ceil(len(ordered_df)/max(per_page,1)))
-    current_page=max(1,min(int(st.session_state.get("review_explorer_page",1)),page_count))
 
+    page_count   = max(1, math.ceil(len(ordered_df)/max(per_page,1)))
+    current_page = max(1, min(int(st.session_state.get("review_explorer_page",1)), page_count))
+    start        = (current_page-1)*per_page
+    page_df      = ordered_df.iloc[start:start+per_page]
+
+    # Build evidence lookup from last Symptomizer run (keyed by original df index)
+    ev_lookup = _build_evidence_lookup()
+
+    # ── Review cards ─────────────────────────────────────────────────────────
+    for orig_idx, row in page_df.iterrows():
+        ev_items = ev_lookup.get(str(orig_idx)) or ev_lookup.get(str(row.get("review_id","")))
+        _render_review_card(row, evidence_items=ev_items)
+
+    st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
+
+    # ── Pager — bottom ───────────────────────────────────────────────────────
     with st.container(border=True):
-        pc=st.columns([0.9,0.9,2.3,1.0,0.9,0.9])
-        if pc[0].button("⏮",use_container_width=True,disabled=current_page<=1,key="re_first"): current_page=1
-        if pc[1].button("‹",use_container_width=True,disabled=current_page<=1,key="re_prev"):  current_page=max(1,current_page-1)
-        pc[2].markdown(f"<div class='compact-pager-status'>Page {current_page} of {page_count:,} <span class='compact-pager-sub'>{(current_page-1)*per_page+1:,}–{min(current_page*per_page,len(ordered_df)):,} of {len(ordered_df):,}</span></div>",unsafe_allow_html=True)
-        if st.session_state.get("review_explorer_page_input")!=current_page:
-            st.session_state["review_explorer_page_input"]=current_page
-        current_page=int(pc[3].number_input("Page",min_value=1,max_value=page_count,value=current_page,
-            step=1,key="review_explorer_page_input",label_visibility="collapsed"))
-        if pc[4].button("›",use_container_width=True,disabled=current_page>=page_count,key="re_next"): current_page=min(page_count,current_page+1)
-        if pc[5].button("⏭",use_container_width=True,disabled=current_page>=page_count,key="re_last"): current_page=page_count
+        pc = st.columns([0.8, 0.8, 2.9, 0.85, 0.8, 0.8])
+        if pc[0].button("⏮", use_container_width=True, disabled=current_page<=1,          key="re_first"): current_page=1
+        if pc[1].button("‹",  use_container_width=True, disabled=current_page<=1,          key="re_prev"):  current_page=max(1,current_page-1)
+        pc[2].markdown(
+            f"<div class='compact-pager-status'>Page {current_page} of {page_count:,}"
+            f"<span class='compact-pager-sub'>{start+1:,}–{min(start+per_page,len(ordered_df)):,} of {len(ordered_df):,} reviews</span></div>",
+            unsafe_allow_html=True)
+        if st.session_state.get("review_explorer_page_input") != current_page:
+            st.session_state["review_explorer_page_input"] = current_page
+        current_page = int(pc[3].number_input("Go", min_value=1, max_value=page_count,
+            value=current_page, step=1, key="review_explorer_page_input", label_visibility="collapsed"))
+        if pc[4].button("›",  use_container_width=True, disabled=current_page>=page_count, key="re_next"):  current_page=min(page_count,current_page+1)
+        if pc[5].button("⏭", use_container_width=True, disabled=current_page>=page_count, key="re_last"):  current_page=page_count
 
-    st.session_state["review_explorer_page"]=max(1,min(current_page,page_count))
-    start=(st.session_state["review_explorer_page"]-1)*per_page
-    for _,row in ordered_df.iloc[start:start+per_page].iterrows():
-        _render_review_card(row)
+    st.session_state["review_explorer_page"] = max(1, min(current_page, page_count))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2187,12 +2259,21 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
             pdesc=st.text_area("Product description",value=st.session_state.get("sym_product_profile",""),
                 placeholder="e.g. SharkNinja Ninja Air Fryer XL — 6-in-1 countertop air fryer with 6 qt basket",height=80,key="sym_pdesc")
             if not overall_df.empty and "review_text" in overall_df.columns:
-                st.caption(f"Will use up to 20 sample reviews from the loaded workspace.")
+                max_samples = min(200, max(5, len(overall_df)))
+                sample_n = st.slider(
+                    "Sample reviews to feed the AI builder",
+                    min_value=5, max_value=max_samples,
+                    value=min(20, max_samples), step=5,
+                    key="sym_sample_n",
+                    help="More samples = richer symptom list, but costs more tokens. 20–40 is usually enough.")
+                st.caption(f"Using {sample_n} reviews out of {len(overall_df):,} loaded.")
+            else:
+                sample_n = 20
             if st.button("🤖 Generate symptom list",type="primary",use_container_width=True,
                          disabled=(not api_key),key="sym_ai_build"):
                 overlay=_show_thinking("Generating symptom catalog for your product…")
                 try:
-                    samples=overall_df["review_text"].fillna("").astype(str).head(20).tolist() if not overall_df.empty else []
+                    samples=overall_df["review_text"].fillna("").astype(str).head(int(sample_n)).tolist() if not overall_df.empty else []
                     result=_ai_build_symptom_list(client=client,product_description=pdesc,sample_reviews=samples)
                     st.session_state["sym_ai_build_result"]=result; st.session_state["sym_product_profile"]=pdesc
                 except Exception as exc: st.error(f"AI builder failed: {exc}")
@@ -2241,12 +2322,14 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
         fids=set(filtered_df["review_id"].astype(str)); target_df=work[work["review_id"].astype(str).isin(fids)]
     else: target_df=work
 
-    rc=st.columns([1.5,1,1,1.5])
+    rc=st.columns([1.5,1,1,1,1])
     n_to_process=rc[0].number_input("Reviews to process",min_value=1,max_value=max(1,len(target_df)),step=1,key="sym_n_to_process")
-    batch_size=int(st.session_state.get("sym_batch_size",5))
+    batch_size=int(rc[1].number_input("Batch size",min_value=1,max_value=20,
+        value=int(st.session_state.get("sym_batch_size",5)),step=1,key="sym_batch_size",
+        help="Reviews sent to the AI in one request. Larger = fewer calls but heavier prompts."))
     est_batches=max(1,math.ceil(int(n_to_process)/batch_size)) if n_to_process else 0
-    rc[1].metric("In scope",f"{len(target_df):,}"); rc[2].metric("Est. batches",f"{est_batches:,}")
-    rc[3].caption(f"Scope: {scope_choice}\nModel: {_shared_model()}")
+    rc[2].metric("In scope",f"{len(target_df):,}"); rc[3].metric("Est. batches",f"{est_batches:,}")
+    rc[4].caption(f"Scope: {scope_choice}\nModel: {_shared_model()}")
 
     run_disabled=(not api_key) or (len(target_df)==0)
     if run_disabled and not api_key: st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable Symptomizer.")
@@ -2317,16 +2400,56 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
     st.markdown(_chip_html([(f"{len(processed)} reviews tagged","green"),(f"{total_tags} labels written","indigo")]),unsafe_allow_html=True)
     st.markdown("")
 
-    new_cands={k:v for k,v in (st.session_state.get("sym_new_candidates") or {}).items()
-               if k.strip() and k.strip() not in (delighters+detractors)}
+    # ── Deduplicate candidates ─────────────────────────────────────────────
+    def _dedup_candidates(raw: Dict[str,Any]) -> Dict[str,Any]:
+        """Merge near-duplicate labels, e.g. 'not too heavy' ≈ 'lightweight'."""
+        def _norm(s: str) -> str:
+            s = s.strip().lower()
+            s = re.sub(r"^(not\s+too\s+|not\s+very\s+|not\s+overly\s+|not\s+)", "", s)
+            s = re.sub(r"[^a-z0-9 ]", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+        labels = sorted(raw.keys(), key=lambda l: -int(raw[l].get("count",0)))
+        merged: Dict[str,Any] = {}; used: Set[str] = set()
+        for a in labels:
+            if a in used: continue
+            merged[a] = dict(raw[a]); used.add(a); na = _norm(a)
+            for b in labels:
+                if b in used or b == a: continue
+                nb = _norm(b)
+                if (difflib.SequenceMatcher(None, na, nb).ratio() >= 0.72
+                        or na in nb or nb in na):
+                    merged[a]["count"] = int(merged[a].get("count",0)) + int(raw[b].get("count",0))
+                    refs = list(merged[a].get("refs",[]))
+                    for r in raw[b].get("refs",[]):
+                        if r not in refs and len(refs) < 50: refs.append(r)
+                    merged[a]["refs"] = refs
+                    merged[a].setdefault("_merged_from",[]).append(b)
+                    used.add(b)
+        return merged
+
+    raw_cands = {k:v for k,v in (st.session_state.get("sym_new_candidates") or {}).items()
+                 if k.strip() and k.strip() not in (delighters+detractors)}
+    new_cands = _dedup_candidates(raw_cands) if raw_cands else {}
     if new_cands:
         with st.expander(f"🟡 New symptom candidates ({len(new_cands)})",expanded=False):
-            st.caption("These labels were suggested by the AI but don't appear in your catalog. Add them if relevant.")
-            cand_df=pd.DataFrame([dict(Add=False,Label=lab,Count=int(rec.get("count",0)))
-                for lab,rec in sorted(new_cands.items(),key=lambda kv:-int(kv[1].get("count",0)))])
+            st.caption(
+                "Themes the AI suggested that aren't in your catalog. "
+                "Near-duplicates have been auto-merged (e.g. 'not too heavy' + 'lightweight' → one row). "
+                "Edit labels before promoting if needed.")
+            cand_rows=[]
+            for lab,rec in sorted(new_cands.items(),key=lambda kv:-int(kv[1].get("count",0))):
+                merged_from=rec.get("_merged_from",[])
+                note = f"merged from: {', '.join(merged_from[:3])}" if merged_from else ""
+                cand_rows.append(dict(Add=False,Label=lab,Count=int(rec.get("count",0)),Notes=note))
+            cand_df=pd.DataFrame(cand_rows)
             edited_cands=st.data_editor(cand_df,num_rows="fixed",use_container_width=True,hide_index=True,
-                key="sym_cand_editor",column_config={"Add":st.column_config.CheckboxColumn(),
-                    "Label":st.column_config.TextColumn(),"Count":st.column_config.NumberColumn(format="%d")})
+                key="sym_cand_editor",
+                column_config={
+                    "Add":   st.column_config.CheckboxColumn(help="Select to add to catalog"),
+                    "Label": st.column_config.TextColumn(help="Edit label text before promoting"),
+                    "Count": st.column_config.NumberColumn(format="%d",help="Review mentions"),
+                    "Notes": st.column_config.TextColumn(disabled=True,help="Auto-merged similar labels"),
+                })
             cc1,cc2=st.columns(2)
             if cc1.button("Add selected → Detractors",use_container_width=True,key="sym_add_det"):
                 to_add=[str(r["Label"]) for _,r in edited_cands.iterrows() if bool(r.get("Add",False)) and str(r.get("Label","")).strip()]
