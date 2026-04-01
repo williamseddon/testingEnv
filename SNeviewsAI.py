@@ -2325,8 +2325,9 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
     rc=st.columns([1.5,1,1,1,1])
     n_to_process=rc[0].number_input("Reviews to process",min_value=1,max_value=max(1,len(target_df)),step=1,key="sym_n_to_process")
     batch_size=int(rc[1].number_input("Batch size",min_value=1,max_value=20,
-        value=int(st.session_state.get("sym_batch_size",5)),step=1,key="sym_batch_size",
+        value=int(st.session_state.get("sym_batch_size",5)),step=1,key="sym_batch_size_run",
         help="Reviews sent to the AI in one request. Larger = fewer calls but heavier prompts."))
+    st.session_state["sym_batch_size"]=batch_size
     est_batches=max(1,math.ceil(int(n_to_process)/batch_size)) if n_to_process else 0
     rc[2].metric("In scope",f"{len(target_df):,}"); rc[3].metric("Est. batches",f"{est_batches:,}")
     rc[4].caption(f"Scope: {scope_choice}\nModel: {_shared_model()}")
