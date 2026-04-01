@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import difflib, gc, hashlib, html, io, json, math, os, random, re
 import sqlite3, tempfile, textwrap, time
+import numpy as np
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date
@@ -1095,6 +1096,329 @@ def _compute_themes(df: pd.DataFrame) -> pd.DataFrame:
             low_star_mentions=int(sub["rating"].isin([1,2]).sum()),
             high_star_mentions=int(sub["rating"].isin([4,5]).sum())))
     return pd.DataFrame(rows).sort_values(["mention_count","low_star_mentions"],ascending=[False,False])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SYMPTOM ANALYTICS  (ported + adapted from Star Walk master app)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_symptom_col_lists(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    """Return (detractor_cols, delighter_cols) preferring AI columns over manual."""
+    ai_det = [c for c in df.columns if c.startswith("AI Symptom Detractor")]
+    ai_del = [c for c in df.columns if c.startswith("AI Symptom Delighter")]
+    man_det = [f"Symptom {i}" for i in range(1, 11)  if f"Symptom {i}" in df.columns]
+    man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in df.columns]
+    return (ai_det or man_det), (ai_del or man_del)
+
+
+def _detect_symptom_state(df: pd.DataFrame) -> str:
+    """Returns 'none', 'partial', or 'full' based on tagged symptom data."""
+    det_cols, del_cols = _get_symptom_col_lists(df)
+    def _has(cols: List[str]) -> bool:
+        for c in cols:
+            if c not in df.columns: continue
+            s = df[c].astype(str).str.strip()
+            if s.replace({"nan":"","None":"","<NA>":""}).ne("").any():
+                return True
+        return False
+    has_det = _has(det_cols)
+    has_del = _has(del_cols)
+    if has_det and has_del: return "full"
+    if has_det or has_del: return "partial"
+    return "none"
+
+
+def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_cols: List[str]) -> pd.DataFrame:
+    """Vectorized symptom analysis — much faster than per-row scanning."""
+    _INVALID = {"<NA>","NA","N/A","NULL","NONE","NAN","","NONE","NONE"}
+    cols = [c for c in symptom_cols if c in df_in.columns]
+    if not cols:
+        return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
+    block = df_in[cols]
+    try:
+        long = block.stack(dropna=False).reset_index()
+    except TypeError:
+        long = block.stack().reset_index()
+    long.columns = ["__idx", "__col", "symptom"]
+    s = long["symptom"].astype("string").str.strip()
+    mask = s.map(lambda v: bool(v and str(v).upper() not in _INVALID and not str(v).startswith("<")))
+    long = long.loc[mask, ["__idx"]].copy()
+    long["symptom"] = s[mask].str.title()
+    if long.empty:
+        return pd.DataFrame(columns=["Item","Avg Star","Mentions","% Total"])
+    counts = long["symptom"].value_counts()
+    avg_map: Dict[str, float] = {}
+    if "rating" in df_in.columns:
+        stars = pd.to_numeric(df_in["rating"], errors="coerce").rename("star")
+        tmp = long.drop_duplicates(subset=["__idx","symptom"]).copy()
+        tmp = tmp.join(stars, on="__idx")
+        avg_map = tmp.groupby("symptom")["star"].mean().to_dict()
+    total = max(1, len(df_in))
+    items = counts.index.tolist()
+    return pd.DataFrame({
+        "Item":     [str(x).title() for x in items],
+        "Avg Star": [round(float(avg_map[x]), 1) if x in avg_map and not pd.isna(avg_map[x]) else None for x in items],
+        "Mentions": counts.values.astype(int),
+        "% Total":  (counts.values / total * 100).round(1).astype(str) + "%",
+    }).sort_values("Mentions", ascending=False, ignore_index=True)
+
+
+def symptom_table_html(df_in: pd.DataFrame, *, max_height_px: int = 400) -> str:
+    """Render a symptom table as theme-safe HTML (works in light + dark mode)."""
+    if df_in is None or df_in.empty:
+        return (f"<div class='sw-table-wrap' style='max-height:{max_height_px}px;"
+                f"padding:12px;color:var(--st-text,#0f172a);'>No data.</div>")
+    cols = [c for c in ["Item","Mentions","% Total","Avg Star","Net Hit"] if c in df_in.columns]
+    th = "".join(f"<th>{html.escape(c)}</th>" for c in cols)
+    rows_html = []
+    for _, row in df_in[cols].iterrows():
+        tds = []
+        for c in cols:
+            v = row.get(c, "")
+            right = "sw-td-right" if c in ("Mentions","% Total","Avg Star","Net Hit") else ""
+            if c == "Avg Star":
+                try:
+                    f = float(v); star_cls = "sw-star-good" if f >= 4.5 else "sw-star-bad"
+                    tds.append(f"<td class='{right} {star_cls}'>{f:.1f}</td>")
+                except Exception:
+                    tds.append(f"<td class='{right}'>{html.escape(str(v))}</td>")
+            elif c == "Net Hit":
+                try:
+                    tds.append(f"<td class='{right}'>{float(v):.3f}</td>")
+                except Exception:
+                    tds.append(f"<td class='{right}'>{html.escape(str(v))}</td>")
+            else:
+                tds.append(f"<td class='{right}'>{html.escape(str(v))}</td>")
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+    body = "".join(rows_html)
+    return (f"<div class='sw-table-wrap' style='max-height:{max_height_px}px;'>"
+            f"<table class='sw-table'><thead><tr>{th}</tr></thead>"
+            f"<tbody>{body}</tbody></table></div>")
+
+
+def _add_net_hit(tbl: pd.DataFrame, avg_rating: float) -> pd.DataFrame:
+    """Add Net Hit column: each theme's share of the gap-to-5★."""
+    if tbl is None or tbl.empty: return tbl
+    d = tbl.copy()
+    d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0).astype(int)
+    gap   = max(0.0, 5.0 - float(avg_rating or 0))
+    total = float(d["Mentions"].sum()) or 0
+    d["Net Hit"] = (gap * (d["Mentions"] / total)).round(3) if total > 0 else 0.0
+    return d[[c for c in ["Item","Mentions","% Total","Avg Star","Net Hit"] if c in d.columns]]
+
+
+def _render_opportunity_scatter(tbl: pd.DataFrame, kind: str, baseline_avg: float) -> None:
+    """Opportunity matrix: Mentions vs Avg ★ scatter."""
+    if tbl is None or tbl.empty: st.info("No data available."); return
+    d = tbl.copy()
+    d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0)
+    d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
+    d = d.dropna(subset=["Avg Star"])
+    if d.empty: st.info("No data available."); return
+
+    x = d["Mentions"].astype(float).to_numpy()
+    y = d["Avg Star"].astype(float).to_numpy()
+    names = d["Item"].astype(str).to_numpy()
+    score = x * np.clip(float(baseline_avg)-y, 0, None) if kind=="detractors" \
+            else x * np.clip(y-float(baseline_avg), 0, None)
+
+    show_labels = st.toggle("Show labels", value=False, key=f"opp_lbl_{kind}")
+    labels_arr  = np.array([""]*len(d), dtype=object)
+    if show_labels:
+        top_idx = np.argsort(-score)[:10]; labels_arr[top_idx] = names[top_idx]
+
+    mx = max(float(np.nanmax(x)), 1e-9)
+    size = (np.sqrt(x) / np.sqrt(mx)) * 24 + 8
+
+    color = "#ef4444" if kind == "detractors" else "#22c55e"
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=y,
+        mode="markers+text" if show_labels else "markers",
+        text=labels_arr, textposition="top center", textfont=dict(size=10, family="Inter"),
+        customdata=np.stack([names], axis=1),
+        hovertemplate="%{customdata[0]}<br>Mentions=%{x:.0f}<br>Avg ★=%{y:.2f}<extra></extra>",
+        marker=dict(size=size, color=color, opacity=0.76,
+                    line=dict(width=1, color="rgba(148,163,184,.38)")),
+    ))
+    fig.add_hline(y=float(baseline_avg), line_dash="dash", opacity=0.45,
+                  annotation_text=f"Avg ★ {baseline_avg:.2f}",
+                  annotation_position="right", annotation_font_size=11)
+    fig.update_layout(
+        height=420, margin=dict(l=44,r=20,t=24,b=40),
+        xaxis_title="Mentions", yaxis_title="Avg ★",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", color="currentColor"),
+    )
+    fig.update_xaxes(gridcolor="rgba(148,163,184,.15)", zerolinecolor="rgba(148,163,184,.15)")
+    fig.update_yaxes(gridcolor="rgba(148,163,184,.15)", zerolinecolor="rgba(148,163,184,.15)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    label = ("Fix first — high mentions × below-baseline ★"
+             if kind == "detractors"
+             else "Amplify — high mentions × above-baseline ★")
+    top15 = d.copy(); top15["Score"] = score
+    top15 = top15.sort_values("Score", ascending=False).head(15)
+    with st.expander(f"📋 {label}", expanded=False):
+        ds = top15[["Item","Mentions","Avg Star","Score"]].copy()
+        ds["Avg Star"] = ds["Avg Star"].map(lambda v: f"{float(v):.1f}" if pd.notna(v) else "—")
+        ds["Score"]    = ds["Score"].map(lambda v: f"{float(v):.1f}")
+        st.dataframe(ds, use_container_width=True, hide_index=True)
+
+
+def _render_symptom_dashboard(filtered_df: pd.DataFrame,
+                               overall_df: Optional[pd.DataFrame] = None) -> None:
+    """
+    Appended to the Dashboard tab.
+    State 1 (no symptoms): shows a friendly prompt banner.
+    State 2 (symptoms present): shows tables, top-theme charts, opportunity matrix.
+    """
+    od = overall_df if overall_df is not None else filtered_df
+    sym_state = _detect_symptom_state(od)
+
+    # ── State banner ────────────────────────────────────────────────────────
+    st.markdown("<hr class='sw-divider'>", unsafe_allow_html=True)
+
+    if sym_state == "none":
+        st.markdown("""
+        <div class="sym-state-banner">
+          <div class="icon">💊</div>
+          <div class="title">No symptoms tagged yet</div>
+          <div class="sub">
+            Run the <strong>Symptomizer</strong> tab to AI-tag delighters and detractors,
+            then return here for the full analytics: symptom tables, top-theme charts,
+            and the opportunity matrix.<br>
+            If your file already contains <em>Symptom 1–20</em> columns with data,
+            they'll appear automatically.
+          </div>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    if sym_state == "partial":
+        det_cols, del_cols = _get_symptom_col_lists(od)
+        missing = []
+        if not any(od[c].astype(str).str.strip().replace({"nan":"","<NA>":""}).ne("").any()
+                   for c in det_cols if c in od.columns):
+            missing.append("detractors")
+        if not any(od[c].astype(str).str.strip().replace({"nan":"","<NA>":""}).ne("").any()
+                   for c in del_cols if c in od.columns):
+            missing.append("delighters")
+        if missing:
+            st.info(f"Partial tagging — {' and '.join(missing)} not yet labelled. "
+                    f"Run the Symptomizer to complete the picture.")
+
+    # ── Section header ───────────────────────────────────────────────────────
+    st.markdown("<div class='section-title'>🩺 Detractors & Delighters</div>",
+                unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>AI-tagged symptom analysis. "
+                "Net Hit = each theme's share of the current gap-to-5★.</div>",
+                unsafe_allow_html=True)
+
+    det_cols, del_cols = _get_symptom_col_lists(od)
+    avg_star = float(_safe_mean(filtered_df["rating"]) or 0)
+
+    # Compute tables
+    det_tbl = _add_net_hit(analyze_symptoms_fast(filtered_df, det_cols), avg_star)
+    del_tbl = _add_net_hit(analyze_symptoms_fast(filtered_df, del_cols), avg_star)
+
+    ctrl_row = st.columns([1.2, 2.8])
+    table_limit = int(ctrl_row[0].selectbox("Rows", [25, 50, 100], index=1, key="sw_tbl_limit"))
+    tbl_view    = ctrl_row[1].radio("Table view", ["Split","Tabs"], horizontal=True, key="sw_tbl_view")
+
+    if tbl_view == "Split":
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.markdown("**🔴 Detractors**")
+            st.markdown(symptom_table_html(det_tbl.head(table_limit), max_height_px=380),
+                        unsafe_allow_html=True)
+        with sc2:
+            st.markdown("**🟢 Delighters**")
+            st.markdown(symptom_table_html(del_tbl.head(table_limit), max_height_px=380),
+                        unsafe_allow_html=True)
+    else:
+        t1, t2 = st.tabs(["🔴 Detractors", "🟢 Delighters"])
+        with t1:
+            st.markdown(symptom_table_html(det_tbl.head(table_limit), max_height_px=420),
+                        unsafe_allow_html=True)
+        with t2:
+            st.markdown(symptom_table_html(del_tbl.head(table_limit), max_height_px=420),
+                        unsafe_allow_html=True)
+
+    # Excel download
+    try:
+        out_xlsx = io.BytesIO()
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            det_tbl.to_excel(writer, sheet_name="Detractors", index=False)
+            del_tbl.to_excel(writer, sheet_name="Delighters", index=False)
+        ds  = st.session_state.get("analysis_dataset") or {}
+        pid = (ds.get("summary") and ds["summary"].product_id) or "symptoms"
+        st.download_button("⬇️ Download Detractors + Delighters (Excel)",
+                           data=out_xlsx.getvalue(),
+                           file_name=f"{pid}_symptoms.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="sw_sym_dl")
+    except Exception:
+        pass
+
+    # ── Top-theme bar charts ─────────────────────────────────────────────────
+    st.markdown("<hr class='sw-divider'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>📊 Top Themes</div>", unsafe_allow_html=True)
+
+    bar_ctrl = st.columns([1, 1, 1.2])
+    top_n    = int(bar_ctrl[0].slider("Top N", 5, 25, 12, 1, key="sw_top_n"))
+    org_only = bar_ctrl[1].toggle("Organic only", value=False, key="sw_org_bar")
+    show_pct = bar_ctrl[2].toggle("Show % of reviews", value=False, key="sw_pct_bar")
+
+    bar_df = (filtered_df[~filtered_df["incentivized_review"].fillna(False)]
+              if org_only else filtered_df)
+    denom  = max(1, len(bar_df))
+    det_top = analyze_symptoms_fast(bar_df, det_cols).head(top_n)
+    del_top = analyze_symptoms_fast(bar_df, del_cols).head(top_n)
+
+    def _bar_chart(tbl: pd.DataFrame, title: str, color: str) -> None:
+        if tbl is None or tbl.empty:
+            st.info(f"No {title.lower()} data."); return
+        t = tbl.copy()
+        t["Mentions"] = pd.to_numeric(t["Mentions"], errors="coerce").fillna(0)
+        t["Pct"]      = t["Mentions"] / denom * 100
+        x_vals  = t["Pct"][::-1] if show_pct else t["Mentions"][::-1]
+        x_label = "% of reviews" if show_pct else "Mentions"
+        hover   = ("%{customdata}<br>%: %{x:.1f}%<extra></extra>" if show_pct
+                   else "%{customdata}<br>Mentions: %{x:.0f}<extra></extra>")
+        fig = go.Figure(go.Bar(
+            x=x_vals, y=t["Item"][::-1], orientation="h",
+            marker_color=color, opacity=0.80,
+            customdata=t["Item"][::-1].astype(str).tolist(),
+            hovertemplate=hover,
+        ))
+        fig.update_layout(
+            title=title, height=max(300, 28 * len(t) + 80),
+            margin=dict(l=160, r=20, t=46, b=30),
+            xaxis_title=x_label, yaxis_title="",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Inter, sans-serif", color="currentColor"),
+        )
+        fig.update_xaxes(gridcolor="rgba(148,163,184,.15)", zerolinecolor="rgba(148,163,184,.15)")
+        fig.update_yaxes(gridcolor="rgba(148,163,184,.15)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        with st.container(border=True): _bar_chart(det_top, "Top Detractors", "#ef4444")
+    with bc2:
+        with st.container(border=True): _bar_chart(del_top, "Top Delighters", "#22c55e")
+
+    # ── Opportunity Matrix ───────────────────────────────────────────────────
+    st.markdown("<hr class='sw-divider'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>🎯 Opportunity Matrix</div>",
+                unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Mentions vs Avg ★ · Fix high-mention low-star "
+                "detractors first · Amplify high-mention high-star delighters.</div>",
+                unsafe_allow_html=True)
+
+    opp_t1, opp_t2 = st.tabs(["🔴 Detractors", "🟢 Delighters"])
+    with opp_t1: _render_opportunity_scatter(det_tbl, "detractors", avg_star)
+    with opp_t2: _render_opportunity_scatter(del_tbl, "delighters", avg_star)
 
 def _apply_filters(df,*,selected_ratings,incentivized_mode,selected_products,
                    selected_locales,recommendation_mode,syndicated_mode,
@@ -2606,7 +2930,9 @@ def main() -> None:
         "🏷️  Review Prompt",
         "💊  Symptomizer",
     ])
-    with tab1: _render_dashboard(filtered_df)
+    with tab1:
+        _render_dashboard(filtered_df)
+        _render_symptom_dashboard(filtered_df, overall_df)
     with tab2: _render_review_explorer(
         summary=summary,overall_df=overall_df,filtered_df=filtered_df,
         prompt_artifacts=st.session_state.get("prompt_run_artifacts"))
