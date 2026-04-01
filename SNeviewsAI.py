@@ -1411,6 +1411,7 @@ def _render_symptom_dashboard(filtered_df: pd.DataFrame,
             xaxis_title=x_label,
             yaxis_title="",
         )
+        fig.update_layout(margin=dict(l=160, r=20, t=46, b=30))
         _sw_style_fig(fig)
         st.plotly_chart(fig, use_container_width=True)
 
