@@ -89,30 +89,36 @@ st.markdown("""
   --slate-200:#e2e8f0; --slate-100:#f1f5f9; --slate-50:#f8fafc; --white:#ffffff;
   --accent:#6366f1; --accent-bg:rgba(99,102,241,.08);
   --success:#059669; --danger:#dc2626; --warning:#d97706; --info:#2563eb;
-  --border:#e2e8f0;
-  --shadow-xs:0 1px 2px rgba(15,23,42,.05);
-  --shadow-sm:0 1px 4px rgba(15,23,42,.07),0 1px 2px rgba(15,23,42,.04);
-  --shadow-md:0 4px 12px rgba(15,23,42,.09),0 2px 4px rgba(15,23,42,.04);
-  --shadow-lg:0 8px 28px rgba(15,23,42,.12),0 4px 8px rgba(15,23,42,.05);
+  /* Surface hierarchy: page=#eef0f4 → sidebar/cards=white → elevated=white+shadow */
+  --page-bg:#eef0f4;
+  --surface:#ffffff;
+  --border:#dde1e8;
+  --border-strong:#c8cdd6;
+  --shadow-xs:0 1px 2px rgba(15,23,42,.06);
+  --shadow-sm:0 1px 4px rgba(15,23,42,.09),0 1px 2px rgba(15,23,42,.05);
+  --shadow-md:0 4px 12px rgba(15,23,42,.11),0 2px 4px rgba(15,23,42,.06);
+  --shadow-lg:0 8px 28px rgba(15,23,42,.14),0 4px 8px rgba(15,23,42,.07);
   --radius-sm:10px; --radius-md:14px; --radius-lg:18px; --radius-xl:22px;
 }
-html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:var(--navy);background:var(--slate-50);}
+/* Force page bg — Streamlit's backgroundColor in config.toml handles root, this catches inner containers */
+html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:var(--navy);background:var(--page-bg)!important;}
+.main,.block-container,.stMainBlockContainer{background:var(--page-bg)!important;}
 .block-container{padding-top:.9rem!important;padding-bottom:2.5rem!important;max-width:1440px!important;}
 
 /* NAV TABS */
 div[data-testid="stTabs"]>div[role="tablist"]{background:var(--navy)!important;border-radius:var(--radius-xl)!important;padding:5px!important;gap:3px!important;border:none!important;box-shadow:var(--shadow-lg)!important;margin:1.1rem 0 1.4rem!important;}
 button[role="tab"]{background:transparent!important;color:rgba(255,255,255,.50)!important;border:none!important;border-radius:var(--radius-md)!important;font-family:'Inter',sans-serif!important;font-weight:600!important;font-size:13.5px!important;padding:10px 18px!important;letter-spacing:-0.01em!important;transition:all .17s ease!important;flex:1!important;white-space:nowrap!important;min-width:0!important;}
 button[role="tab"]:hover{background:rgba(255,255,255,.09)!important;color:rgba(255,255,255,.88)!important;}
-button[role="tab"][aria-selected="true"]{background:var(--white)!important;color:var(--navy)!important;box-shadow:0 2px 10px rgba(0,0,0,.16)!important;font-weight:700!important;}
+button[role="tab"][aria-selected="true"]{background:var(--surface)!important;color:var(--navy)!important;box-shadow:0 2px 10px rgba(0,0,0,.16)!important;font-weight:700!important;}
 button[role="tab"]::before,button[role="tab"]::after{display:none!important;}
 div[data-testid="stTabsContent"]{padding-top:0!important;border:none!important;}
 
 /* CARDS */
-.hero-card{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-xl);padding:18px 22px;box-shadow:var(--shadow-sm);margin-bottom:.9rem;}
-.metric-card{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px 18px 14px;box-shadow:var(--shadow-xs);min-height:108px;display:flex;flex-direction:column;gap:4px;transition:box-shadow .15s,border-color .15s;}
-.metric-card:hover{box-shadow:var(--shadow-md);border-color:rgba(99,102,241,.25);}
-.metric-card.accent{border-color:rgba(99,102,241,.30);background:linear-gradient(145deg,#eef2ff 0%,var(--white) 100%);}
-.info-card,.report-card{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;box-shadow:var(--shadow-xs);}
+.hero-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:18px 22px;box-shadow:var(--shadow-sm);margin-bottom:.9rem;}
+.metric-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px 18px 14px;box-shadow:var(--shadow-xs);min-height:108px;display:flex;flex-direction:column;gap:4px;transition:box-shadow .15s,border-color .15s;}
+.metric-card:hover{box-shadow:var(--shadow-md);border-color:rgba(99,102,241,.30);}
+.metric-card.accent{border-color:rgba(99,102,241,.35);background:linear-gradient(145deg,#eef2ff 0%,var(--surface) 100%);}
+.info-card,.report-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;box-shadow:var(--shadow-xs);}
 
 /* TYPOGRAPHY */
 .hero-kicker{font-size:10.5px;text-transform:uppercase;letter-spacing:.11em;color:var(--accent);font-weight:700;margin-bottom:3px;}
@@ -138,34 +144,37 @@ div[data-testid="stTabsContent"]{padding-top:0!important;border:none!important;}
 
 /* HERO GRID */
 .hero-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-top:12px;}
-.hero-stat{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-md);padding:13px 15px;box-shadow:var(--shadow-xs);}
-.hero-stat.accent{border-color:rgba(99,102,241,.35);background:linear-gradient(145deg,#eef2ff,var(--white));}
+.hero-stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:13px 15px;box-shadow:var(--shadow-xs);}
+.hero-stat.accent{border-color:rgba(99,102,241,.40);background:linear-gradient(145deg,#eef2ff,var(--surface));}
 .hero-stat .label{color:var(--slate-500);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 .hero-stat .value{font-size:24px;font-weight:800;margin-top:4px;color:var(--navy);letter-spacing:-.035em;}
 
 /* BUTTONS */
-.stButton>button{border-radius:var(--radius-sm)!important;font-weight:600!important;font-size:13.5px!important;height:38px!important;border:1.5px solid var(--border)!important;background:var(--white)!important;color:var(--navy-soft)!important;box-shadow:var(--shadow-xs)!important;transition:all .14s ease!important;letter-spacing:-.01em!important;}
+.stButton>button{border-radius:var(--radius-sm)!important;font-weight:600!important;font-size:13.5px!important;height:38px!important;border:1.5px solid var(--border-strong)!important;background:var(--surface)!important;color:var(--navy-soft)!important;box-shadow:var(--shadow-xs)!important;transition:all .14s ease!important;letter-spacing:-.01em!important;}
 .stButton>button:hover{border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(99,102,241,.13)!important;color:var(--accent)!important;}
-[data-testid="baseButton-primary"],[data-testid="baseButton-primary"]:hover{background:var(--navy)!important;color:var(--white)!important;border-color:var(--navy)!important;}
+[data-testid="baseButton-primary"],[data-testid="baseButton-primary"]:hover{background:var(--navy)!important;color:var(--surface)!important;border-color:var(--navy)!important;}
 [data-testid="baseButton-primary"]:hover{background:var(--navy-mid)!important;border-color:var(--navy-mid)!important;box-shadow:0 0 0 3px rgba(15,23,42,.14)!important;}
 
 /* FORMS */
-[data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea,[data-testid="stNumberInput"] input{border-radius:var(--radius-sm)!important;border-color:var(--border)!important;font-family:'Inter',sans-serif!important;font-size:13.5px!important;}
+[data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea,[data-testid="stNumberInput"] input{border-radius:var(--radius-sm)!important;border-color:var(--border-strong)!important;background:var(--surface)!important;font-family:'Inter',sans-serif!important;font-size:13.5px!important;}
 [data-testid="stTextInput"] input:focus,[data-testid="stTextArea"] textarea:focus{border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(99,102,241,.12)!important;}
-[data-testid="stSelectbox"]>div>div,[data-testid="stMultiselect"]>div>div{border-radius:var(--radius-sm)!important;border-color:var(--border)!important;}
+[data-testid="stSelectbox"]>div>div,[data-testid="stMultiselect"]>div>div{border-radius:var(--radius-sm)!important;border-color:var(--border-strong)!important;background:var(--surface)!important;}
 
 /* MISC */
-[data-testid="stContainer"][data-border="true"]{border-radius:var(--radius-lg)!important;border-color:var(--border)!important;}
-[data-testid="stExpander"]{border-radius:var(--radius-md)!important;border-color:var(--border)!important;background:var(--white)!important;}
+[data-testid="stContainer"][data-border="true"]{border-radius:var(--radius-lg)!important;border-color:var(--border)!important;background:var(--surface)!important;}
+[data-testid="stExpander"]{border-radius:var(--radius-md)!important;border-color:var(--border)!important;background:var(--surface)!important;}
 [data-testid="stProgressBar"]>div>div{background:var(--accent)!important;border-radius:999px!important;}
-[data-testid="stMetric"]{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-md);padding:14px 16px;box-shadow:var(--shadow-xs);}
+[data-testid="stMetric"]{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:14px 16px;box-shadow:var(--shadow-xs);}
 [data-testid="stDataFrame"]{border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--border);}
-[data-testid="stSidebar"]{background:var(--white)!important;border-right:1px solid var(--border)!important;}
+/* Sidebar: slightly tinted so it reads as a distinct panel */
+[data-testid="stSidebar"]{background:#f5f7fb!important;border-right:1px solid var(--border)!important;}
 [data-testid="stSidebar"] .stButton>button{width:100%;}
+/* Tabs selected: white pill on dark nav bar — keep high contrast */
+button[role="tab"][aria-selected="true"]{background:var(--surface)!important;color:var(--navy)!important;box-shadow:0 2px 10px rgba(0,0,0,.16)!important;font-weight:700!important;}
 
 /* MISC BOXES */
 .run-plan{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
-.kv{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;}
+.kv{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;}
 .kv .k{color:var(--slate-500);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;font-weight:600;}
 .kv .v{font-size:20px;font-weight:800;margin-top:2px;color:var(--navy);letter-spacing:-.03em;}
 .danger-box{background:#fff1f2;border:1px solid #fca5a5;border-radius:var(--radius-md);padding:12px 14px;color:#991b1b;font-size:13px;}
@@ -201,7 +210,7 @@ mark.hl{background:#fef08a;padding:0 .16em;border-radius:.25em;}
 .compact-pager-sub{font-size:11px;font-weight:400;color:var(--slate-400);margin-top:1px;}
 
 /* ─── SYMPTOM STATE BANNER (was missing) ────────────────────────────────── */
-.sym-state-banner{background:var(--white);border:1px dashed var(--border);border-radius:var(--radius-xl);padding:2rem;text-align:center;margin:1rem 0;}
+.sym-state-banner{background:var(--surface);border:1px dashed var(--border-strong);border-radius:var(--radius-xl);padding:2rem;text-align:center;margin:1rem 0;}
 .sym-state-banner .icon{font-size:2.4rem;margin-bottom:.6rem;}
 .sym-state-banner .title{font-size:15px;font-weight:800;color:var(--navy);margin-bottom:.4rem;}
 .sym-state-banner .sub{font-size:13px;color:var(--slate-500);line-height:1.55;max-width:540px;margin:0 auto;}
@@ -215,7 +224,7 @@ mark.hl{background:#fef08a;padding:0 .16em;border-radius:.25em;}
 .cohort-bar{height:8px;border-radius:4px;display:inline-block;vertical-align:middle;}
 
 /* STATUS BAR */
-.ws-status-bar{display:flex;align-items:center;justify-content:space-between;background:var(--white);border:1px solid var(--border);border-radius:var(--radius-lg);padding:10px 16px;margin-bottom:.5rem;box-shadow:var(--shadow-xs);font-size:13px;gap:12px;flex-wrap:wrap;}
+.ws-status-bar{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:10px 16px;margin-bottom:.5rem;box-shadow:var(--shadow-xs);font-size:13px;gap:12px;flex-wrap:wrap;}
 .ws-status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block;margin-right:6px;box-shadow:0 0 0 3px rgba(5,150,105,.18);}
 .ws-filter-pill{background:var(--slate-100);border:1px solid var(--border);border-radius:999px;padding:3px 10px;font-size:11.5px;font-weight:600;color:var(--slate-600);}
 
@@ -228,7 +237,7 @@ mark.hl{background:#fef08a;padding:0 .16em;border-radius:.25em;}
 
 /* THINKING OVERLAY */
 .thinking-overlay{position:fixed;inset:0;background:rgba(15,23,42,.38);display:flex;align-items:center;justify-content:center;z-index:99999;}
-.thinking-card{width:min(400px,92vw);background:var(--white);border:1px solid var(--border);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);padding:1.6rem;text-align:center;}
+.thinking-card{width:min(400px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);padding:1.6rem;text-align:center;}
 .thinking-spinner{width:40px;height:40px;border:3px solid var(--slate-100);border-top-color:var(--navy);border-radius:50%;margin:0 auto 1rem;animation:tw-spin .8s linear infinite;}
 .thinking-title{color:var(--navy);font-weight:800;font-size:1.05rem;margin-bottom:.25rem;letter-spacing:-.02em;}
 .thinking-sub{color:var(--slate-500);font-size:.92rem;line-height:1.4;}
@@ -1967,7 +1976,7 @@ def _render_dashboard(filtered_df):
                 hover_data={"share":":.1%","review_count":True})
             fig.update_traces(textposition="outside",cliponaxis=False,showlegend=False)
             fig.update_layout(margin=dict(l=24,r=24,t=52,b=20),xaxis_title="",yaxis_title="",
-                plot_bgcolor="white",paper_bgcolor="white",font_family="Inter")
+                plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter")
             st.plotly_chart(fig,use_container_width=True)
     with c2:
         with st.container(border=True):
@@ -1984,7 +1993,7 @@ def _render_dashboard(filtered_df):
                     marker=dict(size=5)),secondary_y=True)
                 fig2.update_layout(title="Review volume + 3-month rolling avg",
                     margin=dict(l=24,r=24,t=52,b=20),hovermode="x unified",
-                    plot_bgcolor="white",paper_bgcolor="white",font_family="Inter",
+                    plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
                     legend=dict(orientation="h",y=1.08,x=0))
                 fig2.update_xaxes(title_text="",showgrid=False)
                 fig2.update_yaxes(title_text="Reviews",secondary_y=False,showgrid=True,gridcolor="#f1f5f9")
@@ -1999,7 +2008,7 @@ def _render_dashboard(filtered_df):
                 hover_data={"mention_count":True,"low_star_mentions":True,"high_star_mentions":True},
                 title="Theme mention rate — colored by avg rating when mentioned")
             fig3.update_layout(margin=dict(l=24,r=24,t=52,b=20),xaxis_tickformat=".0%",yaxis_title="",
-                plot_bgcolor="white",paper_bgcolor="white",font_family="Inter")
+                plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter")
             st.plotly_chart(fig3,use_container_width=True)
 
     # ── Row 3: NEW — Cohort analysis + Star-band trend ────────────────────────
@@ -2019,7 +2028,7 @@ def _render_dashboard(filtered_df):
                     color_discrete_map={"Organic":"#6366f1","Incentivized":"#f59e0b"})
                 fig_c.update_layout(xaxis=dict(tickmode="array",tickvals=[1,2,3,4,5],
                     ticktext=["1★","2★","3★","4★","5★"]),
-                    plot_bgcolor="white",paper_bgcolor="white",font_family="Inter",
+                    plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
                     margin=dict(l=24,r=24,t=52,b=20),
                     legend=dict(orientation="h",y=1.08,x=0))
                 fig_c.update_yaxes(ticksuffix="%")
@@ -2037,7 +2046,7 @@ def _render_dashboard(filtered_df):
                     name="% 4-5★",mode="lines+markers",line=dict(color="#22c55e",width=2),
                     marker=dict(size=4)))
                 fig_sb.update_layout(title="Sentiment drift: 1-2★ vs 4-5★ over time",
-                    hovermode="x unified",plot_bgcolor="white",paper_bgcolor="white",
+                    hovermode="x unified",plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",
                     font_family="Inter",margin=dict(l=24,r=24,t=52,b=20),
                     legend=dict(orientation="h",y=1.08,x=0))
                 fig_sb.update_yaxes(ticksuffix="%",title="% of monthly reviews")
@@ -2067,7 +2076,7 @@ def _render_dashboard(filtered_df):
                     text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
                 fig_loc.update_layout(title="Top markets by review volume",height=max(280,28*len(locale_df)+80),
                     margin=dict(l=80,r=60,t=52,b=20),barmode="overlay",
-                    plot_bgcolor="white",paper_bgcolor="white",font_family="Inter",
+                    plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
                     xaxis_title="Reviews",yaxis_title="",
                     legend=dict(orientation="h",y=1.08,x=0))
                 st.plotly_chart(fig_loc,use_container_width=True)
@@ -2087,7 +2096,7 @@ def _render_dashboard(filtered_df):
                     customdata=len_df["count"]))
                 fig_len.update_layout(title="Review depth vs satisfaction",
                     yaxis_range=[1,5.2],yaxis_title="Avg ★",xaxis_title="",
-                    plot_bgcolor="white",paper_bgcolor="white",font_family="Inter",
+                    plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
                     margin=dict(l=24,r=24,t=52,b=20))
                 st.plotly_chart(fig_len,use_container_width=True)
             # Top reviewer locations
@@ -2305,7 +2314,7 @@ def _render_review_prompt_tab(*,settings,overall_df,filtered_df,summary,filter_d
             else:
                 fig=px.pie(ps,names="label",values="review_count",hole=0.44,
                     color_discrete_sequence=["#6366f1","#10b981","#f59e0b","#ef4444","#3b82f6","#8b5cf6"])
-                fig.update_layout(margin=dict(l=20,r=20,t=20,b=20),paper_bgcolor="white",font_family="Inter")
+                fig.update_layout(margin=dict(l=20,r=20,t=20,b=20),paper_bgcolor="rgba(0,0,0,0)",font_family="Inter")
                 st.plotly_chart(fig,use_container_width=True)
     with tc_col:
         with st.container(border=True):
@@ -2598,7 +2607,7 @@ def main():
     settings=_render_sidebar(dataset["reviews_df"] if dataset else None)
 
     if not dataset:
-        st.markdown("""<div style="margin-top:2rem;padding:2rem;background:white;border:1px solid #e2e8f0;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.07);">
+        st.markdown("""<div style="margin-top:2rem;padding:2rem;background:var(--surface,#fff);border:1px solid #dde1e8;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.08);">
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:.4rem;">No workspace loaded</div>
           <div style="font-size:13px;color:#64748b;">Enter a SharkNinja product URL or upload a review export above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.</div>
