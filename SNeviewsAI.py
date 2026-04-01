@@ -1,4 +1,4 @@
-```python
+
 """
 SharkNinja Review Analyst + Symptomizer — Improved
 ===================================================
