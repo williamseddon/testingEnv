@@ -274,18 +274,6 @@ AI_CONTEXT_TOKEN_BUDGET = 14_000
 
 NON_VALUES = {"<NA>","NA","N/A","NONE","-","","NAN","NULL"}
 
-THEME_KEYWORDS: Dict[str,List[str]] = {
-    "Cooking performance":      ["crispy","cook","cooking","air fry","bake","broil","reheat","dehydrate","temperature","preheat","evenly","juicy","frozen"],
-    "Ease of use":              ["easy","simple","intuitive","buttons","controls","instructions","setup","user friendly","learning curve"],
-    "Capacity and footprint":   ["size","capacity","counter","countertop","space","basket","tray","fits","large","small","compact"],
-    "Cleaning and maintenance": ["clean","cleanup","dishwasher","wash","mess","grease","sticky","scrub"],
-    "Build quality":            ["broke","broken","durable","quality","plastic","flimsy","stopped working","defect","replacement","warranty"],
-    "Noise, odor, and heat":    ["noise","noisy","loud","odor","smell","hot","heat","steam","fan"],
-    "Design and aesthetics":    ["design","looks","sleek","beautiful","style","appearance","color"],
-    "Value and price":          ["price","worth","value","expensive","cost","money","deal"],
-    "Service and shipping":     ["shipping","delivery","customer service","support","return","replacement","arrived","damaged","missing"],
-}
-
 STOPWORDS = {
     "a","about","after","again","all","also","am","an","and","any","are","as","at",
     "be","because","been","before","being","best","better","but","by","can","could",
@@ -860,27 +848,6 @@ def _monthly_trend(df):
     try: return _monthly_trend_cached(_df_cache_key(df))
     except: return pd.DataFrame(columns=["submission_month","review_count","avg_rating","month_start"])
 
-@st.cache_data(show_spinner=False,ttl=300)
-def _compute_themes_cached(df_json):
-    df=pd.read_json(io.StringIO(df_json),orient="split")
-    if df.empty:
-        return pd.DataFrame(columns=["theme","mention_count","mention_rate",
-                                      "avg_rating_when_mentioned","low_star_mentions","high_star_mentions"])
-    texts=df["title_and_text"].fillna("").astype(str).map(_norm_text)
-    rows=[]
-    for theme,keywords in THEME_KEYWORDS.items():
-        mask=texts.map(lambda t:any(kw in t for kw in keywords))
-        sub=df[mask]
-        rows.append(dict(theme=theme,mention_count=int(mask.sum()),
-            mention_rate=_safe_pct(int(mask.sum()),len(df)),
-            avg_rating_when_mentioned=_safe_mean(sub["rating"]),
-            low_star_mentions=int(sub["rating"].isin([1,2]).sum()),
-            high_star_mentions=int(sub["rating"].isin([4,5]).sum())))
-    return pd.DataFrame(rows).sort_values(["mention_count","low_star_mentions"],ascending=[False,False])
-
-def _compute_themes(df):
-    try: return _compute_themes_cached(_df_cache_key(df))
-    except: return pd.DataFrame()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  NEW: COHORT + MARKET ANALYTICS  (richer dashboard)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1636,18 +1603,21 @@ def _ai_build_symptom_list(*,client,product_description,sample_reviews):
         Return STRICT JSON (no markdown, no extra keys):
         {"delighters":[{"label":"<2-4 words Title Case>","rationale":"<10-15 words>"}],
          "detractors":[{"label":"<2-4 words Title Case>","rationale":"<10-15 words>"}]}
-        Rules: 8-12 delighters and 8-12 detractors. Mutually exclusive, reusable noun phrases.
-        Cover: performance, ease of use, value, reliability, design, safety, cleaning.
-        Base the catalog on the sample reviews — prioritise frequently appearing themes.
+        Rules: Generate AS MANY as are genuinely supported by the reviews — do not cap.
+        Aim for thorough coverage: typically 10-25 delighters and 10-25 detractors.
+        Mutually exclusive, reusable noun phrases. Cover all recurring themes you observe.
+        Include: performance, ease of use, value, reliability, design, safety, cleaning,
+        noise, size/capacity, accessories, setup, connectivity, battery, results quality.
+        Base the catalog on the sample reviews — capture every frequently appearing theme.
     """).strip()
-    payload=dict(product_description=product_description,sample_reviews=sample_reviews[:25])
+    payload=dict(product_description=product_description,sample_reviews=sample_reviews[:30])
     result_text=_chat_complete(client,model=_shared_model(),
         messages=[{"role":"system","content":sys},{"role":"user","content":json.dumps(payload)}],
-        temperature=0.0,response_format={"type":"json_object"},max_tokens=1400)
+        temperature=0.0,response_format={"type":"json_object"},max_tokens=3000)
     data=_safe_json_load(result_text)
     return dict(
-        delighters=[str(o.get("label","")).strip() for o in (data.get("delighters") or []) if str(o.get("label","")).strip()][:15],
-        detractors=[str(o.get("label","")).strip() for o in (data.get("detractors") or []) if str(o.get("label","")).strip()][:15])
+        delighters=[str(o.get("label","")).strip() for o in (data.get("delighters") or []) if str(o.get("label","")).strip()],
+        detractors=[str(o.get("label","")).strip() for o in (data.get("detractors") or []) if str(o.get("label","")).strip()])
 
 def _gen_symptomized_workbook(original_bytes,updated_df):
     wb=load_workbook(io.BytesIO(original_bytes))
@@ -1920,14 +1890,14 @@ def _render_review_card(row,evidence_items=None):
     meta_bits=[b for b in [_safe_text(row.get("submission_date")),_safe_text(row.get("content_locale")),
                             _safe_text(row.get("retailer")),_safe_text(row.get("product_or_sku"))] if b]
     is_organic=not _safe_bool(row.get("incentivized_review"),False)
-    chips_html=f"<span class='chip {'green' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
+    # Status chips only (organic/incentivized + recommended)
+    status_chips=f"<span class='chip {'green' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
     rec=row.get("is_recommended")
     if not _is_missing(rec):
-        chips_html+=f"<span class='chip {'green' if _safe_bool(rec,False) else 'red'}'>{'Recommended' if _safe_bool(rec,False) else 'Not recommended'}</span>"
+        status_chips+=f"<span class='chip {'green' if _safe_bool(rec,False) else 'red'}'>{'Recommended' if _safe_bool(rec,False) else 'Not recommended'}</span>"
+    # Symptom chips — kept separate from status
     det_tags=[str(row.get(f"AI Symptom Detractor {j}","")) for j in range(1,11) if _is_filled(row.get(f"AI Symptom Detractor {j}"))]
     del_tags=[str(row.get(f"AI Symptom Delighter {j}","")) for j in range(1,11) if _is_filled(row.get(f"AI Symptom Delighter {j}"))]
-    for t in det_tags: chips_html+=f"<span class='chip red'>{_esc(t)}</span>"
-    for t in del_tags: chips_html+=f"<span class='chip green'>{_esc(t)}</span>"
     with st.container(border=True):
         top_cols=st.columns([5,1.5])
         with top_cols[0]:
@@ -1936,21 +1906,52 @@ def _render_review_card(row,evidence_items=None):
             if meta_bits:
                 st.markdown(f"<div style='font-size:12px;color:var(--slate-400);margin-bottom:4px;'>{' · '.join(_esc(b) for b in meta_bits)}</div>",unsafe_allow_html=True)
         with top_cols[1]:
-            st.markdown(f"<div class='chip-wrap' style='justify-content:flex-end;gap:4px;flex-wrap:wrap;padding-top:2px;'>{chips_html}</div>",unsafe_allow_html=True)
+            st.markdown(f"<div class='chip-wrap' style='justify-content:flex-end;gap:4px;flex-wrap:wrap;padding-top:2px;'>{status_chips}</div>",unsafe_allow_html=True)
+        # Review body
         if evidence_items:
             st.markdown(_highlight_evidence(review_text,evidence_items),unsafe_allow_html=True)
             st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
         else:
             st.markdown(f"<div class='review-body'>{html.escape(review_text)}</div>",unsafe_allow_html=True)
+        # Dedicated symptom rows — visually separated from status chips
+        if det_tags or del_tags:
+            sym_html="<div style='margin-top:9px;padding-top:9px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;'>"
+            if det_tags:
+                det_chips="".join(f"<span class='chip red' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in det_tags)
+                sym_html+=f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--danger);font-weight:700;white-space:nowrap;padding-top:3px;'>Issues</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{det_chips}</div></div>"
+            if del_tags:
+                del_chips="".join(f"<span class='chip green' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in del_tags)
+                sym_html+=f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--success);font-weight:700;white-space:nowrap;padding-top:3px;'>Strengths</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{del_chips}</div></div>"
+            sym_html+="</div>"
+            st.markdown(sym_html,unsafe_allow_html=True)
         footer=[b for b in [f"ID {_safe_text(row.get('review_id'))}",_safe_text(row.get("user_location"))] if b]
         if footer:
-            st.markdown(f"<div style='font-size:11.5px;color:var(--slate-400);margin-top:4px;'>{' · '.join(_esc(b) for b in footer)}</div>",unsafe_allow_html=True)
+            st.markdown(f"<div style='font-size:11.5px;color:var(--slate-400);margin-top:6px;'>{' · '.join(_esc(b) for b in footer)}</div>",unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TAB: DASHBOARD  (with new cohort + market analytics)
+#  TAB: DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
-def _render_dashboard(filtered_df):
+def _render_dashboard(filtered_df,overall_df=None):
+    od=overall_df if overall_df is not None else filtered_df
     st.markdown("<div class='section-title'>Dashboard</div>",unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Rating mix, volume trend, theme signals, and cohort analytics for the current filter set.</div>",unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Rating mix, volume trend, and cohort analytics for the current filter set.</div>",unsafe_allow_html=True)
+
+    # ── Symptom state banner — always at the top ─────────────────────────────
+    sym_state=_detect_symptom_state(od)
+    if sym_state=="none":
+        bc1,bc2=st.columns([4,1])
+        with bc1:
+            st.markdown("""<div class="sym-state-banner" style="padding:1rem 1.4rem;text-align:left;display:flex;align-items:center;gap:14px;margin-bottom:0;">
+              <div style="font-size:1.8rem;flex-shrink:0;">💊</div>
+              <div>
+                <div class="title" style="margin-bottom:2px;">No symptoms tagged yet</div>
+                <div class="sub" style="max-width:none;font-size:12.5px;">Run the Symptomizer to AI-tag delighters &amp; detractors — they'll surface here once complete.</div>
+              </div>
+            </div>""",unsafe_allow_html=True)
+        with bc2:
+            st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
+            if st.button("💊 Symptomizer →",type="primary",use_container_width=True,key="dash_go_sym"):
+                st.session_state["_nav_to_symptomizer"]=True; st.rerun()
+    st.markdown("<div style='height:.9rem'></div>",unsafe_allow_html=True)
 
     scope=st.radio("Scope",["All matching reviews","Organic only"],horizontal=True,key="dashboard_scope")
     chart_df=filtered_df.copy()
@@ -1959,13 +1960,12 @@ def _render_dashboard(filtered_df):
     if chart_df.empty: st.info("No reviews match the current scope."); return
 
     rating_df=_rating_dist(chart_df)
-    monthly_df=_monthly_trend(chart_df)
-    theme_df=_compute_themes(chart_df)
     rating_df["rating_label"]=rating_df["rating"].map(lambda v:f"{int(v)}★")
     rating_df["count_pct_label"]=rating_df.apply(lambda r:f"{int(r['review_count']):,} · {_fmt_pct(r['share'])}",axis=1)
 
-    # ── Row 1: Rating dist + Volume trend ───────────────────────────────────
-    c1,c2=st.columns([1.05,1.15])
+    # ── Row 1: Rating distribution + Organic vs Incentivized cohort ──────────
+    st.markdown("<div style='height:.5rem'></div>",unsafe_allow_html=True)
+    c1,c2=st.columns(2)
     with c1:
         with st.container(border=True):
             fig=px.bar(rating_df,x="rating_label",y="review_count",text="count_pct_label",
@@ -1978,60 +1978,48 @@ def _render_dashboard(filtered_df):
             st.plotly_chart(fig,use_container_width=True)
     with c2:
         with st.container(border=True):
-            vel_df=_rolling_velocity(chart_df)
-            if vel_df.empty: st.info("No dated reviews for volume chart.")
-            else:
-                fig2=make_subplots(specs=[[{"secondary_y":True}]])
-                fig2.add_trace(go.Bar(x=vel_df["month_start"],y=vel_df["review_count"],name="Volume",
-                    marker_color="#6366f1",opacity=.45),secondary_y=False)
-                fig2.add_trace(go.Scatter(x=vel_df["month_start"],y=vel_df["rolling_avg"],
-                    name=f"3-mo avg",mode="lines",line=dict(color="#6366f1",width=2,dash="dot")),secondary_y=False)
-                fig2.add_trace(go.Scatter(x=vel_df["month_start"],y=vel_df["avg_rating"],
-                    name="Avg ★",mode="lines+markers",line=dict(color="#0f172a",width=2),
-                    marker=dict(size=5)),secondary_y=True)
-                fig2.update_layout(title="Review volume + 3-month rolling avg",
-                    margin=dict(l=24,r=24,t=52,b=20),hovermode="x unified",
-                    plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
-                    legend=dict(orientation="h",y=1.08,x=0))
-                fig2.update_xaxes(title_text="",showgrid=False)
-                fig2.update_yaxes(title_text="Reviews",secondary_y=False,showgrid=True,gridcolor="#f1f5f9")
-                fig2.update_yaxes(title_text="Avg ★",range=[1,5],secondary_y=True,showgrid=False)
-                st.plotly_chart(fig2,use_container_width=True)
-
-    # ── Row 2: Theme heatmap ─────────────────────────────────────────────────
-    with st.container(border=True):
-        if not theme_df.empty:
-            fig3=px.bar(theme_df.head(9),x="mention_rate",y="theme",orientation="h",
-                color="avg_rating_when_mentioned",color_continuous_scale="RdYlGn",range_color=[1,5],
-                hover_data={"mention_count":True,"low_star_mentions":True,"high_star_mentions":True},
-                title="Theme mention rate — colored by avg rating when mentioned")
-            fig3.update_layout(margin=dict(l=24,r=24,t=52,b=20),xaxis_tickformat=".0%",yaxis_title="",
-                plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter")
-            st.plotly_chart(fig3,use_container_width=True)
-
-    # ── Row 3: NEW — Cohort analysis + Star-band trend ────────────────────────
-    st.markdown("<hr class='sw-divider'>",unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>📊 Cohort & Sentiment Analysis</div>",unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Organic vs incentivized rating split · Sentiment drift over time</div>",unsafe_allow_html=True)
-
-    ca1,ca2=st.columns(2)
-    with ca1:
-        with st.container(border=True):
             cohort_df=_cohort_by_incentivized(chart_df)
             if cohort_df.empty: st.info("No cohort data.")
             else:
                 fig_c=px.bar(cohort_df,x="star",y="pct",color="cohort",barmode="group",
-                    title="Rating distribution: Organic vs Incentivized",
+                    title="Rating split: Organic vs Incentivized",
                     labels={"star":"Star","pct":"% of cohort","cohort":"Cohort"},
                     color_discrete_map={"Organic":"#6366f1","Incentivized":"#f59e0b"})
                 fig_c.update_layout(xaxis=dict(tickmode="array",tickvals=[1,2,3,4,5],
                     ticktext=["1★","2★","3★","4★","5★"]),
                     plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
-                    margin=dict(l=24,r=24,t=52,b=20),
-                    legend=dict(orientation="h",y=1.08,x=0))
+                    margin=dict(l=24,r=24,t=52,b=20),legend=dict(orientation="h",y=1.08,x=0))
                 fig_c.update_yaxes(ticksuffix="%")
                 st.plotly_chart(fig_c,use_container_width=True)
-    with ca2:
+
+    # ── Row 2: Volume + Rolling Avg — FULL WIDTH ─────────────────────────────
+    st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
+    with st.container(border=True):
+        vel_df=_rolling_velocity(chart_df)
+        if vel_df.empty: st.info("No dated reviews for volume chart.")
+        else:
+            fig2=make_subplots(specs=[[{"secondary_y":True}]])
+            fig2.add_trace(go.Bar(x=vel_df["month_start"],y=vel_df["review_count"],name="Volume",
+                marker_color="#6366f1",opacity=.45),secondary_y=False)
+            fig2.add_trace(go.Scatter(x=vel_df["month_start"],y=vel_df["rolling_avg"],
+                name="3-mo avg",mode="lines",line=dict(color="#6366f1",width=2,dash="dot")),secondary_y=False)
+            fig2.add_trace(go.Scatter(x=vel_df["month_start"],y=vel_df["avg_rating"],
+                name="Avg ★",mode="lines+markers",line=dict(color="#0f172a",width=2),
+                marker=dict(size=5)),secondary_y=True)
+            fig2.update_layout(title="Review volume + 3-month rolling average",
+                margin=dict(l=24,r=24,t=52,b=20),hovermode="x unified",
+                plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
+                legend=dict(orientation="h",y=1.04,x=0))
+            fig2.update_xaxes(title_text="",showgrid=False)
+            fig2.update_yaxes(title_text="Reviews",secondary_y=False,showgrid=True,gridcolor="rgba(148,163,184,0.15)")
+            fig2.update_yaxes(title_text="Avg ★",range=[1,5],secondary_y=True,showgrid=False)
+            st.plotly_chart(fig2,use_container_width=True)
+
+    # ── Row 3: Sentiment drift + Market breakdown ─────────────────────────────
+    st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
+    st.markdown("<div class='section-title' style='font-size:15px;'>📊 Sentiment & Market</div>",unsafe_allow_html=True)
+    sa1,sa2=st.columns(2)
+    with sa1:
         with st.container(border=True):
             sb_df=_star_band_trend(chart_df)
             if sb_df.empty: st.info("Insufficient date data for sentiment trend.")
@@ -2049,36 +2037,32 @@ def _render_dashboard(filtered_df):
                     legend=dict(orientation="h",y=1.08,x=0))
                 fig_sb.update_yaxes(ticksuffix="%",title="% of monthly reviews")
                 st.plotly_chart(fig_sb,use_container_width=True)
-
-    # ── Row 4: NEW — Market breakdown + Review length vs rating ──────────────
-    st.markdown("<hr class='sw-divider'>",unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>🌍 Market & Engagement Breakdown</div>",unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Top markets by volume · Review depth vs satisfaction signal</div>",unsafe_allow_html=True)
-
-    mb1,mb2=st.columns([1.3,1])
-    with mb1:
+    with sa2:
         with st.container(border=True):
-            locale_df=_locale_breakdown(chart_df,top_n=12)
+            locale_df=_locale_breakdown(chart_df,top_n=10)
             if locale_df.empty: st.info("No locale data.")
             else:
                 fig_loc=go.Figure()
                 fig_loc.add_trace(go.Bar(x=locale_df["count"],y=locale_df["content_locale"],
                     orientation="h",name="Reviews",marker_color="#6366f1",opacity=0.75,
                     hovertemplate="%{y}<br>%{x:,} reviews<extra></extra>"))
-                # Overlay avg rating as dot
                 fig_loc.add_trace(go.Scatter(x=locale_df["avg_rating"]*locale_df["count"].max()/5,
                     y=locale_df["content_locale"],mode="markers",name="Avg ★ (scaled)",
                     marker=dict(color=locale_df["avg_rating"],colorscale="RdYlGn",cmin=1,cmax=5,
-                                size=10,showscale=True,colorbar=dict(title="Avg ★",len=0.6,x=1.02)),
+                                size=9,showscale=True,colorbar=dict(title="Avg ★",len=0.6,x=1.02)),
                     hovertemplate="%{y}<br>Avg ★: %{text}<extra></extra>",
                     text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
-                fig_loc.update_layout(title="Top markets by review volume",height=max(280,28*len(locale_df)+80),
+                fig_loc.update_layout(title="Top markets by review volume",
+                    height=max(260,26*len(locale_df)+80),
                     margin=dict(l=80,r=60,t=52,b=20),barmode="overlay",
                     plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
-                    xaxis_title="Reviews",yaxis_title="",
-                    legend=dict(orientation="h",y=1.08,x=0))
+                    xaxis_title="Reviews",yaxis_title="",legend=dict(orientation="h",y=1.08,x=0))
                 st.plotly_chart(fig_loc,use_container_width=True)
-    with mb2:
+
+    # ── Row 4: Review depth + Top locations ───────────────────────────────────
+    st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
+    rd1,rd2=st.columns([1.3,1])
+    with rd1:
         with st.container(border=True):
             len_df=_review_length_cohort(chart_df)
             if len_df.empty: st.info("Insufficient data for review-length analysis.")
@@ -2097,14 +2081,16 @@ def _render_dashboard(filtered_df):
                     plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)",font_family="Inter",
                     margin=dict(l=24,r=24,t=52,b=20))
                 st.plotly_chart(fig_len,use_container_width=True)
-            # Top reviewer locations
-            locs=_top_locations(chart_df,top_n=8)
-            if not locs.empty:
-                st.markdown("**Top reviewer locations**")
+    with rd2:
+        with st.container(border=True):
+            locs=_top_locations(chart_df,top_n=10)
+            if locs.empty: st.info("No reviewer location data.")
+            else:
+                st.markdown("<div style='font-weight:700;font-size:13.5px;color:var(--navy);margin-bottom:8px;'>Top reviewer locations</div>",unsafe_allow_html=True)
                 locs_display=locs.copy()
                 locs_display["avg_rating"]=locs_display["avg_rating"].map(lambda v:f"{v:.2f}★" if pd.notna(v) else "—")
                 locs_display=locs_display.rename(columns={"user_location":"Location","count":"Reviews","avg_rating":"Avg ★"})
-                st.dataframe(locs_display[["Location","Reviews","Avg ★"]],use_container_width=True,hide_index=True,height=200)
+                st.dataframe(locs_display[["Location","Reviews","Avg ★"]],use_container_width=True,hide_index=True,height=280)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: REVIEW EXPLORER
@@ -2346,30 +2332,8 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
             (f"✓ {len(detractors)} detractors","red"),(f"Source: {sym_source}","indigo")]),unsafe_allow_html=True)
         st.markdown("")
 
-    sym_tabs=st.tabs(["📄  Upload workbook","✏️  Manual entry","🤖  AI builder"])
+    sym_tabs=st.tabs(["🤖  AI builder","✏️  Manual entry","📄  Upload workbook"])
     with sym_tabs[0]:
-        st.markdown("Upload an Excel workbook with a **Symptoms** sheet: columns Symptom, Type (Delighter/Detractor), optional Aliases.")
-        sym_upload=st.file_uploader("Upload workbook",type=["xlsx"],key="sym_file_uploader")
-        if sym_upload:
-            raw=sym_upload.getvalue(); st.session_state["_uploaded_raw_bytes"]=raw
-            d,t,a=_get_symptom_whitelists(raw)
-            if d or t:
-                st.session_state.update(sym_delighters=d,sym_detractors=t,sym_aliases=a,sym_symptoms_source="file")
-                st.success(f"Loaded {len(d)} delighters and {len(t)} detractors."); st.rerun()
-            else: st.error("No 'Symptoms' sheet found or it was empty.")
-    with sym_tabs[1]:
-        c1,c2=st.columns(2)
-        with c1:
-            st.markdown("🟢 **Delighters**")
-            del_text=st.text_area("One per line or comma-separated",value="\n".join(delighters),height=200,key="sym_del_manual")
-        with c2:
-            st.markdown("🔴 **Detractors**")
-            det_text=st.text_area("One per line or comma-separated",value="\n".join(detractors),height=200,key="sym_det_manual")
-        if st.button("💾 Save symptoms",use_container_width=True,key="sym_save_manual"):
-            def _parse(t): return [i.strip() for i in re.split(r"[\n,;|]+",t) if i.strip()]
-            st.session_state.update(sym_delighters=_parse(del_text),sym_detractors=_parse(det_text),sym_symptoms_source="manual")
-            st.success(f"Saved."); st.rerun()
-    with sym_tabs[2]:
         if not api_key: st.warning("OpenAI API key required.")
         else:
             pdesc=st.text_area("Product description",value=st.session_state.get("sym_product_profile",""),
@@ -2403,6 +2367,28 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
                     st.session_state.update(sym_delighters=_parse(ai_del),sym_detractors=_parse(ai_det),sym_symptoms_source="ai")
                     st.session_state.pop("sym_ai_build_result",None)
                     st.success(f"Accepted."); st.rerun()
+    with sym_tabs[1]:
+        c1,c2=st.columns(2)
+        with c1:
+            st.markdown("🟢 **Delighters**")
+            del_text=st.text_area("One per line or comma-separated",value="\n".join(delighters),height=200,key="sym_del_manual")
+        with c2:
+            st.markdown("🔴 **Detractors**")
+            det_text=st.text_area("One per line or comma-separated",value="\n".join(detractors),height=200,key="sym_det_manual")
+        if st.button("💾 Save symptoms",use_container_width=True,key="sym_save_manual"):
+            def _parse(t): return [i.strip() for i in re.split(r"[\n,;|]+",t) if i.strip()]
+            st.session_state.update(sym_delighters=_parse(del_text),sym_detractors=_parse(det_text),sym_symptoms_source="manual")
+            st.success(f"Saved."); st.rerun()
+    with sym_tabs[2]:
+        st.markdown("Upload an Excel workbook with a **Symptoms** sheet: columns Symptom, Type (Delighter/Detractor), optional Aliases.")
+        sym_upload=st.file_uploader("Upload workbook",type=["xlsx"],key="sym_file_uploader")
+        if sym_upload:
+            raw=sym_upload.getvalue(); st.session_state["_uploaded_raw_bytes"]=raw
+            d,t,a=_get_symptom_whitelists(raw)
+            if d or t:
+                st.session_state.update(sym_delighters=d,sym_detractors=t,sym_aliases=a,sym_symptoms_source="file")
+                st.success(f"Loaded {len(d)} delighters and {len(t)} detractors."); st.rerun()
+            else: st.error("No 'Symptoms' sheet found or it was empty.")
 
     st.divider()
     st.markdown("### 2 · Configure and run")
@@ -2519,21 +2505,29 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
     with st.expander(f"📋 Review log — last {min(len(processed),20)} processed",expanded=True):
         for rec in processed[-20:]:
             idx=rec.get("idx","?")
-            head=f"Row {idx} — {len(rec.get('wrote_dets',[]))} detractors · {len(rec.get('wrote_dels',[]))} delighters"
+            head=f"Row {idx} — {len(rec.get('wrote_dets',[]))} issues · {len(rec.get('wrote_dels',[]))} strengths"
+            st.markdown("<div style='margin-bottom:6px;'>",unsafe_allow_html=True)
             with st.expander(head):
                 try: vb=str(overall_df.loc[int(idx),"review_text"])[:600]; st.write(vb)
                 except: pass
-                st.markdown("<div class='chip-wrap'>"+
+                # Meta chips
+                st.markdown("<div class='chip-wrap' style='margin-bottom:6px;'>"+
                     f"<span class='chip yellow'>Safety: {_esc(rec.get('safety',''))}</span>"+
                     f"<span class='chip indigo'>Reliability: {_esc(rec.get('reliability',''))}</span>"+
                     f"<span class='chip gray'>Sessions: {_esc(rec.get('sessions',''))}</span>"+
                     "</div>",unsafe_allow_html=True)
-                chips="<div class='chip-wrap'>"
-                for t in rec.get("wrote_dets",[]): chips+=f"<span class='chip red'>{_esc(t)}</span>"
-                for t in rec.get("wrote_dels",[]): chips+=f"<span class='chip green'>{_esc(t)}</span>"
-                chips+="</div>"; st.markdown(chips,unsafe_allow_html=True)
+                # Issues row
+                if rec.get("wrote_dets"):
+                    det_chips="".join(f"<span class='chip red' style='font-size:11px;'>{_esc(t)}</span>" for t in rec.get("wrote_dets",[]))
+                    st.markdown(f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;margin-bottom:5px;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--danger);font-weight:700;white-space:nowrap;padding-top:3px;'>Issues</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{det_chips}</div></div>",unsafe_allow_html=True)
+                # Strengths row
+                if rec.get("wrote_dels"):
+                    del_chips="".join(f"<span class='chip green' style='font-size:11px;'>{_esc(t)}</span>" for t in rec.get("wrote_dels",[]))
+                    st.markdown(f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;margin-bottom:5px;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--success);font-weight:700;white-space:nowrap;padding-top:3px;'>Strengths</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{del_chips}</div></div>",unsafe_allow_html=True)
+                # Evidence
                 for lab,evs in {**rec.get("ev_det",{}),**rec.get("ev_del",{})}.items():
                     for e in (evs or []): st.caption(f"  · {lab}: {e}")
+            st.markdown("</div>",unsafe_allow_html=True)
     ec1,ec2=st.columns([1.5,3])
     if ec1.button("🧾 Prepare export",use_container_width=True,key="sym_prep_export"):
         upd=st.session_state["analysis_dataset"]["reviews_df"]
@@ -2645,8 +2639,18 @@ def main():
                 summary=summary,filter_description=filter_description)
     tab1,tab2,tab3,tab4,tab5=st.tabs([
         "📊  Dashboard","🔍  Review Explorer","🤖  AI Analyst","🏷️  Review Prompt","💊  Symptomizer"])
+    # JS tab navigation (triggered by "Go to Symptomizer" button in dashboard)
+    if st.session_state.pop("_nav_to_symptomizer",False):
+        st.markdown("""<script>
+        setTimeout(function(){
+            var tabs=window.parent.document.querySelectorAll('button[role="tab"]');
+            for(var i=0;i<tabs.length;i++){
+                if(tabs[i].textContent.includes('Symptomizer')){tabs[i].click();break;}
+            }
+        },300);
+        </script>""",unsafe_allow_html=True)
     with tab1:
-        _render_dashboard(filtered_df)
+        _render_dashboard(filtered_df,overall_df)
         _render_symptom_dashboard(filtered_df,overall_df)
     with tab2:
         _render_review_explorer(summary=summary,overall_df=overall_df,filtered_df=filtered_df,
