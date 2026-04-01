@@ -2485,3 +2485,12 @@ def main() -> None:
     ])
     with tab1: _render_dashboard(filtered_df)
     with tab2: _render_review_explorer(
+        summary=summary,overall_df=overall_df,filtered_df=filtered_df,
+        prompt_artifacts=st.session_state.get("prompt_run_artifacts"))
+    with tab3: _render_ai_tab(**common)
+    with tab4: _render_review_prompt_tab(**common)
+    with tab5: _render_symptomizer_tab(**common)
+
+
+if __name__ == "__main__":
+    main()
