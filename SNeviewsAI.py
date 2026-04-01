@@ -1210,7 +1210,18 @@ def _add_net_hit(tbl: pd.DataFrame, avg_rating: float) -> pd.DataFrame:
     return d[[c for c in ["Item","Mentions","% Total","Avg Star","Net Hit"] if c in d.columns]]
 
 
-def _render_opportunity_scatter(tbl: pd.DataFrame, kind: str, baseline_avg: float) -> None:
+def _sw_style_fig(fig: go.Figure) -> go.Figure:
+    """Apply theme-safe Plotly styling — no CSS keywords, no transparent backgrounds."""
+    GRID = "rgba(148,163,184,0.18)"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, system-ui, sans-serif"),
+        margin=dict(l=44, r=20, t=44, b=36),
+    )
+    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID)
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID)
+    return fig
     """Opportunity matrix: Mentions vs Avg ★ scatter."""
     if tbl is None or tbl.empty: st.info("No data available."); return
     d = tbl.copy()
@@ -1395,14 +1406,12 @@ def _render_symptom_dashboard(filtered_df: pd.DataFrame,
             hovertemplate=hover,
         ))
         fig.update_layout(
-            title=title, height=max(300, 28 * len(t) + 80),
-            margin=dict(l=160, r=20, t=46, b=30),
-            xaxis_title=x_label, yaxis_title="",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Inter, sans-serif", color="currentColor"),
+            title=title,
+            height=max(300, 28 * len(t) + 80),
+            xaxis_title=x_label,
+            yaxis_title="",
         )
-        fig.update_xaxes(gridcolor="rgba(148,163,184,.15)", zerolinecolor="rgba(148,163,184,.15)")
-        fig.update_yaxes(gridcolor="rgba(148,163,184,.15)")
+        _sw_style_fig(fig)
         st.plotly_chart(fig, use_container_width=True)
 
     bc1, bc2 = st.columns(2)
