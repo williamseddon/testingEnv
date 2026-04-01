@@ -1,13 +1,16 @@
-# starwalk_ui_v8_3_catalog_first_better_output.py
-# v8.3 — catalog-first symptomization with stronger provided-symptom detection
-#
-# Highlights:
-#   - Catalog-first matching of provided Symptoms + aliases
-#   - Stronger rescue for supplied labels before falling back to learned labels
-#   - Clearer processed-review log: detected vs written
-#   - Safer overwrite semantics, filters, inbox, export, undo, throttling, cost tracking
-#   - Tuned defaults for better real-world output
+"""
+SharkNinja Review Analyst + Symptomizer — Combined App
+=======================================================
+Primary shell : SNeviews AI (review analytics)
+5th tab       : Symptomizer (row-level AI tagging)
+Shared        : OpenAI key/model, CSS style, review dataframe, export
+Style         : Symptomizer gradient + chips + badge rows
+"""
 
+from __future__ import annotations
+
+# ── stdlib ──────────────────────────────────────────────────────────────────
+import difflib
 import gc
 import hashlib
 import html
@@ -17,4511 +20,2538 @@ import math
 import os
 import random
 import re
+import sqlite3
+import tempfile
+import textwrap
 import time
-import difflib
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from collections import Counter
+from dataclasses import dataclass
+from datetime import date
+from typing import (
+    Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+)
+from urllib.parse import urlparse
 
+# ── third-party ──────────────────────────────────────────────────────────────
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils import (
+    column_index_from_string, get_column_letter
+)
 from openpyxl.worksheet.worksheet import Worksheet
+from plotly.subplots import make_subplots
 
 try:
-    from openai import OpenAI  # type: ignore
+    from openai import OpenAI
     _HAS_OPENAI = True
-except Exception:
+except ImportError:
     OpenAI = None  # type: ignore
     _HAS_OPENAI = False
 
 try:
-    import tiktoken  # type: ignore
+    import tiktoken
     _HAS_TIKTOKEN = True
-except Exception:
+except ImportError:
     tiktoken = None  # type: ignore
     _HAS_TIKTOKEN = False
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE CONFIG + SHARED CSS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ----------------------------- Page setup -----------------------------
-st.set_page_config(layout="wide", page_title="Review Symptomizer — v8.3 Catalog-First")
-st.title("✨ Review Symptomizer — v8.3 Catalog-First")
-st.caption(
-    "Catalog-first detection • stronger provided-symptom matching • clearer review log • tuned defaults • safer overwrite • exact K–T / U–AD export • inbox + aliases • filters"
+st.set_page_config(
+    page_title="SharkNinja Review Analyst",
+    layout="wide",
 )
 
-st.markdown(
-    """
-    <style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-      :root {
-        --bg1: rgba(124, 58, 237, .12);
-        --bg2: rgba(6, 182, 212, .10);
-        --line: #e5e7eb;
-        --muted: #667085;
-        --text: #101828;
-        --brand: #7c3aed;
-        --brand-2: #06b6d4;
-        --good: #16a34a;
-        --bad: #dc2626;
-        --warn: #d97706;
-      }
-      html, body, .stApp {
-        font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-        color: var(--text);
-      }
-      .stApp {
-        background:
-          radial-gradient(1000px 420px at 0% -10%, var(--bg1), transparent 60%),
-          radial-gradient(900px 420px at 100% 0%, var(--bg2), transparent 60%);
-      }
-      .hero-shell {
-        background: linear-gradient(180deg, rgba(255,255,255,.97), rgba(255,255,255,.90));
-        border: 1px solid rgba(226,232,240,.95);
-        border-radius: 22px;
-        padding: 18px 20px 16px 20px;
-        box-shadow: 0 10px 30px rgba(16,24,40,.07);
-      }
-      .hero-top {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        gap: 16px;
-        flex-wrap: wrap;
-      }
-      .hero-title {
-        font-size: 22px;
-        font-weight: 800;
-        letter-spacing: -.02em;
-      }
-      .hero-sub {
-        color: var(--muted);
-        font-size: 13px;
-        margin-top: 4px;
-      }
-      .badge-row, .chip-wrap {
-        display: flex;
-        gap: 8px;
-        flex-wrap: wrap;
-      }
-      .badge, .chip {
-        padding: 6px 10px;
-        border-radius: 999px;
-        font-size: 12.5px;
-        line-height: 1;
-        border: 1px solid #e5e7eb;
-        background: #fff;
-        box-shadow: 0 1px 2px rgba(16,24,40,.04);
-      }
-      .chip.blue { background: #eff6ff; border-color: #bfdbfe; }
-      .chip.green { background: #ecfdf3; border-color: #bbf7d0; }
-      .chip.red { background: #fff1f2; border-color: #fecdd3; }
-      .chip.yellow { background: #fffbeb; border-color: #fde68a; }
-      .chip.purple { background: #f5f3ff; border-color: #ddd6fe; }
-      .chip.gray { background: #f8fafc; border-color: #e2e8f0; }
-      .hero-grid {
-        display: grid;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
-        gap: 12px;
-        margin-top: 14px;
-      }
-      .hero-stat {
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 18px;
-        padding: 14px 16px;
-        box-shadow: 0 2px 8px rgba(16,24,40,.05);
-      }
-      .hero-stat.accent {
-        border-color: rgba(124,58,237,.35);
-        box-shadow: 0 6px 18px rgba(124,58,237,.14);
-      }
-      .hero-stat .label {
-        color: #64748b;
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: .08em;
-      }
-      .hero-stat .value {
-        font-size: 28px;
-        font-weight: 800;
-        margin-top: 2px;
-      }
-      .section-title {
-        font-size: 18px;
-        font-weight: 800;
-        margin: 6px 0 10px 0;
-      }
-      .section-sub {
-        color: var(--muted);
-        font-size: 13px;
-        margin: -2px 0 12px 0;
-      }
-      .info-card {
-        background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(255,255,255,.93));
-        border: 1px solid #e5e7eb;
-        border-radius: 18px;
-        padding: 14px 16px;
-        box-shadow: 0 4px 14px rgba(16,24,40,.05);
-      }
-      .info-card.tight { padding: 12px 14px; }
-      .info-card .title { font-size: 13px; color: #475467; font-weight: 700; }
-      .info-card .big { font-size: 30px; font-weight: 800; line-height: 1.1; margin-top: 4px; }
-      .info-card .muted { color: #667085; font-size: 12.5px; margin-top: 4px; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-      .run-plan {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0,1fr));
-        gap: 10px;
-      }
-      .kv {
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 14px;
-        padding: 12px 14px;
-      }
-      .kv .k { color: #667085; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
-      .kv .v { font-size: 20px; font-weight: 800; margin-top: 2px; }
-      .danger-box {
-        background: linear-gradient(180deg, rgba(254,242,242,.92), rgba(254,226,226,.72));
-        border: 1px solid #fecaca;
-        border-radius: 16px;
-        padding: 12px 14px;
-      }
-      .good-box {
-        background: linear-gradient(180deg, rgba(236,253,243,.92), rgba(220,252,231,.72));
-        border: 1px solid #bbf7d0;
-        border-radius: 16px;
-        padding: 12px 14px;
-      }
-      .tiny { font-size: 12px; color: #667085; }
-      mark.hl { background: #fde68a; padding: 0 .16em; border-radius: .25em; }
-      .stButton > button {
-        height: 42px;
-        border-radius: 12px;
-        font-weight: 700;
-        border: 1px solid #d0d5dd;
-        background: linear-gradient(180deg, #ffffff, #f8fafc);
-        box-shadow: 0 1px 2px rgba(16,24,40,.04);
-      }
-      .stButton > button:hover {
-        border-color: rgba(124,58,237,.35);
-        box-shadow: 0 4px 12px rgba(124,58,237,.14);
-      }
-      .stNumberInput input, .stTextInput input, .stDateInput input {
-        border-radius: 12px !important;
-      }
-      @media (max-width: 1100px) {
-        .hero-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
-        .run-plan { grid-template-columns: 1fr; }
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.markdown("""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  :root {
+    --bg1: rgba(124,58,237,.12);
+    --bg2: rgba(6,182,212,.10);
+    --line: #e5e7eb;
+    --muted: #667085;
+    --text: #101828;
+    --brand: #7c3aed;
+    --brand-2: #06b6d4;
+    --good: #16a34a;
+    --bad: #dc2626;
+    --warn: #d97706;
+  }
+  html, body, .stApp {
+    font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    color: var(--text);
+  }
+  .stApp {
+    background:
+      radial-gradient(1000px 420px at 0% -10%, var(--bg1), transparent 60%),
+      radial-gradient(900px 420px at 100% 0%,  var(--bg2), transparent 60%);
+  }
+  /* ── cards ── */
+  .hero-card, .metric-card, .info-card, .report-card {
+    background: linear-gradient(180deg,rgba(255,255,255,.97),rgba(255,255,255,.90));
+    border: 1px solid rgba(226,232,240,.95);
+    border-radius: 18px;
+    padding: 14px 16px;
+    box-shadow: 0 6px 20px rgba(16,24,40,.06);
+    margin-bottom: .6rem;
+  }
+  .hero-card { border-radius: 22px; padding: 18px 20px 16px; }
+  .hero-title { font-size:22px; font-weight:800; letter-spacing:-.02em; }
+  .hero-sub   { color:var(--muted); font-size:13px; margin-top:4px; }
+  .metric-card { min-height:148px; display:flex; flex-direction:column; justify-content:space-between; }
+  .metric-label { color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .metric-value { font-size:clamp(1.55rem,2vw,2rem); font-weight:800; color:#16213e; line-height:1.05; }
+  .metric-sub   { color:#4b5563; font-size:.83rem; line-height:1.3; }
+  .section-title { font-size:18px; font-weight:800; margin:6px 0 10px; }
+  .section-sub   { color:var(--muted); font-size:13px; margin:-2px 0 12px; }
+  /* ── chips / badges ── */
+  .badge-row, .chip-wrap { display:flex; gap:8px; flex-wrap:wrap; }
+  .badge, .chip {
+    padding:6px 10px; border-radius:999px; font-size:12.5px; line-height:1;
+    border:1px solid #e5e7eb; background:#fff;
+    box-shadow:0 1px 2px rgba(16,24,40,.04);
+  }
+  .chip.blue   { background:#eff6ff; border-color:#bfdbfe; }
+  .chip.green  { background:#ecfdf3; border-color:#bbf7d0; }
+  .chip.red    { background:#fff1f2; border-color:#fecdd3; }
+  .chip.yellow { background:#fffbeb; border-color:#fde68a; }
+  .chip.purple { background:#f5f3ff; border-color:#ddd6fe; }
+  .chip.gray   { background:#f8fafc; border-color:#e2e8f0; }
+  /* ── hero stat grid ── */
+  .hero-grid {
+    display:grid; grid-template-columns:repeat(5,minmax(0,1fr));
+    gap:12px; margin-top:14px;
+  }
+  .hero-stat {
+    background:#fff; border:1px solid #e5e7eb; border-radius:18px;
+    padding:14px 16px; box-shadow:0 2px 8px rgba(16,24,40,.05);
+  }
+  .hero-stat.accent { border-color:rgba(124,58,237,.35); box-shadow:0 6px 18px rgba(124,58,237,.14); }
+  .hero-stat .label { color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .hero-stat .value { font-size:28px; font-weight:800; margin-top:2px; }
+  /* ── run plan ── */
+  .run-plan { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .kv { background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:12px 14px; }
+  .kv .k { color:#667085; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  .kv .v { font-size:20px; font-weight:800; margin-top:2px; }
+  /* ── misc ── */
+  .danger-box {
+    background:linear-gradient(180deg,rgba(254,242,242,.92),rgba(254,226,226,.72));
+    border:1px solid #fecaca; border-radius:16px; padding:12px 14px;
+  }
+  .tiny { font-size:12px; color:#667085; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+  mark.hl { background:#fde68a; padding:0 .16em; border-radius:.25em; }
+  /* ── thinking overlay ── */
+  .thinking-overlay {
+    position:fixed; inset:0; background:rgba(15,23,42,.30);
+    display:flex; align-items:center; justify-content:center; z-index:99999;
+  }
+  .thinking-card {
+    width:min(430px,92vw); background:rgba(255,255,255,.98);
+    border:1px solid rgba(49,51,63,.12); border-radius:20px;
+    box-shadow:0 24px 60px rgba(15,23,42,.18); padding:1.2rem 1.3rem; text-align:center;
+  }
+  .thinking-spinner {
+    width:40px; height:40px; border:4px solid rgba(17,24,39,.14);
+    border-top-color:#111827; border-radius:50%;
+    margin:0 auto .8rem; animation:thinking-spin .9s linear infinite;
+  }
+  .thinking-title { color:#16213e; font-weight:700; font-size:1.08rem; margin-bottom:.3rem; }
+  .thinking-sub   { color:#4b5563; font-size:.95rem; line-height:1.35; }
+  @keyframes thinking-spin { to { transform:rotate(360deg); } }
+  /* ── buttons ── */
+  .stButton > button {
+    height:42px; border-radius:12px; font-weight:700;
+    border:1px solid #d0d5dd;
+    background:linear-gradient(180deg,#ffffff,#f8fafc);
+    box-shadow:0 1px 2px rgba(16,24,40,.04);
+  }
+  .stButton > button:hover {
+    border-color:rgba(124,58,237,.35);
+    box-shadow:0 4px 12px rgba(124,58,237,.14);
+  }
+  /* ── AI response ── */
+  .ai-response-html { color:#16213e; font-size:.86rem; line-height:1.5; }
+  .ai-response-html h2,.ai-response-html h3,.ai-response-html h4 {
+    font-size:.97rem; line-height:1.25; margin:.4rem 0 .32rem; color:#16213e;
+  }
+  .ai-response-html p,.ai-response-html li { font-size:.86rem; line-height:1.48; margin-bottom:.38rem; }
+  .ai-response-html ul,.ai-response-html ol { padding-left:1.08rem; margin:.1rem 0 .35rem; }
+  /* ── inline evidence chips ── */
+  .inline-evidence-chip {
+    position:relative; display:inline-flex; align-items:center;
+    border:1px solid rgba(49,51,63,.14); border-radius:999px;
+    padding:.12rem .44rem; background:rgba(245,247,250,.98);
+    color:#16213e; font-size:.73rem; line-height:1.18;
+    cursor:help; white-space:nowrap; margin-right:.1rem;
+  }
+  .inline-evidence-chip:hover::after {
+    content:attr(data-tooltip);
+    position:absolute; left:50%; top:calc(100% + 9px);
+    transform:translateX(-50%);
+    width:min(340px,72vw); background:rgba(17,24,39,.96);
+    color:#f9fafb; border-radius:12px; padding:.65rem .75rem;
+    font-size:.75rem; line-height:1.32;
+    box-shadow:0 16px 34px rgba(15,23,42,.26);
+    white-space:normal; z-index:1000; text-align:left;
+  }
+  @media(max-width:1100px) {
+    .hero-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .run-plan  { grid-template-columns:1fr; }
+  }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+APP_TITLE              = "SharkNinja Review Analyst"
+DEFAULT_PASSKEY        = "caC6wVBHos09eVeBkLIniLUTzrNMMH2XMADEhpHe1ewUw"
+DEFAULT_DISPLAYCODE    = "15973_3_0-en_us"
+DEFAULT_API_VERSION    = "5.5"
+DEFAULT_PAGE_SIZE      = 100
+DEFAULT_SORT           = "SubmissionTime:desc"
+DEFAULT_CONTENT_LOCALES = (
+    "en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,"
+    "id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,"
+    "tr*,vi*,en_AU,en_CA,en_GB"
 )
+BAZAARVOICE_ENDPOINT   = "https://api.bazaarvoice.com/data/reviews.json"
 
+# SNeviews model options (used in shared sidebar)
+MODEL_OPTIONS      = ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-5"]
+DEFAULT_MODEL      = "gpt-4o-mini"
+REASONING_OPTIONS  = ["none", "low", "medium", "high"]
+DEFAULT_REASONING  = "low"
 
-# ----------------------------- Utilities -----------------------------
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
 
+THEME_KEYWORDS: Dict[str, List[str]] = {
+    "Cooking performance":      ["crispy","cook","cooking","air fry","bake","broil","reheat","dehydrate","temperature","preheat","evenly","juicy","frozen"],
+    "Ease of use":              ["easy","simple","intuitive","buttons","controls","instructions","setup","user friendly","learning curve"],
+    "Capacity and footprint":   ["size","capacity","counter","countertop","space","basket","tray","fits","large","small","compact"],
+    "Cleaning and maintenance": ["clean","cleanup","dishwasher","wash","mess","grease","sticky","scrub"],
+    "Build quality":            ["broke","broken","durable","quality","plastic","flimsy","stopped working","defect","replacement","warranty"],
+    "Noise, odor, and heat":    ["noise","noisy","loud","odor","smell","hot","heat","steam","fan"],
+    "Design and aesthetics":    ["design","looks","sleek","beautiful","style","appearance","color"],
+    "Value and price":          ["price","worth","value","expensive","cost","money","deal"],
+    "Service and shipping":     ["shipping","delivery","customer service","support","return","replacement","arrived","damaged","missing"],
+}
 
-def clean_text(x: Any) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+STOPWORDS = {
+    "a","about","after","again","all","also","am","an","and","any","are","as","at",
+    "be","because","been","before","being","best","better","but","by","can","could",
+    "did","do","does","don","down","even","every","for","from","get","got","great",
+    "had","has","have","he","her","here","hers","him","his","how","i","if","in",
+    "into","is","it","its","just","like","love","made","make","many","me","more",
+    "most","much","my","new","no","not","now","of","on","one","only","or","other",
+    "our","out","over","product","really","so","some","than","that","the","their",
+    "them","then","there","these","they","this","to","too","use","used","using",
+    "very","was","we","well","were","what","when","which","while","with","would",
+    "you","your",
+}
+
+PERSONAS: Dict[str, Dict[str, Any]] = {
+    "Product Development": {
+        "blurb": "Translates reviews into product and feature decisions.",
+        "prompt": "Create a report for the product development team. Highlight what customers love, unmet needs, feature gaps, usability friction, and concrete roadmap opportunities. End with the top 5 product actions ranked by impact.",
+        "instructions": "You are a senior product strategy analyst. Focus on feature prioritization, user experience, jobs-to-be-done, and roadmap implications. Cite review IDs for important claims.",
+    },
+    "Quality Engineer": {
+        "blurb": "Focuses on failure modes, defects, durability, and root-cause signals.",
+        "prompt": "Create a report for a quality engineer. Identify defect patterns, reliability risks, cleaning issues, performance inconsistencies, and probable root-cause hypotheses. Separate confirmed evidence from inference.",
+        "instructions": "You are a senior quality and reliability analyst. Prioritize failure modes, defect language, repeat complaints, severity, and probable root causes. Cite review IDs for material claims.",
+    },
+    "Consumer Insights": {
+        "blurb": "Extracts sentiment drivers, purchase motivations, and voice-of-customer insights.",
+        "prompt": "Create a report for the consumer insights team. Summarize key sentiment drivers, barriers to adoption, purchase motivations, key use cases, and how tone changes across star ratings and incentivized vs non-incentivized reviews.",
+        "instructions": "You are a consumer insights lead. Synthesize sentiment drivers, motivations, barriers, and language. Use concise, executive-ready writing and cite review IDs for important findings.",
+    },
+}
+
+# Symptomizer column layout
+DET_LETTERS  = ["K","L","M","N","O","P","Q","R","S","T"]
+DEL_LETTERS  = ["U","V","W","X","Y","Z","AA","AB","AC","AD"]
+DET_INDEXES  = [column_index_from_string(c) for c in DET_LETTERS]
+DEL_INDEXES  = [column_index_from_string(c) for c in DEL_LETTERS]
+META_ORDER   = [("Safety","AE"),("Reliability","AF"),("# of Sessions","AG")]
+META_INDEXES = {name: column_index_from_string(col) for name, col in META_ORDER}
+AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
+AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
+AI_META_HEADERS = ["AI Safety","AI Reliability","AI # of Sessions"]
+
+SAFETY_ENUM    = ["Not Mentioned","Concern","Positive"]
+RELIABILITY_ENUM = ["Not Mentioned","Negative","Neutral","Positive"]
+SESSIONS_ENUM  = ["0","1","2–3","4–9","10+","Unknown"]
+
+DEFAULT_PRIORITY_DELIGHTERS = [
+    "Overall Satisfaction","Ease Of Use","Effective Results","Visible Improvement",
+    "Time Saver","Comfort","Value","Reliability",
+]
+DEFAULT_PRIORITY_DETRACTORS = [
+    "Poor Results","Ease Of Use","Reliability Issue","High Cost","Irritation",
+    "Battery Problem","High Noise","Cleaning Difficulty","Setup Issue",
+    "Connectivity Issue","Safety Concern",
+]
 
 
-def is_filled(val: Any) -> bool:
-    if pd.isna(val):
-        return False
-    s = str(val).strip()
-    return (s != "") and (s.upper() not in NON_VALUES)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SHARED UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class ReviewDownloaderError(Exception):
+    pass
+
+@dataclass
+class ReviewBatchSummary:
+    product_url: str
+    product_id: str
+    total_reviews: int
+    page_size: int
+    requests_needed: int
+    reviews_downloaded: int
+
+
+def _safe_text(value: Any, default: str = "") -> str:
+    if value is None: return default
+    if isinstance(value, (list,tuple,set,dict,pd.Series,pd.DataFrame,pd.Index)): return default
+    try:
+        missing = pd.isna(value)
+    except Exception:
+        missing = False
+    if isinstance(missing, bool) and missing: return default
+    text = str(value).strip()
+    return default if text.lower() in {"nan","none","null","<na>"} else text
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try: return int(float(value))
+    except Exception: return default
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if value is None: return default
+    if isinstance(value, bool): return value
+    text = _safe_text(value).lower()
+    if text in {"true","1","yes","y","t"}: return True
+    if text in {"false","0","no","n","f",""}: return False
+    return default
+
+def _safe_mean(series: pd.Series) -> Optional[float]:
+    if series.empty: return None
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    return float(numeric.mean()) if not numeric.empty else None
+
+def _safe_pct(num: float, den: float) -> float:
+    return 0.0 if not den else float(num)/float(den)
 
 def _fmt_money(x: float) -> str:
-    try:
-        return f"${x:,.4f}" if x < 1 else f"${x:,.2f}"
-    except Exception:
-        return "$0.00"
-
+    try: return f"${x:,.4f}" if x < 1 else f"${x:,.2f}"
+    except Exception: return "$0.00"
 
 def _fmt_secs(sec: float) -> str:
-    sec = float(sec or 0.0)
-    if sec < 0:
-        sec = 0
-    m = int(sec // 60)
-    s = int(round(sec - m * 60))
+    sec = max(0.0, float(sec or 0))
+    m = int(sec // 60); s = int(round(sec - m*60))
     return f"{m}:{s:02d}"
-
-
-def _safe(s: Any) -> str:
-    return html.escape(str(s or ""))
-
 
 def _canon(s: str) -> str:
     return " ".join(str(s).split()).lower().strip()
 
-
 def _canon_simple(s: str) -> str:
     return "".join(ch for ch in _canon(s) if ch.isalnum())
 
+def _safe_html(s: Any) -> str:
+    return html.escape(str(s or ""))
 
-def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-    low = {str(c).strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        key = str(cand).strip().lower()
-        if key in low:
-            return low[key]
-    for cand in candidates:
-        key = str(cand).strip().lower()
-        for lc, orig in low.items():
-            if key and (key == lc or key in lc):
-                return orig
-    return None
-
-
-_BOOL_TRUE = {"true", "t", "yes", "y", "1", "seeded"}
-_BOOL_FALSE = {"false", "f", "no", "n", "0", "non-seeded", "nonseeded", "not seeded", "unseeded"}
-
-
-def _boolish(x: Any) -> Optional[bool]:
-    if pd.isna(x):
-        return None
-    s = str(x).strip().lower()
-    if s in _BOOL_TRUE:
-        return True
-    if s in _BOOL_FALSE:
-        return False
-    return None
-
-
-def _coerce_datetime_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
-    if col and col in df_in.columns:
-        try:
-            if not pd.api.types.is_datetime64_any_dtype(df_in[col]):
-                df_in[col] = pd.to_datetime(df_in[col], errors="coerce")
-        except Exception:
-            pass
-
-
-def _coerce_numeric_inplace(df_in: pd.DataFrame, col: Optional[str]) -> None:
-    if col and col in df_in.columns:
-        try:
-            if not pd.api.types.is_numeric_dtype(df_in[col]):
-                df_in[col] = pd.to_numeric(df_in[col], errors="coerce")
-        except Exception:
-            pass
-
-
-def _unique_sorted_str(series: Optional[pd.Series], limit: int = 5000) -> List[str]:
-    if series is None:
-        return []
-    try:
-        vals = series.dropna().astype(str).map(str.strip)
-        vals = vals[vals != ""]
-        uniq = list(pd.unique(vals))
-        if len(uniq) > limit:
-            uniq = uniq[:limit]
-        uniq.sort()
-        return uniq
-    except Exception:
-        return []
-
-
-def _chip_html(items: List[Tuple[str, str]]) -> str:
-    if not items:
-        return "<span class='chip gray'>No active filters</span>"
-    out = ["<div class='chip-wrap'>"]
+def _chip_html(items: List[Tuple[str,str]]) -> str:
+    if not items: return "<span class='chip gray'>No active filters</span>"
+    parts = ["<div class='chip-wrap'>"]
     for text, color in items:
-        out.append(f"<span class='chip {color}'>{_safe(text)}</span>")
-    out.append("</div>")
-    return "".join(out)
+        parts.append(f"<span class='chip {color}'>{_safe_html(text)}</span>")
+    parts.append("</div>")
+    return "".join(parts)
 
+def _is_missing_value(value: Any) -> bool:
+    if value is None: return True
+    if isinstance(value, (list,tuple,set,dict,pd.Series,pd.DataFrame,pd.Index)): return False
+    try: missing = pd.isna(value)
+    except Exception: return False
+    return bool(missing) if isinstance(missing,(bool,int)) else False
 
-def highlight_text(text: str, terms: List[str]) -> str:
-    safe = html.escape(str(text))
-    terms = [t for t in (terms or []) if isinstance(t, str) and len(t.strip()) >= 3]
-    if not terms:
-        return safe
-    uniq = sorted({t.strip() for t in terms}, key=len, reverse=True)
-    try:
-        pattern = re.compile("|".join(re.escape(t) for t in uniq), re.IGNORECASE)
-    except Exception:
-        return safe
-    return pattern.sub(lambda m: f"<mark class='hl'>{html.escape(m.group(0))}</mark>", safe)
+def _format_metric_number(value: Optional[float], digits: int = 2) -> str:
+    if value is None or _is_missing_value(value): return "n/a"
+    return f"{value:.{digits}f}"
 
+def _format_pct(value: Optional[float], digits: int = 1) -> str:
+    if value is None or _is_missing_value(value): return "n/a"
+    return f"{100*float(value):.{digits}f}%"
 
-# -------------------------- Throttling / costs --------------------------
-def _throttle(kind: str, est_in_tokens: int) -> None:
-    rpm = int(st.session_state.get("throttle_rpm", 0) or 0)
-    tpm = int(st.session_state.get("throttle_tpm", 0) or 0)
-    if rpm <= 0 and tpm <= 0:
-        return
+def _truncate_text(text: str, max_chars: int = 420) -> str:
+    text = re.sub(r"\s+"," ",_safe_text(text)).strip()
+    return text if len(text) <= max_chars else text[:max_chars-3].rstrip()+"..."
 
-    now = float(time.time())
-    key = f"_throttle_{kind}"
-    bucket = st.session_state.get(key) or {"events": []}
-    events = bucket.get("events") or []
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+"," ",str(text).lower()).strip()
 
-    pruned: List[Tuple[float, int]] = []
-    for e in events:
-        try:
-            ts, tok = float(e[0]), int(e[1])
-        except Exception:
-            continue
-        if (now - ts) < 60.0:
-            pruned.append((ts, tok))
-    pruned.sort(key=lambda x: x[0])
+def _tokenize(text: str) -> List[str]:
+    return [t for t in re.findall(r"[a-z0-9']+",_normalize_text(text))
+            if len(t) > 2 and t not in STOPWORDS]
 
-    if rpm > 0 and len(pruned) >= rpm:
-        sleep_sec = 60.0 - (now - pruned[0][0]) + 0.05
-        if sleep_sec > 0:
-            time.sleep(sleep_sec)
-            now = float(time.time())
-            pruned = [(ts, tok) for ts, tok in pruned if (now - ts) < 60.0]
+def _slugify(text: str, fallback: str = "custom") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+","_",_safe_text(text).lower())
+    cleaned = re.sub(r"_+","_",cleaned).strip("_") or fallback
+    return ("prompt_"+cleaned if cleaned[0].isdigit() else cleaned)[:64]
 
-    if tpm > 0:
-        tok_sum = sum(tok for _, tok in pruned)
-        need = int(est_in_tokens)
-        if tok_sum + need > tpm and pruned:
-            running = tok_sum
-            sleep_until_ts: Optional[float] = None
-            for ts, tok in pruned:
-                running -= tok
-                if running + need <= tpm:
-                    sleep_until_ts = ts
-                    break
-            if sleep_until_ts is None:
-                sleep_until_ts = pruned[0][0]
-            sleep_sec = 60.0 - (now - float(sleep_until_ts)) + 0.05
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
-                now = float(time.time())
-                pruned = [(ts, tok) for ts, tok in pruned if (now - ts) < 60.0]
+def _first_non_empty(series: pd.Series) -> str:
+    for v in series.astype(str):
+        v = _safe_text(v)
+        if v and v.lower() != "nan": return v
+    return ""
 
-    pruned.append((now, int(est_in_tokens)))
-    bucket["events"] = pruned
-    st.session_state[key] = bucket
+def _clean_text(x: Any) -> str:
+    if pd.isna(x): return ""
+    return str(x).strip()
 
-
-MODEL_PRICING_PER_1M = {
-    "gpt-4o-mini": {"in": 0.15, "out": 0.60},
-    "gpt-4o": {"in": 2.50, "out": 10.00},
-    "gpt-4.1": {"in": 2.00, "out": 8.00},
-    "gpt-5": {"in": 1.25, "out": 10.00},
-}
-EMBEDDING_PRICING_PER_1M = {
-    "text-embedding-3-small": 0.02,
-}
-
-
-def _price_for_model(model_id: str) -> Tuple[float, float]:
-    try:
-        ov = st.session_state.get("_pricing_overrides", {}).get("models", {})
-        if model_id in ov:
-            return (float(ov[model_id].get("in", 0.0)), float(ov[model_id].get("out", 0.0)))
-    except Exception:
-        pass
-    p = MODEL_PRICING_PER_1M.get(model_id, None)
-    if not p:
-        return (0.0, 0.0)
-    return (float(p.get("in", 0.0)), float(p.get("out", 0.0)))
-
-
-def _price_for_embedding(model_id: str) -> float:
-    try:
-        ov = st.session_state.get("_pricing_overrides", {}).get("embeddings", {})
-        if model_id in ov:
-            return float(ov[model_id])
-    except Exception:
-        pass
-    return float(EMBEDDING_PRICING_PER_1M.get(model_id, 0.0))
-
-
-def _cost_chat(model_id: str, input_tokens: int, output_tokens: int) -> float:
-    pin, pout = _price_for_model(model_id)
-    return (float(input_tokens) * pin + float(output_tokens) * pout) / 1_000_000.0
-
-
-def _cost_embed(model_id: str, input_tokens: int) -> float:
-    p = _price_for_embedding(model_id)
-    return float(input_tokens) * p / 1_000_000.0
-
-
-def _ensure_usage_tracker() -> Dict[str, Any]:
-    if "_usage" not in st.session_state:
-        st.session_state["_usage"] = {
-            "chat_in": 0,
-            "chat_out": 0,
-            "embed_in": 0,
-            "cost_chat": 0.0,
-            "cost_embed": 0.0,
-            "by_component": {},
-        }
-    return st.session_state["_usage"]
-
-
-def _track(component: str, model_id: str, in_tok: int = 0, out_tok: int = 0, embed: bool = False) -> None:
-    tr = _ensure_usage_tracker()
-    component = str(component or "unknown")
-    comp = tr["by_component"].setdefault(component, {"chat_in": 0, "chat_out": 0, "embed_in": 0, "cost": 0.0})
-    if embed:
-        tr["embed_in"] += int(in_tok)
-        c = _cost_embed(model_id, int(in_tok))
-        tr["cost_embed"] += c
-        comp["embed_in"] += int(in_tok)
-        comp["cost"] += c
-    else:
-        tr["chat_in"] += int(in_tok)
-        tr["chat_out"] += int(out_tok)
-        c = _cost_chat(model_id, int(in_tok), int(out_tok))
-        tr["cost_chat"] += c
-        comp["chat_in"] += int(in_tok)
-        comp["chat_out"] += int(out_tok)
-        comp["cost"] += c
-
-
-def _extract_usage(resp: Any) -> Tuple[int, int]:
-    if resp is None:
-        return (0, 0)
-    usage = getattr(resp, "usage", None)
-    if usage is None:
-        try:
-            usage = resp.get("usage")  # type: ignore
-        except Exception:
-            usage = None
-    if usage is None:
-        return (0, 0)
-
-    def _get(obj: Any, k1: str, k2: str) -> int:
-        if isinstance(obj, dict):
-            return obj.get(k1, obj.get(k2, 0)) or 0
-        return getattr(obj, k1, getattr(obj, k2, 0)) or 0
-
-    pt = _get(usage, "prompt_tokens", "input_tokens")
-    ct = _get(usage, "completion_tokens", "output_tokens")
-    if (pt or 0) == 0:
-        pt = _get(usage, "total_tokens", "prompt_tokens")
-    return (int(pt or 0), int(ct or 0))
-
+def _is_filled(val: Any) -> bool:
+    if pd.isna(val): return False
+    s = str(val).strip()
+    return s != "" and s.upper() not in NON_VALUES
 
 def _estimate_tokens(text: str, model_id: str = "gpt-4o-mini") -> int:
     s = str(text or "")
-    if not s:
-        return 0
+    if not s: return 0
     if _HAS_TIKTOKEN:
         try:
             enc = tiktoken.get_encoding("cl100k_base")
             return int(len(enc.encode(s)))
-        except Exception:
-            pass
-    return int(max(1, math.ceil(len(s) / 4)))
+        except Exception: pass
+    return int(max(1, math.ceil(len(s)/4)))
 
 
-# ------------------------------ Loaders ------------------------------
-@st.cache_data(show_spinner=False)
-def _load_reviews_df(file_bytes: bytes) -> pd.DataFrame:
-    bio = io.BytesIO(file_bytes)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SHARED OPENAI HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_api_key() -> Optional[str]:
     try:
-        df0 = pd.read_excel(bio, sheet_name="Star Walk scrubbed verbatims")
-    except Exception:
-        bio.seek(0)
-        df0 = pd.read_excel(bio)
-    df0.columns = [str(c).strip() for c in df0.columns]
-    return df0
+        if "OPENAI_API_KEY" in st.secrets: return str(st.secrets["OPENAI_API_KEY"])
+        if "openai" in st.secrets and st.secrets["openai"].get("api_key"):
+            return str(st.secrets["openai"]["api_key"])
+    except Exception: pass
+    return os.getenv("OPENAI_API_KEY")
 
-
-@st.cache_data(show_spinner=False)
-def get_symptom_whitelists(file_bytes: bytes) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
-    bio = io.BytesIO(file_bytes)
+def _get_openai_client() -> Optional[Any]:
+    key = _get_api_key()
+    if not (_HAS_OPENAI and key): return None
     try:
-        df_sym = pd.read_excel(bio, sheet_name="Symptoms")
-    except Exception:
-        return [], [], {}
-    if df_sym is None or df_sym.empty:
-        return [], [], {}
-
-    df_sym.columns = [str(c).strip() for c in df_sym.columns]
-    lowcols = {c.lower(): c for c in df_sym.columns}
-
-    alias_col = next((lowcols.get(c) for c in ["aliases", "alias"] if c in lowcols), None)
-    label_col = next((lowcols.get(c) for c in ["symptom", "label", "name", "item"] if c in lowcols), None)
-    type_col = next((lowcols.get(c) for c in ["type", "polarity", "category", "side"] if c in lowcols), None)
-
-    pos_tags = {"delighter", "delighters", "positive", "pos", "pros"}
-    neg_tags = {"detractor", "detractors", "negative", "neg", "cons"}
-
-    def _clean(series: pd.Series) -> List[str]:
-        vals = series.dropna().astype(str).map(str.strip)
-        out: List[str] = []
-        seen: Set[str] = set()
-        for v in vals:
-            if v and v not in seen:
-                seen.add(v)
-                out.append(v)
-        return out
-
-    delighters: List[str] = []
-    detractors: List[str] = []
-    alias_map: Dict[str, List[str]] = {}
-
-    if label_col and type_col:
-        df_sym[type_col] = df_sym[type_col].astype(str).str.lower().str.strip()
-        delighters = _clean(df_sym.loc[df_sym[type_col].isin(pos_tags), label_col])
-        detractors = _clean(df_sym.loc[df_sym[type_col].isin(neg_tags), label_col])
-        if alias_col:
-            for _, row in df_sym.iterrows():
-                lbl = str(row.get(label_col, "")).strip()
-                als = str(row.get(alias_col, "")).strip()
-                if lbl:
-                    if als:
-                        alias_map[lbl] = [p.strip() for p in als.replace(",", "|").split("|") if p.strip()]
-                    else:
-                        alias_map.setdefault(lbl, [])
-    else:
-        for lc, orig in lowcols.items():
-            if ("delight" in lc) or ("positive" in lc) or lc == "pros":
-                delighters.extend(_clean(df_sym[orig]))
-            if ("detract" in lc) or ("negative" in lc) or lc == "cons":
-                detractors.extend(_clean(df_sym[orig]))
-        delighters = list(dict.fromkeys(delighters))
-        detractors = list(dict.fromkeys(detractors))
-
-    return delighters, detractors, alias_map
-
-# ------------------------- Symptom schema helpers -------------------------
-def detect_symptom_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-    cols = [str(c).strip() for c in df.columns]
-    man_det = [f"Symptom {i}" for i in range(1, 11) if f"Symptom {i}" in cols]
-    man_del = [f"Symptom {i}" for i in range(11, 21) if f"Symptom {i}" in cols]
-    ai_det = [c for c in cols if c.startswith("AI Symptom Detractor ")]
-    ai_del = [c for c in cols if c.startswith("AI Symptom Delighter ")]
-    return {
-        "manual_detractors": man_det,
-        "manual_delighters": man_del,
-        "ai_detractors": ai_det,
-        "ai_delighters": ai_del,
-    }
-
-
-def _filled_mask(df_in: pd.DataFrame, cols: List[str]) -> pd.Series:
-    if not cols:
-        return pd.Series(False, index=df_in.index)
-    mask = pd.Series(False, index=df_in.index)
-    for c in cols:
-        if c not in df_in.columns:
-            continue
-        s = df_in[c].fillna("").astype(str).str.strip()
-        mask |= (s != "") & (~s.str.upper().isin(NON_VALUES))
-    return mask
-
-
-def detect_missing(df: pd.DataFrame, colmap: Dict[str, List[str]]) -> pd.DataFrame:
-    det_cols = colmap["manual_detractors"] + colmap["ai_detractors"]
-    del_cols = colmap["manual_delighters"] + colmap["ai_delighters"]
-
-    out = df.copy()
-    out["Has_Detractors"] = _filled_mask(out, det_cols)
-    out["Has_Delighters"] = _filled_mask(out, del_cols)
-    out["Needs_Detractors"] = ~out["Has_Detractors"]
-    out["Needs_Delighters"] = ~out["Has_Delighters"]
-    out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
-    return out
-
-
-DET_LETTERS = ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"]
-DEL_LETTERS = ["U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD"]
-DET_INDEXES = [column_index_from_string(c) for c in DET_LETTERS]
-DEL_INDEXES = [column_index_from_string(c) for c in DEL_LETTERS]
-META_ORDER = [("Safety", "AE"), ("Reliability", "AF"), ("# of Sessions", "AG")]
-META_INDEXES = {name: column_index_from_string(col) for name, col in META_ORDER}
-
-AI_DET_HEADERS = [f"AI Symptom Detractor {i}" for i in range(1, 11)]
-AI_DEL_HEADERS = [f"AI Symptom Delighter {i}" for i in range(1, 11)]
-AI_META_HEADERS = ["AI Safety", "AI Reliability", "AI # of Sessions"]
-
-
-def ensure_ai_columns(df_in: pd.DataFrame) -> pd.DataFrame:
-    for h in AI_DET_HEADERS + AI_DEL_HEADERS + AI_META_HEADERS:
-        if h not in df_in.columns:
-            df_in[h] = None
-    return df_in
-
-
-def clear_ai_slots_for_indices(df_in: pd.DataFrame, indices: Iterable[int]) -> pd.DataFrame:
-    df2 = ensure_ai_columns(df_in)
-    for idx in indices:
-        for j in range(1, 11):
-            df2.loc[idx, f"AI Symptom Detractor {j}"] = None
-            df2.loc[idx, f"AI Symptom Delighter {j}"] = None
-        df2.loc[idx, "AI Safety"] = None
-        df2.loc[idx, "AI Reliability"] = None
-        df2.loc[idx, "AI # of Sessions"] = None
-    return df2
-
-
-def build_canonical_maps(
-    delighters: List[str], detractors: List[str], alias_map: Dict[str, List[str]]
-) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
-    del_map = {_canon(x): x for x in delighters}
-    det_map = {_canon(x): x for x in detractors}
-    alias_to_label: Dict[str, str] = {}
-    for label, aliases in (alias_map or {}).items():
-        for a in aliases:
-            alias_to_label[_canon(a)] = label
-    return del_map, det_map, alias_to_label
-
-
-SAFETY_ENUM = ["Not Mentioned", "Concern", "Positive"]
-RELIABILITY_ENUM = ["Not Mentioned", "Negative", "Neutral", "Positive"]
-SESSIONS_ENUM = ["0", "1", "2–3", "4–9", "10+", "Unknown"]
-
-
-def _symptom_list_version(delighters: List[str], detractors: List[str], aliases: Dict[str, List[str]]) -> str:
-    payload = json.dumps({"del": delighters, "det": detractors, "ali": aliases}, sort_keys=True, ensure_ascii=False)
-    try:
-        return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
-    except Exception:
-        return f"{len(delighters)}_{len(detractors)}"
-
-
-def _ensure_label_cache() -> Dict[Any, Any]:
-    if "_label_cache" not in st.session_state:
-        st.session_state["_label_cache"] = {}
-    return st.session_state["_label_cache"]
-
-
-# -------------------------- Theme normalization --------------------------
-THEME_RULES = [
-    (
-        re.compile(r"\b(pulls?|pulled|pulling).{0,12}\bhair\b|\bhair\s+(?:loss|fall(?:ing)?|coming\s+out|pulled)\b", re.I),
-        {"det": "Hair Loss/Pull"},
-    ),
-    (re.compile(r"\b(snags?|tangles?|catches?)\s+(?:hair|strands?)\b", re.I), {"det": "Hair Snag/Tangle"}),
-    (re.compile(r"\b(too\s+hot|burns?|scalds?|overheats?)\b", re.I), {"det": "Excess Heat"}),
-    (re.compile(r"\b(too\s+noisy|loud|whine|high\s+noise)\b", re.I), {"det": "High Noise"}),
-    (
-        re.compile(r"\b(battery|charge|runtime)\b.+\b(poor|short|bad|low)\b|\b(poor|short|bad|low)\b.+\b(battery|charge|runtime)\b", re.I),
-        {"det": "Battery Life: Short"},
-    ),
-    (
-        re.compile(r"\b(cooling\s+pad)\b.*\b(issue|issues|problem|problems|fail|failed|broken)\b|\b(issue|issues|problem|problems)\b.*\b(cooling\s+pad)\b", re.I),
-        {"det": "Cooling Pad Issue"},
-    ),
-    (
-        re.compile(r"\b(learning\s+curve|hard\s+to\s+learn|takes\s+time\s+to\s+learn|not\s+intuitive)\b", re.I),
-        {"det": "Learning Curve"},
-    ),
-    (
-        re.compile(r"\b(initially|at\s+first)\b.*\b(complicated|confusing|hard)\b|\b(complicated|confusing|hard)\b.*\b(at\s+first|initially)\b", re.I),
-        {"det": "Learning Curve"},
-    ),
-    (
-        re.compile(r"\b(absolutely|totally|really)?\s*love(s|d)?\b|\bworks\s+(amazing|great|fantastic|perfect)\b|\boverall\b.+\b(great|good|positive|happy)\b", re.I),
-        {"del": "Overall Satisfaction"},
-    ),
-    (
-        re.compile(r"\b(easy|quick|simple)\s+to\s+(use|clean|attach|remove)\b|\buser[-\s]?friendly\b|\bintuitive\b", re.I),
-        {"del": "Ease Of Use"},
-    ),
-    (re.compile(r"\b(fast|quick)\s+(dry|drying)\b|\bdries\s+quickly\b", re.I), {"del": "Fast Drying"}),
-    (re.compile(r"\b(shine|smooth|sleek|frizz\s*(?:free|control))\b", re.I), {"del": "Frizz Control/Shine"}),
-    (
-        re.compile(r"\b(attachments?|accessories?)\b.+\b(handy|useful|versatile|helpful)\b", re.I),
-        {"del": "Attachment Usability"},
-    ),
-    (re.compile(r"\b(comfortable|comfort|comfy)\b", re.I), {"del": "Comfort"}),
-]
-
-CANONICAL_SYNONYMS = [
-    (
-        "Comfort",
-        "del",
-        [
-            r"\bcomfortable\b",
-            r"\bcomfort\b",
-            r"\bcomfy\b",
-            r"\bconfortable\b",
-            r"\bconfort\b",
-            r"\bcomftable\b",
-            r"\bcomfort\s*(fit|use|design|feel)\b",
-        ],
-    ),
-    (
-        "Cooling Pad Issue",
-        "det",
-        [r"\bcooling\s+pad\b.*\b(issue|problem|broken|fail)", r"\b(issue|problem)s?\b.*\bcooling\s+pad\b"],
-    ),
-    (
-        "Learning Curve",
-        "det",
-        [r"\blearning\s+curve\b", r"\bnot\s+intuitive\b", r"\bhard\s+to\s+learn\b", r"\bconfusing\s+at\s+first\b", r"\binitially\s+complicated\b"],
-    ),
-]
-
-SINGULAR_LASTWORD_MAP = {
-    "Issues": "Issue",
-    "Problems": "Problem",
-    "Complaints": "Complaint",
-    "Defects": "Defect",
-    "Glitches": "Glitch",
-}
-
-
-def _short_title(s: str) -> str:
-    s = re.sub(r"[\s\-_/]+", " ", str(s).strip())
-    s = re.sub(r"[^\w\s+/]", "", s)
-    s = re.sub(r"\s+", " ", s)
-    parts: List[str] = []
-    for token in s.split(" "):
-        if "/" in token:
-            parts.append("/".join([p[:1].upper() + p[1:].lower() if p else "" for p in token.split("/")]))
-        else:
-            parts.append(token[:1].upper() + token[1:].lower())
-    return " ".join(parts).strip()
-
-
-def _singularize_last_word(label: str) -> str:
-    s = str(label).strip()
-    if not s:
-        return s
-    toks = s.split()
-    if not toks:
-        return s
-    last = toks[-1]
-    repl = SINGULAR_LASTWORD_MAP.get(last)
-    if repl:
-        toks[-1] = repl
-        return " ".join(toks)
-    return s
-
-
-def normalize_theme_label(raw: str, side_hint: str = "", singularize: bool = True) -> str:
-    txt = str(raw or "").strip()
-    if not txt:
-        return ""
-
-    for rx, mapping in THEME_RULES:
-        if rx.search(txt):
-            if side_hint.lower().startswith("del") and mapping.get("del"):
-                out = mapping["del"]
-                return _singularize_last_word(out) if singularize else out
-            if side_hint.lower().startswith("det") and mapping.get("det"):
-                out = mapping["det"]
-                return _singularize_last_word(out) if singularize else out
-            out = mapping.get("del") or mapping.get("det") or _short_title(txt[:32])
-            return _singularize_last_word(out) if singularize else out
-
-    low = txt.lower()
-    for canon, side, pats in CANONICAL_SYNONYMS:
-        if side_hint.lower().startswith("del") and side != "del":
-            continue
-        if side_hint.lower().startswith("det") and side != "det":
-            continue
-        for p in pats:
-            if re.search(p, low, flags=re.I):
-                return _singularize_last_word(canon) if singularize else canon
-
-    out = _short_title(txt[:60])
-    if singularize:
-        out = _singularize_last_word(out)
-    if out.endswith(" Issues"):
-        out = out[:-7] + " Issue"
-    return out.strip()
-
-
-# --------------------------- Learned theme store ---------------------------
-def _ensure_learned_store() -> Dict[str, Any]:
-    if "learned" not in st.session_state:
-        st.session_state["learned"] = {
-            "labels": {"Delighter": {}, "Detractor": {}},
-            "emb": {"Delighter": {}, "Detractor": {}},
-            "keywords": {"Delighter": {}, "Detractor": {}},
-            "families": {"Delighter": {}, "Detractor": {}},
-            "product_profile": "",
-            "product_category": "",
-            "product_parts": [],
-            "use_cases": [],
-            "glossary_terms": [],
-            "version": "",
-            "ts": None,
-        }
-    ls = st.session_state["learned"]
-    ls.setdefault("labels", {"Delighter": {}, "Detractor": {}})
-    ls.setdefault("emb", {"Delighter": {}, "Detractor": {}})
-    ls.setdefault("keywords", {"Delighter": {}, "Detractor": {}})
-    ls.setdefault("families", {"Delighter": {}, "Detractor": {}})
-    ls.setdefault("product_profile", "")
-    ls.setdefault("product_category", "")
-    ls.setdefault("product_parts", [])
-    ls.setdefault("use_cases", [])
-    ls.setdefault("glossary_terms", [])
-    ls.setdefault("version", "")
-    ls.setdefault("ts", None)
-    return ls
-
-
-def _update_learned(side: str, canonical: str, synonym: str = "") -> None:
-    ls = _ensure_learned_store()
-    side = "Delighter" if str(side).lower().startswith("del") else "Detractor"
-    d = ls["labels"][side].setdefault(canonical, {"synonyms": set(), "count": 0})
-    d["count"] = int(d.get("count", 0)) + 1
-    if synonym and synonym.strip() and _canon_simple(synonym) != _canon_simple(canonical):
-        d["synonyms"].add(synonym.strip())
-
-
-def _known_learned_labels(side: str) -> List[str]:
-    ls = _ensure_learned_store()
-    side = "Delighter" if str(side).lower().startswith("del") else "Detractor"
-    items = list(ls["labels"][side].keys())
-    items.sort(key=lambda k: -int(ls["labels"][side].get(k, {}).get("count", 0)))
-    return items
-
-
-def _ensure_embed_cache() -> Dict[Any, Any]:
-    if "_embed_cache" not in st.session_state:
-        st.session_state["_embed_cache"] = {}
-    return st.session_state["_embed_cache"]
-
-
-def _embed_text(text: str, client: Any, model_id: str, component: str) -> Optional[List[float]]:
-    if client is None:
-        return None
-    t = str(text or "").strip()
-    if not t:
-        return None
-    key = (model_id, _canon(t))
-    cache = _ensure_embed_cache()
-    if key in cache:
-        return cache[key]
-    try:
-        _throttle("embed", _estimate_tokens(t, model_id="gpt-4o-mini"))
-        resp = client.embeddings.create(model=model_id, input=[t])
-        pt, _ = _extract_usage(resp)
-        if pt:
-            _track(component, model_id, in_tok=pt, out_tok=0, embed=True)
-        vec = resp.data[0].embedding  # type: ignore
-        cache[key] = vec
-        return vec
-    except Exception:
-        return None
-
-
-def _cos_sim(a: List[float], b: List[float]) -> float:
-    if (not a) or (not b):
-        return 0.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += float(x) * float(y)
-        na += float(x) * float(x)
-        nb += float(y) * float(y)
-    if na <= 0 or nb <= 0:
-        return 0.0
-    return float(dot / (math.sqrt(na) * math.sqrt(nb)))
-
-
-def _best_semantic_match(
-    candidate: str,
-    pool: List[str],
-    pool_emb: Dict[str, List[float]],
-    client: Any,
-    embed_model: str,
-    component: str,
-) -> Tuple[Optional[str], float]:
-    cand_vec = _embed_text(candidate, client, embed_model, component=component)
-    if not cand_vec:
-        return (None, 0.0)
-    best_lab, best = None, 0.0
-    for lab in pool:
-        v = pool_emb.get(lab)
-        if not v:
-            v = _embed_text(lab, client, embed_model, component=component)
-            if v:
-                pool_emb[lab] = v
-        if not v:
-            continue
-        s = _cos_sim(cand_vec, v)
-        if s > best:
-            best = s
-            best_lab = lab
-    return (best_lab, float(best))
-
-
-def resolve_candidate_to_canonical(
-    candidate_raw: str,
-    side: str,
-    delighters: List[str],
-    detractors: List[str],
-    alias_to_label: Dict[str, str],
-    learned_store: Dict[str, Any],
-    sim_threshold_lex: float,
-    sim_threshold_sem: float,
-    client: Any,
-    embed_model: str,
-) -> Dict[str, Any]:
-    side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
-    allowed = delighters if side_norm == "Delighter" else detractors
-
-    cand_theme = normalize_theme_label(candidate_raw, side_norm)
-    cand_canon = _canon(cand_theme)
-    cand_key = _canon_simple(cand_theme)
-    raw_key = _canon_simple(str(candidate_raw or "").strip())
-    raw_canon = _canon(str(candidate_raw or "").strip())
-
-    allowed_keys = {_canon_simple(x): x for x in allowed}
-    if raw_key in allowed_keys:
-        return {"canonical": allowed_keys[raw_key], "kind": "exact_existing", "target": allowed_keys[raw_key], "score": 1.0}
-    if cand_key in allowed_keys:
-        return {"canonical": allowed_keys[cand_key], "kind": "exact_existing", "target": allowed_keys[cand_key], "score": 1.0}
-    if raw_canon in alias_to_label:
-        tgt = alias_to_label[raw_canon]
-        return {"canonical": tgt, "kind": "alias_to_existing", "target": tgt, "score": 1.0}
-    if cand_canon in alias_to_label:
-        tgt = alias_to_label[cand_canon]
-        return {"canonical": tgt, "kind": "alias_to_existing", "target": tgt, "score": 1.0}
-
-    try:
-        m = difflib.get_close_matches(cand_theme, allowed, n=1, cutoff=float(sim_threshold_lex))
-        if m:
-            tgt = m[0]
-            return {"canonical": tgt, "kind": "alias_to_existing", "target": tgt, "score": float(sim_threshold_lex)}
-    except Exception:
-        pass
-
-    learned_labels = list(learned_store.get("labels", {}).get(side_norm, {}).keys())
-    try:
-        m2 = difflib.get_close_matches(cand_theme, learned_labels, n=1, cutoff=float(sim_threshold_lex))
-        if m2:
-            tgt = m2[0]
-            return {"canonical": tgt, "kind": "synonym_to_learned", "target": tgt, "score": float(sim_threshold_lex)}
-    except Exception:
-        pass
-
-    score_used = 0.0
-    if client is not None and embed_model:
-        pool_emb_allowed = learned_store.setdefault("_emb_allowed", {})
-        pool_emb_learned = learned_store.setdefault("_emb_learned", {})
-        best_a, score_a = _best_semantic_match(cand_theme, allowed, pool_emb_allowed, client, embed_model, component="embed-merge")
-        best_l, score_l = _best_semantic_match(cand_theme, learned_labels, pool_emb_learned, client, embed_model, component="embed-merge")
-
-        best_lab, best_score, best_kind = None, 0.0, ""
-        if best_a and score_a >= best_score:
-            best_lab, best_score, best_kind = best_a, score_a, "alias_to_existing"
-        if best_l and score_l > best_score:
-            best_lab, best_score, best_kind = best_l, score_l, "synonym_to_learned"
-        if best_lab and best_score >= float(sim_threshold_sem):
-            score_used = float(best_score)
-            return {"canonical": best_lab, "kind": best_kind, "target": best_lab, "score": score_used}
-
-    return {"canonical": cand_theme, "kind": "new", "target": "", "score": score_used}
-
-
-# --------------------------- Prelearn utilities ---------------------------
-STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "this", "that", "these", "those", "it", "its", "i", "me", "my",
-    "we", "our", "you", "your", "to", "of", "in", "on", "for", "with", "as", "at", "by", "from", "is", "are", "was",
-    "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "so", "very", "really", "just", "also", "too",
-    "not", "no", "yes", "they", "them", "their", "he", "she", "his", "her", "him", "there", "here", "when", "while",
-    "because", "into", "out", "up", "down", "over", "under", "again", "more", "most", "less", "least", "can", "could",
-    "should", "would", "will", "won't", "dont", "don't", "im", "i'm", "ive", "i've", "it's", "cant", "can't", "didnt",
-    "didn't", "wasnt", "wasn't", "isnt", "isn't", "arent", "aren't",
-}
-
-
-def _top_terms(texts: List[str], top_n: int = 30) -> List[Tuple[str, int]]:
-    counts: Dict[str, int] = {}
-    for t in texts:
-        toks = re.findall(r"[A-Za-z][A-Za-z']{2,}", str(t).lower())
-        toks = [w for w in toks if w not in STOPWORDS]
-        for w in toks:
-            counts[w] = counts.get(w, 0) + 1
-    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    return items[:top_n]
-
-
-def _sample_reviews(df_in: pd.DataFrame, n: int, seed: int = 7) -> pd.DataFrame:
-    if n >= len(df_in):
-        return df_in.copy()
-    df2 = df_in.copy()
-    if "Star Rating" in df2.columns:
-        try:
-            rng = random.Random(seed)
-            out_idx: List[int] = []
-            for _, g in df2.groupby("Star Rating"):
-                gidx = list(g.index)
-                take = max(1, int(round(n * (len(gidx) / len(df2)))))
-                rng.shuffle(gidx)
-                out_idx.extend(gidx[:take])
-            out_idx = out_idx[:n]
-            return df2.loc[out_idx]
-        except Exception:
-            pass
-    return df2.sample(n=n, random_state=seed)
-
-
-
-
-# ---------------------- Universal backbone + routing ----------------------
-ROUTER_STOPWORDS = set(STOPWORDS) | {
-    "product", "item", "thing", "device", "review", "reviews", "using", "used", "works", "working",
-    "one", "two", "first", "really", "super", "pretty", "quite", "much", "lot", "lots", "also",
-}
-
-DEFAULT_PRIORITY_DELIGHTERS = [
-    "Overall Satisfaction",
-    "Ease Of Use",
-    "Effective Results",
-    "Visible Improvement",
-    "Time Saver",
-    "Comfort",
-    "Value",
-    "Reliability",
-]
-DEFAULT_PRIORITY_DETRACTORS = [
-    "Poor Results",
-    "Ease Of Use",
-    "Reliability Issue",
-    "High Cost",
-    "Irritation",
-    "Battery Problem",
-    "High Noise",
-    "Cleaning Difficulty",
-    "Setup Issue",
-    "Connectivity Issue",
-    "Safety Concern",
-]
-
-UNIVERSAL_ASPECT_BACKBONE = {
-    "Overall Satisfaction": {
-        "positive_patterns": [
-            r"\bbest\b", r"\bfavorite\b", r"\blove(?:d)?\b", r"\bamazing\b", r"\bexcellent\b",
-            r"\bhighly recommend\b", r"\bcould not recommend more\b", r"\bwould recommend\b",
-            r"\bworth it\b", r"\bvery happy\b", r"\bso happy\b", r"\bglad i bought\b",
-            r"\bimpressed\b", r"\bgame changer\b",
-        ],
-        "negative_patterns": [
-            r"\bdo not recommend\b", r"\bwould not recommend\b", r"\bregret\b", r"\bwaste of money\b",
-            r"\bvery disappointed\b", r"\bso disappointed\b", r"\breturn(?:ed|ing)?\b",
-        ],
-        "positive_labels": ["Overall Satisfaction"],
-        "negative_labels": ["Overall Dissatisfaction", "Poor Results"],
-    },
-    "Effective Results": {
-        "positive_patterns": [
-            r"\bworks? (?:great|well|amazing(?:ly)?|perfectly)\b", r"\bactually works?\b", r"\bdid what (?:it|this) (?:says|promised?)\b",
-            r"\bmade a difference\b", r"\bnoticeable difference\b", r"\bnoticeable results?\b",
-            r"\beffective\b", r"\bhelped\b", r"\bgot results?\b", r"\bdoes the job\b",
-            r"\bimproved?\b", r"\bbetter than\b", r"\bremoved?\b", r"\bcleaned?\b",
-        ],
-        "negative_patterns": [
-            r"\bdidn['’]t work\b", r"\bdoesn['’]t work\b", r"\bnot effective\b", r"\bno results?\b",
-            r"\bno difference\b", r"\bunderwhelming\b", r"\bpoor results?\b", r"\bdoes very little\b",
-            r"\bexpected more\b", r"\bbarely works?\b",
-        ],
-        "positive_labels": ["Effective Results", "Performance", "Works Well"],
-        "negative_labels": ["Poor Results", "Performance Issue", "Poor Performance"],
-    },
-    "Visible Improvement": {
-        "positive_patterns": [
-            r"\bglow(?:ing)?\b", r"\bsmoother\b", r"\bsofter\b", r"\bbrighter\b", r"\bclearer\b",
-            r"\bshinier\b", r"\bshine\b", r"\bnoticeable improvement\b", r"\blooks better\b", r"\bhealthier\b",
-            r"\bless frizz\b", r"\bwithout frizz\b", r"\bfrizz[- ]?free\b", r"\bsalon look\b", r"\bdead skin gone\b", r"\bskin was glowing\b",
-        ],
-        "negative_patterns": [],
-        "positive_labels": ["Visible Improvement", "Improved Appearance"],
-        "negative_labels": [],
-    },
-    "Ease Of Use": {
-        "positive_patterns": [
-            r"\beasy to (?:use|clean|attach|remove|assemble|set up|setup|operate)\b", r"\bsimple to use\b",
-            r"\buser[- ]?friendly\b", r"\bintuitive\b", r"\bstraightforward\b", r"\beffortless\b",
-            r"\bquick to (?:use|set up|setup)\b",
-        ],
-        "negative_patterns": [
-            r"\bhard to (?:use|clean|attach|remove|assemble|set up|setup|operate)\b", r"\bdifficult to (?:use|clean|assemble|set up|setup)\b",
-            r"\bconfusing\b", r"\bcomplicated\b", r"\bnot intuitive\b", r"\blearning curve\b",
-            r"\bfrustrating\b", r"\bcumbersome\b", r"\binstructions? (?:are )?(?:bad|unclear|confusing)\b",
-        ],
-        "positive_labels": ["Ease Of Use", "Easy Setup", "Easy To Clean"],
-        "negative_labels": ["Ease Of Use", "Difficult To Use", "Setup Issue", "Learning Curve", "Cleaning Difficulty"],
-    },
-    "Time Saver": {
-        "positive_patterns": [
-            r"\bsaves? time\b", r"\bquick(?:er)?\b", r"\bfaster\b", r"\bcut my .* time\b", r"\bsped up\b",
-            r"\btakes less time\b", r"\bso much quicker\b", r"\bin minutes?\b",
-        ],
-        "negative_patterns": [r"\btoo slow\b", r"\btakes forever\b", r"\btime consuming\b"],
-        "positive_labels": ["Time Saver", "Fast Results"],
-        "negative_labels": ["Slow Performance", "Time Consuming"],
-    },
-    "Comfort": {
-        "positive_patterns": [
-            r"\bcomfortable\b", r"\bcomfort\b", r"\blightweight\b", r"\bergonomic\b", r"\bfeels good\b",
-            r"\beasy on my (?:hand|arms|ears|skin)\b",
-        ],
-        "negative_patterns": [
-            r"\buncomfortable\b", r"\bheavy\b", r"\bawkward\b", r"\bbulky\b", r"\bhurts?\b",
-            r"\bsore\b", r"\btiring to hold\b",
-        ],
-        "positive_labels": ["Comfort"],
-        "negative_labels": ["Comfort Issue", "Size Issue"],
-    },
-    "Value": {
-        "positive_patterns": [
-            r"\bworth (?:it|the money|every penny)\b", r"\bgood value\b", r"\bgreat value\b", r"\breasonably priced\b", r"\bsaves? me money\b", r"\bwithout spending money\b",
-        ],
-        "negative_patterns": [
-            r"\bexpensive\b", r"\boverpriced\b", r"\btoo pricey\b", r"\btoo expensive\b", r"\bnot worth\b",
-            r"\bpricey\b", r"\bcosts? too much\b",
-        ],
-        "positive_labels": ["Value", "Worth The Price"],
-        "negative_labels": ["High Cost", "Value Issue"],
-    },
-    "Reliability": {
-        "positive_patterns": [
-            r"\breliable\b", r"\bsturdy\b", r"\bdurable\b", r"\bwell built\b", r"\bholds up\b",
-            r"\bstill working\b", r"\bsolid build\b",
-        ],
-        "negative_patterns": [
-            r"\bbroke(?:n)?\b", r"\bstopped working\b", r"\bdefective\b", r"\bfaulty\b", r"\bmalfunction(?:ed|ing)?\b",
-            r"\bdead on arrival\b", r"\bleaks?\b", r"\bcracked\b", r"\bnot durable\b", r"\bquit working\b",
-            r"\bproduct failure\b",
-        ],
-        "positive_labels": ["Reliability", "Durability"],
-        "negative_labels": ["Reliability Issue", "Product Failure", "Reliability"],
-    },
-    "Battery": {
-        "positive_patterns": [r"\blong battery life\b", r"\bbattery lasts?\b", r"\bholds a charge\b", r"\blasts all day\b"],
-        "negative_patterns": [
-            r"\bbattery dies?\b", r"\bshort battery life\b", r"\bwon['’]t charge\b", r"\bcharging issue\b",
-            r"\bbattery problem\b", r"\bdrains? quickly\b",
-        ],
-        "positive_labels": ["Battery Life"],
-        "negative_labels": ["Battery Problem", "Short Battery Life", "Battery Life"],
-    },
-    "Noise": {
-        "positive_patterns": [r"\bquiet\b", r"\bnot noisy\b", r"\bsurprisingly quiet\b"],
-        "negative_patterns": [r"\bloud\b", r"\bnoisy\b", r"\bhigh[- ]pitched\b", r"\bwhin(?:e|y)\b"],
-        "positive_labels": ["Quiet Operation"],
-        "negative_labels": ["High Noise", "Noise"],
-    },
-    "Cleaning / Maintenance": {
-        "positive_patterns": [r"\beasy to clean\b", r"\blow maintenance\b", r"\bsimple to clean\b"],
-        "negative_patterns": [
-            r"\bhard to clean\b", r"\bdifficult to clean\b", r"\bmessy\b", r"\bmaintenance hassle\b",
-            r"\bclogs?\b", r"\bresidue\b", r"\bwater spill(?:age)?\b",
-        ],
-        "positive_labels": ["Easy To Clean"],
-        "negative_labels": ["Cleaning Difficulty", "Clogged Pores", "Maintenance Issue"],
-    },
-    "Connectivity": {
-        "positive_patterns": [r"\bconnects? quickly\b", r"\bpairs? easily\b", r"\bapp works?\b"],
-        "negative_patterns": [
-            r"\bwon['’]t connect\b", r"\bpairing issue\b", r"\bapp issue\b", r"\bdisconnects?\b",
-            r"\bbluetooth issue\b", r"\bsync issue\b",
-        ],
-        "positive_labels": ["Connectivity", "App Experience"],
-        "negative_labels": ["Connectivity Issue", "App Issue"],
-    },
-    "Design": {
-        "positive_patterns": [r"\bcompact\b", r"\bsleek\b", r"\bwell designed\b", r"\bportable\b", r"\bgreat design\b"],
-        "negative_patterns": [r"\bbulky\b", r"\btoo big\b", r"\btoo small\b", r"\bpoor design\b", r"\bflimsy\b"],
-        "positive_labels": ["Design", "Compact Design", "Portability"],
-        "negative_labels": ["Design Issue", "Size Issue"],
-    },
-    "Attachments / Versatility": {
-        "positive_patterns": [
-            r"\battachments?\b.*\b(?:useful|helpful|versatile|handy|great)\b", r"\bversatile\b", r"\bmultiple uses\b", r"\bwet and dry\b", r"\bwet or dry\b", r"\bcan be used on wet and dry\b", r"\bworks? on (?:curly|straight|thick|fine) hair\b",
-        ],
-        "negative_patterns": [r"\battachment issue\b", r"\bmissing attachment\b", r"\blimited functionality\b"],
-        "positive_labels": ["Attachment Usability", "Versatility"],
-        "negative_labels": ["Attachment Issue", "Limited Functionality"],
-    },
-    "Safety": {
-        "positive_patterns": [r"\bfeels safe\b", r"\bsafe to use\b", r"\bgentle\b", r"\bno irritation\b"],
-        "negative_patterns": [
-            r"\bburn(?:ed|s|ing)?\b", r"\birritat(?:ed|es|ing|ion)\b", r"\bhurt\b", r"\bunsafe\b",
-            r"\bconcerning\b", r"\btoo hot\b", r"\bheat(?:ing)? issue\b",
-        ],
-        "positive_labels": ["Safety"],
-        "negative_labels": ["Safety Concern", "Irritation", "Excess Heat"],
-    },
-}
-
-UNIVERSAL_L2_TEMPLATES = {
-    "Overall Satisfaction": {
-        "Delighter": [
-            {"label": "Strong Recommendation", "patterns": [r"\bhighly recommend\b", r"\bcould not recommend more\b", r"\bwould recommend\b", r"\brecommend(?: it)? to anyone\b"], "boost": 0.54},
-            {"label": "Favorite Product", "patterns": [r"\bfavorite\b", r"\bbest product\b", r"\bgo[- ]to\b"], "boost": 0.50},
-        ],
-        "Detractor": [
-            {"label": "Would Not Recommend", "patterns": [r"\bdo not recommend\b", r"\bwould not recommend\b", r"\bcannot recommend\b"], "boost": 0.60},
-            {"label": "Return Intent", "patterns": [r"\breturn(?:ed|ing)?\b", r"\bsending it back\b", r"\bgot a refund\b"], "boost": 0.56},
-            {"label": "Buyer Remorse", "patterns": [r"\bregret(?:ted)?\b", r"\bwish i had(?: not|n't)\b", r"\bwaste of money\b"], "boost": 0.54},
-        ],
-    },
-    "Effective Results": {
-        "Delighter": [
-            {"label": "Visible Improvement", "patterns": [r"\bglow(?:ing)?\b", r"\bsmoother\b", r"\bclearer\b", r"\bbrighter\b", r"\bnoticeable improvement\b", r"\blooks better\b"], "boost": 0.64},
-            {"label": "Fast Results", "patterns": [r"\bafter (?:one|1) use\b", r"\bimmediate(?:ly)?\b", r"\binstant(?:ly)?\b", r"\bright away\b", r"\bquick results?\b"], "boost": 0.58},
-            {"label": "Consistent Results", "patterns": [r"\bevery time\b", r"\bconsisten(?:t|cy)\b", r"\breliable results?\b"], "boost": 0.50},
-            {"label": "Strong Performance", "patterns": [r"\bpowerful\b", r"\bstrong performance\b", r"\bdoes the job\b", r"\bworks? really well\b"], "boost": 0.48},
-        ],
-        "Detractor": [
-            {"label": "Poor Results", "patterns": [r"\bno results?\b", r"\bno difference\b", r"\bdidn['’]t work\b", r"\bdoesn['’]t work\b", r"\bnot effective\b"], "boost": 0.62},
-            {"label": "Slow Results", "patterns": [r"\btakes? too long\b", r"\bslow results?\b", r"\bnot quick\b"], "boost": 0.48},
-            {"label": "Inconsistent Results", "patterns": [r"\binconsistent\b", r"\bworks? sometimes\b", r"\bhit or miss\b", r"\bnot always\b"], "boost": 0.54},
-            {"label": "Weak Performance", "patterns": [r"\bweak\b", r"\bunderspowered\b", r"\bbarely works?\b"], "boost": 0.44},
-        ],
-    },
-    "Ease Of Use": {
-        "Delighter": [
-            {"label": "Easy Setup", "patterns": [r"\beasy to set up\b", r"\bsetup was easy\b", r"\bquick setup\b", r"\beasy to assemble\b"], "boost": 0.60},
-            {"label": "Intuitive Controls", "patterns": [r"\bintuitive\b", r"\bstraightforward\b", r"\buser[- ]?friendly\b", r"\beasy to navigate\b"], "boost": 0.54},
-            {"label": "Easy To Clean", "patterns": [r"\beasy to clean\b", r"\bsimple to clean\b", r"\bcleans up easily\b"], "boost": 0.56},
-        ],
-        "Detractor": [
-            {"label": "Setup Issue", "patterns": [r"\bhard to set up\b", r"\bdifficult to set up\b", r"\bsetup issue\b", r"\bassembly issue\b"], "boost": 0.62},
-            {"label": "Confusing Instructions", "patterns": [r"\binstructions? (?:are )?(?:bad|unclear|confusing)\b", r"\bmanual (?:is )?(?:bad|unclear|confusing)\b"], "boost": 0.58},
-            {"label": "Learning Curve", "patterns": [r"\blearning curve\b", r"\bnot intuitive\b", r"\bconfusing\b", r"\bcomplicated\b"], "boost": 0.54},
-            {"label": "Cleaning Difficulty", "patterns": [r"\bhard to clean\b", r"\bdifficult to clean\b", r"\bannoying to clean\b"], "boost": 0.56},
-        ],
-    },
-    "Time Saver": {
-        "Delighter": [
-            {"label": "Time Saver", "patterns": [r"\bsaves? time\b", r"\bso much quicker\b", r"\bsped up\b"], "boost": 0.56},
-            {"label": "Fast Results", "patterns": [r"\bquick(?:er)?\b", r"\bfaster\b", r"\bworks fast\b"], "boost": 0.48},
-        ],
-        "Detractor": [
-            {"label": "Time Consuming", "patterns": [r"\btime consuming\b", r"\btakes forever\b", r"\btoo slow\b"], "boost": 0.58},
-            {"label": "Slow Performance", "patterns": [r"\bslow\b", r"\bnot fast\b"], "boost": 0.46},
-        ],
-    },
-    "Comfort": {
-        "Delighter": [
-            {"label": "Comfortable Fit", "patterns": [r"\bcomfortable\b", r"\bfits? well\b", r"\bfeels good\b"], "boost": 0.54},
-            {"label": "Lightweight Design", "patterns": [r"\blightweight\b", r"\bnot heavy\b", r"\beasy to hold\b"], "boost": 0.48},
-        ],
-        "Detractor": [
-            {"label": "Comfort Issue", "patterns": [r"\buncomfortable\b", r"\bhurts?\b", r"\bsore\b"], "boost": 0.58},
-            {"label": "Heavy/Bulky Feel", "patterns": [r"\bheavy\b", r"\bbulky\b", r"\bawkward\b", r"\btiring to hold\b"], "boost": 0.50},
-        ],
-    },
-    "Value": {
-        "Delighter": [
-            {"label": "Worth The Price", "patterns": [r"\bworth (?:it|the money|every penny)\b", r"\bworth the price\b"], "boost": 0.60},
-            {"label": "Good Value", "patterns": [r"\bgood value\b", r"\bgreat value\b", r"\bpriced fairly\b"], "boost": 0.54},
-        ],
-        "Detractor": [
-            {"label": "High Cost", "patterns": [r"\btoo expensive\b", r"\boverpriced\b", r"\bpricey\b", r"\bcosts? too much\b"], "boost": 0.62},
-            {"label": "Not Worth The Price", "patterns": [r"\bnot worth\b", r"\bnot worth the price\b", r"\bnot worth the money\b"], "boost": 0.58},
-        ],
-    },
-    "Reliability": {
-        "Delighter": [
-            {"label": "Durable Build", "patterns": [r"\bdurable\b", r"\bsturdy\b", r"\bwell built\b", r"\bsolid build\b"], "boost": 0.56},
-            {"label": "Reliable Performance", "patterns": [r"\breliable\b", r"\bstill working\b", r"\bholds up\b"], "boost": 0.50},
-        ],
-        "Detractor": [
-            {"label": "Product Failure", "patterns": [r"\bstopped working\b", r"\bquit working\b", r"\bproduct failure\b", r"\bbroke(?:n)?\b"], "boost": 0.66},
-            {"label": "Defective Unit", "patterns": [r"\bdefective\b", r"\bfaulty\b", r"\bdead on arrival\b"], "boost": 0.62},
-            {"label": "Short Lifespan", "patterns": [r"\bafter (?:a few|few) uses?\b", r"\bdidn['’]t last\b", r"\bstopped working after\b"], "boost": 0.54},
-            {"label": "Leaking/Spillage", "patterns": [r"\bleaks?\b", r"\bspills?\b", r"\bleaking\b"], "boost": 0.52},
-        ],
-    },
-    "Battery": {
-        "Delighter": [
-            {"label": "Long Battery Life", "patterns": [r"\blong battery life\b", r"\bbattery lasts?\b", r"\blasts all day\b"], "boost": 0.58},
-            {"label": "Fast Charging", "patterns": [r"\bcharges? quickly\b", r"\bfast charging\b"], "boost": 0.50},
-        ],
-        "Detractor": [
-            {"label": "Short Battery Life", "patterns": [r"\bshort battery life\b", r"\bdrains? quickly\b", r"\bbattery dies?\b"], "boost": 0.62},
-            {"label": "Charging Issue", "patterns": [r"\bwon['’]t charge\b", r"\bcharging issue\b", r"\bdoesn['’]t charge\b"], "boost": 0.58},
-        ],
-    },
-    "Noise": {
-        "Delighter": [
-            {"label": "Quiet Operation", "patterns": [r"\bquiet\b", r"\bsurprisingly quiet\b", r"\bnot noisy\b"], "boost": 0.54},
-        ],
-        "Detractor": [
-            {"label": "High Noise", "patterns": [r"\bloud\b", r"\bnoisy\b", r"\bhigh[- ]pitched\b", r"\bwhin(?:e|y)\b"], "boost": 0.62},
-        ],
-    },
-    "Cleaning / Maintenance": {
-        "Delighter": [
-            {"label": "Easy To Clean", "patterns": [r"\beasy to clean\b", r"\blow maintenance\b", r"\bsimple to clean\b"], "boost": 0.56},
-            {"label": "Low Maintenance", "patterns": [r"\blow maintenance\b", r"\bminimal maintenance\b"], "boost": 0.48},
-        ],
-        "Detractor": [
-            {"label": "Cleaning Difficulty", "patterns": [r"\bhard to clean\b", r"\bdifficult to clean\b", r"\bmessy\b"], "boost": 0.60},
-            {"label": "Residue Build-Up", "patterns": [r"\bresidue\b", r"\bbuildup\b", r"\bleaves? behind\b"], "boost": 0.46},
-            {"label": "Clogging", "patterns": [r"\bclogs?\b", r"\bclogged\b"], "boost": 0.52},
-        ],
-    },
-    "Connectivity": {
-        "Delighter": [
-            {"label": "Easy Pairing", "patterns": [r"\bpairs? easily\b", r"\bconnects? quickly\b"], "boost": 0.56},
-            {"label": "App Experience", "patterns": [r"\bapp works?\b", r"\bapp is easy\b"], "boost": 0.48},
-        ],
-        "Detractor": [
-            {"label": "Pairing Issue", "patterns": [r"\bpairing issue\b", r"\bwon['’]t pair\b", r"\bwon['’]t connect\b"], "boost": 0.62},
-            {"label": "App Issue", "patterns": [r"\bapp issue\b", r"\bapp crashes?\b", r"\bapp doesn['’]t work\b"], "boost": 0.58},
-            {"label": "Sync Issue", "patterns": [r"\bsync issue\b", r"\bdisconnects?\b", r"\bbluetooth issue\b"], "boost": 0.54},
-        ],
-    },
-    "Design": {
-        "Delighter": [
-            {"label": "Compact Design", "patterns": [r"\bcompact\b", r"\bdoesn['’]t take up much space\b"], "boost": 0.54},
-            {"label": "Portable Design", "patterns": [r"\bportable\b", r"\beasy to travel with\b"], "boost": 0.48},
-            {"label": "Premium Design", "patterns": [r"\bwell designed\b", r"\bgreat design\b", r"\bpremium feel\b", r"\bsleek\b"], "boost": 0.46},
-        ],
-        "Detractor": [
-            {"label": "Bulky Design", "patterns": [r"\bbulky\b", r"\btoo big\b", r"\btakes up too much space\b"], "boost": 0.56},
-            {"label": "Flimsy Build", "patterns": [r"\bflimsy\b", r"\bcheaply made\b", r"\bpoor design\b"], "boost": 0.52},
-            {"label": "Size Issue", "patterns": [r"\btoo small\b", r"\btoo big\b", r"\bwrong size\b"], "boost": 0.48},
-        ],
-    },
-    "Attachments / Versatility": {
-        "Delighter": [
-            {"label": "Versatile Attachments", "patterns": [r"\battachments?\b.*\b(?:useful|helpful|versatile|great)\b", r"\bmultiple uses\b", r"\bversatile\b"], "boost": 0.56},
-            {"label": "Attachment Usability", "patterns": [r"\battachments?\b.*\b(?:easy|simple|handy)\b", r"\beasy to switch\b"], "boost": 0.50},
-            {"label": "Multi-Use", "patterns": [r"\bmultiple uses\b", r"\bcan use it for\b"], "boost": 0.46},
-        ],
-        "Detractor": [
-            {"label": "Attachment Issue", "patterns": [r"\battachment issue\b", r"\battachments?\b.*\b(?:don['’]t|do not) fit\b", r"\bhard to attach\b"], "boost": 0.58},
-            {"label": "Missing Attachment", "patterns": [r"\bmissing attachment\b", r"\bdidn['’]t come with\b"], "boost": 0.54},
-            {"label": "Limited Functionality", "patterns": [r"\blimited functionality\b", r"\bnot versatile\b", r"\bonly does one thing\b"], "boost": 0.52},
-        ],
-    },
-    "Safety": {
-        "Delighter": [
-            {"label": "Safe To Use", "patterns": [r"\bsafe to use\b", r"\bfeels safe\b", r"\bgentle\b", r"\bno irritation\b"], "boost": 0.54},
-        ],
-        "Detractor": [
-            {"label": "Irritation", "patterns": [r"\birritat(?:ed|es|ing|ion)\b", r"\bredness\b", r"\brash\b"], "boost": 0.60},
-            {"label": "Excess Heat", "patterns": [r"\btoo hot\b", r"\bburn(?:ed|s|ing)?\b", r"\bheat issue\b"], "boost": 0.58},
-            {"label": "Safety Concern", "patterns": [r"\bunsafe\b", r"\bconcerning\b", r"\bworried about safety\b"], "boost": 0.54},
-        ],
-    },
-}
-
-
-
-def _compile_backbone_rules() -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for aspect, spec in UNIVERSAL_ASPECT_BACKBONE.items():
-        out[aspect] = dict(spec)
-        out[aspect]["positive_patterns"] = [re.compile(p, re.I) for p in spec.get("positive_patterns", [])]
-        out[aspect]["negative_patterns"] = [re.compile(p, re.I) for p in spec.get("negative_patterns", [])]
-    return out
-
-
-UNIVERSAL_ASPECT_BACKBONE_COMPILED = _compile_backbone_rules()
-
-
-def _dedupe_keep_order_str(values: Iterable[str]) -> List[str]:
-    out: List[str] = []
-    seen: Set[str] = set()
-    for v in values:
-        s = str(v or "").strip()
-        if not s:
-            continue
-        k = _canon_simple(s)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(s)
-    return out
-
-
-def _compile_l2_templates() -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-    out: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for family, by_side in UNIVERSAL_L2_TEMPLATES.items():
-        out[family] = {}
-        for side, specs in by_side.items():
-            compiled_specs: List[Dict[str, Any]] = []
-            for spec in specs:
-                spec2 = dict(spec)
-                spec2["patterns"] = [re.compile(p, re.I) for p in spec.get("patterns", [])]
-                compiled_specs.append(spec2)
-            out[family][side] = compiled_specs
-    return out
-
-
-UNIVERSAL_L2_TEMPLATES_COMPILED = _compile_l2_templates()
-
-FAMILY_TOKEN_HINTS = {
-    "Overall Satisfaction": ["satisfaction", "recommend", "favorite", "best", "happy", "impressed", "regret", "disappointed", "return"],
-    "Effective Results": ["result", "results", "performance", "effective", "works", "working", "improvement", "difference", "quality", "output", "glow", "smooth", "smoother", "shine", "frizz", "curly", "curl", "salon"],
-    "Ease Of Use": ["easy", "setup", "clean", "instructions", "intuitive", "simple", "user", "friendly", "complicated"],
-    "Time Saver": ["time", "quick", "quicker", "fast", "faster", "slow", "forever", "minutes"],
-    "Comfort": ["comfort", "comfortable", "lightweight", "ergonomic", "heavy", "bulky", "awkward", "fit"],
-    "Value": ["value", "worth", "price", "priced", "cost", "expensive", "overpriced", "pricey", "money", "affordable"],
-    "Reliability": ["reliable", "durable", "sturdy", "broke", "broken", "defective", "faulty", "failure", "leak", "lasting"],
-    "Battery": ["battery", "charge", "charging", "runtime", "power"],
-    "Noise": ["noise", "noisy", "loud", "quiet", "whine"],
-    "Cleaning / Maintenance": ["clean", "cleaning", "maintenance", "messy", "clog", "residue", "buildup"],
-    "Connectivity": ["connect", "connected", "pair", "pairing", "sync", "app", "bluetooth", "wifi"],
-    "Design": ["design", "compact", "portable", "size", "bulky", "flimsy", "sleek", "premium"],
-    "Attachments / Versatility": ["attachment", "attachments", "accessory", "versatile", "multi", "tool", "nozzle", "wet", "dry", "curly", "straight"],
-    "Safety": ["safe", "safety", "burn", "irritation", "rash", "hot", "heat", "gentle"],
-}
-
-
-def _build_family_seed_labels() -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
-    for family, spec in UNIVERSAL_ASPECT_BACKBONE.items():
-        labels: List[str] = [family]
-        labels.extend(list(spec.get("positive_labels", []) or []))
-        labels.extend(list(spec.get("negative_labels", []) or []))
-        for side in ("Delighter", "Detractor"):
-            for tmpl in (UNIVERSAL_L2_TEMPLATES.get(family, {}) or {}).get(side, []) or []:
-                labels.append(str(tmpl.get("label", "") or ""))
-        out[family] = _dedupe_keep_order_str([normalize_theme_label(x) for x in labels if str(x).strip()])
-    return out
-
-
-FAMILY_SEED_LABELS = _build_family_seed_labels()
-
-
-def _infer_l1_family_from_label(label: str, side: str = "") -> str:
-    raw = normalize_theme_label(label, side)
-    if not raw:
-        return ""
-    raw_key = _canon_simple(raw)
-    raw_tokens = set(_label_tokens(raw))
-
-    for family, seeds in FAMILY_SEED_LABELS.items():
-        seed_keys = {_canon_simple(family)} | {_canon_simple(s) for s in seeds}
-        if raw_key in seed_keys:
-            return family
-
-    best_family = ""
-    best_score = 0.0
-    for family, seeds in FAMILY_SEED_LABELS.items():
-        score = 0.0
-        family_tokens = set(_label_tokens(family))
-        hint_tokens = set(FAMILY_TOKEN_HINTS.get(family, []))
-        seed_tokens: Set[str] = set()
-        for s in seeds[:16]:
-            seed_tokens |= set(_label_tokens(s))
-        if raw_tokens & family_tokens:
-            score += 1.25 * len(raw_tokens & family_tokens)
-        if raw_tokens & hint_tokens:
-            score += 0.85 * len(raw_tokens & hint_tokens)
-        if raw_tokens & seed_tokens:
-            score += 0.55 * len(raw_tokens & seed_tokens)
-        try:
-            close = max([difflib.SequenceMatcher(None, _canon(raw), _canon(s)).ratio() for s in ([family] + seeds[:12])])
-        except Exception:
-            close = 0.0
-        score += 0.9 * close
-        if score > best_score:
-            best_score = score
-            best_family = family
-    if best_score >= 1.75:
-        return best_family
-    return ""
-
-
-def _get_label_family(label: str, side: str, learned_store: Optional[Dict[str, Any]] = None) -> str:
-    side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
-    cache = st.session_state.setdefault("_label_family_cache", {})
-    key = (side_norm, _canon_simple(label))
-    if key in cache:
-        return str(cache.get(key) or "")
-    ls = learned_store or _ensure_learned_store()
-    fam = str(((ls.get("families", {}) or {}).get(side_norm, {}) or {}).get(label, "") or "")
-    if not fam:
-        fam = _infer_l1_family_from_label(label, side_norm)
-    cache[key] = fam
-    if fam:
-        ls.setdefault("families", {}).setdefault(side_norm, {})[label] = fam
-    return fam
-
-
-def _group_labels_by_family(side: str, labels: Iterable[str], learned_store: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
-    for lab in labels:
-        fam = _get_label_family(str(lab), side, learned_store) or "Other"
-        out.setdefault(fam, [])
-        if str(lab) not in out[fam]:
-            out[fam].append(str(lab))
-    return out
-
-
-def _route_l2_template_candidates(
-    review_s: str,
-    side: str,
-    allowed_labels: List[str],
-    matched_families: Set[str],
-    max_ev_chars: int = 120,
-) -> Tuple[Dict[str, float], Dict[str, List[str]], List[str]]:
-    scores: Dict[str, float] = {}
-    ev_map: Dict[str, List[str]] = {}
-    raw_labels: List[str] = []
-    if not bool(st.session_state.get("enable_deep_l2_routing", True)):
-        return scores, ev_map, raw_labels
-
-    specificity_bias = float(st.session_state.get("l2_specificity_bias", 0.16) or 0.16)
-    max_per_family = int(st.session_state.get("l2_candidate_top_n", 3) or 3)
-
-    for family in matched_families:
-        picked_in_family = 0
-        for spec in (UNIVERSAL_L2_TEMPLATES_COMPILED.get(family, {}) or {}).get(side, []) or []:
-            hits = _regex_snippets(review_s, spec.get("patterns", []) or [], max_hits=2, max_chars=max_ev_chars)
-            if not hits:
-                continue
-            candidate_names = [str(spec.get("label", "") or "")] + list(spec.get("aliases", []) or [])
-            resolved = _resolve_available_label(candidate_names, allowed_labels, side)
-            if not resolved:
-                continue
-            score = float(spec.get("boost", 0.52) or 0.52) + specificity_bias + (0.06 * len(hits))
-            if resolved not in scores or score > scores[resolved]:
-                scores[resolved] = score
-            ev_map.setdefault(resolved, [])
-            ev_map[resolved] = _dedupe_keep_order_str(ev_map[resolved] + hits)[:2]
-            raw_labels.append(resolved)
-            picked_in_family += 1
-            if picked_in_family >= max_per_family:
-                break
-    return scores, ev_map, _dedupe_keep_order_str(raw_labels)
-
-
-def _parse_label_textarea(text_in: Any) -> List[str]:
-    s = str(text_in or "")
-    raw = re.split(r"[\n,;|]+", s)
-    vals = [normalize_theme_label(x.strip()) for x in raw if str(x).strip()]
-    return _dedupe_keep_order_str(vals)
-
-
-def _provided_catalog_labels(side: str) -> List[str]:
-    side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
-    vals = DELIGHTERS if side_norm == "Delighter" else DETRACTORS
-    return [str(x).strip() for x in (vals or []) if str(x).strip()]
-
-
-def _provided_catalog_keyset(side: str) -> Set[str]:
-    return {_canon_simple(x) for x in _provided_catalog_labels(side)}
-
-
-def _label_phrase_parts(label: str) -> List[str]:
-    raw_parts = re.split(r"\s*-\s*|[/|,&]+", str(label or ""))
-    parts: List[str] = []
-    for p in raw_parts:
-        ps = str(p or "").strip()
-        if not ps:
-            continue
-        if len(ps) < 4:
-            continue
-        if _canon_simple(ps) == _canon_simple(label):
-            continue
-        parts.append(ps)
-    return _dedupe_keep_order_str(parts)
-
-
-def _priority_theme_labels(side: str) -> List[str]:
-    side_norm = "Delighter" if str(side).lower().startswith("del") else "Detractor"
-    defaults = DEFAULT_PRIORITY_DELIGHTERS if side_norm == "Delighter" else DEFAULT_PRIORITY_DETRACTORS
-    key = "priority_delighters_text" if side_norm == "Delighter" else "priority_detractors_text"
-    custom = _parse_label_textarea(st.session_state.get(key, ""))
-    if not custom:
-        custom = list(defaults)
-    return _dedupe_keep_order_str(list(defaults) + custom)
-
-
-def _route_config_signature() -> str:
-    payload = {
-        "universal": bool(st.session_state.get("use_universal_l1_backbone", True)),
-        "recall": bool(st.session_state.get("high_recall_labeling", True)),
-        "deep_l2": bool(st.session_state.get("enable_deep_l2_routing", True)),
-        "top_n": int(st.session_state.get("router_candidate_top_n", 6) or 6),
-        "l2_top_n": int(st.session_state.get("l2_candidate_top_n", 3) or 3),
-        "threshold": float(st.session_state.get("router_rescue_threshold", 0.95) or 0.95),
-        "l2_threshold": float(st.session_state.get("l2_rescue_threshold", 1.08) or 1.08),
-        "family_boost": float(st.session_state.get("router_family_boost", 0.38) or 0.38),
-        "l2_bias": float(st.session_state.get("l2_specificity_bias", 0.16) or 0.16),
-        "pd": _priority_theme_labels("Delighter"),
-        "pt": _priority_theme_labels("Detractor"),
-    }
-    try:
-        return hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
-    except Exception:
-        return str(payload)
-
-
-def _label_tokens(label: str) -> List[str]:
-    toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9+/']*", str(label or ""))]
-    return [t for t in toks if t not in ROUTER_STOPWORDS and len(t) >= 3]
-
-
-def _phrase_snippets(text_in: str, phrases: Iterable[str], max_hits: int = 2, max_chars: int = 120) -> List[str]:
-    text_s = str(text_in or "")
-    out: List[str] = []
-    seen: Set[str] = set()
-    for ph in phrases:
-        phs = str(ph or "").strip()
-        if not phs:
-            continue
-        try:
-            rx = re.compile(r"(?<!\w)" + re.escape(phs) + r"(?!\w)", re.I)
-        except Exception:
-            continue
-        for m in rx.finditer(text_s):
-            hit = text_s[m.start():m.end()][:max_chars].strip()
-            if hit and hit.lower() not in seen:
-                seen.add(hit.lower())
-                out.append(hit)
-                if len(out) >= max_hits:
-                    return out
-    return out
-
-
-def _regex_snippets(text_in: str, patterns: Iterable[Any], max_hits: int = 2, max_chars: int = 120) -> List[str]:
-    text_s = str(text_in or "")
-    out: List[str] = []
-    seen: Set[str] = set()
-    for p in patterns:
-        rx = p if hasattr(p, "finditer") else re.compile(str(p), re.I)
-        for m in rx.finditer(text_s):
-            hit = text_s[m.start():m.end()][:max_chars].strip(" .,;:-")
-            if hit and hit.lower() not in seen:
-                seen.add(hit.lower())
-                out.append(hit[:max_chars])
-                if len(out) >= max_hits:
-                    return out
-    return out
-
-
-def _keyword_snippets(text_in: str, keywords: Iterable[str], max_hits: int = 2, max_chars: int = 120) -> List[str]:
-    text_s = str(text_in or "")
-    out: List[str] = []
-    seen: Set[str] = set()
-    for kw in keywords:
-        k = str(kw or "").strip().lower()
-        if not k:
-            continue
-        if (len(k) < 4) and (" " not in k):
-            continue
-        try:
-            if " " in k:
-                rx = re.compile(re.escape(k), re.I)
-            else:
-                rx = re.compile(r"(?<!\w)" + re.escape(k) + r"(?!\w)", re.I)
-        except Exception:
-            continue
-        for m in rx.finditer(text_s):
-            hit = text_s[m.start():m.end()][:max_chars].strip()
-            if hit and hit.lower() not in seen:
-                seen.add(hit.lower())
-                out.append(hit)
-                if len(out) >= max_hits:
-                    return out
-    return out
-
-
-def _resolve_available_label(candidate_names: List[str], allowed_labels: List[str], side: str) -> Optional[str]:
-    clean_allowed = [str(x).strip() for x in (allowed_labels or []) if str(x).strip()]
-    if not clean_allowed:
-        return candidate_names[0] if bool(st.session_state.get("use_universal_l1_backbone", True)) and candidate_names else None
-
-    exact = {_canon_simple(x): x for x in clean_allowed}
-    for cand in candidate_names:
-        c = str(cand or "").strip()
-        if not c:
-            continue
-        k = _canon_simple(c)
-        if k in exact:
-            return exact[k]
-        norm = normalize_theme_label(c, side)
-        kn = _canon_simple(norm)
-        if kn in exact:
-            return exact[kn]
-        tgt = ALIAS_TO_LABEL.get(_canon(c))
-        if tgt and _canon_simple(tgt) in exact:
-            return exact[_canon_simple(tgt)]
-    cutoff = max(0.84, float(st.session_state.get("sim_threshold_lex", 0.94)) - 0.06)
-    for cand in candidate_names:
-        c = normalize_theme_label(cand, side)
-        m = difflib.get_close_matches(c, clean_allowed, n=1, cutoff=cutoff)
-        if m:
-            return m[0]
-    if bool(st.session_state.get("use_universal_l1_backbone", True)) and candidate_names:
-        return normalize_theme_label(candidate_names[0], side)
-    return None
-
-
-def _coerce_label_to_allowed(raw_label: str, allowed_labels: List[str], side: str) -> Optional[str]:
-    raw = str(raw_label or "").strip()
-    if not raw:
-        return None
-    exact = {_canon_simple(x): x for x in allowed_labels}
-    for cand in [raw, normalize_theme_label(raw, side)]:
-        if _canon_simple(cand) in exact:
-            return exact[_canon_simple(cand)]
-        tgt = ALIAS_TO_LABEL.get(_canon(cand))
-        if tgt and _canon_simple(tgt) in exact:
-            return exact[_canon_simple(tgt)]
-    cutoff = max(0.84, float(st.session_state.get("sim_threshold_lex", 0.94)) - 0.06)
-    candidates = difflib.get_close_matches(normalize_theme_label(raw, side), list(allowed_labels), n=1, cutoff=cutoff)
-    if candidates:
-        return candidates[0]
-    raw_tokens = set(_label_tokens(raw))
-    if raw_tokens:
-        best = None
-        best_score = 0.0
-        for lab in allowed_labels:
-            toks = set(_label_tokens(lab))
-            if not toks:
-                continue
-            inter = len(raw_tokens & toks)
-            if inter <= 0:
-                continue
-            score = inter / max(1, len(raw_tokens | toks))
-            if score > best_score:
-                best_score = score
-                best = lab
-        if best and best_score >= 0.5:
-            return best
-    return None
-
-
-def _score_existing_label(
-    review: str,
-    label: str,
-    side: str,
-    learned_store: Dict[str, Any],
-    matched_families: Optional[Set[str]] = None,
-    max_ev_chars: int = 120,
-) -> Tuple[float, List[str]]:
-    score = 0.0
-    evs: List[str] = []
-    catalog_keys = _provided_catalog_keyset(side)
-    label_key = _canon_simple(label)
-    if label in _priority_theme_labels(side):
-        score += 0.08
-    if label_key in catalog_keys:
-        score += 0.12
-
-    family = _get_label_family(label, side, learned_store)
-    if family and matched_families and family in matched_families:
-        score += float(st.session_state.get("router_family_boost", 0.38) or 0.38)
-
-    label_evs = _phrase_snippets(review, [label], max_hits=2, max_chars=max_ev_chars)
-    if label_evs:
-        score += 1.00
-        evs.extend(label_evs)
-
-    part_hits = _phrase_snippets(review, _label_phrase_parts(label)[:4], max_hits=2, max_chars=max_ev_chars)
-    if part_hits:
-        score += 0.28 + (0.06 * min(2, len(part_hits)))
-        evs.extend(part_hits)
-
-    for alias in (ALIASES.get(label, []) or [])[:12]:
-        hit = _phrase_snippets(review, [alias], max_hits=2, max_chars=max_ev_chars)
-        if hit:
-            score += 0.85
-            evs.extend(hit)
-            break
-
-    kw_pool = list((learned_store.get("keywords", {}).get(side, {}).get(label, set()) or set()))[:12]
-    kw_hits = _keyword_snippets(review, kw_pool, max_hits=3, max_chars=max_ev_chars)
-    if kw_hits:
-        score += 0.34 * min(3, len(kw_hits))
-        if family and matched_families and family in matched_families:
-            score += 0.14
-        evs.extend(kw_hits)
-
-    rtoks = set(re.findall(r"[A-Za-z][A-Za-z0-9+/']*", str(review or "").lower()))
-    ltoks = [t for t in _label_tokens(label) if t not in ROUTER_STOPWORDS]
-    overlap = [t for t in ltoks if t in rtoks]
-    if len(overlap) >= 2:
-        score += 0.42 + (0.08 * min(3, len(overlap)))
-        evs.extend(_phrase_snippets(review, overlap[:2], max_hits=2, max_chars=max_ev_chars))
-        if label_key in catalog_keys:
-            score += 0.12
-    elif len(overlap) == 1 and len(ltoks) >= 1 and len(overlap[0]) >= 5:
-        score += 0.22
-        evs.extend(_phrase_snippets(review, overlap[:1], max_hits=1, max_chars=max_ev_chars))
-
-    if family:
-        fam_kw_hits = _keyword_snippets(review, list(FAMILY_TOKEN_HINTS.get(family, []))[:12], max_hits=2, max_chars=max_ev_chars)
-        if fam_kw_hits and label_key in catalog_keys:
-            score += 0.12 * min(2, len(fam_kw_hits))
-            evs.extend(fam_kw_hits)
-
-    if family and matched_families and family in matched_families:
-        is_specific_l2 = _canon_simple(label) != _canon_simple(family)
-        if is_specific_l2:
-            score += float(st.session_state.get("l2_specificity_bias", 0.16) or 0.16)
-        family_hits = _regex_snippets(
-            review,
-            (UNIVERSAL_ASPECT_BACKBONE_COMPILED.get(family, {}) or {}).get(
-                "positive_patterns" if str(side).lower().startswith("del") else "negative_patterns", []
-            ) or [],
-            max_hits=2,
-            max_chars=max_ev_chars,
-        )
-        if family_hits:
-            evs.extend(family_hits)
-            score += 0.10 * len(family_hits)
-
-    return (score, _dedupe_keep_order_str(evs)[:2])
-
-def _route_review_candidates(
-    review: str,
-    allowed_delighters: List[str],
-    allowed_detractors: List[str],
-    learned_store: Dict[str, Any],
-    top_n: int = 6,
-    max_ev_chars: int = 120,
-) -> Dict[str, Any]:
-    review_s = str(review or "").strip()
-    out = {
-        "dels": [],
-        "dets": [],
-        "ev_del_map": {},
-        "ev_det_map": {},
-        "del_scores": {},
-        "det_scores": {},
-        "matched_del_families": [],
-        "matched_det_families": [],
-        "l2_dels": [],
-        "l2_dets": [],
-    }
-    if not review_s:
-        return out
-
-    side_cfg = {
-        "Delighter": {
-            "allowed": allowed_delighters,
-            "labels_key": "positive_labels",
-            "patterns_key": "positive_patterns",
-            "out_labels": "dels",
-            "out_ev": "ev_del_map",
-            "out_scores": "del_scores",
-            "out_families": "matched_del_families",
-            "out_l2": "l2_dels",
-        },
-        "Detractor": {
-            "allowed": allowed_detractors,
-            "labels_key": "negative_labels",
-            "patterns_key": "negative_patterns",
-            "out_labels": "dets",
-            "out_ev": "ev_det_map",
-            "out_scores": "det_scores",
-            "out_families": "matched_det_families",
-            "out_l2": "l2_dets",
-        },
-    }
-
-    for side, cfg in side_cfg.items():
-        allowed = list(cfg["allowed"] or [])
-        scores: Dict[str, float] = {}
-        ev_map: Dict[str, List[str]] = {}
-        priority = set(_priority_theme_labels(side))
-        provided_catalog_keys = _provided_catalog_keyset(side)
-
-        aspect_hits: Dict[str, List[str]] = {}
-        for aspect, spec in UNIVERSAL_ASPECT_BACKBONE_COMPILED.items():
-            pats = spec.get(cfg["patterns_key"], []) or []
-            hits = _regex_snippets(review_s, pats, max_hits=2, max_chars=max_ev_chars)
-            if not hits:
-                continue
-            aspect_hits[aspect] = hits
-            names = list(spec.get(cfg["labels_key"], []) or []) + [aspect]
-            resolved = _resolve_available_label(names, allowed, side)
-            if not resolved:
-                continue
-            base = 1.15 if resolved in priority else 0.95
-            if _canon_simple(resolved) in provided_catalog_keys:
-                base += 0.18
-            scores[resolved] = scores.get(resolved, 0.0) + base + (0.10 * len(hits))
-            ev_map.setdefault(resolved, [])
-            ev_map[resolved] = _dedupe_keep_order_str(ev_map[resolved] + hits)[:2]
-
-        matched_families = set(aspect_hits.keys())
-        out[cfg["out_families"]] = sorted(matched_families)
-
-        l2_scores, l2_ev_map, l2_raw_labels = _route_l2_template_candidates(
-            review_s,
-            side=side,
-            allowed_labels=allowed,
-            matched_families=matched_families,
-            max_ev_chars=max_ev_chars,
-        )
-        out[cfg["out_l2"]] = list(l2_raw_labels)[: max(1, int(st.session_state.get("l2_candidate_top_n", 3) or 3) * 3)]
-        for lab, sc in l2_scores.items():
-            sc2 = float(sc) + (0.12 if _canon_simple(lab) in provided_catalog_keys else 0.0)
-            scores[lab] = max(scores.get(lab, 0.0), sc2)
-        for lab, evs in l2_ev_map.items():
-            ev_map.setdefault(lab, [])
-            ev_map[lab] = _dedupe_keep_order_str(ev_map[lab] + list(evs or []))[:2]
-
-        if side == "Delighter" and aspect_hits.get("Visible Improvement"):
-            eff_label = _resolve_available_label(["Effective Results", "Performance", "Works Well"], allowed, side)
-            if eff_label:
-                eff_hits = list(aspect_hits.get("Visible Improvement", []))
-                scores[eff_label] = max(scores.get(eff_label, 0.0), 0.92 + (0.08 * len(eff_hits)))
-                if eff_hits:
-                    ev_map.setdefault(eff_label, [])
-                    ev_map[eff_label] = _dedupe_keep_order_str(ev_map[eff_label] + eff_hits)[:2]
-                matched_families.add("Effective Results")
-                out[cfg["out_families"]] = sorted(matched_families)
-
-        pool = sorted(list(allowed), key=lambda lab: (0 if _canon_simple(lab) in provided_catalog_keys else 1, str(lab)))
-        for lab in pool:
-            sc, evs = _score_existing_label(
-                review_s,
-                lab,
-                side,
-                learned_store,
-                matched_families=matched_families,
-                max_ev_chars=max_ev_chars,
-            )
-            if sc <= 0:
-                continue
-            if _canon_simple(lab) in provided_catalog_keys:
-                sc += 0.12
-            family = _get_label_family(lab, side, learned_store)
-            is_specific_l2 = bool(family) and (_canon_simple(lab) != _canon_simple(family))
-            if sc >= 0.35 or lab in priority or (is_specific_l2 and family in matched_families):
-                scores[lab] = max(scores.get(lab, 0.0), sc if lab not in scores else scores[lab] + (0.22 * sc))
-                if evs:
-                    ev_map.setdefault(lab, [])
-                    ev_map[lab] = _dedupe_keep_order_str(ev_map[lab] + evs)[:2]
-
-        ordered = sorted(scores.items(), key=lambda kv: (0 if _canon_simple(kv[0]) in provided_catalog_keys else 1, -kv[1], kv[0]))
-        picked: List[str] = []
-        picked_specific: List[str] = []
-        for lab, sc in ordered:
-            family = _get_label_family(lab, side, learned_store)
-            is_specific_l2 = bool(family) and (_canon_simple(lab) != _canon_simple(family))
-            is_catalog = _canon_simple(lab) in provided_catalog_keys
-            min_score = 0.45 if lab not in priority else 0.30
-            if is_catalog and ev_map.get(lab):
-                min_score = min(min_score, 0.28 if not is_specific_l2 else 0.32)
-            elif is_catalog:
-                min_score = min(min_score, 0.32 if not is_specific_l2 else 0.36)
-            if is_specific_l2 and family in matched_families:
-                min_score = min(min_score, 0.40)
-            if sc < min_score:
-                continue
-            picked.append(lab)
-            if is_specific_l2:
-                picked_specific.append(lab)
-            if len(picked) >= int(top_n):
-                break
-
-        out[cfg["out_labels"]] = picked
-        out[cfg["out_ev"]] = {lab: ev_map.get(lab, [])[:2] for lab in picked if ev_map.get(lab)}
-        out[cfg["out_scores"]] = {lab: float(scores.get(lab, 0.0)) for lab in picked}
-        out[cfg["out_l2"]] = _dedupe_keep_order_str((out.get(cfg["out_l2"], []) or []) + picked_specific)[: max(1, int(st.session_state.get("l2_candidate_top_n", 3) or 3) * 3)]
-
-    return out
-
-def _apply_router_rescue(
-    norm: Dict[str, Any],
-    router: Dict[str, Any],
-    needs_del: bool,
-    needs_det: bool,
-    require_evidence_flag: bool,
-    max_ev_per_label: int,
-) -> Dict[str, Any]:
-    base_threshold = float(st.session_state.get("router_rescue_threshold", 0.95) or 0.95)
-    l2_threshold = float(st.session_state.get("l2_rescue_threshold", max(base_threshold + 0.10, 1.05)) or max(base_threshold + 0.10, 1.05))
-
-    def _merge(side_key: str, ev_key: str, route_key: str, route_ev_key: str, score_key: str, needs_side: bool, side_name: str) -> None:
-        if not needs_side:
-            return
-        labs = list(norm.get(side_key, []) or [])
-        ev_map = dict(norm.get(ev_key, {}) or {})
-        route_labs = list(router.get(route_key, []) or [])
-        route_evs = dict(router.get(route_ev_key, {}) or {})
-        scores = dict(router.get(score_key, {}) or {})
-
-        for lab in route_labs:
-            sc = float(scores.get(lab, 0.0) or 0.0)
-            evs = list(route_evs.get(lab, []) or [])[:max_ev_per_label]
-            family = _get_label_family(lab, side_name, _ensure_learned_store())
-            is_specific_l2 = bool(family) and (_canon_simple(lab) != _canon_simple(family))
-            is_catalog = _canon_simple(lab) in _provided_catalog_keyset(side_name)
-            required_score = l2_threshold if is_specific_l2 else base_threshold
-            if is_catalog:
-                required_score = min(required_score, max(0.62, base_threshold - (0.14 if is_specific_l2 else 0.22)))
-            if lab in labs:
-                if evs and not ev_map.get(lab):
-                    ev_map[lab] = evs
-                continue
-            if sc < required_score:
-                continue
-            if require_evidence_flag and not evs:
-                continue
-            labs.append(lab)
-            if evs:
-                ev_map[lab] = evs
-            if len(labs) >= 10:
-                break
-
-        norm[side_key] = labs[:10]
-        norm[ev_key] = {k: list(v)[:max_ev_per_label] for k, v in ev_map.items() if k in norm[side_key]}
-
-    _merge("dels", "ev_del_map", "dels", "ev_del_map", "del_scores", needs_del, "Delighter")
-    _merge("dets", "ev_det_map", "dets", "ev_det_map", "det_scores", needs_det, "Detractor")
-    return norm
+        return OpenAI(api_key=key, timeout=60, max_retries=3)
+    except TypeError:
+        try: return OpenAI(api_key=key)
+        except Exception: return None
+
+def _shared_model() -> str:
+    return st.session_state.get("shared_model", DEFAULT_MODEL)
+
+def _shared_reasoning() -> str:
+    return st.session_state.get("shared_reasoning", DEFAULT_REASONING)
+
+def _show_thinking(message: str):
+    ph = st.empty()
+    ph.markdown(f"""
+    <div class="thinking-overlay">
+      <div class="thinking-card">
+        <div class="thinking-spinner"></div>
+        <div class="thinking-title">OpenAI is working</div>
+        <div class="thinking-sub">{_safe_html(message)}</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+    return ph
 
 def _safe_json_load(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
-    if not s:
-        return {}
+    if not s: return {}
+    try: return json.loads(s)
+    except Exception: pass
     try:
-        return json.loads(s)
-    except Exception:
-        pass
-    try:
-        i = s.find("{")
-        j = s.rfind("}")
-        if i >= 0 and j > i:
-            return json.loads(s[i:j + 1])
-    except Exception:
-        return {}
+        i = s.find("{"); j = s.rfind("}")
+        if i >= 0 and j > i: return json.loads(s[i:j+1])
+    except Exception: pass
     return {}
 
-
-def _chat_json_with_retries(
-    client: Any,
-    *,
-    model: str,
-    temperature: float,
-    messages: List[Dict[str, str]],
-    component: str,
-    response_format: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    if client is None:
-        return {}
-    attempts = 1 + int(st.session_state.get("app_json_retries", 2) or 0)
-    last_err: Optional[Exception] = None
-    for a in range(1, attempts + 1):
-        try:
-            kwargs: Dict[str, Any] = {
-                "model": model,
-                "temperature": float(temperature),
-                "messages": messages,
-            }
-            if response_format:
-                kwargs["response_format"] = response_format
-            est = sum(_estimate_tokens(m.get("content", ""), model_id=model) for m in (messages or []))
-            _throttle("chat", est)
-            resp = client.chat.completions.create(**kwargs)
-            pt, ct = _extract_usage(resp)
-            if pt or ct:
-                _track(component, model, in_tok=pt, out_tok=ct, embed=False)
-            content = resp.choices[0].message.content or "{}"
-            data = _safe_json_load(content)
-            if data:
-                return data
-            last_err = RuntimeError("Invalid/empty JSON response")
-        except Exception as e:
-            last_err = e
-        if a < attempts:
-            time.sleep(min((2 ** (a - 1)) + random.random(), 20))
-    _ = last_err
-    return {}
+def _chat_complete(
+    client: Any, *, model: str, messages: List[Dict[str,str]],
+    temperature: float = 0.0, response_format: Optional[Dict] = None,
+    max_tokens: int = 1200,
+) -> str:
+    if client is None: return ""
+    kwargs: Dict[str,Any] = dict(model=model, temperature=temperature,
+                                  messages=messages, max_tokens=max_tokens)
+    if response_format: kwargs["response_format"] = response_format
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception: return ""
 
 
-def _prelearn_llm_batch_mine(
-    texts: List[str],
-    client: Any,
-    model: str,
-    temperature: float,
-    known_themes: Dict[str, List[str]],
-    max_themes: int = 30,
-) -> Dict[str, Any]:
-    if client is None:
-        return {"detractors": [], "delighters": [], "product_profile": "", "product_category": "", "product_parts": [], "use_cases": []}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — DATA LAYER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    l1_options = list(UNIVERSAL_ASPECT_BACKBONE.keys())
-    sys = "\n".join([
-        "You analyze consumer product reviews to extract CONSISTENT, reusable symptom themes across ANY product category.",
-        "Return STRICT JSON with schema:",
-        '{"product_profile":"<1-2 sentence product summary>", "product_category":"<short category>", "product_parts":["part1","part2"], "use_cases":["use1","use2"], "detractors":[{"label":"<2-4 words Title Case>","parent_l1":"<one L1 aspect>","keywords":["k1","k2","k3"]}], "delighters":[{"label":"<2-4 words Title Case>","parent_l1":"<one L1 aspect>","keywords":["k1","k2","k3"]}]}',
-        "",
-        "Rules:",
-        "- Labels must be mutually exclusive, reusable, and not too tiny or one-off.",
-        "- Prefer a broad L1 + reusable L2 style theme over very narrow phrasing.",
-        "- Reuse an existing theme exactly if it already exists.",
-        "- Use singular nouns when possible (Issue, Problem, Failure).",
-        f"- parent_l1 must be one of: {', '.join(l1_options)}",
-        f"- Return at most {max_themes // 2} detractors and {max_themes // 2} delighters.",
-        "- Keywords should be short and literal (1-2 words), lowercase.",
-        "- product_parts should be concrete parts / components if obvious.",
-        "- use_cases should be broad reusable jobs-to-be-done.",
-    ])
+def _get_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"})
+    return s
 
-    payload = {
-        "reviews": texts[:40],
-        "known_detractor_themes": known_themes.get("Detractor", [])[:60],
-        "known_delighter_themes": known_themes.get("Delighter", [])[:60],
-        "priority_delighter_backbone": _priority_theme_labels("Delighter")[:20],
-        "priority_detractor_backbone": _priority_theme_labels("Detractor")[:20],
-        "available_l1_aspects": l1_options,
+def _extract_product_id_from_url(url: str) -> Optional[str]:
+    path = urlparse(url).path
+    m = re.search(r"/([A-Za-z0-9_-]+)\.html(?:$|[?#])", path)
+    if m:
+        c = m.group(1).strip().upper()
+        if re.fullmatch(r"[A-Z0-9_-]{3,}", c): return c
+    return None
+
+def _extract_product_id_from_html(h: str) -> Optional[str]:
+    for pat in [r'Item\s*No\.?\s*([A-Z0-9_-]{3,})',r'"productId"\s*:\s*"([A-Z0-9_-]{3,})"',
+                r'"sku"\s*:\s*"([A-Z0-9_-]{3,})"',r'"model"\s*:\s*"([A-Z0-9_-]{3,})"']:
+        m = re.search(pat, h, flags=re.IGNORECASE)
+        if m: return m.group(1).strip().upper()
+    soup = BeautifulSoup(h, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    for pat in [r"Item\s*No\.?\s*([A-Z0-9_-]{3,})", r"Model\s*:?\s*([A-Z0-9_-]{3,})"]:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m: return m.group(1).strip().upper()
+    return None
+
+def _fetch_reviews_page(session, *, product_id, passkey, displaycode,
+                        api_version, page_size, offset, sort, content_locales):
+    params = {
+        "resource":"reviews","action":"REVIEWS_N_STATS",
+        "filter":[f"productid:eq:{product_id}",
+                  f"contentlocale:eq:{content_locales}","isratingsonly:eq:false"],
+        "filter_reviews":f"contentlocale:eq:{content_locales}",
+        "include":"authors,products,comments","filteredstats":"reviews",
+        "Stats":"Reviews","limit":int(page_size),"offset":int(offset),
+        "limit_comments":3,"sort":sort,
+        "passkey":passkey,"apiversion":api_version,"displaycode":displaycode,
     }
+    resp = session.get(BAZAARVOICE_ENDPOINT, params=params, timeout=45)
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("HasErrors"):
+        raise ReviewDownloaderError(f"Bazaarvoice error: {payload.get('Errors')}")
+    return payload
 
-    data = _chat_json_with_retries(
-        client,
-        model=model,
-        temperature=float(temperature),
-        messages=[{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(payload)}],
-        component="prelearn-mine",
-        response_format={"type": "json_object"},
-    )
+def _is_incentivized(review: Dict) -> bool:
+    badges = [str(b).lower() for b in (review.get("BadgesOrder") or [])]
+    if any("incentivized" in b for b in badges): return True
+    ctx = review.get("ContextDataValues") or {}
+    if isinstance(ctx, dict):
+        for k, v in ctx.items():
+            if "incentivized" in str(k).lower():
+                flag = str((v.get("Value","") if isinstance(v,dict) else v)).strip().lower()
+                if flag in {"","true","1","yes"}: return True
+    return False
+
+def _flatten_review(r: Dict) -> Dict:
+    photos = r.get("Photos") or []
+    urls = []
+    for p in photos:
+        sz = p.get("Sizes") or {}
+        for sn in ["large","normal","thumbnail"]:
+            u = (sz.get(sn) or {}).get("Url")
+            if u: urls.append(u); break
+    syn = r.get("SyndicationSource") or {}
     return {
-        "product_profile": str(data.get("product_profile", "") or "").strip(),
-        "product_category": str(data.get("product_category", "") or "").strip(),
-        "product_parts": [str(x).strip() for x in (data.get("product_parts", []) or []) if str(x).strip()][:16],
-        "use_cases": [str(x).strip() for x in (data.get("use_cases", []) or []) if str(x).strip()][:16],
-        "detractors": data.get("detractors", []) or [],
-        "delighters": data.get("delighters", []) or [],
+        "review_id": r.get("Id"), "product_id": r.get("ProductId"),
+        "original_product_name": r.get("OriginalProductName"),
+        "title": _safe_text(r.get("Title")), "review_text": _safe_text(r.get("ReviewText")),
+        "rating": r.get("Rating"), "is_recommended": r.get("IsRecommended"),
+        "user_nickname": r.get("UserNickname"), "author_id": r.get("AuthorId"),
+        "user_location": r.get("UserLocation"), "content_locale": r.get("ContentLocale"),
+        "submission_time": r.get("SubmissionTime"),
+        "moderation_status": r.get("ModerationStatus"),
+        "campaign_id": r.get("CampaignId"), "source_client": r.get("SourceClient"),
+        "is_featured": r.get("IsFeatured"), "is_syndicated": r.get("IsSyndicated"),
+        "syndication_source_name": syn.get("Name"),
+        "is_ratings_only": r.get("IsRatingsOnly"),
+        "total_positive_feedback_count": r.get("TotalPositiveFeedbackCount"),
+        "badges": ", ".join(str(x) for x in (r.get("BadgesOrder") or [])),
+        "context_data_json": json.dumps(r.get("ContextDataValues") or {}, ensure_ascii=False),
+        "photos_count": len(photos), "photo_urls": " | ".join(urls),
+        "incentivized_review": _is_incentivized(r),
+        "raw_json": json.dumps(r, ensure_ascii=False),
     }
 
-def _merge_theme_dict(themes: Dict[str, Dict[str, Any]], side: str, canonical: str, keywords: List[str], count_inc: int = 1) -> None:
-    d = themes.setdefault(side, {})
-    rec = d.setdefault(canonical, {"count": 0, "keywords": set()})
-    rec["count"] = int(rec.get("count", 0)) + int(count_inc)
-    for k in (keywords or []):
-        kk = str(k).strip().lower()
-        if kk and len(kk) <= 32:
-            rec["keywords"].add(kk)
+def _ensure_columns(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+    for c in cols:
+        if c not in df.columns: df[c] = pd.NA
+    return df
+
+def _extract_age_group(val: Any) -> Optional[str]:
+    if val is None or (isinstance(val,float) and pd.isna(val)): return None
+    payload = val
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if not stripped: return None
+        try: payload = json.loads(stripped)
+        except Exception: return None
+    if not isinstance(payload, dict): return None
+    for k, raw in payload.items():
+        if "age" not in str(k).lower(): continue
+        candidate = raw.get("Value") or raw.get("Label") if isinstance(raw,dict) else raw
+        candidate = _safe_text(candidate)
+        if candidate and candidate.lower() not in {"nan","none","null","unknown","prefer not to say"}:
+            return candidate
+    return None
+
+def _finalize_reviews_df(df: pd.DataFrame) -> pd.DataFrame:
+    required = [
+        "review_id","product_id","base_sku","sku_item","product_or_sku",
+        "original_product_name","title","review_text","rating","is_recommended",
+        "content_locale","submission_time","submission_date","submission_month",
+        "incentivized_review","is_syndicated","photos_count","photo_urls",
+        "title_and_text","retailer","post_link","age_group","user_nickname",
+        "user_location","total_positive_feedback_count","source_system","source_file",
+    ]
+    df = _ensure_columns(df.copy(), required)
+    if df.empty:
+        for c in ["has_photos","has_media","review_length_chars","review_length_words",
+                  "rating_label","year_month_sort"]:
+            if c not in df.columns: df[c] = pd.Series(dtype="object")
+        return df
+
+    df["review_id"] = df["review_id"].fillna("").astype(str).str.strip()
+    missing_ids = df["review_id"].eq("") | df["review_id"].str.lower().isin({"nan","none","null"})
+    if missing_ids.any():
+        df.loc[missing_ids,"review_id"] = [f"review_{i+1}" for i in range(int(missing_ids.sum()))]
+
+    if "context_data_json" in df.columns:
+        df["age_group"] = df["age_group"].fillna(df["context_data_json"].map(_extract_age_group))
+
+    df["rating"]            = pd.to_numeric(df["rating"], errors="coerce")
+    df["incentivized_review"]= df["incentivized_review"].fillna(False).astype(bool)
+    df["is_syndicated"]      = df["is_syndicated"].fillna(False).astype(bool)
+    df["photos_count"]       = pd.to_numeric(df["photos_count"],errors="coerce").fillna(0).astype(int)
+    df["title"]              = df["title"].fillna("").astype(str)
+    df["review_text"]        = df["review_text"].fillna("").astype(str)
+    df["submission_time"]    = pd.to_datetime(df["submission_time"],errors="coerce",utc=True).dt.tz_convert(None)
+    df["submission_date"]    = df["submission_time"].dt.date
+    df["submission_month"]   = df["submission_time"].dt.to_period("M").astype(str)
+    df["content_locale"]     = df["content_locale"].fillna("").astype(str).replace({"":pd.NA})
+    df["base_sku"]           = df.get("base_sku",pd.Series(dtype="str")).fillna("").astype(str).str.strip()
+    df["sku_item"]           = df.get("sku_item",pd.Series(dtype="str")).fillna("").astype(str).str.strip()
+    df["product_id"]         = df["product_id"].fillna("").astype(str).str.strip()
+    fallback = df["base_sku"].where(df["base_sku"].ne(""), df["product_id"])
+    df["product_or_sku"]     = df["sku_item"].where(df["sku_item"].ne(""), fallback)
+    df["product_or_sku"]     = df["product_or_sku"].fillna("").astype(str).str.strip().replace({"":pd.NA})
+    df["title_and_text"]     = (df["title"].str.strip()+" "+df["review_text"].str.strip()).str.strip()
+    df["has_photos"]         = df["photos_count"] > 0
+    df["has_media"]          = df["has_photos"]
+    df["review_length_chars"]= df["review_text"].str.len()
+    df["review_length_words"]= df["review_text"].str.split().str.len().fillna(0).astype(int)
+    df["rating_label"]       = df["rating"].map(lambda x: f"{int(x)} star" if pd.notna(x) else "Unknown")
+    df["year_month_sort"]    = pd.to_datetime(df["submission_month"],format="%Y-%m",errors="coerce")
+    sort_cols = [c for c in ["submission_time","review_id"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols,ascending=[False,False],na_position="last").reset_index(drop=True)
+    return df
+
+def _pick_first_col(df: pd.DataFrame, aliases: Sequence[str]) -> Optional[str]:
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for a in aliases:
+        c = lookup.get(str(a).strip().lower())
+        if c: return c
+    return None
+
+def _series_from_aliases(df: pd.DataFrame, aliases: Sequence[str]) -> pd.Series:
+    c = _pick_first_col(df, aliases)
+    if c is None: return pd.Series([pd.NA]*len(df), index=df.index)
+    return df[c]
+
+def _parse_flag(value: Any, *, pos: Sequence[str], neg: Sequence[str]) -> Any:
+    text = _safe_text(value).lower()
+    if text in {"","nan","none","null","n/a"}: return pd.NA
+    if any(text==t.lower() for t in neg): return False
+    if any(text==t.lower() for t in pos): return True
+    if text.startswith(("not ","non ")): return False
+    return True
+
+def _normalize_uploaded_df(raw_df: pd.DataFrame, *, source_name: str = "") -> pd.DataFrame:
+    working = raw_df.copy()
+    working.columns = [str(c).strip() for c in working.columns]
+    n = pd.DataFrame(index=working.index)
+    n["review_id"]              = _series_from_aliases(working,["Event Id","Event ID","Review ID","Review Id","Id"])
+    n["product_id"]             = _series_from_aliases(working,["Base SKU","Product ID","Product Id","ProductId","BaseSKU"])
+    n["base_sku"]               = _series_from_aliases(working,["Base SKU","BaseSKU"])
+    n["sku_item"]               = _series_from_aliases(working,["SKU Item","SKU","Child SKU","Variant SKU","Item Number","Item No"])
+    n["original_product_name"]  = _series_from_aliases(working,["Product Name","Product","Name"])
+    n["review_text"]            = _series_from_aliases(working,["Review Text","Review","Body","Content"])
+    n["title"]                  = _series_from_aliases(working,["Title","Review Title","Headline"])
+    n["post_link"]              = _series_from_aliases(working,["Post Link","URL","Review URL","Product URL"])
+    n["rating"]                 = _series_from_aliases(working,["Rating (num)","Rating","Stars","Star Rating"])
+    n["submission_time"]        = _series_from_aliases(working,["Opened date","Opened Date","Submission Time","Review Date","Date"])
+    n["content_locale"]         = _series_from_aliases(working,["Content Locale","Locale","Location","Country"])
+    n["retailer"]               = _series_from_aliases(working,["Retailer","Merchant","Channel"])
+    n["age_group"]              = _series_from_aliases(working,["Age Group","Age","Age Range"])
+    n["user_location"]          = _series_from_aliases(working,["Location","Country"])
+    n["user_nickname"]          = pd.NA
+    n["total_positive_feedback_count"] = pd.NA
+    n["is_recommended"]         = pd.NA
+    n["photos_count"]           = 0
+    n["photo_urls"]             = pd.NA
+    n["source_file"]            = source_name or pd.NA
+    n["source_system"]          = "Uploaded file"
+    seeded = _series_from_aliases(working,["Seeded Flag","Seeded","Incentivized"])
+    n["incentivized_review"]    = seeded.map(lambda v: _parse_flag(v,
+        pos=["seeded","incentivized","yes","true","1"],
+        neg=["not seeded","not incentivized","no","false","0"]))
+    syndicated = _series_from_aliases(working,["Syndicated Flag","Syndicated"])
+    n["is_syndicated"]          = syndicated.map(lambda v: _parse_flag(v,
+        pos=["syndicated","yes","true","1"],neg=["not syndicated","no","false","0"]))
+    return _finalize_reviews_df(n)
+
+def _read_uploaded_file(uploaded_file: Any) -> pd.DataFrame:
+    fname = getattr(uploaded_file,"name","uploaded_file")
+    raw = uploaded_file.getvalue()
+    suffix = fname.lower().rsplit(".",1)[-1] if "." in fname else "csv"
+    if suffix == "csv":
+        try:    raw_df = pd.read_csv(io.BytesIO(raw))
+        except UnicodeDecodeError: raw_df = pd.read_csv(io.BytesIO(raw),encoding="latin-1")
+    elif suffix in {"xlsx","xls","xlsm"}:
+        raw_df = pd.read_excel(io.BytesIO(raw))
+    else:
+        raise ReviewDownloaderError(f"Unsupported file type: {fname}")
+    if raw_df.empty: raise ReviewDownloaderError(f"{fname} is empty.")
+    return _normalize_uploaded_df(raw_df, source_name=fname)
+
+def _load_uploaded_files(uploaded_files: Sequence[Any]) -> Dict[str,Any]:
+    if not uploaded_files:
+        raise ReviewDownloaderError("Upload at least one file.")
+    with st.spinner("Reading uploaded files…"):
+        frames = [_read_uploaded_file(f) for f in uploaded_files]
+    combined = pd.concat(frames, ignore_index=True)
+    combined["review_id"] = combined["review_id"].astype(str)
+    combined = combined.drop_duplicates(subset=["review_id"],keep="first").reset_index(drop=True)
+    combined = _finalize_reviews_df(combined)
+    inferred_id = _first_non_empty(combined["base_sku"].fillna("")) or \
+                  _first_non_empty(combined["product_id"].fillna("")) or "UPLOADED_REVIEWS"
+    file_names = [getattr(f,"name","uploaded_file") for f in uploaded_files]
+    src_label = file_names[0] if len(file_names)==1 else f"{len(file_names)} uploaded files"
+    summary = ReviewBatchSummary(
+        product_url="", product_id=inferred_id,
+        total_reviews=len(combined), page_size=max(len(combined),1),
+        requests_needed=0, reviews_downloaded=len(combined),
+    )
+    return {"summary":summary,"reviews_df":combined,"source_type":"uploaded","source_label":src_label}
+
+def _load_product_reviews(product_url: str) -> Dict[str,Any]:
+    product_url = product_url.strip()
+    if not re.match(r"^https?://",product_url,flags=re.IGNORECASE):
+        product_url = "https://"+product_url
+    session = _get_session()
+    with st.spinner("Loading product page…"):
+        resp = session.get(product_url, timeout=30); resp.raise_for_status()
+        product_html = resp.text
+    product_id = _extract_product_id_from_url(product_url) or _extract_product_id_from_html(product_html)
+    if not product_id:
+        raise ReviewDownloaderError("Could not find product ID on page.")
+    with st.spinner("Checking review volume…"):
+        payload = _fetch_reviews_page(session, product_id=product_id,
+            passkey=DEFAULT_PASSKEY, displaycode=DEFAULT_DISPLAYCODE,
+            api_version=DEFAULT_API_VERSION, page_size=1, offset=0,
+            sort=DEFAULT_SORT, content_locales=DEFAULT_CONTENT_LOCALES)
+        total = int(payload.get("TotalResults",0))
+    progress = st.progress(0.0, text="Downloading reviews…")
+    status   = st.empty()
+    offsets  = list(range(0,total,DEFAULT_PAGE_SIZE))
+    raw_reviews: List[Dict] = []
+    for i, offset in enumerate(offsets,1):
+        status.info(f"Pulling page {i}/{len(offsets)}")
+        page = _fetch_reviews_page(session, product_id=product_id,
+            passkey=DEFAULT_PASSKEY, displaycode=DEFAULT_DISPLAYCODE,
+            api_version=DEFAULT_API_VERSION, page_size=DEFAULT_PAGE_SIZE,
+            offset=offset, sort=DEFAULT_SORT, content_locales=DEFAULT_CONTENT_LOCALES)
+        raw_reviews.extend(page.get("Results") or [])
+        progress.progress(i/len(offsets))
+    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+    rows = [_flatten_review(r) for r in raw_reviews]
+    df   = _finalize_reviews_df(pd.DataFrame(rows))
+    if not df.empty:
+        df["review_id"]      = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku",pd.Series(index=df.index,dtype="object")).fillna(product_id)
+        df["base_sku"]       = df.get("base_sku",pd.Series(index=df.index,dtype="object")).fillna(product_id)
+        df["product_id"]     = df["product_id"].fillna(product_id)
+    summary = ReviewBatchSummary(
+        product_url=product_url, product_id=product_id,
+        total_reviews=total, page_size=DEFAULT_PAGE_SIZE,
+        requests_needed=len(offsets), reviews_downloaded=len(df),
+    )
+    return {"summary":summary,"reviews_df":df,"source_type":"bazaarvoice","source_label":product_url}
 
 
-def _consolidate_themes_semantic(
-    side: str,
-    themes: Dict[str, Dict[str, Any]],
-    client: Any,
-    embed_model: str,
-    sem_merge_threshold: float = 0.92,
-) -> Dict[str, Dict[str, Any]]:
-    if not themes.get(side):
-        return themes
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — ANALYTICS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    labels = list(themes[side].keys())
-    key_to_lab: Dict[str, str] = {}
-    for lab in labels:
-        k = _canon_simple(normalize_theme_label(lab, side))
-        if k in key_to_lab and key_to_lab[k] != lab:
-            tgt = key_to_lab[k]
-            themes[side][tgt]["count"] += themes[side][lab]["count"]
-            themes[side][tgt]["keywords"] |= themes[side][lab]["keywords"]
-            del themes[side][lab]
-        else:
-            key_to_lab[k] = lab
-
-    labels = list(themes[side].keys())
-    if client is None or not embed_model or len(labels) < 2:
-        return themes
-
-    store = _ensure_learned_store()
-    pool_emb = store["emb"][side]
-    for lab in labels:
-        if lab not in pool_emb:
-            v = _embed_text(lab, client, embed_model, component="prelearn-embed-themes")
-            if v:
-                pool_emb[lab] = v
-
-    labels_sorted = sorted(labels, key=lambda x: -int(themes[side][x]["count"]))
-    for i, a in enumerate(labels_sorted):
-        if a not in themes[side]:
-            continue
-        va = pool_emb.get(a)
-        if not va:
-            continue
-        for b in labels_sorted[i + 1:]:
-            if b not in themes[side] or b == a:
-                continue
-            vb = pool_emb.get(b)
-            if not vb:
-                continue
-            sim = _cos_sim(va, vb)
-            lex_sub = (_canon(a) in _canon(b)) or (_canon(b) in _canon(a))
-            if sim >= float(sem_merge_threshold) or lex_sub:
-                themes[side][a]["count"] += themes[side][b]["count"]
-                themes[side][a]["keywords"] |= themes[side][b]["keywords"]
-                del themes[side][b]
-    return themes
-
-
-def run_prelearn(
-    df_in: pd.DataFrame,
-    client: Any,
-    prelearn_model: str,
-    temperature: float,
-    embed_model: str,
-    sample_n: int,
-    batch_size: int,
-    sem_merge_threshold: float,
-    status_box: Any,
-    prog_bar: Any,
-) -> Dict[str, Any]:
-    t0 = time.perf_counter()
-    learned = _ensure_learned_store()
-
-    status_box.markdown("🔎 **Prelearn:** sampling reviews…")
-    df_s = _sample_reviews(df_in, n=int(sample_n))
-    reviews = [str(x) for x in df_s["Verbatim"].tolist() if str(x).strip()]
-    prog_bar.progress(0.05)
-
-    status_box.markdown("🧠 **Prelearn:** building quick product glossary…")
-    learned["glossary_terms"] = _top_terms(reviews, top_n=40)
-    prog_bar.progress(0.12)
-
-    themes: Dict[str, Dict[str, Any]] = {"Delighter": {}, "Detractor": {}}
-    family_votes: Dict[str, Dict[str, Dict[str, int]]] = {"Delighter": {}, "Detractor": {}}
-    profiles: List[str] = []
-    categories: List[str] = []
-    parts_accum: List[str] = []
-    use_cases_accum: List[str] = []
-    n = len(reviews)
+def _compute_metrics(df: pd.DataFrame) -> Dict[str,Any]:
+    n = len(df)
     if n == 0:
-        status_box.markdown("⚠️ **Prelearn:** no reviews found.")
-        prog_bar.progress(1.0)
-        return learned
-
-    batches = [reviews[i:i + int(batch_size)] for i in range(0, n, int(batch_size))]
-    total_batches = len(batches)
-    status_box.markdown(f"🤖 **Prelearn:** mining themes with LLM… ({total_batches} batches)")
-    start_batch_time = time.perf_counter()
-
-    def _note_family(side_name: str, label_name: str, family_name: str) -> None:
-        fam = str(family_name or "").strip()
-        if fam not in UNIVERSAL_ASPECT_BACKBONE:
-            fam = _infer_l1_family_from_label(label_name, side_name)
-        if not fam:
-            return
-        slot = family_votes.setdefault(side_name, {}).setdefault(label_name, {})
-        slot[fam] = int(slot.get(fam, 0)) + 1
-
-    for bi, chunk in enumerate(batches, start=1):
-        elapsed = time.perf_counter() - start_batch_time
-        avg = (elapsed / max(1, bi - 1)) if bi > 1 else 0.0
-        rem = (total_batches - bi + 1) * avg
-        status_box.markdown(
-            f"🤖 **Prelearn:** batch {bi}/{total_batches} • reviews {((bi - 1) * batch_size) + 1}-{min(bi * batch_size, n)} of {n} • ETA ~ {_fmt_secs(rem)}"
-        )
-        known = {"Delighter": list(themes["Delighter"].keys()), "Detractor": list(themes["Detractor"].keys())}
-        data = _prelearn_llm_batch_mine(
-            texts=chunk,
-            client=client,
-            model=prelearn_model,
-            temperature=temperature,
-            known_themes=known,
-            max_themes=30,
-        )
-        if data.get("product_profile"):
-            profiles.append(str(data["product_profile"]))
-        if data.get("product_category"):
-            categories.append(str(data["product_category"]))
-        parts_accum.extend([str(x).strip() for x in (data.get("product_parts", []) or []) if str(x).strip()])
-        use_cases_accum.extend([str(x).strip() for x in (data.get("use_cases", []) or []) if str(x).strip()])
-
-        for obj in data.get("delighters", []) or []:
-            lab = normalize_theme_label(obj.get("label", ""), "Delighter")
-            kws = obj.get("keywords", []) or []
-            if not lab:
-                continue
-            _merge_theme_dict(themes, "Delighter", lab, kws, count_inc=1)
-            _note_family("Delighter", lab, str(obj.get("parent_l1", "") or ""))
-        for obj in data.get("detractors", []) or []:
-            lab = normalize_theme_label(obj.get("label", ""), "Detractor")
-            kws = obj.get("keywords", []) or []
-            if not lab:
-                continue
-            _merge_theme_dict(themes, "Detractor", lab, kws, count_inc=1)
-            _note_family("Detractor", lab, str(obj.get("parent_l1", "") or ""))
-
-        prog_bar.progress(min(0.78, 0.12 + 0.66 * (bi / max(1, total_batches))))
-        budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
-        if budget > 0:
-            tr_now = _ensure_usage_tracker()
-            session_total = float(tr_now["cost_chat"] + tr_now["cost_embed"])
-            if session_total >= budget:
-                status_box.markdown(
-                    f"⛔ **Budget guard:** session spend {_fmt_money(session_total)} exceeded limit {_fmt_money(budget)}. Stopping prelearn early."
-                )
-                break
-        if bi % 5 == 0:
-            gc.collect()
-
-    status_box.markdown("🧩 **Prelearn:** consolidating themes…")
-    themes = _consolidate_themes_semantic("Delighter", themes, client, embed_model, sem_merge_threshold=float(sem_merge_threshold))
-    themes = _consolidate_themes_semantic("Detractor", themes, client, embed_model, sem_merge_threshold=float(sem_merge_threshold))
-    prog_bar.progress(0.90)
-
-    learned["labels"] = {"Delighter": {}, "Detractor": {}}
-    learned["keywords"] = {"Delighter": {}, "Detractor": {}}
-    learned["families"] = {"Delighter": {}, "Detractor": {}}
-    for side in ("Delighter", "Detractor"):
-        for lab, rec in sorted(themes.get(side, {}).items(), key=lambda kv: (-int(kv[1]["count"]), kv[0])):
-            learned["labels"][side][lab] = {"synonyms": set(), "count": int(rec.get("count", 0))}
-            learned["keywords"][side][lab] = set(rec.get("keywords", set()))
-            fam_votes = (family_votes.get(side, {}) or {}).get(lab, {}) or {}
-            family = ""
-            if fam_votes:
-                family = sorted(fam_votes.items(), key=lambda kv: (-int(kv[1]), kv[0]))[0][0]
-            if not family:
-                family = _infer_l1_family_from_label(lab, side)
-            if family:
-                learned["families"][side][lab] = family
-
-    learned["product_profile"] = " ".join([p.strip() for p in profiles[:6] if p.strip()])[:600]
-    learned["product_category"] = sorted([c for c in categories if c], key=lambda x: (-categories.count(x), x))[0] if categories else ""
-    learned["product_parts"] = _dedupe_keep_order_str(parts_accum)[:20]
-    learned["use_cases"] = _dedupe_keep_order_str(use_cases_accum)[:20]
-    learned["ts"] = time.time()
-    learned["version"] = f"prelearn_{int(learned['ts'] or 0)}"
-
-    prog_bar.progress(1.0)
-    status_box.markdown(
-        f"✅ **Prelearn complete** in {_fmt_secs(time.perf_counter() - t0)} • learned {len(learned['labels']['Delighter'])} delighter themes and {len(learned['labels']['Detractor'])} detractor themes."
-    )
-    return learned
-
-# ------------------------------ Batch labeler ------------------------------
-_LABELER_DEFAULT = {
-    "dels": [],
-    "dets": [],
-    "unl_dels": [],
-    "unl_dets": [],
-    "ev_del_map": {},
-    "ev_det_map": {},
-    "safety": "Not Mentioned",
-    "reliability": "Not Mentioned",
-    "sessions": "Unknown",
-}
-
-
-def _label_cache_key(
-    verbatim: str,
-    model: str,
-    temperature: float,
-    allowed_delighters: List[str],
-    allowed_detractors: List[str],
-    known_theme_hints: Dict[str, List[str]],
-    max_ev_per_label: int,
-    max_ev_chars: int,
-) -> Tuple[Any, ...]:
-    return (
-        "lab4",
-        _canon(verbatim),
-        model,
-        f"{float(temperature):.2f}",
-        _symptom_list_version(allowed_delighters, allowed_detractors, {}),
-        int(max_ev_per_label),
-        int(max_ev_chars),
-        json.dumps(known_theme_hints, sort_keys=True)[:2000],
-        _route_config_signature(),
+        return dict(review_count=0,avg_rating=None,avg_rating_non_incentivized=None,
+                    pct_low_star=0.0,pct_one_star=0.0,pct_two_star=0.0,pct_five_star=0.0,
+                    pct_incentivized=0.0,pct_with_photos=0.0,pct_syndicated=0.0,
+                    recommend_rate=None,median_review_words=None,
+                    non_incentivized_count=0,low_star_count=0)
+    ni = df[~df["incentivized_review"].fillna(False)]
+    rec_base = df[df["is_recommended"].notna()]
+    rec_rate = _safe_pct(int(rec_base["is_recommended"].astype(bool).sum()),len(rec_base)) if not rec_base.empty else None
+    mw = float(df["review_length_words"].median()) if "review_length_words" in df.columns and not df["review_length_words"].dropna().empty else None
+    low = df["rating"].isin([1,2])
+    return dict(
+        review_count=n, avg_rating=_safe_mean(df["rating"]),
+        avg_rating_non_incentivized=_safe_mean(ni["rating"]),
+        pct_low_star=_safe_pct(int(low.sum()),n),
+        pct_one_star=_safe_pct(int((df["rating"]==1).sum()),n),
+        pct_two_star=_safe_pct(int((df["rating"]==2).sum()),n),
+        pct_five_star=_safe_pct(int((df["rating"]==5).sum()),n),
+        pct_incentivized=_safe_pct(int(df["incentivized_review"].fillna(False).sum()),n),
+        pct_with_photos=_safe_pct(int(df["has_photos"].fillna(False).sum()),n),
+        pct_syndicated=_safe_pct(int(df["is_syndicated"].fillna(False).sum()),n),
+        recommend_rate=rec_rate, median_review_words=mw,
+        non_incentivized_count=len(ni),
+        low_star_count=int(low.sum()),
     )
 
+def _rating_distribution(df: pd.DataFrame) -> pd.DataFrame:
+    base = pd.DataFrame({"rating":[1,2,3,4,5]})
+    if df.empty:
+        base["review_count"]=0; base["share"]=0.0; return base
+    grouped = (df.dropna(subset=["rating"]).assign(rating=lambda x:x["rating"].astype(int))
+               .groupby("rating",as_index=False).size().rename(columns={"size":"review_count"}))
+    merged = base.merge(grouped,how="left",on="rating").fillna({"review_count":0})
+    merged["review_count"] = merged["review_count"].astype(int)
+    merged["share"] = merged["review_count"] / max(len(df),1)
+    return merged
 
-def _normalize_unified_output(
-    data: Any,
-    allowed_delighters: List[str],
-    allowed_detractors: List[str],
-    max_ev_per_label: int,
-    max_ev_chars: int,
-) -> Dict[str, Any]:
-    if not isinstance(data, dict):
-        data = {}
-    raw_dels = data.get("delighters", []) or []
-    raw_dets = data.get("detractors", []) or []
-    unl_dels = [x for x in (data.get("unlisted_delighters", []) or []) if isinstance(x, str) and x.strip()][:10]
-    unl_dets = [x for x in (data.get("unlisted_detractors", []) or []) if isinstance(x, str) and x.strip()][:10]
+def _monthly_trend(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return pd.DataFrame(columns=["submission_month","review_count","avg_rating","month_start"])
+    return (df.dropna(subset=["submission_time"])
+            .assign(month_start=lambda x:x["submission_time"].dt.to_period("M").dt.to_timestamp())
+            .groupby("month_start",as_index=False)
+            .agg(review_count=("review_id","count"),avg_rating=("rating","mean"))
+            .assign(submission_month=lambda x:x["month_start"].dt.strftime("%Y-%m"))
+            .sort_values("month_start"))
 
-    s = str(data.get("safety", "Not Mentioned")).strip()
-    r = str(data.get("reliability", "Not Mentioned")).strip()
-    n = str(data.get("sessions", "Unknown")).strip()
-    s = s if s in SAFETY_ENUM else "Not Mentioned"
-    r = r if r in RELIABILITY_ENUM else "Not Mentioned"
-    n = n if n in SESSIONS_ENUM else "Unknown"
+def _compute_themes(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["theme","mention_count","mention_rate",
+                                     "avg_rating_when_mentioned","low_star_mentions","high_star_mentions"])
+    texts = df["title_and_text"].fillna("").astype(str).map(_normalize_text)
+    rows = []
+    for theme, keywords in THEME_KEYWORDS.items():
+        mask = texts.map(lambda t: any(kw in t for kw in keywords))
+        sub  = df[mask]
+        rows.append(dict(theme=theme, mention_count=int(mask.sum()),
+            mention_rate=_safe_pct(int(mask.sum()),len(df)),
+            avg_rating_when_mentioned=_safe_mean(sub["rating"]),
+            low_star_mentions=int(sub["rating"].isin([1,2]).sum()),
+            high_star_mentions=int(sub["rating"].isin([4,5]).sum())))
+    return pd.DataFrame(rows).sort_values(["mention_count","low_star_mentions"],ascending=[False,False])
 
-    def _extract_allowed(objs: Iterable[Any], allowed: List[str], side: str) -> Tuple[List[str], Dict[str, List[str]]]:
-        out_labels: List[str] = []
-        ev_map: Dict[str, List[str]] = {}
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            raw_lbl = str(obj.get("label", "")).strip()
-            lbl = _coerce_label_to_allowed(raw_lbl, allowed, side)
-            if not lbl:
-                continue
-            evs_raw = obj.get("evidence", []) or []
-            evs = []
-            for e in evs_raw:
-                if isinstance(e, str) and e.strip():
-                    evs.append(str(e)[:max_ev_chars])
-            if lbl not in out_labels:
-                out_labels.append(lbl)
-                ev_map[lbl] = _dedupe_keep_order_str(evs)[:max_ev_per_label]
-            elif evs:
-                ev_map[lbl] = _dedupe_keep_order_str((ev_map.get(lbl, []) or []) + evs)[:max_ev_per_label]
-            if len(out_labels) >= 10:
-                break
-        return out_labels, ev_map
+def _top_terms(texts: Iterable[str], *, top_n: int = 12) -> pd.DataFrame:
+    counter: Counter = Counter()
+    for t in texts: counter.update(_tokenize(t))
+    return pd.DataFrame([{"term":t,"count":c} for t,c in counter.most_common(top_n)])
 
-    dels, ev_del_map = _extract_allowed(raw_dels, allowed_delighters, "Delighter")
-    dets, ev_det_map = _extract_allowed(raw_dets, allowed_detractors, "Detractor")
-    return {
-        "dels": dels,
-        "dets": dets,
-        "unl_dels": unl_dels,
-        "unl_dets": unl_dets,
-        "ev_del_map": ev_del_map,
-        "ev_det_map": ev_det_map,
-        "safety": s,
-        "reliability": r,
-        "sessions": n,
-    }
+def _apply_filters(df: pd.DataFrame, *, selected_ratings, incentivized_mode,
+                   selected_products, selected_locales, recommendation_mode,
+                   syndicated_mode, media_mode, date_range, text_query) -> pd.DataFrame:
+    if df.empty: return df.copy()
+    f = df.copy()
+    if selected_ratings: f = f[f["rating"].isin(selected_ratings)]
+    if selected_products and "product_or_sku" in f.columns:
+        f = f[f["product_or_sku"].fillna("").isin(selected_products)]
+    if incentivized_mode == "Non-incentivized only":
+        f = f[~f["incentivized_review"].fillna(False)]
+    elif incentivized_mode == "Incentivized only":
+        f = f[f["incentivized_review"].fillna(False)]
+    if selected_locales:
+        f = f[f["content_locale"].fillna("Unknown").isin(selected_locales)]
+    if recommendation_mode == "Recommended only":
+        f = f[f["is_recommended"].fillna(False)]
+    elif recommendation_mode == "Not recommended only":
+        f = f[f["is_recommended"].notna() & ~f["is_recommended"].fillna(False)]
+    if syndicated_mode == "Syndicated only": f = f[f["is_syndicated"].fillna(False)]
+    elif syndicated_mode == "Non-syndicated only": f = f[~f["is_syndicated"].fillna(False)]
+    if media_mode == "With photos only": f = f[f["has_photos"].fillna(False)]
+    elif media_mode == "No photos only": f = f[~f["has_photos"].fillna(False)]
+    if date_range and date_range[0] and date_range[1] and "submission_date" in f.columns:
+        f = f[f["submission_date"].notna() &
+              (f["submission_date"]>=date_range[0]) &
+              (f["submission_date"]<=date_range[1])]
+    q = text_query.strip()
+    if q: f = f[f["title_and_text"].fillna("").str.contains(re.escape(q),case=False,na=False,regex=True)]
+    return f.reset_index(drop=True)
+
+def _build_filter_options(df: pd.DataFrame) -> Dict[str,Any]:
+    valid_dates = df["submission_date"].dropna() if "submission_date" in df.columns else pd.Series(dtype="object")
+    product_groups = sorted({str(v).strip() for v in df["product_or_sku"].dropna().astype(str)
+                             if str(v).strip() and str(v).strip().lower() not in {"nan","none"}}
+                            ) if not df.empty else []
+    return dict(
+        ratings=[1,2,3,4,5],
+        product_groups=product_groups,
+        locales=sorted(str(l) for l in df["content_locale"].dropna().unique()) if not df.empty else [],
+        min_date=valid_dates.min() if not valid_dates.empty else None,
+        max_date=valid_dates.max() if not valid_dates.empty else None,
+    )
+
+def _describe_filters(*, selected_ratings, selected_products, review_source_mode,
+                      selected_locales, recommendation_mode, date_range, text_query) -> str:
+    parts: List[str] = []
+    if selected_ratings and set(selected_ratings)!={1,2,3,4,5}:
+        parts.append("ratings="+",".join(str(r) for r in selected_ratings))
+    if selected_products:
+        parts.append("sku="+", ".join(selected_products[:4])+("…" if len(selected_products)>4 else ""))
+    if review_source_mode != "All reviews": parts.append(f"source={review_source_mode.lower()}")
+    if selected_locales: parts.append("locales="+", ".join(selected_locales))
+    if recommendation_mode != "All": parts.append(f"recommendation={recommendation_mode.lower()}")
+    if date_range and date_range[0] and date_range[1]:
+        parts.append(f"dates={date_range[0]} to {date_range[1]}")
+    if text_query.strip(): parts.append(f'text="{text_query.strip()}"')
+    return "; ".join(parts) if parts else "No active filters"
+
+def _product_display_name(summary: ReviewBatchSummary, df: pd.DataFrame) -> str:
+    if not df.empty and "original_product_name" in df.columns:
+        name = _first_non_empty(df["original_product_name"].fillna(""))
+        if name: return name
+    return summary.product_id
 
 
-def _openai_labeler_unified_batch(
-    items: List[Dict[str, Any]],
-    client: Any,
-    model: str,
-    temperature: float,
-    allowed_delighters: List[str],
-    allowed_detractors: List[str],
-    known_theme_hints: Dict[str, List[str]],
-    max_ev_per_label: int = 2,
-    max_ev_chars: int = 120,
-    product_profile: str = "",
-) -> Dict[int, Dict[str, Any]]:
-    out_by_idx: Dict[int, Dict[str, Any]] = {}
-    if not items:
-        return out_by_idx
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — AI ANALYST
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    cache = _ensure_label_cache()
-    to_send: List[Tuple[int, str, bool, bool, Tuple[Any, ...]]] = []
-    router_by_idx: Dict[int, Dict[str, Any]] = {}
-    learned_store = _ensure_learned_store()
-    router_top_n = int(st.session_state.get("router_candidate_top_n", 6) or 6)
+GENERAL_ANALYST_INSTRUCTIONS = textwrap.dedent("""
+    You are SharkNinja Review Analyst, an internal voice-of-customer assistant.
+    Help product development, quality engineering, and consumer insights teams understand the review base.
+    Prioritize the supplied review text over generic product assumptions.
+    Ground every material claim in the supplied review dataset.
+    Do not invent counts, quotes, or trends that are not supported by the evidence.
+    When evidence is mixed or weak, say so clearly.
+    Use markdown. Cite supporting review IDs in parentheses, e.g. (review_ids: 12345, 67890).
+    Default to a crisp response. Stay under roughly 375 words unless asked for a deep dive.
+""").strip()
 
-    for it in items:
-        idx = int(it.get("idx"))
-        review = str(it.get("review") or "")
-        needs_del = bool(it.get("needs_del", True))
-        needs_det = bool(it.get("needs_det", True))
-        if not review.strip():
-            out_by_idx[idx] = dict(_LABELER_DEFAULT)
-            continue
+def _build_persona_instructions(persona_name: Optional[str]) -> str:
+    if not persona_name: return GENERAL_ANALYST_INSTRUCTIONS
+    p = PERSONAS[persona_name]
+    return textwrap.dedent(f"""
+        {p['instructions']}
+        Ground every important finding in the supplied review dataset.
+        Do not invent facts, counts, or quotes.
+        If evidence is mixed or weak, say so explicitly.
+        Use markdown. Cite review IDs in parentheses, e.g. (review_ids: 12345, 67890).
+        Keep the report compact and decision-ready. Stay under ~375 words unless asked.
+        End with a short action list tailored to the audience.
+    """).strip()
 
-        key = _label_cache_key(
-            review,
-            model,
-            float(temperature),
-            allowed_delighters,
-            allowed_detractors,
-            known_theme_hints,
-            int(max_ev_per_label),
-            int(max_ev_chars),
-        )
-        router = _route_review_candidates(
-            review,
-            allowed_delighters=allowed_delighters,
-            allowed_detractors=allowed_detractors,
-            learned_store=learned_store,
-            top_n=router_top_n,
-            max_ev_chars=max_ev_chars,
-        )
-        router_by_idx[idx] = router
-        if key in cache:
-            cached = dict(cache[key])
-            if bool(st.session_state.get("high_recall_labeling", True)):
-                cached = _apply_router_rescue(
-                    cached,
-                    router,
-                    needs_del=needs_del,
-                    needs_det=needs_det,
-                    require_evidence_flag=bool(st.session_state.get("require_evidence_flag", True)),
-                    max_ev_per_label=int(max_ev_per_label),
-                )
-            out_by_idx[idx] = cached
-        else:
-            to_send.append((idx, review, needs_del, needs_det, key))
+def _select_relevant_reviews(df: pd.DataFrame, question: str, max_reviews: int = 18) -> pd.DataFrame:
+    if df.empty: return df.copy()
+    working = df.copy()
+    working["search_blob"] = working["title_and_text"].fillna("").astype(str).map(_normalize_text)
+    qtokens = _tokenize(question)
+    def score(row):
+        s = 0.0; text = row["search_blob"]
+        for t in qtokens:
+            if t in text: s += 3+text.count(t)
+        rating = row.get("rating")
+        if any(t in {"defect","broken","issue","problem","negative","bad"} for t in qtokens):
+            if pd.notna(rating): s += max(0,6-float(rating))
+        if not _safe_bool(row.get("incentivized_review"),False): s += 0.5
+        if pd.notna(row.get("review_length_words")): s += min(float(row.get("review_length_words",0))/60,2)
+        return s
+    working["_score"] = working.apply(score, axis=1)
+    ranked = working.sort_values(["_score","submission_time"],ascending=[False,False],na_position="last")
+    combined = pd.concat([
+        ranked.head(max_reviews),
+        df[df["rating"].isin([1,2])].head(max_reviews//3 or 1),
+        df[df["rating"].isin([4,5])].head(max_reviews//3 or 1),
+    ],ignore_index=True).drop_duplicates(subset=["review_id"])
+    return combined.head(max_reviews).drop(columns=["search_blob","_score"],errors="ignore")
 
-    if not to_send:
-        return out_by_idx
+def _review_snippet_rows(df: pd.DataFrame, *, max_reviews: int = 18) -> List[Dict]:
+    rows = []
+    for _, row in df.head(max_reviews).iterrows():
+        rows.append(dict(
+            review_id=_safe_text(row.get("review_id")),
+            rating=_safe_int(row.get("rating"),0) if pd.notna(row.get("rating")) else None,
+            incentivized_review=_safe_bool(row.get("incentivized_review"),False),
+            content_locale=_safe_text(row.get("content_locale")),
+            submission_date=_safe_text(row.get("submission_date")),
+            title=_truncate_text(row.get("title",""),120),
+            snippet=_truncate_text(row.get("review_text",""),520),
+        ))
+    return rows
 
+def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, question) -> str:
+    overall_metrics  = _compute_metrics(overall_df)
+    filtered_metrics = _compute_metrics(filtered_df)
+    rating_df        = _rating_distribution(filtered_df)
+    monthly_df       = _monthly_trend(filtered_df).tail(12)
+    relevant = _select_relevant_reviews(filtered_df, question, max_reviews=18)
+    recent   = filtered_df.sort_values(["submission_time","review_id"],ascending=[False,False],na_position="last").head(10)
+    low_star = filtered_df[filtered_df["rating"].isin([1,2])].head(8)
+    hi_star  = filtered_df[filtered_df["rating"].isin([4,5])].head(8)
+    evidence = pd.concat([relevant,recent,low_star,hi_star],ignore_index=True).drop_duplicates(subset=["review_id"]).head(28)
+    return json.dumps({
+        "product": dict(product_id=summary.product_id, product_url=summary.product_url,
+                        product_name=_product_display_name(summary,overall_df)),
+        "analysis_scope": dict(current_filter_description=filter_description,
+                               overall_review_count=len(overall_df),filtered_review_count=len(filtered_df)),
+        "metric_snapshot": dict(overall=overall_metrics, filtered=filtered_metrics,
+                                rating_distribution_filtered=rating_df.to_dict(orient="records"),
+                                monthly_trend_filtered=monthly_df.to_dict(orient="records")),
+        "review_text_evidence": _review_snippet_rows(evidence, max_reviews=28),
+    }, ensure_ascii=False, indent=2, default=str)
+
+def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description,
+                  chat_history, persona_name=None) -> str:
+    client = _get_openai_client()
+    if client is None: raise ReviewDownloaderError("No OpenAI API key configured.")
+    instructions = _build_persona_instructions(persona_name)
+    ai_context   = _build_ai_context(overall_df=overall_df,filtered_df=filtered_df,
+                                     summary=summary,filter_description=filter_description,question=question)
+    msgs: List[Dict[str,str]] = [{"role":m["role"],"content":m["content"]} for m in list(chat_history)[-8:]]
+    msgs.append({"role":"user","content":f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_context}"})
+    result = _chat_complete(client, model=_shared_model(), messages=[
+        {"role":"system","content":instructions}, *msgs
+    ], temperature=0.0, max_tokens=1100)
+    if not result: raise ReviewDownloaderError("OpenAI returned an empty answer.")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — REVIEW PROMPT (existing tab 4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+REVIEW_PROMPT_STARTER_ROWS = [
+    {"column_name":"perceived_loudness",
+     "prompt":"How is product loudness described? Use Positive, Negative, Neutral, or Not Mentioned.",
+     "labels":"Positive, Negative, Neutral, Not Mentioned"},
+    {"column_name":"reliability_risk_signal",
+     "prompt":"Does the review mention a product reliability or durability risk? Use Risk Mentioned, Positive Reliability, or Not Mentioned.",
+     "labels":"Risk Mentioned, Positive Reliability, Not Mentioned"},
+]
+
+def _default_prompt_df() -> pd.DataFrame:
+    return pd.DataFrame([REVIEW_PROMPT_STARTER_ROWS[0]])
+
+def _normalize_prompt_definitions(prompt_df: pd.DataFrame, existing_columns: Sequence[str]) -> List[Dict]:
+    if prompt_df is None or prompt_df.empty: return []
+    normalized = []
+    seen: Set[str] = set()
+    existing_set = {str(c) for c in existing_columns}
+    for _, row in prompt_df.fillna("").iterrows():
+        raw_prompt = _safe_text(row.get("prompt"))
+        raw_labels = _safe_text(row.get("labels"))
+        raw_column = _safe_text(row.get("column_name"))
+        if not raw_prompt and not raw_labels and not raw_column: continue
+        if not raw_prompt: raise ReviewDownloaderError("Each Review Prompt row needs a prompt.")
+        if not raw_labels: raise ReviewDownloaderError("Each Review Prompt row needs labels.")
+        labels = [l.strip() for l in raw_labels.split(",") if l.strip()]
+        deduped = list(dict.fromkeys(labels))
+        if "Not Mentioned" not in deduped and len(deduped) <= 7: deduped.append("Not Mentioned")
+        if len(deduped) < 2: raise ReviewDownloaderError("Each prompt needs at least two labels.")
+        col = _slugify(raw_column or raw_prompt)
+        if col in existing_set and col not in {"review_id"}: col = f"{col}_ai"
+        base = col; suffix = 2
+        while col in seen: col = f"{base}_{suffix}"; suffix += 1
+        seen.add(col)
+        normalized.append(dict(column_name=col,
+                                display_name=col.replace("_"," ").title(),
+                                prompt=raw_prompt, labels=deduped,
+                                labels_csv=", ".join(deduped)))
+    return normalized
+
+def _build_tagging_schema(prompt_definitions: Sequence[Dict]) -> Dict:
+    item_props = {"review_id":{"type":"string"}}
+    required   = ["review_id"]
+    for p in prompt_definitions:
+        item_props[p["column_name"]] = {"type":"string","enum":list(p["labels"])}
+        required.append(p["column_name"])
+    return {"type":"object","additionalProperties":False,
+            "properties":{"results":{"type":"array","items":{"type":"object",
+                "additionalProperties":False,"properties":item_props,"required":required}}},
+            "required":["results"]}
+
+def _classify_chunk(*, client, chunk_df, prompt_definitions) -> pd.DataFrame:
+    prompt_count = max(len(prompt_definitions),1)
+    max_out = int(max(1800,min(12000,450+len(chunk_df)*(18+12*prompt_count))))
+    reviews_payload = [dict(review_id=_safe_text(row.get("review_id")),
+        rating=_safe_int(row.get("rating"),0) if pd.notna(row.get("rating")) else None,
+        title=_truncate_text(row.get("title",""),200),
+        review_text=_truncate_text(row.get("review_text",""),1000),
+        incentivized_review=_safe_bool(row.get("incentivized_review"),False))
+        for _, row in chunk_df.iterrows()]
+    prompt_payload = [dict(column_name=p["column_name"],prompt=p["prompt"],labels=p["labels"])
+                      for p in prompt_definitions]
+    instructions = textwrap.dedent("""
+        You are a deterministic review-tagging engine.
+        For each review and each prompt definition, return exactly one allowed label.
+        Base each label only on the supplied review content.
+        If the review does not mention the topic, use Not Mentioned when available.
+    """).strip()
+    result_text = _chat_complete(client, model=_shared_model(),
+        messages=[{"role":"system","content":instructions},
+                  {"role":"user","content":json.dumps({"prompt_definitions":prompt_payload,"reviews":reviews_payload})}],
+        temperature=0.0,
+        response_format={"type":"json_schema","name":"review_prompt_tagging",
+                          "schema":_build_tagging_schema(prompt_definitions),"strict":True},
+        max_tokens=max_out)
+    data = _safe_json_load(result_text)
+    output_rows = data.get("results") or []
+    out_df = pd.DataFrame(output_rows)
+    if out_df.empty: raise ReviewDownloaderError("OpenAI returned no row-level prompt results.")
+    out_df["review_id"] = out_df["review_id"].astype(str)
+    expected = set(chunk_df["review_id"].astype(str))
+    returned = set(out_df["review_id"].astype(str))
+    if expected != returned:
+        missing = sorted(expected-returned); extra = sorted(returned-expected)
+        raise ReviewDownloaderError(f"Incomplete batch. Missing: {missing[:5]} Extra: {extra[:5]}")
+    for p in prompt_definitions:
+        if p["column_name"] not in out_df.columns:
+            raise ReviewDownloaderError(f"OpenAI omitted column: {p['column_name']}")
+    return out_df
+
+def _run_review_prompt_tagging(*, client, source_df, prompt_definitions, chunk_size) -> pd.DataFrame:
+    if source_df.empty: raise ReviewDownloaderError("No reviews in scope.")
+    chunks = list(range(0,len(source_df),chunk_size))
+    progress = st.progress(0.0,text="Preparing AI review prompt run…")
+    status   = st.empty()
+    outputs: List[pd.DataFrame] = []
+    for i, start in enumerate(chunks,1):
+        chunk_df = source_df.iloc[start:start+chunk_size].copy()
+        status.info(f"Classifying reviews {start+1}-{min(start+chunk_size,len(source_df))} of {len(source_df)}")
+        outputs.append(_classify_chunk(client=client,chunk_df=chunk_df,prompt_definitions=prompt_definitions))
+        progress.progress(i/len(chunks))
+    status.success(f"Finished tagging {len(source_df):,} reviews.")
+    combined = pd.concat(outputs,ignore_index=True).drop_duplicates(subset=["review_id"],keep="last")
+    return combined
+
+def _merge_prompt_results(overall_df, prompt_results_df, prompt_definitions) -> pd.DataFrame:
+    updated = overall_df.copy()
+    rid_series = updated["review_id"].astype(str)
+    lookup = prompt_results_df.set_index("review_id")
+    for p in prompt_definitions:
+        col = p["column_name"]
+        if col not in updated.columns: updated[col] = pd.NA
+        mapping = lookup[col].to_dict()
+        new_vals = rid_series.map(mapping)
+        updated[col] = new_vals.where(new_vals.notna(), updated[col])
+    return updated
+
+def _summarize_prompt_results(prompt_results_df, prompt_definitions, source_df=None) -> pd.DataFrame:
+    merged = prompt_results_df.copy()
+    merged["review_id"] = merged["review_id"].astype(str)
+    if source_df is not None and not source_df.empty and "review_id" in source_df.columns:
+        lookup = source_df[[c for c in ["review_id","rating"] if c in source_df.columns]].copy()
+        lookup["review_id"] = lookup["review_id"].astype(str)
+        merged = merged.merge(lookup,on="review_id",how="left")
+    rows = []
+    total = max(len(prompt_results_df),1)
+    for p in prompt_definitions:
+        col = p["column_name"]
+        for label in p["labels"]:
+            sub = merged[merged[col]==label]
+            rows.append(dict(column_name=col,display_name=p["display_name"],label=str(label),
+                review_count=len(sub),share=_safe_pct(len(sub),total),
+                avg_rating=_safe_mean(sub["rating"]) if "rating" in sub.columns else None))
+    return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — EXPORT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _autosize_worksheet(ws, df: pd.DataFrame) -> None:
+    ws.freeze_panes = "A2"
+    for idx, col in enumerate(df.columns, 1):
+        series = df[col].head(250).fillna("").astype(str)
+        max_len = max([len(str(col))]+[len(v) for v in series.tolist()])
+        ws.column_dimensions[get_column_letter(idx)].width = min(max_len+2,48)
+
+def _dataframe_for_sql(df: pd.DataFrame) -> pd.DataFrame:
+    sql_df = df.copy()
+    for col in sql_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(sql_df[col]):
+            sql_df[col] = sql_df[col].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif pd.api.types.is_bool_dtype(sql_df[col]):
+            sql_df[col] = sql_df[col].astype(int)
+    return sql_df
+
+def _build_master_excel(summary: ReviewBatchSummary, reviews_df: pd.DataFrame, *,
+                        prompt_definitions=None, prompt_summary_df=None,
+                        prompt_scope_label="") -> bytes:
+    metrics  = _compute_metrics(reviews_df)
+    rating_df= _rating_distribution(reviews_df)
+    monthly_df=_monthly_trend(reviews_df)
+    summary_df = pd.DataFrame([dict(
+        product_name=_product_display_name(summary,reviews_df),
+        product_id=summary.product_id, product_url=summary.product_url,
+        reviews_downloaded=summary.reviews_downloaded,
+        avg_rating=metrics.get("avg_rating"),
+        avg_rating_non_incentivized=metrics.get("avg_rating_non_incentivized"),
+        pct_low_star=metrics.get("pct_low_star"),
+        pct_incentivized=metrics.get("pct_incentivized"),
+        generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    )])
+    priority_cols = ["review_id","product_id","rating","incentivized_review",
+                     "is_recommended","submission_time","content_locale","title","review_text"]
+    prompt_cols = [p["column_name"] for p in (prompt_definitions or []) if p["column_name"] in reviews_df.columns]
+    ordered = [c for c in priority_cols+prompt_cols if c in reviews_df.columns]
+    remaining = [c for c in reviews_df.columns if c not in ordered]
+    export_reviews = reviews_df[ordered+remaining]
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        sheets = {"Summary":summary_df,"Reviews":export_reviews,
+                  "RatingDistribution":rating_df,"ReviewVolume":monthly_df}
+        if prompt_definitions:
+            sheets["ReviewPromptDefinitions"] = pd.DataFrame([
+                dict(column_name=p["column_name"],display_name=p["display_name"],
+                     prompt=p["prompt"],labels=", ".join(p["labels"]),scope=prompt_scope_label)
+                for p in prompt_definitions])
+        if prompt_summary_df is not None and not prompt_summary_df.empty:
+            sheets["ReviewPromptSummary"] = prompt_summary_df
+        for sname, df in sheets.items():
+            df.to_excel(writer, sheet_name=sname, index=False)
+            _autosize_worksheet(writer.sheets[sname], df)
+    out.seek(0)
+    return out.getvalue()
+
+def _get_master_bundle(summary: ReviewBatchSummary, reviews_df: pd.DataFrame,
+                       prompt_artifacts: Optional[Dict]) -> Dict:
+    prompt_defs    = (prompt_artifacts or {}).get("definitions") or []
+    prompt_sum_df  = (prompt_artifacts or {}).get("summary_df")
+    prompt_scope   = (prompt_artifacts or {}).get("scope_label","")
+    key = json.dumps(dict(product_id=summary.product_id,review_count=len(reviews_df),
+                           columns=sorted(str(c) for c in reviews_df.columns),
+                           prompt_sig=(prompt_artifacts or {}).get("definition_signature")),
+                     sort_keys=True)
+    bundle = st.session_state.get("master_export_bundle")
+    if bundle and bundle.get("key")==key: return bundle
+    excel_bytes = _build_master_excel(summary,reviews_df,
+                                       prompt_definitions=prompt_defs,
+                                       prompt_summary_df=prompt_sum_df,
+                                       prompt_scope_label=prompt_scope)
+    ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    bundle = dict(key=key, excel_bytes=excel_bytes,
+                  excel_name=f"{summary.product_id}_review_workspace_{ts}.xlsx")
+    st.session_state["master_export_bundle"] = bundle
+    return bundle
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SYMPTOMIZER — HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_symptom_whitelists_from_file(file_bytes: bytes) -> Tuple[List[str],List[str],Dict[str,List[str]]]:
+    bio = io.BytesIO(file_bytes)
+    try: df_sym = pd.read_excel(bio, sheet_name="Symptoms")
+    except Exception: return [], [], {}
+    if df_sym is None or df_sym.empty: return [], [], {}
+    df_sym.columns = [str(c).strip() for c in df_sym.columns]
+    lowcols = {c.lower():c for c in df_sym.columns}
+    alias_col = next((lowcols[c] for c in ["aliases","alias"] if c in lowcols), None)
+    label_col = next((lowcols[c] for c in ["symptom","label","name","item"] if c in lowcols), None)
+    type_col  = next((lowcols[c] for c in ["type","polarity","category","side"] if c in lowcols), None)
+    pos_tags  = {"delighter","delighters","positive","pos","pros"}
+    neg_tags  = {"detractor","detractors","negative","neg","cons"}
+    def _clean(s: pd.Series) -> List[str]:
+        vals = s.dropna().astype(str).str.strip()
+        out: List[str] = []; seen: Set[str] = set()
+        for v in vals:
+            if v and v not in seen: seen.add(v); out.append(v)
+        return out
+    delighters: List[str] = []; detractors: List[str] = []; alias_map: Dict[str,List[str]] = {}
+    if label_col and type_col:
+        df_sym[type_col] = df_sym[type_col].astype(str).str.lower().str.strip()
+        delighters = _clean(df_sym.loc[df_sym[type_col].isin(pos_tags),label_col])
+        detractors = _clean(df_sym.loc[df_sym[type_col].isin(neg_tags),label_col])
+        if alias_col:
+            for _, row in df_sym.iterrows():
+                lbl = str(row.get(label_col,"")).strip()
+                als = str(row.get(alias_col,"")).strip()
+                if lbl:
+                    alias_map[lbl] = [p.strip() for p in als.replace(",","|").split("|") if p.strip()] if als else []
+    else:
+        for lc, orig in lowcols.items():
+            if "delight" in lc or "positive" in lc or lc=="pros": delighters.extend(_clean(df_sym[orig]))
+            if "detract" in lc or "negative" in lc or lc=="cons": detractors.extend(_clean(df_sym[orig]))
+        delighters = list(dict.fromkeys(delighters)); detractors = list(dict.fromkeys(detractors))
+    return delighters, detractors, alias_map
+
+def _ensure_ai_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for h in AI_DET_HEADERS+AI_DEL_HEADERS+AI_META_HEADERS:
+        if h not in df.columns: df[h] = None
+    return df
+
+def _detect_symptom_columns(df: pd.DataFrame) -> Dict[str,List[str]]:
+    cols = [str(c).strip() for c in df.columns]
+    return dict(
+        manual_detractors=[f"Symptom {i}" for i in range(1,11) if f"Symptom {i}" in cols],
+        manual_delighters=[f"Symptom {i}" for i in range(11,21) if f"Symptom {i}" in cols],
+        ai_detractors=[c for c in cols if c.startswith("AI Symptom Detractor ")],
+        ai_delighters=[c for c in cols if c.startswith("AI Symptom Delighter ")],
+    )
+
+def _filled_mask(df: pd.DataFrame, cols: List[str]) -> pd.Series:
+    if not cols: return pd.Series(False, index=df.index)
+    mask = pd.Series(False, index=df.index)
+    for c in cols:
+        if c not in df.columns: continue
+        s = df[c].fillna("").astype(str).str.strip()
+        mask |= (s!="") & (~s.str.upper().isin(NON_VALUES))
+    return mask
+
+def _detect_missing(df: pd.DataFrame, colmap: Dict[str,List[str]]) -> pd.DataFrame:
+    out = df.copy()
+    det_cols = colmap["manual_detractors"]+colmap["ai_detractors"]
+    del_cols = colmap["manual_delighters"]+colmap["ai_delighters"]
+    out["Has_Detractors"]    = _filled_mask(out, det_cols)
+    out["Has_Delighters"]    = _filled_mask(out, del_cols)
+    out["Needs_Detractors"]  = ~out["Has_Detractors"]
+    out["Needs_Delighters"]  = ~out["Has_Delighters"]
+    out["Needs_Symptomization"] = out["Needs_Detractors"] & out["Needs_Delighters"]
+    return out
+
+def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detractors,
+                             product_profile="", max_ev_chars=120) -> Dict[int,Dict]:
+    out_by_idx: Dict[int,Dict] = {}
+    if not items: return out_by_idx
     sys_lines = [
-        "You are a high-recall but disciplined review symptomizer for consumer products across MANY product categories.",
-        "Start broad: reason in reusable L1 product aspects first (Overall Satisfaction, Effective Results, Ease Of Use, Time Saver, Comfort, Value, Reliability, Battery, Noise, Cleaning / Maintenance, Connectivity, Design, Attachments / Versatility, Safety).",
-        "Then go one level deeper: when the evidence is direct, add a reusable L2 subtheme such as Easy Setup, Confusing Instructions, Visible Improvement, Fast Results, Strong Recommendation, Product Failure, Short Battery Life, Pairing Issue, Compact Design, High Cost, or Irritation.",
-        "Candidate labels, matched aspect families, and evidence supplied per review are strong hints derived from rules, aliases, the provided Symptoms sheet, learned keywords, and prelearned knowledge. Reuse them whenever supported.",
-        "Prefer labels from the provided Symptoms sheet first. Only fall back to universal backbone labels or learned temporary labels when no provided label fits as well.",
-        "Do not be overly sparse. If the same review clearly supports multiple broad labels, include all of them. If it clearly supports both a broad L1 and a reusable L2 under that L1, include both when available.",
+        "You are a high-recall, disciplined review symptomizer for consumer products.",
+        "For each review, return relevant delighters (positive themes) and detractors (negative themes).",
+        "Only include a label if there is direct textual support in the review.",
         "Return STRICT JSON with schema:",
-        '{"items":[{"id":"<id>","detractors":[{"label":"<one from allowed detractors>","evidence":["<exact substring>", "..."]}], "delighters":[{"label":"<one from allowed delighters>","evidence":["<exact substring>", "..."]}], "unlisted_detractors":["<THEME>", "..."], "unlisted_delighters":["<THEME>", "..."], "safety":"<enum>", "reliability":"<enum>", "sessions":"<enum>"}]}',
-        "",
+        '{"items":[{"id":"<id>","detractors":[{"label":"<from allowed list>","evidence":["<exact substring>"]}],'
+        '"delighters":[{"label":"<from allowed list>","evidence":["<exact substring>"]}],'
+        '"unlisted_detractors":["<SHORT THEME>"],"unlisted_delighters":["<SHORT THEME>"],'
+        '"safety":"<enum>","reliability":"<enum>","sessions":"<enum>"}]}',
         "Rules:",
-        f"- Evidence MUST be exact substrings from THAT review. Each ≤ {max_ev_chars} chars. Up to {max_ev_per_label} per label.",
-        "- Use ONLY allowed lists for delighters and detractors. Prefer provided catalog labels first, then broad stable labels plus reusable L2 themes over tiny wording variants.",
-        "- If a review clearly shows strong recommendation, strong results, visible improvement, ease, comfort, value, reliability, setup experience, connectivity experience, or safety, tag it. Do not leave obvious broad labels blank.",
-        "- Only include a label if there is textual support in the review.",
-        "- For unlisted_* items, return a SHORT reusable THEME (1–3 words), Title Case, no punctuation except slashes.",
-        "- Avoid duplicates and near-duplicates.",
-        "- Cap to maximum 10 detractors and 10 delighters. Cap to 10 unlisted per side.",
-        "- Always return ALL keys for every item (use empty lists / Not Mentioned if none).",
-        "",
-        "Meta enums:",
+        f"- Evidence must be exact substrings ≤{max_ev_chars} chars. Up to 2 per label.",
+        "- Use ONLY the allowed lists. If nothing fits, use unlisted_* for a short reusable theme.",
+        "- Cap to maximum 10 detractors and 10 delighters.",
         "SAFETY one of: ['Not Mentioned','Concern','Positive']",
         "RELIABILITY one of: ['Not Mentioned','Negative','Neutral','Positive']",
         "SESSIONS one of: ['0','1','2–3','4–9','10+','Unknown']",
     ]
-    if product_profile and str(product_profile).strip():
-        sys_lines.insert(1, f"Product context (brief): {str(product_profile).strip()[:600]}")
+    if product_profile:
+        sys_lines.insert(1, f"Product context: {product_profile[:400]}")
+    payload = dict(
+        allowed_delighters=allowed_delighters,
+        allowed_detractors=allowed_detractors,
+        items=[dict(id=str(it["idx"]),review=it["review"],
+                    needs_delighters=it.get("needs_del",True),
+                    needs_detractors=it.get("needs_det",True))
+               for it in items],
+    )
+    result_text = _chat_complete(client, model=_shared_model(),
+        messages=[{"role":"system","content":"\n".join(sys_lines)},
+                  {"role":"user","content":json.dumps(payload)}],
+        temperature=0.0, response_format={"type":"json_object"},
+        max_tokens=4000)
+    data = _safe_json_load(result_text)
+    items_out = data.get("items") or (data if isinstance(data,list) else [])
+    by_id = {str(o.get("id")):o for o in items_out if isinstance(o,dict) and "id" in o}
 
-    payload = {
-        "provided_catalog_delighters": _provided_catalog_labels("Delighter")[:200],
-        "provided_catalog_detractors": _provided_catalog_labels("Detractor")[:200],
-        "fallback_delighters": [x for x in allowed_delighters if _canon_simple(x) not in _provided_catalog_keyset("Delighter")][:120],
-        "fallback_detractors": [x for x in allowed_detractors if _canon_simple(x) not in _provided_catalog_keyset("Detractor")][:120],
-        "priority_delighter_themes": _priority_theme_labels("Delighter")[:20],
-        "priority_detractor_themes": _priority_theme_labels("Detractor")[:20],
-        "allowed_delighters": allowed_delighters,
-        "allowed_detractors": allowed_detractors,
-        "known_unlisted_detractor_themes": (known_theme_hints.get("Detractor") or [])[:60],
-        "known_unlisted_delighter_themes": (known_theme_hints.get("Delighter") or [])[:60],
-        "items": [
-            {
-                "id": str(idx),
-                "review": review,
-                "needs_delighters": bool(needs_del),
-                "needs_detractors": bool(needs_det),
-                "matched_positive_aspects": (router_by_idx.get(idx, {}) or {}).get("matched_del_families", []),
-                "matched_negative_aspects": (router_by_idx.get(idx, {}) or {}).get("matched_det_families", []),
-                "candidate_delighters": (router_by_idx.get(idx, {}) or {}).get("dels", [])[:router_top_n],
-                "candidate_detractors": (router_by_idx.get(idx, {}) or {}).get("dets", [])[:router_top_n],
-                "candidate_specific_delighters": (router_by_idx.get(idx, {}) or {}).get("l2_dels", [])[: max(router_top_n, 6)],
-                "candidate_specific_detractors": (router_by_idx.get(idx, {}) or {}).get("l2_dets", [])[: max(router_top_n, 6)],
-                "candidate_delighter_evidence": (router_by_idx.get(idx, {}) or {}).get("ev_del_map", {}),
-                "candidate_detractor_evidence": (router_by_idx.get(idx, {}) or {}).get("ev_det_map", {}),
-            }
-            for (idx, review, needs_del, needs_det, _) in to_send
-        ],
-    }
-    data = {}
-    if client is not None:
-        data = _chat_json_with_retries(
-            client,
-            model=model,
-            temperature=float(temperature),
-            messages=[
-                {"role": "system", "content": "\n".join(sys_lines)},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            component="symptomize-label-batch",
-            response_format={"type": "json_object"},
-        )
+    def _extract(objs, allowed, side):
+        labels = []; ev_map = {}
+        for obj in (objs or []):
+            if not isinstance(obj,dict): continue
+            raw = str(obj.get("label","")).strip()
+            # coerce to nearest allowed label
+            exact = {_canon_simple(x):x for x in allowed}
+            lbl = exact.get(_canon_simple(raw))
+            if not lbl:
+                m = difflib.get_close_matches(raw, allowed, n=1, cutoff=0.82)
+                lbl = m[0] if m else None
+            if not lbl: continue
+            evs = [str(e)[:max_ev_chars] for e in (obj.get("evidence") or []) if isinstance(e,str) and e.strip()]
+            if lbl not in labels: labels.append(lbl); ev_map[lbl]=evs[:2]
+            if len(labels)>=10: break
+        return labels, ev_map
 
-    items_out: List[Any] = []
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        items_out = data["items"]
-    elif isinstance(data, list):
-        items_out = data
-
-    by_id: Dict[str, Any] = {}
-    for obj in items_out:
-        if isinstance(obj, dict) and "id" in obj:
-            by_id[str(obj.get("id"))] = obj
-
-    for (idx, _, needs_del, needs_det, key) in to_send:
-        obj = by_id.get(str(idx), {}) or {}
-        norm = _normalize_unified_output(obj, allowed_delighters, allowed_detractors, int(max_ev_per_label), int(max_ev_chars))
-        router = router_by_idx.get(idx, {}) or {}
-        if bool(st.session_state.get("high_recall_labeling", True)):
-            norm = _apply_router_rescue(
-                norm,
-                router,
-                needs_del=needs_del,
-                needs_det=needs_det,
-                require_evidence_flag=bool(st.session_state.get("require_evidence_flag", True)),
-                max_ev_per_label=int(max_ev_per_label),
-            )
-        out_by_idx[idx] = norm
-        cache[key] = dict(norm)
-
+    for it in items:
+        idx  = int(it["idx"])
+        obj  = by_id.get(str(idx)) or {}
+        dels, ev_del = _extract(obj.get("delighters",[]), allowed_delighters, "del")
+        dets, ev_det = _extract(obj.get("detractors",[]), allowed_detractors, "det")
+        safety      = str(obj.get("safety","Not Mentioned"))
+        reliability = str(obj.get("reliability","Not Mentioned"))
+        sessions    = str(obj.get("sessions","Unknown"))
+        safety      = safety      if safety      in SAFETY_ENUM      else "Not Mentioned"
+        reliability = reliability if reliability in RELIABILITY_ENUM else "Not Mentioned"
+        sessions    = sessions    if sessions    in SESSIONS_ENUM    else "Unknown"
+        out_by_idx[idx] = dict(dels=dels,dets=dets,ev_del=ev_del,ev_det=ev_det,
+                                unl_dels=obj.get("unlisted_delighters",[])[:10],
+                                unl_dets=obj.get("unlisted_detractors",[])[:10],
+                                safety=safety,reliability=reliability,sessions=sessions)
     return out_by_idx
 
+def _ai_build_symptom_list(*, client, product_description: str, sample_reviews: List[str]) -> Dict:
+    sys = textwrap.dedent("""
+        You design symptom catalogs for consumer product review analysis.
+        Return STRICT JSON:
+        {"delighters":[{"label":"<2-4 words Title Case>","rationale":"<short>"}],
+         "detractors":[{"label":"<2-4 words Title Case>","rationale":"<short>"}]}
+        Rules:
+        - Return 8-12 delighters and 8-12 detractors.
+        - Labels must be mutually exclusive and reusable across many reviews.
+        - Use singular nouns when possible.
+        - Cover broad aspects: performance, ease of use, value, reliability, design, safety.
+    """).strip()
+    payload = dict(product_description=product_description,
+                   sample_reviews=sample_reviews[:20])
+    result_text = _chat_complete(client, model=_shared_model(),
+        messages=[{"role":"system","content":sys},
+                  {"role":"user","content":json.dumps(payload)}],
+        temperature=0.0, response_format={"type":"json_object"}, max_tokens=1200)
+    data = _safe_json_load(result_text)
+    return dict(
+        delighters=[str(o.get("label","")).strip() for o in (data.get("delighters") or []) if str(o.get("label","")).strip()][:15],
+        detractors=[str(o.get("label","")).strip() for o in (data.get("detractors") or []) if str(o.get("label","")).strip()][:15],
+    )
 
-# ------------------------------ Export helpers ------------------------------
-def generate_template_workbook_bytes(
-    original_bytes: bytes,
-    updated_df: pd.DataFrame,
-    processed_idx: Optional[Set[int]] = None,
-    overwrite_processed_slots: bool = False,
-) -> bytes:
+def _generate_symptomized_workbook(original_bytes: bytes, updated_df: pd.DataFrame) -> bytes:
     wb = load_workbook(io.BytesIO(original_bytes))
     sheet_name = "Star Walk scrubbed verbatims"
-    if sheet_name not in wb.sheetnames:
-        sheet_name = wb.sheetnames[0]
+    if sheet_name not in wb.sheetnames: sheet_name = wb.sheetnames[0]
     ws: Worksheet = wb[sheet_name]
-
-    df2 = ensure_ai_columns(updated_df.copy())
-
-    for name, col in META_ORDER:
-        col_idx = column_index_from_string(col)
-        if not ws.cell(row=1, column=col_idx).value:
-            ws.cell(row=1, column=col_idx, value=name)
-
-    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    fill_red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    fill_yel = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-    fill_blu = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
-    fill_pur = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")
-
-    pset = set(processed_idx or [])
-
-    def _clear_template_slots(row_i: int) -> None:
-        for col_idx in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
-            ws.cell(row=row_i, column=col_idx, value=None)
-
+    df2 = _ensure_ai_columns(updated_df.copy())
+    fill_green = PatternFill(start_color="C6EFCE",end_color="C6EFCE",fill_type="solid")
+    fill_red   = PatternFill(start_color="FFC7CE",end_color="FFC7CE",fill_type="solid")
+    fill_yel   = PatternFill(start_color="FFF2CC",end_color="FFF2CC",fill_type="solid")
+    fill_blu   = PatternFill(start_color="CFE2F3",end_color="CFE2F3",fill_type="solid")
+    fill_pur   = PatternFill(start_color="EAD1DC",end_color="EAD1DC",fill_type="solid")
     for i, (rid, row) in enumerate(df2.iterrows(), start=2):
-        if overwrite_processed_slots and (int(rid) in pset):
-            _clear_template_slots(i)
-        for j, col_idx in enumerate(DET_INDEXES, start=1):
+        for j, col_idx in enumerate(DET_INDEXES, 1):
             val = row.get(f"AI Symptom Detractor {j}")
-            cv = None if (pd.isna(val) or str(val).strip() == "") else val
+            cv  = None if (pd.isna(val) or str(val).strip()=="") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
-            if cv is not None:
-                cell.fill = fill_red
-        for j, col_idx in enumerate(DEL_INDEXES, start=1):
+            if cv: cell.fill = fill_red
+        for j, col_idx in enumerate(DEL_INDEXES, 1):
             val = row.get(f"AI Symptom Delighter {j}")
-            cv = None if (pd.isna(val) or str(val).strip() == "") else val
+            cv  = None if (pd.isna(val) or str(val).strip()=="") else val
             cell = ws.cell(row=i, column=col_idx, value=cv)
-            if cv is not None:
-                cell.fill = fill_green
-        safety = row.get("AI Safety")
-        reliab = row.get("AI Reliability")
-        sess = row.get("AI # of Sessions")
-        if is_filled(safety):
-            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(safety))
-            c.fill = fill_yel
-        if is_filled(reliab):
-            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(reliab))
-            c.fill = fill_blu
-        if is_filled(sess):
-            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(sess))
-            c.fill = fill_pur
-
-    for c in DET_INDEXES + DEL_INDEXES + list(META_INDEXES.values()):
-        try:
-            ws.column_dimensions[get_column_letter(c)].width = 28
-        except Exception:
-            pass
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
-
-
-def apply_symptoms_updates_to_workbook(
-    original_bytes: bytes,
-    new_symptoms: List[Tuple[str, str]],
-    alias_additions: List[Tuple[str, str]],
-) -> bytes:
-    wb = load_workbook(io.BytesIO(original_bytes))
-    if "Symptoms" not in wb.sheetnames:
-        ws = wb.create_sheet("Symptoms")
-    else:
-        ws = wb["Symptoms"]
-
-    headers_row = [c.value for c in ws[1]] if ws.max_row >= 1 else []
-    headers = [str(h).strip() if h is not None else "" for h in headers_row]
-    header_map = {str(h).strip().lower(): i + 1 for i, h in enumerate(headers) if str(h).strip()}
-    used_cols: Set[int] = set()
-
-    def _ensure_header(name: str, synonyms: List[str], preferred_index: Optional[int] = None) -> int:
-        for syn in synonyms:
-            idx = header_map.get(str(syn).lower())
-            if idx:
-                if not ws.cell(row=1, column=idx).value:
-                    ws.cell(row=1, column=idx, value=name)
-                used_cols.add(idx)
-                return idx
-        max_col = int(getattr(ws, "max_column", 0) or 0)
-        idx = preferred_index if (preferred_index and preferred_index > 0) else (max_col + 1 if max_col > 0 else 1)
-        while idx in used_cols:
-            idx += 1
-        ws.cell(row=1, column=idx, value=name)
-        used_cols.add(idx)
-        return idx
-
-    col_label = _ensure_header("Symptom", ["symptom", "label", "name", "item"], preferred_index=1)
-    col_type = _ensure_header("Type", ["type", "polarity", "category", "side"], preferred_index=2)
-    col_alias = _ensure_header("Aliases", ["aliases", "alias"], preferred_index=3)
-
-    existing_row: Dict[str, int] = {}
-    existing_aliases: Dict[str, Set[str]] = {}
-    last_row = int(getattr(ws, "max_row", 0) or 0)
-    for r_i in range(2, last_row + 1):
-        v = ws.cell(row=r_i, column=col_label).value
-        if not v:
-            continue
-        lab = str(v).strip()
-        existing_row[lab] = r_i
-        als = ws.cell(row=r_i, column=col_alias).value
-        aset: Set[str] = set()
-        if als:
-            aset = {a.strip() for a in str(als).replace(",", "|").split("|") if a.strip()}
-        existing_aliases[lab] = aset
-
-    for label, side in new_symptoms:
-        lab = str(label).strip()
-        if not lab or lab in existing_row:
-            continue
-        rnew = (int(getattr(ws, "max_row", 1) or 1)) + 1
-        ws.cell(row=rnew, column=col_label, value=lab)
-        ws.cell(row=rnew, column=col_type, value=str(side).strip() or "")
-        existing_row[lab] = rnew
-        existing_aliases[lab] = set()
-
-    for tgt_label, alias in alias_additions:
-        tgt = str(tgt_label).strip()
-        als = str(alias).strip()
-        if not tgt or not als or tgt not in existing_row:
-            continue
-        aset = existing_aliases.setdefault(tgt, set())
-        if _canon_simple(als) == _canon_simple(tgt):
-            continue
-        if any(_canon_simple(als) == _canon_simple(a) for a in aset):
-            continue
-        aset.add(als)
-        r_i = existing_row[tgt]
-        ws.cell(row=r_i, column=col_alias, value=" | ".join(sorted(aset)))
-
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.getvalue()
-
-# ----------------------------- Session bootstrap -----------------------------
-def _make_openai_client(api_key: str, timeout_s: float, max_retries: int):
-    if not (_HAS_OPENAI and api_key):
-        return None
-    try:
-        return OpenAI(api_key=api_key, timeout=float(timeout_s), max_retries=int(max_retries))
-    except TypeError:
-        try:
-            return OpenAI(api_key=api_key)
-        except Exception:
-            return None
-
-
-def _reset_filter_state() -> None:
-    for k in [
-        "f_source_sel",
-        "f_model_sel",
-        "f_country_sel",
-        "f_seeded_mode",
-        "f_new_mode",
-        "f_rating_sel",
-        "f_date_range",
-    ]:
-        st.session_state.pop(k, None)
-
-
-def _reset_run_outputs() -> None:
-    st.session_state["processed_rows"] = []
-    st.session_state["processed_idx_set"] = set()
-    st.session_state["new_symptom_candidates"] = {}
-    st.session_state["alias_suggestion_candidates"] = {}
-    st.session_state["last_run_processed_count"] = 0
-    st.session_state["ev_cov_num"] = 0
-    st.session_state["ev_cov_den"] = 0
-    st.session_state.pop("export_bytes", None)
-
-
-def _suggest_autotune_settings(
-    df_in: pd.DataFrame,
-    work_in: Optional[pd.DataFrame],
-    delighters: List[str],
-    detractors: List[str],
-    learned_store: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Any], str]:
-    ls = learned_store or _ensure_learned_store()
-    review_lengths = pd.Series(dtype="float64")
-    if df_in is not None and not df_in.empty and "Verbatim" in df_in.columns:
-        try:
-            review_lengths = df_in["Verbatim"].fillna("").astype(str).str.len()
-        except Exception:
-            review_lengths = pd.Series(dtype="float64")
-
-    n_reviews = int(len(df_in) if df_in is not None else 0)
-    median_chars = int(review_lengths.median()) if len(review_lengths) else 0
-    p90_chars = int(review_lengths.quantile(0.90)) if len(review_lengths) else median_chars
-    catalog_total = int(len(delighters) + len(detractors))
-    learned_total = int(len((ls.get("labels", {}) or {}).get("Delighter", {})) + len((ls.get("labels", {}) or {}).get("Detractor", {})))
-
-    missing_both_rate = 1.0
-    any_missing_rate = 1.0
-    if isinstance(work_in, pd.DataFrame) and not work_in.empty and "Needs_Symptomization" in work_in.columns:
-        try:
-            missing_both_rate = float(work_in["Needs_Symptomization"].mean())
-            any_missing_rate = float(((work_in["Needs_Delighters"]) | (work_in["Needs_Detractors"])).mean())
-        except Exception:
-            pass
-
-    sparse_catalog = catalog_total < 60
-    deep_catalog = catalog_total >= 140
-    long_reviews = median_chars >= 260 or p90_chars >= 700
-    heavy_gap = missing_both_rate >= 0.35 or any_missing_rate >= 0.60
-
-    def _top_family_priorities(labels_in: List[str], side_name: str) -> List[str]:
-        counts: Dict[str, int] = {}
-        for lab in labels_in:
-            fam = _infer_l1_family_from_label(lab, side_name)
-            if fam:
-                counts[fam] = counts.get(fam, 0) + 1
-        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        return [fam for fam, _ in ordered[:5]]
-
-    del_priority = _dedupe_keep_order_str(DEFAULT_PRIORITY_DELIGHTERS + _top_family_priorities(delighters, "Delighter"))
-    det_priority = _dedupe_keep_order_str(DEFAULT_PRIORITY_DETRACTORS + _top_family_priorities(detractors, "Detractor"))
-
-    router_candidate_top_n = 10 if sparse_catalog else 8 if catalog_total < 140 else 7
-    l2_candidate_top_n = 4 if (sparse_catalog or learned_total > 0) else 3
-    router_rescue_threshold = 0.82 if (sparse_catalog and heavy_gap) else 0.86 if sparse_catalog else 0.92 if deep_catalog else 0.88
-    l2_rescue_threshold = min(1.35, router_rescue_threshold + (0.16 if deep_catalog else 0.12))
-    llm_batch_size = 4 if long_reviews else 6 if median_chars < 240 else 5
-    batch_token_budget = 28000 if long_reviews else 36000 if median_chars < 260 else 32000
-    prelearn_sample_n = int(min(1600, max(350, round(min(max(n_reviews, 1), 3000) * (0.45 if sparse_catalog else 0.35)))))
-
-    cfg = {
-        "auto_tune_on_upload": True,
-        "temperature_setting": 0.0 if (sparse_catalog or heavy_gap) else 0.1,
-        "require_evidence_flag": True,
-        "max_ev_per_label": 2,
-        "max_ev_chars": 140 if long_reviews else 120,
-        "prelearn_enabled": True,
-        "prelearn_sample_n": prelearn_sample_n,
-        "prelearn_batch_size": 80 if n_reviews >= 1200 else 60,
-        "prelearn_merge_threshold": 0.91 if (sparse_catalog or heavy_gap) else 0.93,
-        "use_learned_as_allowed": (catalog_total < 45 and learned_total > 0),
-        "use_universal_l1_backbone": True,
-        "high_recall_labeling": True,
-        "enable_deep_l2_routing": True,
-        "router_candidate_top_n": router_candidate_top_n,
-        "l2_candidate_top_n": l2_candidate_top_n,
-        "router_family_boost": 0.45 if sparse_catalog else 0.38,
-        "l2_specificity_bias": 0.20 if (sparse_catalog or heavy_gap) else 0.16,
-        "router_rescue_threshold": router_rescue_threshold,
-        "l2_rescue_threshold": l2_rescue_threshold,
-        "sim_threshold_lex": 0.95 if deep_catalog else 0.93,
-        "sim_threshold_sem": 0.92,
-        "llm_batch_size": llm_batch_size,
-        "batch_token_budget": batch_token_budget,
-        "priority_delighters_text": ", ".join(del_priority[:10]),
-        "priority_detractors_text": ", ".join(det_priority[:10]),
-    }
-
-    notes: List[str] = []
-    if sparse_catalog:
-        notes.append("smaller symptom catalog → more candidate tags and stronger family boosts")
-    if heavy_gap:
-        notes.append("many rows still unlabeled → lower rescue threshold for better recall")
-    if long_reviews:
-        notes.append("longer reviews → smaller batches and slightly longer evidence windows")
-    if learned_total > 0:
-        notes.append("prelearned themes available → deeper reusable L2 routing enabled")
-    if not notes:
-        notes.append("balanced settings for broad coverage plus reusable L2 specificity")
-
-    summary = "Auto-tune: " + "; ".join(notes) + "."
-    return cfg, summary
-
-
-def _apply_autotune_settings(cfg: Dict[str, Any], summary: str = "", source: str = "manual") -> None:
-    for k, v in (cfg or {}).items():
-        st.session_state[k] = v
-    if summary:
-        st.session_state["_autotune_summary"] = str(summary)
-    st.session_state["_autotune_last_source"] = str(source)
-    st.session_state["_router_sig"] = _route_config_signature()
-
-
-def _init_defaults() -> None:
-    defaults = {
-        "scope_choice": "Missing both",
-        "run_mode": "First N in current scope",
-        "overwrite_target": "Current scope only",
-        "confirm_overwrite": False,
-        "n_to_process": 10,
-        "ui_log_limit": 40,
-        "throttle_rpm": 0,
-        "throttle_tpm": 0,
-        "llm_batch_size": 6,
-        "batch_token_budget": 35000,
-        "budget_limit": 0.0,
-        "app_json_retries": 2,
-        "enable_undo": True,
-        "auto_tune_on_upload": True,
-        "temperature_setting": 0.1,
-        "require_evidence_flag": True,
-        "max_ev_per_label": 2,
-        "max_ev_chars": 120,
-        "prelearn_enabled": True,
-        "prelearn_model_setting": "gpt-4o-mini",
-        "prelearn_sample_n": 800,
-        "prelearn_batch_size": 60,
-        "prelearn_merge_threshold": 0.92,
-        "use_learned_as_allowed": False,
-        "use_universal_l1_backbone": True,
-        "high_recall_labeling": True,
-        "enable_deep_l2_routing": True,
-        "router_candidate_top_n": 6,
-        "l2_candidate_top_n": 3,
-        "router_family_boost": 0.38,
-        "l2_specificity_bias": 0.16,
-        "router_rescue_threshold": 0.95,
-        "l2_rescue_threshold": 1.08,
-        "priority_delighters_text": ", ".join(DEFAULT_PRIORITY_DELIGHTERS),
-        "priority_detractors_text": ", ".join(DEFAULT_PRIORITY_DETRACTORS),
-        "sim_threshold_lex": 0.94,
-        "sim_threshold_sem": 0.92,
-    }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
-
-
-_init_defaults()
-
-uploaded_file = st.file_uploader(
-    "📂 Upload Excel workbook (reviews sheet + optional Symptoms sheet)",
-    type=["xlsx"],
-    help="Expected review sheet: 'Star Walk scrubbed verbatims'. Symptoms sheet is optional but recommended.",
-)
-if not uploaded_file:
-    st.stop()
-
-uploaded_bytes = uploaded_file.getvalue()
-file_sig = hashlib.md5(uploaded_bytes).hexdigest()
-
-if st.session_state.get("_file_sig") != file_sig:
-    st.session_state["_file_sig"] = file_sig
-    st.session_state["uploaded_bytes"] = uploaded_bytes
-    st.session_state["uploaded_name"] = getattr(uploaded_file, "name", "reviews.xlsx")
-
-    df0 = _load_reviews_df(uploaded_bytes)
-    if "Verbatim" not in df0.columns:
-        st.error("Missing required 'Verbatim' column.")
-        st.stop()
-
-    df0["Verbatim"] = df0["Verbatim"].map(clean_text)
-    st.session_state["df_work"] = ensure_ai_columns(df0)
-
-    c_date = _find_col(st.session_state["df_work"], ["Review Date"])
-    c_star = _find_col(st.session_state["df_work"], ["Star Rating", "star rating", "Rating"])
-    _coerce_datetime_inplace(st.session_state["df_work"], c_date)
-    _coerce_numeric_inplace(st.session_state["df_work"], c_star)
-
-    d, t, a = get_symptom_whitelists(uploaded_bytes)
-    st.session_state["DELIGHTERS"] = d
-    st.session_state["DETRACTORS"] = t
-    st.session_state["ALIASES"] = a
-
-    st.session_state["undo_stack"] = []
-    st.session_state["processed_rows"] = []
-    st.session_state["processed_idx_set"] = set()
-    st.session_state["new_symptom_candidates"] = {}
-    st.session_state["alias_suggestion_candidates"] = {}
-    st.session_state["last_run_processed_count"] = 0
-    st.session_state["ev_cov_num"] = 0
-    st.session_state["ev_cov_den"] = 0
-    st.session_state["_label_cache"] = {}
-    st.session_state["_embed_cache"] = {}
-    st.session_state["_usage"] = {
-        "chat_in": 0,
-        "chat_out": 0,
-        "embed_in": 0,
-        "cost_chat": 0.0,
-        "cost_embed": 0.0,
-        "by_component": {},
-    }
-    st.session_state.pop("export_bytes", None)
-    st.session_state.pop("learned", None)
-    _ensure_learned_store()
-
-flash_msg = st.session_state.pop("_flash_msg", None)
-if flash_msg and isinstance(flash_msg, (tuple, list)) and len(flash_msg) == 2:
-    level, msg = flash_msg
-    if level == "success":
-        st.success(str(msg))
-    elif level == "warning":
-        st.warning(str(msg))
-    else:
-        st.info(str(msg))
-
-
-# ----------------------------- Core data state -----------------------------
-df = st.session_state["df_work"]
-DELIGHTERS = st.session_state.get("DELIGHTERS", []) or []
-DETRACTORS = st.session_state.get("DETRACTORS", []) or []
-ALIASES = st.session_state.get("ALIASES", {}) or {}
-_, _, ALIAS_TO_LABEL = build_canonical_maps(DELIGHTERS, DETRACTORS, ALIASES)
-
-if not DELIGHTERS and not DETRACTORS:
-    st.warning("No Symptoms sheet was found, or it was empty. Prelearn can bootstrap themes, and learned themes can be used temporarily.")
-else:
-    st.success(f"Loaded {len(DELIGHTERS)} delighters and {len(DETRACTORS)} detractors from the Symptoms sheet.")
-
-_autotune_probe_work = detect_missing(df, detect_symptom_columns(df))
-_autotune_cfg_preview, _autotune_summary_preview = _suggest_autotune_settings(
-    df,
-    _autotune_probe_work,
-    DELIGHTERS,
-    DETRACTORS,
-    _ensure_learned_store(),
-)
-st.session_state["_autotune_preview"] = dict(_autotune_cfg_preview)
-st.session_state["_autotune_summary"] = str(_autotune_summary_preview or st.session_state.get("_autotune_summary", ""))
-if bool(st.session_state.get("auto_tune_on_upload", True)) and st.session_state.get("_autotuned_file_sig") != file_sig:
-    _apply_autotune_settings(_autotune_cfg_preview, summary=_autotune_summary_preview, source="upload")
-    st.session_state["_autotuned_file_sig"] = file_sig
-
-
-# ----------------------------- Sidebar controls -----------------------------
-st.sidebar.header("⚙️ Controls")
-
-st.sidebar.subheader("🪄 Auto-tune")
-auto_tune_on_upload = st.sidebar.checkbox(
-    "Auto-tune on new workbook",
-    value=bool(st.session_state.get("auto_tune_on_upload", True)),
-    help="Applies recommended settings for better broad coverage plus disciplined reusable L2 specificity.",
-)
-st.session_state["auto_tune_on_upload"] = bool(auto_tune_on_upload)
-st.sidebar.caption(str(st.session_state.get("_autotune_summary", "")))
-_preview_cfg = st.session_state.get("_autotune_preview", {}) or {}
-if _preview_cfg:
-    st.sidebar.markdown(
-        _chip_html([
-            ("Router", f"{int(_preview_cfg.get('router_candidate_top_n', 0) or 0)} tags"),
-            ("Deep L2", f"{int(_preview_cfg.get('l2_candidate_top_n', 0) or 0)}/family"),
-            ("Rescue", f"{float(_preview_cfg.get('router_rescue_threshold', 0.0) or 0.0):.2f}"),
-            ("Batch", f"{int(_preview_cfg.get('llm_batch_size', 0) or 0)} req"),
-        ]),
-        unsafe_allow_html=True,
-    )
-if st.sidebar.button("Apply tuned settings now", use_container_width=True, key="apply_tuned_settings_now"):
-    cfg_now, summary_now = _suggest_autotune_settings(
-        df,
-        detect_missing(df, detect_symptom_columns(df)),
-        DELIGHTERS,
-        DETRACTORS,
-        _ensure_learned_store(),
-    )
-    _apply_autotune_settings(cfg_now, summary=summary_now, source="manual")
-    st.rerun()
-
-st.sidebar.subheader("🤖 Model")
-MODEL_CHOICES = {
-    "Fast — GPT-4o-mini": "gpt-4o-mini",
-    "Balanced — GPT-4.1": "gpt-4.1",
-    "Balanced — GPT-4o": "gpt-4o",
-    "Advanced — GPT-5": "gpt-5",
-}
-_model_labels = list(MODEL_CHOICES.keys())
-_selected_model_label_default = str(st.session_state.get("selected_model_label", _model_labels[0]))
-if _selected_model_label_default not in MODEL_CHOICES:
-    _selected_model_label_default = _model_labels[0]
-selected_model_label = st.sidebar.selectbox("Run model", _model_labels, index=_model_labels.index(_selected_model_label_default))
-st.session_state["selected_model_label"] = selected_model_label
-selected_model = MODEL_CHOICES[selected_model_label]
-temperature = st.sidebar.slider(
-    "Creativity (temperature)",
-    0.0,
-    1.0,
-    float(st.session_state.get("temperature_setting", 0.1) or 0.1),
-    0.1,
-)
-st.session_state["temperature_setting"] = float(temperature)
-
-st.sidebar.subheader("🛡️ Stability")
-request_timeout_s = st.sidebar.number_input("Request timeout (sec)", 10, 300, 60, 10)
-sdk_max_retries = st.sidebar.number_input("SDK retries", 0, 10, 3, 1)
-app_json_retries = st.sidebar.number_input("JSON retries", 0, 6, int(st.session_state.get("app_json_retries", 2)), 1)
-ui_log_limit = st.sidebar.slider("Show last N processed reviews", 0, 200, int(st.session_state.get("ui_log_limit", 40)), 10)
-enable_undo = st.sidebar.checkbox("Keep undo snapshots", value=bool(st.session_state.get("enable_undo", True)))
-st.session_state["app_json_retries"] = int(app_json_retries)
-st.session_state["ui_log_limit"] = int(ui_log_limit)
-st.session_state["enable_undo"] = bool(enable_undo)
-
-st.sidebar.subheader("⚡ Throughput")
-llm_batch_size = st.sidebar.slider("LLM batch size", 1, 12, int(st.session_state.get("llm_batch_size", 6)), 1)
-batch_token_budget = st.sidebar.slider("Batch token budget", 5000, 100000, int(st.session_state.get("batch_token_budget", 35000)), 1000)
-throttle_rpm = st.sidebar.number_input("Throttle chat requests/min (0 = off)", 0, 600, int(st.session_state.get("throttle_rpm", 0)), 10)
-throttle_tpm = st.sidebar.number_input("Throttle input tokens/min (0 = off)", 0, 2_000_000, int(st.session_state.get("throttle_tpm", 0)), 10_000)
-st.session_state["llm_batch_size"] = int(llm_batch_size)
-st.session_state["batch_token_budget"] = int(batch_token_budget)
-st.session_state["throttle_rpm"] = int(throttle_rpm)
-st.session_state["throttle_tpm"] = int(throttle_tpm)
-
-st.sidebar.subheader("🧾 Evidence")
-require_evidence = st.sidebar.checkbox(
-    "Require evidence to write labels",
-    value=bool(st.session_state.get("require_evidence_flag", True)),
-)
-max_ev_per_label = st.sidebar.slider(
-    "Max evidence snippets per label",
-    1,
-    3,
-    int(st.session_state.get("max_ev_per_label", 2) or 2),
-)
-max_ev_chars = st.sidebar.slider(
-    "Max evidence length",
-    40,
-    200,
-    int(st.session_state.get("max_ev_chars", 120) or 120),
-    10,
-)
-st.session_state["require_evidence_flag"] = bool(require_evidence)
-st.session_state["max_ev_per_label"] = int(max_ev_per_label)
-st.session_state["max_ev_chars"] = int(max_ev_chars)
-
-st.sidebar.subheader("🧠 Prelearn")
-prelearn_enabled = st.sidebar.checkbox(
-    "Auto-run prelearn before symptomizing",
-    value=bool(st.session_state.get("prelearn_enabled", True)),
-)
-_PRELEARN_MODELS = ["gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5"]
-_prelearn_model_default = str(st.session_state.get("prelearn_model_setting", "gpt-4o-mini"))
-if _prelearn_model_default not in _PRELEARN_MODELS:
-    _prelearn_model_default = _PRELEARN_MODELS[0]
-prelearn_model = st.sidebar.selectbox("Prelearn model", _PRELEARN_MODELS, index=_PRELEARN_MODELS.index(_prelearn_model_default))
-st.session_state["prelearn_model_setting"] = prelearn_model
-embed_model = st.sidebar.selectbox("Embedding model", ["text-embedding-3-small"], index=0)
-prelearn_sample_n = st.sidebar.slider("Prelearn sample size", 100, 3000, int(st.session_state.get("prelearn_sample_n", 800)), 50)
-prelearn_batch_size = st.sidebar.slider("Prelearn batch size", 20, 120, int(st.session_state.get("prelearn_batch_size", 60)), 10)
-prelearn_merge_threshold = st.sidebar.slider(
-    "Prelearn merge threshold",
-    0.85,
-    0.99,
-    float(st.session_state.get("prelearn_merge_threshold", 0.92) or 0.92),
-    0.01,
-)
-use_learned_as_allowed = st.sidebar.checkbox(
-    "Use learned themes as temporary allowed labels",
-    value=bool(st.session_state.get("use_learned_as_allowed", False)),
-    help="Leave this OFF when your Symptoms sheet is already strong. Turn it ON only when you want learned fallback labels to supplement a sparse catalog.",
-)
-st.session_state["prelearn_enabled"] = bool(prelearn_enabled)
-st.session_state["prelearn_sample_n"] = int(prelearn_sample_n)
-st.session_state["prelearn_batch_size"] = int(prelearn_batch_size)
-st.session_state["prelearn_merge_threshold"] = float(prelearn_merge_threshold)
-st.session_state["use_learned_as_allowed"] = bool(use_learned_as_allowed)
-
-st.sidebar.subheader("🎯 Universal tagging")
-use_universal_l1_backbone = st.sidebar.checkbox(
-    "Use universal L1 backbone (works for any product)",
-    value=bool(st.session_state.get("use_universal_l1_backbone", True)),
-    help="Always makes broad reusable themes like Ease Of Use, Effective Results, Overall Satisfaction, Reliability, Value, and Safety available as temporary labels.",
-)
-high_recall_labeling = st.sidebar.checkbox(
-    "High-recall symptomization",
-    value=bool(st.session_state.get("high_recall_labeling", True)),
-    help="Blends LLM output with rule, alias, learned keyword, and aspect-family routing so obvious broad tags are not missed.",
-)
-enable_deep_l2_routing = st.sidebar.checkbox(
-    "Deeper reusable L2 routing",
-    value=bool(st.session_state.get("enable_deep_l2_routing", True)),
-    help="Pushes the router to surface slightly more specific reusable L2 themes like Easy Setup, Product Failure, Short Battery Life, or Strong Recommendation when evidence is direct.",
-)
-router_candidate_top_n = st.sidebar.slider(
-    "Candidate tags per review",
-    3,
-    12,
-    int(st.session_state.get("router_candidate_top_n", 6) or 6),
-    1,
-    help="How many routed tags the model sees for each review.",
-)
-l2_candidate_top_n = st.sidebar.slider(
-    "Deep L2 candidates per family",
-    1,
-    6,
-    int(st.session_state.get("l2_candidate_top_n", 3) or 3),
-    1,
-    help="How many reusable L2 candidates the router can surface inside each matched L1 family.",
-)
-router_family_boost = st.sidebar.slider(
-    "L1→L2 family boost",
-    0.0,
-    1.0,
-    float(st.session_state.get("router_family_boost", 0.38) or 0.38),
-    0.05,
-    help="Boosts existing labels whose L1 family is already strongly supported in the review.",
-)
-l2_specificity_bias = st.sidebar.slider(
-    "L2 specificity bias",
-    0.0,
-    0.50,
-    float(st.session_state.get("l2_specificity_bias", 0.16) or 0.16),
-    0.02,
-    help="Extra preference for reusable L2 themes with direct evidence.",
-)
-router_rescue_threshold = st.sidebar.slider(
-    "Broad rescue threshold",
-    0.40,
-    1.80,
-    float(st.session_state.get("router_rescue_threshold", 0.95) or 0.95),
-    0.05,
-    help="Lower values add more high-confidence routed broad tags when the model misses them.",
-)
-l2_rescue_threshold = st.sidebar.slider(
-    "Deep L2 rescue threshold",
-    0.60,
-    1.80,
-    float(st.session_state.get("l2_rescue_threshold", 1.08) or 1.08),
-    0.05,
-    help="Use a slightly higher threshold to keep L2 rescue specific and disciplined.",
-)
-priority_delighters_text = st.sidebar.text_area(
-    "Priority delighter themes",
-    value=str(st.session_state.get("priority_delighters_text", ", ".join(DEFAULT_PRIORITY_DELIGHTERS))),
-    height=90,
-    help="Broad L1 themes to always prioritize when supported by evidence.",
-)
-priority_detractors_text = st.sidebar.text_area(
-    "Priority detractor themes",
-    value=str(st.session_state.get("priority_detractors_text", ", ".join(DEFAULT_PRIORITY_DETRACTORS))),
-    height=90,
-    help="Broad L1 themes to always prioritize when supported by evidence.",
-)
-st.session_state["use_universal_l1_backbone"] = bool(use_universal_l1_backbone)
-st.session_state["high_recall_labeling"] = bool(high_recall_labeling)
-st.session_state["enable_deep_l2_routing"] = bool(enable_deep_l2_routing)
-st.session_state["router_candidate_top_n"] = int(router_candidate_top_n)
-st.session_state["l2_candidate_top_n"] = int(l2_candidate_top_n)
-st.session_state["router_family_boost"] = float(router_family_boost)
-st.session_state["l2_specificity_bias"] = float(l2_specificity_bias)
-st.session_state["router_rescue_threshold"] = float(router_rescue_threshold)
-st.session_state["l2_rescue_threshold"] = float(l2_rescue_threshold)
-st.session_state["priority_delighters_text"] = str(priority_delighters_text or "")
-st.session_state["priority_detractors_text"] = str(priority_detractors_text or "")
-
-st.sidebar.subheader("🧩 Consistency")
-sim_threshold_lex = st.sidebar.slider(
-    "Lexical similarity guard",
-    0.80,
-    0.99,
-    float(st.session_state.get("sim_threshold_lex", 0.94) or 0.94),
-    0.01,
-)
-sim_threshold_sem = st.sidebar.slider(
-    "Semantic similarity guard",
-    0.80,
-    0.99,
-    float(st.session_state.get("sim_threshold_sem", 0.92) or 0.92),
-    0.01,
-)
-st.session_state["sim_threshold_lex"] = float(sim_threshold_lex)
-st.session_state["sim_threshold_sem"] = float(sim_threshold_sem)
-st.session_state["_router_sig"] = _route_config_signature()
-
-st.sidebar.subheader("💰 Budget")
-if "_pricing_overrides" not in st.session_state:
-    st.session_state["_pricing_overrides"] = {"models": {}, "embeddings": {}}
-with st.sidebar.expander("Pricing overrides", expanded=False):
-    models_to_show = sorted({selected_model, prelearn_model})
-    for mid in models_to_show:
-        default = MODEL_PRICING_PER_1M.get(mid, {"in": 0.0, "out": 0.0})
-        cur_in = st.session_state["_pricing_overrides"]["models"].get(mid, {}).get("in", default["in"])
-        cur_out = st.session_state["_pricing_overrides"]["models"].get(mid, {}).get("out", default["out"])
-        in_p = st.number_input(f"{mid} input ($/1M)", value=float(cur_in), step=0.01, key=f"ov_{mid}_in")
-        out_p = st.number_input(f"{mid} output ($/1M)", value=float(cur_out), step=0.01, key=f"ov_{mid}_out")
-        st.session_state["_pricing_overrides"]["models"][mid] = {"in": float(in_p), "out": float(out_p)}
-    emb_default = EMBEDDING_PRICING_PER_1M.get(embed_model, 0.0)
-    emb_cur = st.session_state["_pricing_overrides"]["embeddings"].get(embed_model, emb_default)
-    emb_p = st.number_input(f"{embed_model} ($/1M tokens)", value=float(emb_cur), step=0.01, key=f"ov_{embed_model}_emb")
-    st.session_state["_pricing_overrides"]["embeddings"][embed_model] = float(emb_p)
-
-budget_limit = st.sidebar.number_input(
-    "Stop runs if session spend exceeds (USD)",
-    min_value=0.0,
-    value=float(st.session_state.get("budget_limit", 0.0)),
-    step=1.0,
-)
-st.session_state["budget_limit"] = float(budget_limit)
-
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-client = _make_openai_client(api_key, request_timeout_s, sdk_max_retries)
-if client is None:
-    st.sidebar.warning("OpenAI is not configured. Upload / preview / export still work, but symptomization and prelearn require OPENAI_API_KEY.")
-
-tr = _ensure_usage_tracker()
-pin, pout = _price_for_model(selected_model)
-pemb = _price_for_embedding(embed_model)
-st.sidebar.markdown(
-    f"<div class='tiny'>Model <span class='mono'>{selected_model}</span>: <b>${pin}</b>/1M input • <b>${pout}</b>/1M output</div>",
-    unsafe_allow_html=True,
-)
-st.sidebar.markdown(
-    f"<div class='tiny'>Embeddings <span class='mono'>{embed_model}</span>: <b>${pemb}</b>/1M tokens</div>",
-    unsafe_allow_html=True,
-)
-st.sidebar.markdown(
-    f"<div class='chip-wrap'>"
-    f"<span class='chip blue'>Input {int(tr['chat_in']):,}</span>"
-    f"<span class='chip purple'>Output {int(tr['chat_out']):,}</span>"
-    f"<span class='chip yellow'>Embed {int(tr['embed_in']):,}</span>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-st.sidebar.markdown(
-    f"<div class='chip-wrap'>"
-    f"<span class='chip green'>Chat {_fmt_money(float(tr['cost_chat']))}</span>"
-    f"<span class='chip green'>Embed {_fmt_money(float(tr['cost_embed']))}</span>"
-    f"<span class='chip green'><b>Total {_fmt_money(float(tr['cost_chat']) + float(tr['cost_embed']))}</b></span>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-
-
-# ----------------------------- Filtering logic -----------------------------
-colmap = detect_symptom_columns(df)
-work = detect_missing(df, colmap)
-
-c_source = _find_col(work, ["Source"])
-c_model = _find_col(work, ["Model (SKU)", "Model", "SKU"])
-c_seeded = _find_col(work, ["Seeded"])
-c_country = _find_col(work, ["Country", "Region"])
-c_newrev = _find_col(work, ["New Review", "New"])
-c_rdate = _find_col(work, ["Review Date"])
-c_rating = _find_col(work, ["Star Rating", "star rating", "Rating"])
-_coerce_datetime_inplace(work, c_rdate)
-_coerce_numeric_inplace(work, c_rating)
-
-
-def _apply_filters_to_work(work_df: pd.DataFrame) -> pd.DataFrame:
-    out = work_df.copy()
-
-    src_sel = st.session_state.get("f_source_sel", []) or []
-    if c_source and src_sel:
-        out = out[out[c_source].astype(str).isin([str(x) for x in src_sel])]
-
-    model_sel = st.session_state.get("f_model_sel", []) or []
-    if c_model and model_sel:
-        out = out[out[c_model].astype(str).isin([str(x) for x in model_sel])]
-
-    country_sel = st.session_state.get("f_country_sel", []) or []
-    if c_country and country_sel:
-        out = out[out[c_country].astype(str).isin([str(x) for x in country_sel])]
-
-    seeded_mode = str(st.session_state.get("f_seeded_mode", "All"))
-    if c_seeded and seeded_mode != "All":
-        b = out[c_seeded].map(_boolish)
-        if seeded_mode == "Seeded only":
-            out = out[b == True]
-        elif seeded_mode == "Non-seeded only":
-            out = out[b == False]
-
-    new_mode = str(st.session_state.get("f_new_mode", "All"))
-    if c_newrev and new_mode != "All":
-        b = out[c_newrev].map(_boolish)
-        if new_mode == "New only":
-            out = out[b == True]
-        elif new_mode == "Not new only":
-            out = out[b == False]
-
-    date_range = st.session_state.get("f_date_range", None)
-    if c_rdate and date_range and isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-        try:
-            start = pd.Timestamp(date_range[0])
-            end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-            out = out[(out[c_rdate] >= start) & (out[c_rdate] <= end)]
-        except Exception:
-            pass
-
-    rating_sel = st.session_state.get("f_rating_sel", None)
-    if c_rating and rating_sel is not None and len(rating_sel) > 0:
-        try:
-            out = out[out[c_rating].isin(list(rating_sel))]
-        except Exception:
-            out = out[out[c_rating].astype(str).isin([str(x) for x in rating_sel])]
-
-    return out
-
-
-work_filtered = _apply_filters_to_work(work)
-scope_choice = st.session_state.get("scope_choice", "Missing both")
-if scope_choice == "Missing both":
-    target = work_filtered[(work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])]
-elif scope_choice == "Any missing":
-    target = work_filtered[(work_filtered["Needs_Delighters"]) | (work_filtered["Needs_Detractors"])]
-elif scope_choice == "Missing delighters only":
-    target = work_filtered[(work_filtered["Needs_Delighters"]) & (~work_filtered["Needs_Detractors"])]
-else:
-    target = work_filtered[(~work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])]
-
-
-def _active_filter_items() -> List[Tuple[str, str]]:
-    items: List[Tuple[str, str]] = []
-    src_sel = st.session_state.get("f_source_sel", []) or []
-    model_sel = st.session_state.get("f_model_sel", []) or []
-    country_sel = st.session_state.get("f_country_sel", []) or []
-    seeded_mode = str(st.session_state.get("f_seeded_mode", "All"))
-    new_mode = str(st.session_state.get("f_new_mode", "All"))
-    rating_sel = st.session_state.get("f_rating_sel", []) or []
-    date_range = st.session_state.get("f_date_range", None)
-    if src_sel:
-        items.append((f"Source: {len(src_sel)}", "blue"))
-    if model_sel:
-        items.append((f"SKU: {len(model_sel)}", "purple"))
-    if country_sel:
-        items.append((f"Country: {len(country_sel)}", "blue"))
-    if seeded_mode != "All":
-        items.append((seeded_mode, "yellow"))
-    if new_mode != "All":
-        items.append((new_mode, "yellow"))
-    if rating_sel:
-        items.append((f"Rating: {', '.join([str(x) for x in rating_sel])}", "green"))
-    if date_range and isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-        items.append((f"Date: {date_range[0]} → {date_range[1]}", "gray"))
-    return items
-
-
-# ----------------------------- Run helpers -----------------------------
-processed_rows: List[Dict[str, Any]] = st.session_state.get("processed_rows", []) or []
-processed_idx_set: Set[int] = st.session_state.get("processed_idx_set", set()) or set()
-new_symptom_candidates: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state.get("new_symptom_candidates", {}) or {}
-alias_suggestion_candidates: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state.get("alias_suggestion_candidates", {}) or {}
-
-
-def _agg_candidate(d: Dict[Any, Any], key: Tuple[Any, ...], idx: int, max_refs: int = 50) -> None:
-    rec = d.setdefault(key, {"count": 0, "refs": []})
-    rec["count"] = int(rec.get("count", 0)) + 1
-    refs = rec.get("refs", [])
-    if isinstance(refs, list) and len(refs) < max_refs:
-        refs.append(int(idx))
-        rec["refs"] = refs
-
-
-def _active_allowed_lists() -> Tuple[List[str], List[str]]:
-    dels = list(DELIGHTERS)
-    dets = list(DETRACTORS)
-    if bool(st.session_state.get("use_universal_l1_backbone", True)):
-        for x in _priority_theme_labels("Delighter"):
-            if x not in dels:
-                dels.append(x)
-        for x in _priority_theme_labels("Detractor"):
-            if x not in dets:
-                dets.append(x)
-    if bool(st.session_state.get("use_learned_as_allowed", False)):
-        for x in _known_learned_labels("Delighter")[:80]:
-            if x not in dels:
-                dels.append(x)
-        for x in _known_learned_labels("Detractor")[:80]:
-            if x not in dets:
-                dets.append(x)
-    return dels, dets
-
-
-def _build_run_selection() -> Tuple[pd.DataFrame, bool, str]:
-    run_mode = st.session_state.get("run_mode", "First N in current scope")
-    overwrite_mode = False
-    label = run_mode
-    if run_mode == "First N in current scope":
-        rows_iter = target.sort_index().head(int(st.session_state.get("n_to_process", 10) or 10))
-        label = f"First {len(rows_iter):,} rows in current scope"
-    elif run_mode == "All reviews in current scope":
-        rows_iter = target.sort_index()
-        label = f"All {len(rows_iter):,} rows in current scope"
-    elif run_mode == "Missing-both fast pass":
-        rows_iter = work_filtered[(work_filtered["Needs_Delighters"]) & (work_filtered["Needs_Detractors"])].sort_index()
-        label = f"Missing-both within current filters ({len(rows_iter):,} rows)"
-    else:
-        overwrite_mode = True
-        if st.session_state.get("overwrite_target", "Current scope only") == "Current scope only":
-            rows_iter = target.sort_index()
-            label = f"Rebuild current scope from scratch ({len(rows_iter):,} rows)"
+            if cv: cell.fill = fill_green
+        if _is_filled(row.get("AI Safety")):
+            c = ws.cell(row=i, column=META_INDEXES["Safety"], value=str(row["AI Safety"])); c.fill=fill_yel
+        if _is_filled(row.get("AI Reliability")):
+            c = ws.cell(row=i, column=META_INDEXES["Reliability"], value=str(row["AI Reliability"])); c.fill=fill_blu
+        if _is_filled(row.get("AI # of Sessions")):
+            c = ws.cell(row=i, column=META_INDEXES["# of Sessions"], value=str(row["AI # of Sessions"])); c.fill=fill_pur
+    for c in DET_INDEXES+DEL_INDEXES+list(META_INDEXES.values()):
+        try: ws.column_dimensions[get_column_letter(c)].width = 28
+        except Exception: pass
+    out = io.BytesIO(); wb.save(out); return out.getvalue()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SESSION STATE INIT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _init_session_state() -> None:
+    st.session_state.setdefault("analysis_dataset", None)
+    st.session_state.setdefault("chat_messages", [])
+    st.session_state.setdefault("master_export_bundle", None)
+    st.session_state.setdefault("prompt_definitions_df", _default_prompt_df())
+    st.session_state.setdefault("prompt_builder_suggestion", None)
+    st.session_state.setdefault("prompt_run_artifacts", None)
+    st.session_state.setdefault("prompt_run_notice", None)
+    st.session_state.setdefault("chat_scope_signature", None)
+    st.session_state.setdefault("chat_scope_notice", None)
+    st.session_state.setdefault("active_main_view", "Dashboard")
+    st.session_state.setdefault("workspace_view_selector", "Dashboard")
+    st.session_state.setdefault("review_explorer_page", 1)
+    st.session_state.setdefault("review_explorer_per_page", 20)
+    st.session_state.setdefault("review_explorer_sort", "Newest")
+    # shared model
+    st.session_state.setdefault("shared_model", DEFAULT_MODEL)
+    st.session_state.setdefault("shared_reasoning", DEFAULT_REASONING)
+    # symptomizer
+    st.session_state.setdefault("sym_delighters", [])
+    st.session_state.setdefault("sym_detractors", [])
+    st.session_state.setdefault("sym_aliases", {})
+    st.session_state.setdefault("sym_symptoms_source", "none")  # none | file | manual | ai
+    st.session_state.setdefault("sym_processed_rows", [])
+    st.session_state.setdefault("sym_new_candidates", {})
+    st.session_state.setdefault("sym_product_profile", "")
+    st.session_state.setdefault("sym_scope_choice", "Missing both")
+    st.session_state.setdefault("sym_n_to_process", 10)
+    st.session_state.setdefault("sym_batch_size", 5)
+    st.session_state.setdefault("sym_max_ev_chars", 120)
+    st.session_state.setdefault("sym_run_notice", None)
+
+_init_session_state()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SHARED SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_shared_sidebar(df: Optional[pd.DataFrame]) -> Dict[str,Any]:
+    api_key = _get_api_key()
+    selected_ratings    = [1,2,3,4,5]
+    selected_products: List[str] = []
+    review_source_mode  = "All reviews"
+    selected_locales: List[str] = []
+    recommendation_mode = "All"
+    date_range: Optional[Tuple[date,date]] = None
+    text_query          = ""
+
+    with st.sidebar:
+        # ── Shared Model Settings ──────────────────────────────────────────
+        st.header("🤖 AI Model Settings")
+        st.selectbox("Model", options=MODEL_OPTIONS,
+                     index=MODEL_OPTIONS.index(st.session_state.get("shared_model",DEFAULT_MODEL)),
+                     key="shared_model",
+                     help="Used by the AI Analyst, Review Prompt, and Symptomizer tabs.")
+        st.selectbox("Reasoning effort", options=REASONING_OPTIONS,
+                     index=REASONING_OPTIONS.index(st.session_state.get("shared_reasoning",DEFAULT_REASONING)),
+                     key="shared_reasoning")
+        if api_key:
+            st.success("OpenAI API key loaded")
         else:
-            rows_iter = work_filtered.sort_index()
-            label = f"Rebuild all filtered rows from scratch ({len(rows_iter):,} rows)"
-    return rows_iter, overwrite_mode, label
+            st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable AI features.")
+        st.caption(f"Model: {_shared_model()} · Reasoning: {_shared_reasoning()}")
+        st.divider()
 
+        # ── Review Filters ─────────────────────────────────────────────────
+        st.header("🔍 Review Filters")
+        st.caption("These filters drive the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.")
+        if df is None:
+            st.info("Build a workspace to unlock filters.")
+        else:
+            options = _build_filter_options(df)
+            RATING_OPTIONS = ["All ratings","1 star","2 stars","3 stars","4 stars","5 stars","1-2 stars","4-5 stars","Custom"]
+            rating_mode = st.selectbox("Ratings", options=RATING_OPTIONS, index=0, key="sidebar_rating_mode")
+            custom_ratings = None
+            if rating_mode == "Custom":
+                custom_ratings = st.multiselect("Custom ratings", options=options["ratings"],
+                                                default=options["ratings"], key="sidebar_custom_ratings")
+            mapping = {"All ratings":[1,2,3,4,5],"1 star":[1],"2 stars":[2],"3 stars":[3],
+                       "4 stars":[4],"5 stars":[5],"1-2 stars":[1,2],"4-5 stars":[4,5]}
+            selected_ratings = mapping.get(rating_mode, custom_ratings or [1,2,3,4,5])
 
-def _run_button_label(rows_df: pd.DataFrame, overwrite_mode: bool) -> str:
-    run_mode = st.session_state.get("run_mode", "First N in current scope")
-    n = len(rows_df)
-    if overwrite_mode:
-        return f"🧹 Rebuild {n:,} row(s)"
-    if run_mode == "Missing-both fast pass":
-        return f"✨ Run missing-both on {n:,} row(s)"
-    if run_mode == "All reviews in current scope":
-        return f"🚀 Run all {n:,} in scope"
-    return f"▶️ Run first {n:,} row(s)"
+            review_source_mode = st.selectbox("Review source",
+                options=["All reviews","Organic only","Incentivized only"], index=0, key="sidebar_review_source")
 
+            if options["product_groups"] and len(options["product_groups"])>1:
+                selected_products = st.multiselect("SKU / product ID", options=options["product_groups"],
+                                                   default=[], key="sidebar_product_groups")
+            if options["locales"]:
+                selected_locales = st.multiselect("Market / locale", options=options["locales"],
+                                                  default=[], key="sidebar_locales")
+            recommendation_mode = st.selectbox("Recommendation status",
+                options=["All","Recommended only","Not recommended only"], index=0, key="sidebar_recommendation")
+            if options["min_date"] and options["max_date"]:
+                picked = st.date_input("Submission date range",
+                    value=(options["min_date"],options["max_date"]),
+                    min_value=options["min_date"], max_value=options["max_date"], key="sidebar_date_range")
+                if isinstance(picked,tuple) and len(picked)==2: date_range=(picked[0],picked[1])
+            text_query = st.text_input("Text contains", value="", key="sidebar_text_query",
+                                       placeholder="noise, basket, capacity…")
 
-def _run_symptomize(rows_df: pd.DataFrame, overwrite_mode: bool = False) -> None:
-    global df
+        st.divider()
+        # ── Symptomizer batch settings ─────────────────────────────────────
+        st.header("⚡ Symptomizer Settings")
+        st.slider("Batch size", 1, 12, key="sym_batch_size")
+        st.slider("Max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
 
-    _reset_run_outputs()
-    processed_rows_local: List[Dict[str, Any]] = st.session_state["processed_rows"]
-    processed_idx_set_local: Set[int] = st.session_state["processed_idx_set"]
-    new_symptom_candidates_local: Dict[Tuple[str, str], Dict[str, Any]] = st.session_state["new_symptom_candidates"]
-    alias_suggestion_candidates_local: Dict[Tuple[str, str, str], Dict[str, Any]] = st.session_state["alias_suggestion_candidates"]
-    existing_catalog_keys: Set[str] = {_canon_simple(x) for x in (DELIGHTERS + DETRACTORS)}
-    for _label, _aliases in (ALIASES or {}).items():
-        existing_catalog_keys.add(_canon_simple(_label))
-        for _a in (_aliases or []):
-            existing_catalog_keys.add(_canon_simple(_a))
-
-    prog = st.progress(0.0)
-    eta_box = st.empty()
-    status_box = st.empty()
-
-    if prelearn_enabled and client is not None:
-        ls = _ensure_learned_store()
-        if not (ls.get("labels", {}).get("Delighter") or ls.get("labels", {}).get("Detractor")):
-            status_box.markdown("🧠 Auto-running prelearn…")
-            pre_box = st.empty()
-            pre_prog = st.progress(0.0)
-            run_prelearn(
-                df_in=df,
-                client=client,
-                prelearn_model=prelearn_model,
-                temperature=0.0,
-                embed_model=embed_model,
-                sample_n=int(prelearn_sample_n),
-                batch_size=int(prelearn_batch_size),
-                sem_merge_threshold=float(prelearn_merge_threshold),
-                status_box=pre_box,
-                prog_bar=pre_prog,
-            )
-            pre_box.empty()
-            pre_prog.empty()
-
-    df = ensure_ai_columns(df)
-    snapshot: List[Tuple[int, Dict[str, Optional[str]]]] = []
-    do_undo = bool(st.session_state.get("enable_undo", True))
-
-    if overwrite_mode:
-        idxs = rows_df.index.tolist()
-        if do_undo:
-            for idx_clear in idxs:
-                old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_clear, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
-                old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_clear, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
-                old_vals.update({
-                    "AI Safety": df.loc[idx_clear, "AI Safety"],
-                    "AI Reliability": df.loc[idx_clear, "AI Reliability"],
-                    "AI # of Sessions": df.loc[idx_clear, "AI # of Sessions"],
-                })
-                snapshot.append((int(idx_clear), old_vals))
-        df = clear_ai_slots_for_indices(df, idxs)
-    elif do_undo:
-        for idx_keep in rows_df.index.tolist():
-            old_vals = {f"AI Symptom Detractor {j}": df.loc[idx_keep, f"AI Symptom Detractor {j}"] for j in range(1, 11)}
-            old_vals.update({f"AI Symptom Delighter {j}": df.loc[idx_keep, f"AI Symptom Delighter {j}"] for j in range(1, 11)})
-            old_vals.update({
-                "AI Safety": df.loc[idx_keep, "AI Safety"],
-                "AI Reliability": df.loc[idx_keep, "AI Reliability"],
-                "AI # of Sessions": df.loc[idx_keep, "AI # of Sessions"],
-            })
-            snapshot.append((int(idx_keep), old_vals))
-
-    total_n = max(1, len(rows_df))
-    t0 = time.perf_counter()
-    cost_start = float(_ensure_usage_tracker()["cost_chat"] + _ensure_usage_tracker()["cost_embed"])
-    cov_num = 0
-    cov_den = 0
-    ui_keep = int(st.session_state.get("ui_log_limit", 40))
-
-    allowed_dels, allowed_dets = _active_allowed_lists()
-    known_hints = {
-        "Delighter": _known_learned_labels("Delighter")[:60],
-        "Detractor": _known_learned_labels("Detractor")[:60],
-    }
-    product_profile = str(_ensure_learned_store().get("product_profile", "") or "").strip()
-
-    batch_size = int(st.session_state.get("llm_batch_size", 6) or 1)
-    batch_budget = int(st.session_state.get("batch_token_budget", 35000) or 35000)
-    overhead_est = _estimate_tokens(
-        json.dumps({"allowed_delighters": allowed_dels, "allowed_detractors": allowed_dets, "known": known_hints, "profile": product_profile[:600]}),
-        model_id=selected_model,
-    ) + 800
-
-    rows_list = list(rows_df.iterrows())
-    batches: List[List[Tuple[int, pd.Series]]] = []
-    cur: List[Tuple[int, pd.Series]] = []
-    cur_tok = 0
-    for idx, row in rows_list:
-        vb = str(row.get("Verbatim", "") or "")
-        t_est = _estimate_tokens(vb, model_id=selected_model)
-        if cur and ((len(cur) >= batch_size) or (overhead_est + cur_tok + t_est > batch_budget)):
-            batches.append(cur)
-            cur = []
-            cur_tok = 0
-        cur.append((int(idx), row))
-        cur_tok += int(t_est)
-        if overhead_est + cur_tok > batch_budget and len(cur) == 1:
-            batches.append(cur)
-            cur = []
-            cur_tok = 0
-    if cur:
-        batches.append(cur)
-
-    done = 0
-    for bi, batch_rows in enumerate(batches, start=1):
-        items: List[Dict[str, Any]] = []
-        for idx, row in batch_rows:
-            vb = str(row.get("Verbatim", "") or "")
-            if overwrite_mode:
-                needs_del = True
-                needs_det = True
-            else:
-                needs_del = bool(row.get("Needs_Delighters", False))
-                needs_det = bool(row.get("Needs_Detractors", False))
-            items.append({"idx": int(idx), "review": vb, "needs_del": needs_del, "needs_det": needs_det})
-
-        status_box.markdown(f"🔄 **Batch {bi}/{len(batches)}** — labeling + meta…")
-        outs_by_idx: Dict[int, Dict[str, Any]] = {}
-        if client is not None:
-            outs_by_idx = _openai_labeler_unified_batch(
-                items=items,
-                client=client,
-                model=selected_model,
-                temperature=temperature,
-                allowed_delighters=allowed_dels,
-                allowed_detractors=allowed_dets,
-                known_theme_hints=known_hints,
-                max_ev_per_label=max_ev_per_label,
-                max_ev_chars=max_ev_chars,
-                product_profile=product_profile,
-            )
-
-        for it in items:
-            idx = int(it["idx"])
-            vb = str(it["review"] or "")
-            needs_deli = bool(it["needs_del"])
-            needs_detr = bool(it["needs_det"])
-            out = outs_by_idx.get(idx, dict(_LABELER_DEFAULT))
-
-            dels = out.get("dels", []) or []
-            dets = out.get("dets", []) or []
-            unl_dels = out.get("unl_dels", []) or []
-            unl_dets = out.get("unl_dets", []) or []
-            ev_del_map = out.get("ev_del_map", {}) or {}
-            ev_det_map = out.get("ev_det_map", {}) or {}
-            safety = out.get("safety", "Not Mentioned")
-            reliability = out.get("reliability", "Not Mentioned")
-            sessions = out.get("sessions", "Unknown")
-
-            wrote_dets: List[str] = []
-            wrote_dels: List[str] = []
-            ev_written_det: Dict[str, List[str]] = {}
-            ev_written_del: Dict[str, List[str]] = {}
-
-            def _label_allowed(label: str, side: str) -> bool:
-                if not require_evidence:
-                    return True
-                evs = (ev_det_map if side == "det" else ev_del_map).get(label, [])
-                return len(evs) > 0
-
-            if overwrite_mode:
-                for j in range(1, 11):
-                    df.loc[idx, f"AI Symptom Detractor {j}"] = None
-                    df.loc[idx, f"AI Symptom Delighter {j}"] = None
-
-            if needs_detr and dets:
-                dets_to_write = [lab for lab in dets if _label_allowed(lab, "det")][:10]
-                for j, lab in enumerate(dets_to_write):
-                    df.loc[idx, f"AI Symptom Detractor {j + 1}"] = lab
-                    ev_written_det[lab] = ev_det_map.get(lab, [])
-                wrote_dets = dets_to_write
-            if needs_deli and dels:
-                dels_to_write = [lab for lab in dels if _label_allowed(lab, "del")][:10]
-                for j, lab in enumerate(dels_to_write):
-                    df.loc[idx, f"AI Symptom Delighter {j + 1}"] = lab
-                    ev_written_del[lab] = ev_del_map.get(lab, [])
-                wrote_dels = dels_to_write
-
-            df.loc[idx, "AI Safety"] = safety
-            df.loc[idx, "AI Reliability"] = reliability
-            df.loc[idx, "AI # of Sessions"] = sessions
-
-            learned = _ensure_learned_store()
-            new_unl_dels: List[str] = []
-            new_unl_dets: List[str] = []
-            alias_sugs_for_row: List[Tuple[str, str, str, float]] = []
-
-            def _handle_unlisted_list(items2: List[str], side_label: str) -> None:
-                nonlocal new_unl_dels, new_unl_dets, alias_sugs_for_row
-                for raw in items2 or []:
-                    raw2 = str(raw).strip()
-                    if not raw2:
-                        continue
-                    res = resolve_candidate_to_canonical(
-                        candidate_raw=raw2,
-                        side=side_label,
-                        delighters=DELIGHTERS,
-                        detractors=DETRACTORS,
-                        alias_to_label=ALIAS_TO_LABEL,
-                        learned_store=learned,
-                        sim_threshold_lex=float(sim_threshold_lex),
-                        sim_threshold_sem=float(sim_threshold_sem),
-                        client=client,
-                        embed_model=embed_model,
-                    )
-                    canon = str(res["canonical"]).strip()
-                    kind = res.get("kind", "new")
-                    tgt = str(res.get("target", "") or "").strip()
-                    score = float(res.get("score", 0.0) or 0.0)
-                    _update_learned(side_label, canon, synonym=raw2)
-                    if kind in {"exact_existing", "alias_to_existing"} and tgt:
-                        alias_sugs_for_row.append((tgt, raw2, side_label, score))
-                    elif kind == "synonym_to_learned":
-                        pass
-                    else:
-                        if side_label.lower().startswith("del"):
-                            new_unl_dels.append(canon)
-                        else:
-                            new_unl_dets.append(canon)
-
-            _handle_unlisted_list(unl_dels, "Delighter")
-            _handle_unlisted_list(unl_dets, "Detractor")
-
-            def _dedupe_keep_order(lst: List[str]) -> List[str]:
-                out2: List[str] = []
-                seen: Set[str] = set()
-                for x in lst:
-                    k2 = _canon_simple(x)
-                    if not x or k2 in seen:
-                        continue
-                    seen.add(k2)
-                    out2.append(x)
-                return out2
-
-            new_unl_dels = _dedupe_keep_order([normalize_theme_label(x, "Delighter") for x in new_unl_dels])
-            new_unl_dets = _dedupe_keep_order([normalize_theme_label(x, "Detractor") for x in new_unl_dets])
-
-            for lab in new_unl_dels:
-                _agg_candidate(new_symptom_candidates_local, (lab, "Delighter"), int(idx))
-            for lab in new_unl_dets:
-                _agg_candidate(new_symptom_candidates_local, (lab, "Detractor"), int(idx))
-            for tgt, alias, side_label, score in alias_sugs_for_row:
-                side_norm = "Delighter" if side_label.lower().startswith("del") else "Detractor"
-                _agg_candidate(alias_suggestion_candidates_local, (tgt, alias, side_norm), int(idx))
-
-            for lab in wrote_dels:
-                if _canon_simple(lab) not in existing_catalog_keys:
-                    _agg_candidate(new_symptom_candidates_local, (normalize_theme_label(lab, "Delighter"), "Delighter"), int(idx))
-            for lab in wrote_dets:
-                if _canon_simple(lab) not in existing_catalog_keys:
-                    _agg_candidate(new_symptom_candidates_local, (normalize_theme_label(lab, "Detractor"), "Detractor"), int(idx))
-
-            total_labels = len(wrote_dets) + len(wrote_dels)
-            labels_with_ev = sum(1 for lab in wrote_dets if len(ev_written_det.get(lab, [])) > 0) + sum(1 for lab in wrote_dels if len(ev_written_del.get(lab, [])) > 0)
-            cov_num += labels_with_ev
-            cov_den += total_labels
-            row_ev_cov = (labels_with_ev / total_labels) if total_labels else 0.0
-
-            if ui_keep > 0:
-                detected_dets = list(dets)[:10]
-                detected_dels = list(dels)[:10]
-                detected_ev_det = {lab: list((ev_det_map.get(lab, []) or []))[:max_ev_per_label] for lab in detected_dets if ev_det_map.get(lab)}
-                detected_ev_del = {lab: list((ev_del_map.get(lab, []) or []))[:max_ev_per_label] for lab in detected_dels if ev_del_map.get(lab)}
-                det_status = "Written to workbook" if wrote_dets else ("Detected but not written because this row already had detractors." if (detected_dets and not needs_detr) else ("Detected but filtered out by the evidence guard." if (detected_dets and needs_detr) else "No strong detractor match found."))
-                del_status = "Written to workbook" if wrote_dels else ("Detected but not written because this row already had delighters." if (detected_dels and not needs_deli) else ("Detected but filtered out by the evidence guard." if (detected_dels and needs_deli) else "No strong delighter match found."))
-                processed_rows_local.append({
-                    "Index": int(idx),
-                    "Verbatim": str(vb)[:4000],
-                    "Needs_Detractors": needs_detr,
-                    "Needs_Delighters": needs_deli,
-                    "Detected_Detractors": detected_dets,
-                    "Detected_Delighters": detected_dels,
-                    "Detected_Evidence_Detractors": detected_ev_det,
-                    "Detected_Evidence_Delighters": detected_ev_del,
-                    "Added_Detractors": wrote_dets,
-                    "Added_Delighters": wrote_dels,
-                    "Evidence_Detractors": ev_written_det,
-                    "Evidence_Delighters": ev_written_del,
-                    "Detractor_Status": det_status,
-                    "Delighter_Status": del_status,
-                    "NewCand_Detractors": new_unl_dets,
-                    "NewCand_Delighters": new_unl_dels,
-                    "AliasSuggestions": alias_sugs_for_row,
-                    ">10 Detractors Detected": len(dets) > 10,
-                    ">10 Delighters Detected": len(dels) > 10,
-                    "Safety": safety,
-                    "Reliability": reliability,
-                    "Sessions": sessions,
-                    "Evidence_Coverage": row_ev_cov,
-                })
-                if len(processed_rows_local) > ui_keep:
-                    del processed_rows_local[:len(processed_rows_local) - ui_keep]
-
-            processed_idx_set_local.add(int(idx))
-            done += 1
-
-        prog.progress(done / total_n)
-        elapsed = time.perf_counter() - t0
-        rate = (done / elapsed) if elapsed > 0 else 0.0
-        rem = total_n - done
-        eta_sec = (rem / rate) if rate > 0 else 0.0
-        tr2 = _ensure_usage_tracker()
-        spent = float(tr2["cost_chat"] + tr2["cost_embed"]) - cost_start
-        avg_per = (spent / done) if done else 0.0
-        est_total = avg_per * total_n
-        eta_box.markdown(
-            f"**Progress:** {done}/{total_n} • **ETA:** ~ {_fmt_secs(eta_sec)} • **Speed:** {rate * 60:.1f} rev/min • **Spend:** {_fmt_money(spent)} • **Est total:** {_fmt_money(est_total)}"
-        )
-        budget = float(st.session_state.get("budget_limit", 0.0) or 0.0)
-        session_total = float(tr2["cost_chat"] + tr2["cost_embed"])
-        if budget > 0 and session_total >= budget:
-            status_box.markdown(
-                f"⛔ **Budget guard:** session spend {_fmt_money(session_total)} exceeded limit {_fmt_money(budget)}. Stopping early."
-            )
-            break
-        if done % 50 == 0:
-            gc.collect()
-
-    status_box.markdown("✅ Done.")
-    if do_undo and snapshot:
-        st.session_state["undo_stack"].append({"rows": snapshot})
-    st.session_state["processed_rows"] = processed_rows_local
-    st.session_state["processed_idx_set"] = processed_idx_set_local
-    st.session_state["new_symptom_candidates"] = new_symptom_candidates_local
-    st.session_state["alias_suggestion_candidates"] = alias_suggestion_candidates_local
-    st.session_state["last_run_processed_count"] = len(processed_idx_set_local)
-    st.session_state["ev_cov_num"] = int(cov_num)
-    st.session_state["ev_cov_den"] = int(cov_den)
-    st.session_state["df_work"] = df
-    st.session_state.pop("export_bytes", None)
-
-
-def _undo_last_run() -> Tuple[bool, str]:
-    global df
-    if not st.session_state.get("undo_stack"):
-        return (False, "Nothing to undo.")
-    snap = st.session_state["undo_stack"].pop()
-    for idx, old_vals in snap.get("rows", []):
-        for col, val in old_vals.items():
-            if col not in df.columns:
-                df[col] = None
-            df.loc[idx, col] = val
-    st.session_state["df_work"] = df
-    st.session_state.pop("export_bytes", None)
-    return (True, "Reverted the last run.")
-
-# ----------------------------- Main dashboard -----------------------------
-learned_store = _ensure_learned_store()
-file_name = st.session_state.get("uploaded_name", getattr(uploaded_file, "name", "reviews.xlsx"))
-file_base = os.path.splitext(file_name)[0]
-need_del = int(work["Needs_Delighters"].sum())
-need_det = int(work["Needs_Detractors"].sum())
-need_both = int(work["Needs_Symptomization"].sum())
-rows_for_run, overwrite_mode_selected, run_selection_label = _build_run_selection()
-estimated_batches = max(1, math.ceil(len(rows_for_run) / max(1, int(st.session_state.get("llm_batch_size", 6))))) if len(rows_for_run) else 0
-
-a1, a2 = st.columns([2.5, 1.2])
-with a1:
-    st.markdown(
-        f"""
-        <div class='hero-shell'>
-          <div class='hero-top'>
-            <div>
-              <div class='hero-title'>Review workspace</div>
-              <div class='hero-sub'>Workbook: <span class='mono'>{_safe(file_name)}</span></div>
-            </div>
-            <div class='badge-row'>
-              <span class='badge'>Symptoms: {len(DELIGHTERS) + len(DETRACTORS):,}</span>
-              <span class='badge'>Aliases: {sum(len(v) for v in ALIASES.values()) if ALIASES else 0:,}</span>
-              <span class='badge'>Learned themes: {len(learned_store.get('labels', {}).get('Delighter', {})) + len(learned_store.get('labels', {}).get('Detractor', {})):,}</span>
-            </div>
-          </div>
-          <div class='hero-grid'>
-            <div class='hero-stat'><div class='label'>Total reviews</div><div class='value'>{len(work):,}</div></div>
-            <div class='hero-stat'><div class='label'>Need delighters</div><div class='value'>{need_del:,}</div></div>
-            <div class='hero-stat'><div class='label'>Need detractors</div><div class='value'>{need_det:,}</div></div>
-            <div class='hero-stat accent'><div class='label'>Missing both</div><div class='value'>{need_both:,}</div></div>
-            <div class='hero-stat'><div class='label'>Filtered eligible</div><div class='value'>{len(work_filtered):,}</div></div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with a2:
-    st.markdown(
-        f"""
-        <div class='info-card'>
-          <div class='title'>Current run plan</div>
-          <div class='big'>{len(rows_for_run):,}</div>
-          <div class='muted'>{_safe(run_selection_label)}</div>
-          <div class='muted' style='margin-top:8px;'>Estimated batches: <b>{estimated_batches:,}</b><br/>Overwrite mode: <b>{'Yes' if overwrite_mode_selected else 'No'}</b></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    src_map = {"All reviews":"All reviews","Organic only":"Non-incentivized only","Incentivized only":"Incentivized only"}
+    return dict(
+        selected_ratings=selected_ratings,
+        selected_products=selected_products,
+        review_source_mode=review_source_mode,
+        incentivized_mode=src_map.get(review_source_mode,"All reviews"),
+        selected_locales=selected_locales,
+        recommendation_mode=recommendation_mode,
+        date_range=date_range,
+        text_query=text_query,
+        api_key=api_key,
     )
 
 
-tab_dash, tab_run, tab_log, tab_inbox, tab_export = st.tabs([
-    "📊 Dashboard",
-    "🚀 Run Center",
-    "🧾 Review Log",
-    "🟡 Inbox",
-    "📦 Exports",
-])
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — RENDER HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_dash:
-    st.markdown("<div class='section-title'>Filter reviews and inspect scope</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>The filters below decide which rows are eligible. The scope decides which of those rows are in your current working set.</div>", unsafe_allow_html=True)
+def _render_metric_card(label: str, value: str, subtext: str) -> None:
+    st.markdown(f"""
+    <div class="metric-card">
+      <div class="metric-label">{label}</div>
+      <div class="metric-value">{value}</div>
+      <div class="metric-sub">{subtext}</div>
+    </div>""", unsafe_allow_html=True)
 
-    f1, f2 = st.columns([5, 1])
-    with f1:
-        st.markdown(_chip_html(_active_filter_items()), unsafe_allow_html=True)
-    with f2:
-        st.button("Clear filters", use_container_width=True, on_click=_reset_filter_state, key="clear_filters_btn")
-
-    row1 = st.columns(3)
-    with row1[0]:
-        if c_source:
-            st.multiselect("Source", options=_unique_sorted_str(work[c_source]), key="f_source_sel")
-        else:
-            st.caption("Source column not found")
-    with row1[1]:
-        if c_model:
-            st.multiselect("Model (SKU)", options=_unique_sorted_str(work[c_model]), key="f_model_sel")
-        else:
-            st.caption("Model / SKU column not found")
-    with row1[2]:
-        if c_country:
-            st.multiselect("Country", options=_unique_sorted_str(work[c_country]), key="f_country_sel")
-        else:
-            st.caption("Country column not found")
-
-    row2 = st.columns(3)
-    with row2[0]:
-        if c_seeded:
-            st.selectbox("Seeded", ["All", "Seeded only", "Non-seeded only"], key="f_seeded_mode")
-        else:
-            st.caption("Seeded column not found")
-    with row2[1]:
-        if c_newrev:
-            st.selectbox("New Review", ["All", "New only", "Not new only"], key="f_new_mode")
-        else:
-            st.caption("New Review column not found")
-    with row2[2]:
-        if c_rating:
-            vals = work[c_rating].dropna().tolist()
-            opts = sorted({int(v) if isinstance(v, (int, float)) and float(v).is_integer() else v for v in vals})
-            st.multiselect("Star Rating", options=opts, key="f_rating_sel", help="Leave empty to include all ratings.")
-        else:
-            st.caption("Star Rating column not found")
-
-    if c_rdate and work[c_rdate].notna().any():
-        try:
-            dmin = pd.to_datetime(work[c_rdate].min()).date()
-            dmax = pd.to_datetime(work[c_rdate].max()).date()
-            current_date_value = st.session_state.get("f_date_range", (dmin, dmax))
-            if not isinstance(current_date_value, (tuple, list)) or len(current_date_value) != 2:
-                current_date_value = (dmin, dmax)
-            st.date_input("Review Date range", value=current_date_value, key="f_date_range")
-        except Exception:
-            st.caption("Review Date could not be parsed")
-
-    st.divider()
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.metric("Filtered eligible", f"{len(work_filtered):,}")
-    with p2:
-        st.metric("Current scope", f"{len(target):,}")
-    with p3:
-        st.metric("Selected for next run", f"{len(rows_for_run):,}")
-
-    with st.expander("Preview in-scope rows", expanded=False):
-        preview_cols = ["Verbatim", "Has_Delighters", "Has_Detractors", "Needs_Delighters", "Needs_Detractors"]
-        extras = [c for c in [c_rating, c_rdate, c_source, c_model, c_country] if c and c in target.columns]
-        st.dataframe(target[preview_cols + extras].head(200), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("<div class='section-title'>Product Knowledge Prelearn</div>", unsafe_allow_html=True)
-    pc1, pc2 = st.columns([1.2, 2.8])
-    with pc1:
-        run_prelearn_btn = st.button("🧠 Run prelearn now", use_container_width=True, disabled=(client is None), key="run_prelearn_now")
-    with pc2:
-        st.markdown(
-            "<div class='tiny'>Prelearn builds a product glossary and canonical theme hints so the labeler stops inventing tiny wording variants.</div>",
-            unsafe_allow_html=True,
-        )
-
-    prelearn_status = st.empty()
-    prelearn_prog_box = st.empty()
-    if run_prelearn_btn and client is not None:
-        prelearn_prog = prelearn_prog_box.progress(0.0)
-        learned_store = run_prelearn(
-            df_in=df,
-            client=client,
-            prelearn_model=prelearn_model,
-            temperature=0.0,
-            embed_model=embed_model,
-            sample_n=int(prelearn_sample_n),
-            batch_size=int(prelearn_batch_size),
-            sem_merge_threshold=float(prelearn_merge_threshold),
-            status_box=prelearn_status,
-            prog_bar=prelearn_prog,
-        )
-        st.session_state["learned"] = learned_store
+def _render_workspace_header(summary, overall_df, prompt_artifacts, *, source_type, source_label) -> None:
+    bundle = _get_master_bundle(summary, overall_df, prompt_artifacts)
+    product_name = _product_display_name(summary, overall_df)
+    organic_count = int((~overall_df["incentivized_review"].fillna(False)).sum()) if not overall_df.empty else 0
+    if source_type=="uploaded":
+        subtitle = f"Source: {source_label} | {summary.reviews_downloaded:,} reviews | {organic_count:,} organic"
     else:
-        prelearn_prog_box.empty()
-
-    learned_store = _ensure_learned_store()
-    if learned_store.get("labels", {}).get("Delighter") or learned_store.get("labels", {}).get("Detractor"):
-        with st.expander("Show learned product knowledge", expanded=False):
-            if learned_store.get("product_category"):
-                st.markdown(f"**Product category**: {_safe(learned_store.get('product_category', ''))}", unsafe_allow_html=True)
-            st.markdown("**Product profile**")
-            st.write(learned_store.get("product_profile", "") or "(none)")
-            if learned_store.get("product_parts"):
-                st.markdown("**Likely product parts / components**")
-                st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip gray'>{_safe(x)}</span>" for x in learned_store.get("product_parts", [])[:20]]) + "</div>",
-                    unsafe_allow_html=True,
-                )
-            if learned_store.get("use_cases"):
-                st.markdown("**Likely use cases / jobs-to-be-done**")
-                st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip yellow'>{_safe(x)}</span>" for x in learned_store.get("use_cases", [])[:20]]) + "</div>",
-                    unsafe_allow_html=True,
-                )
-            st.markdown("**Glossary terms**")
-            if learned_store.get("glossary_terms"):
-                st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip blue'>{_safe(w)} · {c}</span>" for w, c in learned_store["glossary_terms"][:30]]) + "</div>",
-                    unsafe_allow_html=True,
-                )
-            grouped_del = _group_labels_by_family("Delighter", list(learned_store.get("labels", {}).get("Delighter", {}).keys())[:80], learned_store)
-            grouped_det = _group_labels_by_family("Detractor", list(learned_store.get("labels", {}).get("Detractor", {}).keys())[:80], learned_store)
-            st.markdown("**Learned delighters by L1 family**")
-            for fam, labs in grouped_del.items():
-                st.markdown(f"<div class='tiny'><b>{_safe(fam)}</b></div>", unsafe_allow_html=True)
-                st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_safe(x)}</span>" for x in labs[:20]]) + "</div>", unsafe_allow_html=True)
-            st.markdown("**Learned detractors by L1 family**")
-            for fam, labs in grouped_det.items():
-                st.markdown(f"<div class='tiny'><b>{_safe(fam)}</b></div>", unsafe_allow_html=True)
-                st.markdown("<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_safe(x)}</span>" for x in labs[:20]]) + "</div>", unsafe_allow_html=True)
-
-with tab_run:
-    st.markdown("<div class='section-title'>Run Center</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>One place to choose scope, choose run mode, inspect the plan, and start safely.</div>", unsafe_allow_html=True)
-
-    rleft, rright = st.columns([1.45, 1.05])
-    with rleft:
-        st.selectbox(
-            "Scope",
-            ["Missing both", "Any missing", "Missing delighters only", "Missing detractors only"],
-            key="scope_choice",
-            help="Current scope is used for normal runs. Missing-both fast pass ignores this selector and always uses missing-both within the current filters.",
-        )
-        st.radio(
-            "Run mode",
-            [
-                "First N in current scope",
-                "All reviews in current scope",
-                "Missing-both fast pass",
-                "Rebuild selected rows (overwrite AI output)",
-            ],
-            key="run_mode",
-        )
-
-        if st.session_state.get("run_mode") == "First N in current scope":
-            n_cols = st.columns([1.3, 1, 1, 1, 1])
-            with n_cols[0]:
-                bound_max = max(1, len(target))
-                cur_n = int(st.session_state.get("n_to_process", 10) or 10)
-                st.session_state["n_to_process"] = min(max(cur_n, 1), bound_max)
-                st.number_input(
-                    "How many rows from the top of scope?",
-                    min_value=1,
-                    max_value=bound_max,
-                    step=1,
-                    key="n_to_process",
-                )
-
-            def _set_n(v: int) -> None:
-                st.session_state["n_to_process"] = min(max(int(v), 1), max(1, len(target)))
-
-            with n_cols[1]:
-                st.button("10", use_container_width=True, on_click=_set_n, args=(10,), key="set_n_10")
-            with n_cols[2]:
-                st.button("25", use_container_width=True, on_click=_set_n, args=(25,), key="set_n_25")
-            with n_cols[3]:
-                st.button("50", use_container_width=True, on_click=_set_n, args=(50,), key="set_n_50")
-            with n_cols[4]:
-                st.button("100", use_container_width=True, on_click=_set_n, args=(100,), key="set_n_100")
-
-        if st.session_state.get("run_mode") == "Rebuild selected rows (overwrite AI output)":
-            st.markdown(
-                "<div class='danger-box'><b>Overwrite mode</b><br/>Selected AI slots will be cleared for the chosen rows, then rebuilt from scratch. Manual symptom columns are not touched.</div>",
-                unsafe_allow_html=True,
-            )
-            st.radio(
-                "Overwrite target",
-                ["Current scope only", "All filtered reviews"],
-                key="overwrite_target",
-                horizontal=True,
-            )
-            st.checkbox("I understand this will replace existing AI output for the selected rows", key="confirm_overwrite")
-        else:
-            st.session_state["confirm_overwrite"] = False
-
-    with rright:
-        rows_for_run, overwrite_mode_selected, run_selection_label = _build_run_selection()
-        estimated_batches = max(1, math.ceil(len(rows_for_run) / max(1, int(st.session_state.get("llm_batch_size", 6))))) if len(rows_for_run) else 0
-        st.markdown(
-            f"""
-            <div class='info-card'>
-              <div class='title'>Run summary</div>
-              <div class='run-plan'>
-                <div class='kv'><div class='k'>Filtered eligible</div><div class='v'>{len(work_filtered):,}</div></div>
-                <div class='kv'><div class='k'>Current scope</div><div class='v'>{len(target):,}</div></div>
-                <div class='kv'><div class='k'>Selected now</div><div class='v'>{len(rows_for_run):,}</div></div>
-                <div class='kv'><div class='k'>Estimated batches</div><div class='v'>{estimated_batches:,}</div></div>
-              </div>
-              <div class='muted' style='margin-top:10px;'>{_safe(run_selection_label)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if client is None:
-            st.warning("OpenAI is not configured, so runs are disabled.")
-        elif len(rows_for_run) == 0:
-            st.info("No rows match the current filters / scope / run mode.")
-        elif overwrite_mode_selected:
-            st.info("Overwrite rebuilds both sides for selected rows, even if they were not previously missing.")
-
-        btn_cols = st.columns([1.5, 1])
-        run_disabled = (client is None) or (len(rows_for_run) == 0) or (overwrite_mode_selected and not st.session_state.get("confirm_overwrite", False))
-        with btn_cols[0]:
-            start_run_btn = st.button(_run_button_label(rows_for_run, overwrite_mode_selected), use_container_width=True, disabled=run_disabled, key="start_run_btn")
-        with btn_cols[1]:
-            undo_btn = st.button("↩️ Undo last run", use_container_width=True, key="undo_last_run_btn")
-
-        if overwrite_mode_selected and not st.session_state.get("confirm_overwrite", False):
-            st.caption("Check the confirmation box to enable overwrite mode.")
-
-    if start_run_btn:
-        _run_symptomize(rows_for_run, overwrite_mode=overwrite_mode_selected)
-        st.session_state["_flash_msg"] = ("success", f"Processed {int(st.session_state.get('last_run_processed_count', 0)):,} review(s).")
+        subtitle = (f"Product ID {summary.product_id} | {summary.reviews_downloaded:,} reviews downloaded | "
+                    f"{organic_count:,} organic | {summary.requests_needed} Bazaarvoice requests")
+    st.markdown(f"""
+    <div class="hero-card">
+      <div class="hero-title">{_safe_html(product_name)}</div>
+      <div class="hero-sub">{_safe_html(subtitle)}</div>
+    </div>""", unsafe_allow_html=True)
+    action_cols = st.columns([1.2,1.2,4])
+    action_cols[0].download_button("⬇️ Download all reviews", data=bundle["excel_bytes"],
+        file_name=bundle["excel_name"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
+    if action_cols[1].button("🔄 Reset workspace", use_container_width=True):
+        for k in ["analysis_dataset","chat_messages","chat_scope_signature","chat_scope_notice",
+                  "master_export_bundle","prompt_run_artifacts","prompt_run_notice",
+                  "sym_processed_rows","sym_new_candidates","sym_product_profile"]:
+            st.session_state[k] = [] if k in {"chat_messages","sym_processed_rows"} else (
+                {} if k in {"sym_new_candidates"} else None if k in {"analysis_dataset"} else "")
         st.rerun()
-    if undo_btn:
-        ok, msg = _undo_last_run()
-        st.session_state["_flash_msg"] = ("success" if ok else "info", msg)
+    action_cols[2].caption("The workbook includes Reviews, Rating Distribution, Volume trend, and any AI prompt columns.")
+
+def _render_top_metrics(overall_df, filtered_df) -> None:
+    metrics = _compute_metrics(filtered_df)
+    cards = [
+        ("Reviews in view", f"{metrics['review_count']:,}", f"of {len(overall_df):,} loaded"),
+        ("Avg rating", _format_metric_number(metrics["avg_rating"]), "Filtered view"),
+        ("Avg rating (organic)", _format_metric_number(metrics["avg_rating_non_incentivized"]),
+         f"{metrics['non_incentivized_count']:,} organic reviews"),
+        ("% 1-2 star", _format_pct(metrics["pct_low_star"]), f"{metrics['low_star_count']:,} low-star reviews"),
+        ("% incentivized", _format_pct(metrics["pct_incentivized"]), "Current view share"),
+    ]
+    cols = st.columns(len(cards))
+    for col, (label,value,subtext) in zip(cols,cards):
+        with col: _render_metric_card(label,value,subtext)
+
+def _sort_reviews(df: pd.DataFrame, sort_mode: str) -> pd.DataFrame:
+    w = df.copy()
+    if sort_mode=="Newest":    return w.sort_values(["submission_time","review_id"],ascending=[False,False],na_position="last")
+    if sort_mode=="Oldest":    return w.sort_values(["submission_time","review_id"],ascending=[True,True],na_position="last")
+    if sort_mode=="Highest rating": return w.sort_values(["rating","submission_time"],ascending=[False,False],na_position="last")
+    if sort_mode=="Lowest rating":  return w.sort_values(["rating","submission_time"],ascending=[True,False],na_position="last")
+    if sort_mode=="Longest":   return w.sort_values(["review_length_words","submission_time"],ascending=[False,False],na_position="last")
+    return w
+
+def _render_review_card(row: pd.Series) -> None:
+    rating_value = _safe_int(row.get("rating"),0) if pd.notna(row.get("rating")) else 0
+    filled = "&#9733;" * max(0,min(rating_value,5))
+    empty  = "&#9734;" * max(0,5-rating_value)
+    title  = _safe_text(row.get("title"),"No title") or "No title"
+    review_text = _safe_text(row.get("review_text"),"No written review text.") or "No written review text."
+    meta_bits = [b for b in [_safe_text(row.get("submission_date")),_safe_text(row.get("content_locale")),
+                              _safe_text(row.get("retailer")),_safe_text(row.get("product_or_sku"))] if b]
+    chips = ["Organic" if not _safe_bool(row.get("incentivized_review"),False) else "Incentivized"]
+    rec = row.get("is_recommended")
+    if not _is_missing_value(rec): chips.append("Recommended" if _safe_bool(rec,False) else "Not recommended")
+    if _safe_bool(row.get("has_photos"),False): chips.append(f"Photos: {_safe_int(row.get('photos_count'),0)}")
+    # show any AI Symptom columns
+    det_tags = [str(row.get(f"AI Symptom Detractor {j}","")) for j in range(1,11)
+                if _is_filled(row.get(f"AI Symptom Detractor {j}"))]
+    del_tags = [str(row.get(f"AI Symptom Delighter {j}","")) for j in range(1,11)
+                if _is_filled(row.get(f"AI Symptom Delighter {j}"))]
+    with st.container(border=True):
+        top_cols = st.columns([4.6,1.6])
+        with top_cols[0]:
+            st.markdown(f"<div class='tiny'>{filled}{empty} {rating_value}/5</div>",unsafe_allow_html=True)
+            st.markdown(f"**{title}**")
+            if meta_bits: st.caption(" | ".join(meta_bits))
+        with top_cols[1]: st.caption(" | ".join(chips))
+        st.write(review_text)
+        if det_tags or del_tags:
+            chips_html = "<div class='chip-wrap'>"
+            for t in det_tags: chips_html+=f"<span class='chip red'>{_safe_html(t)}</span>"
+            for t in del_tags: chips_html+=f"<span class='chip green'>{_safe_html(t)}</span>"
+            chips_html+="</div>"
+            st.markdown(chips_html, unsafe_allow_html=True)
+        footer = [b for b in [f"Review ID: {_safe_text(row.get('review_id'))}",
+                               _safe_text(row.get("user_location"))] if b]
+        if footer: st.caption(" | ".join(footer))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — TAB: DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_dashboard(filtered_df: pd.DataFrame) -> None:
+    st.subheader("Dashboard")
+    st.markdown("<div class='section-sub'>Rating mix, volume, and theme signals for the current filter set.</div>",unsafe_allow_html=True)
+    chart_scope = st.radio("Dashboard scope",["All matching reviews","Organic only"],horizontal=True,key="dashboard_chart_scope")
+    chart_df = filtered_df.copy()
+    if chart_scope=="Organic only":
+        chart_df = chart_df[~chart_df["incentivized_review"].fillna(False)].reset_index(drop=True)
+    if chart_df.empty:
+        st.info("No reviews match the current scope."); return
+
+    rating_df  = _rating_distribution(chart_df)
+    monthly_df = _monthly_trend(chart_df)
+    theme_df   = _compute_themes(chart_df)
+
+    rating_df["rating_label"]     = rating_df["rating"].map(lambda v: f"{int(v)}★")
+    rating_df["count_pct_label"]  = rating_df.apply(lambda r: f"{int(r['review_count']):,} · {_format_pct(r['share'])}", axis=1)
+
+    chart_cols = st.columns([1.05,1.15])
+    with chart_cols[0]:
+        with st.container(border=True):
+            fig = px.bar(rating_df,x="rating_label",y="review_count",text="count_pct_label",
+                         title="Rating distribution",
+                         category_orders={"rating_label":["1★","2★","3★","4★","5★"]},
+                         hover_data={"share":":.1%","review_count":True})
+            fig.update_traces(textposition="outside",cliponaxis=False)
+            fig.update_layout(margin=dict(l=24,r=24,t=60,b=20),xaxis_title="Star rating",yaxis_title="Review count")
+            st.plotly_chart(fig, use_container_width=True)
+    with chart_cols[1]:
+        with st.container(border=True):
+            if monthly_df.empty:
+                st.info("No dated reviews for volume chart.")
+            else:
+                fig2 = make_subplots(specs=[[{"secondary_y":True}]])
+                fig2.add_trace(go.Bar(x=monthly_df["month_start"],y=monthly_df["review_count"],name="Review count",opacity=0.62),secondary_y=False)
+                fig2.add_trace(go.Scatter(x=monthly_df["month_start"],y=monthly_df["avg_rating"],name="Avg rating",mode="lines+markers"),secondary_y=True)
+                fig2.update_layout(title="Review volume over time",margin=dict(l=24,r=24,t=60,b=20),hovermode="x unified")
+                fig2.update_xaxes(title_text="Month")
+                fig2.update_yaxes(title_text="Review count",secondary_y=False)
+                fig2.update_yaxes(title_text="Avg rating",range=[1,5],secondary_y=True)
+                st.plotly_chart(fig2, use_container_width=True)
+
+    with st.container(border=True):
+        st.markdown("**Theme signals**")
+        if not theme_df.empty:
+            fig3 = px.bar(theme_df.head(9),x="mention_rate",y="theme",orientation="h",
+                          color="avg_rating_when_mentioned",color_continuous_scale="RdYlGn",
+                          range_color=[1,5],
+                          hover_data={"mention_count":True,"low_star_mentions":True,"high_star_mentions":True},
+                          title="Theme mention rate (colored by avg rating when mentioned)")
+            fig3.update_layout(margin=dict(l=24,r=24,t=60,b=20),xaxis_tickformat=".0%",yaxis_title="")
+            st.plotly_chart(fig3, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — TAB: REVIEW EXPLORER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_review_explorer(*, summary, overall_df, filtered_df, prompt_artifacts) -> None:
+    st.subheader("Review Explorer")
+    st.markdown(f"<div class='section-sub'>Showing {len(filtered_df):,} reviews out of {len(overall_df):,} loaded.</div>",unsafe_allow_html=True)
+    bundle = _get_master_bundle(summary, overall_df, prompt_artifacts)
+    top_cols = st.columns([1.3,1.35,1.0,2.05])
+    top_cols[0].download_button("⬇️ Download all reviews",data=bundle["excel_bytes"],
+        file_name=bundle["excel_name"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,key="explorer_download")
+    sort_mode = top_cols[1].selectbox("Sort reviews",
+        options=["Newest","Oldest","Highest rating","Lowest rating","Longest"],
+        key="review_explorer_sort")
+    per_page  = int(top_cols[2].selectbox("Per page",options=[10,20,30,50],
+        key="review_explorer_per_page"))
+    top_cols[3].caption("Use sidebar filters to narrow the stream.")
+    ordered_df = _sort_reviews(filtered_df, sort_mode).reset_index(drop=True)
+    if ordered_df.empty:
+        st.info("No reviews match the current filters."); return
+    page_count = max(1,math.ceil(len(ordered_df)/max(per_page,1)))
+    current_page = max(1,min(int(st.session_state.get("review_explorer_page",1)),page_count))
+    pager_cols = st.columns([0.9,0.9,2.3,1.0,0.9,0.9])
+    if pager_cols[0].button("⏮",use_container_width=True,disabled=current_page<=1,key="re_first"): current_page=1
+    if pager_cols[1].button("←",use_container_width=True,disabled=current_page<=1,key="re_prev"):  current_page=max(1,current_page-1)
+    pager_cols[2].markdown(f"<div style='text-align:center;font-weight:700;padding-top:.6rem;'>Page {current_page} of {page_count:,} &nbsp;·&nbsp; {(current_page-1)*per_page+1:,}–{min(current_page*per_page,len(ordered_df)):,} of {len(ordered_df):,}</div>",unsafe_allow_html=True)
+    if st.session_state.get("review_explorer_page_input")!=current_page:
+        st.session_state["review_explorer_page_input"]=current_page
+    current_page=int(pager_cols[3].number_input("Page",min_value=1,max_value=page_count,
+        value=current_page,step=1,key="review_explorer_page_input",label_visibility="collapsed"))
+    if pager_cols[4].button("→",use_container_width=True,disabled=current_page>=page_count,key="re_next"): current_page=min(page_count,current_page+1)
+    if pager_cols[5].button("⏭",use_container_width=True,disabled=current_page>=page_count,key="re_last"): current_page=page_count
+    st.session_state["review_explorer_page"]=max(1,min(current_page,page_count))
+    start = (st.session_state["review_explorer_page"]-1)*per_page
+    for _,row in ordered_df.iloc[start:start+per_page].iterrows():
+        _render_review_card(row)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — TAB: AI ANALYST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_description) -> None:
+    st.subheader("AI — Product & Consumer Insights")
+    st.markdown("<div class='section-sub'>Ask anything. The assistant is grounded in the currently filtered review text.</div>",unsafe_allow_html=True)
+    if filtered_df.empty:
+        st.info("Adjust filters — no reviews in scope."); return
+
+    scope_sig = json.dumps(dict(product_id=summary.product_id,filter_description=filter_description,
+                                review_count=len(filtered_df),
+                                source_type=(st.session_state.get("analysis_dataset") or {}).get("source_type","bazaarvoice")),sort_keys=True)
+    if st.session_state.get("chat_scope_signature")!=scope_sig:
+        if st.session_state.get("chat_messages"):
+            st.session_state["chat_messages"]=[]
+            st.session_state["chat_scope_notice"]="AI chat cleared — scope changed."
+        st.session_state["chat_scope_signature"]=scope_sig
+
+    notice = st.session_state.pop("chat_scope_notice",None)
+    if notice: st.info(notice)
+
+    with st.container(border=True):
+        sc = st.columns([1.2,1.0,2.0])
+        sc[0].metric("Reviews in scope",f"{len(filtered_df):,}")
+        organic = int((~filtered_df["incentivized_review"].fillna(False)).sum())
+        sc[1].metric("Organic reviews",f"{organic:,}")
+        sc[2].caption(f"Model: {_shared_model()} · Scope: {filter_description}")
+
+    api_key = settings.get("api_key")
+    if not api_key:
+        st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable AI features.")
+        st.code('OPENAI_API_KEY = "sk-..."', language="toml"); return
+
+    quick_actions = {
+        "Executive summary": dict(prompt="Create a concise executive summary. Lead with biggest strengths, biggest risks, key consumer insight, and top 3 actions.",help="Leadership readout.",persona=None),
+        "Product Development": dict(prompt=PERSONAS["Product Development"]["prompt"],help=PERSONAS["Product Development"]["blurb"],persona="Product Development"),
+        "Quality Engineer":    dict(prompt=PERSONAS["Quality Engineer"]["prompt"],   help=PERSONAS["Quality Engineer"]["blurb"],   persona="Quality Engineer"),
+        "Consumer Insights":   dict(prompt=PERSONAS["Consumer Insights"]["prompt"],  help=PERSONAS["Consumer Insights"]["blurb"],  persona="Consumer Insights"),
+    }
+    quick_trigger: Optional[Tuple] = None
+    with st.container(border=True):
+        st.markdown("**Quick reports**")
+        action_cols = st.columns(4)
+        for col,(label,config) in zip(action_cols,quick_actions.items()):
+            if col.button(label,use_container_width=True,help=config["help"],key=f"ai_quick_{_slugify(label)}"):
+                quick_trigger=(config["persona"],label,config["prompt"])
+
+    chat_container = st.container(border=True)
+    with chat_container:
+        if not st.session_state["chat_messages"]:
+            st.info("Start with a quick report or type a question below.")
+        for msg in st.session_state["chat_messages"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+    helper_cols = st.columns([1.8,1.1,1.1])
+    helper_cols[0].caption(f"Scope: {filter_description}")
+    if helper_cols[1].button("Clear chat",use_container_width=True,key="ai_clear_chat"):
+        st.session_state["chat_messages"]=[]; st.rerun()
+
+    user_message = st.chat_input("Ask about complaint drivers, opportunities, quality risks, sentiment…",key="ai_chat_input")
+    prompt_to_send = visible_user_message = persona_name = None
+    if quick_trigger:
+        persona_name, visible_user_message, prompt_to_send = quick_trigger
+    elif user_message:
+        prompt_to_send = visible_user_message = user_message
+
+    if prompt_to_send and visible_user_message:
+        prior = list(st.session_state["chat_messages"])
+        st.session_state["chat_messages"].append({"role":"user","content":visible_user_message})
+        overlay = _show_thinking("Reviewing the filtered review text and building a grounded answer…")
+        try:
+            answer = _call_analyst(question=prompt_to_send,overall_df=overall_df,filtered_df=filtered_df,
+                                   summary=summary,filter_description=filter_description,
+                                   chat_history=prior,persona_name=persona_name)
+            if persona_name: answer=f"## {persona_name} report\n\n{answer}"
+        except Exception as exc:
+            answer = f"OpenAI request failed: {exc}"
+        finally:
+            overlay.empty()
+        st.session_state["chat_messages"].append({"role":"assistant","content":answer})
         st.rerun()
 
-with tab_log:
-    st.markdown("<div class='section-title'>Processed reviews</div>", unsafe_allow_html=True)
-    current_processed_rows = st.session_state.get("processed_rows", []) or []
-    if current_processed_rows and int(st.session_state.get("ui_log_limit", 40)) > 0:
-        cov_num = int(st.session_state.get("ev_cov_num", 0) or 0)
-        cov_den = int(st.session_state.get("ev_cov_den", 0) or 0)
-        overall_cov = (cov_num / cov_den) if cov_den else 0.0
-        st.caption(f"Evidence coverage for the latest run: {overall_cov * 100:.1f}% of written labels include at least one snippet.")
-        for rec in current_processed_rows:
-            head = f"Row {rec['Index']} — written Dets: {len(rec['Added_Detractors'])} • written Dels: {len(rec['Added_Delighters'])}"
-            detected_total = len(rec.get("Detected_Detractors", []) or []) + len(rec.get("Detected_Delighters", []) or [])
-            if detected_total:
-                head += f" • detected total: {detected_total}"
-            if rec[">10 Detractors Detected"] or rec[">10 Delighters Detected"]:
-                head += " • ⚠ trimmed to 10"
-            with st.expander(head):
-                evidence_terms: List[str] = []
-                for _, evs in (rec.get("Detected_Evidence_Detractors", {}) or {}).items():
-                    evidence_terms.extend(evs or [])
-                for _, evs in (rec.get("Detected_Evidence_Delighters", {}) or {}).items():
-                    evidence_terms.extend(evs or [])
 
-                st.markdown("**Verbatim**")
-                st.markdown(highlight_text(rec["Verbatim"], evidence_terms), unsafe_allow_html=True)
-                st.markdown(
-                    "<div class='chip-wrap'>"
-                    f"<span class='chip gray'>Needed detractors: {'Yes' if rec.get('Needs_Detractors', False) else 'No'}</span>"
-                    f"<span class='chip gray'>Needed delighters: {'Yes' if rec.get('Needs_Delighters', False) else 'No'}</span>"
-                    f"<span class='chip yellow'>Safety: {_safe(rec.get('Safety', 'Not Mentioned'))}</span>"
-                    f"<span class='chip blue'>Reliability: {_safe(rec.get('Reliability', 'Not Mentioned'))}</span>"
-                    f"<span class='chip purple'># Sessions: {_safe(rec.get('Sessions', 'Unknown'))}</span>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SNEVIEWS — TAB: REVIEW PROMPT
+# ═══════════════════════════════════════════════════════════════════════════════
 
-                st.markdown("**Detractors detected**")
-                st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip red'>{_safe(lab)} · evidence {len((rec.get('Detected_Evidence_Detractors', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Detected_Detractors", [])]) + "</div>",
-                    unsafe_allow_html=True,
-                )
-                st.caption(str(rec.get("Detractor_Status", "")))
+def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, filter_description) -> None:
+    st.subheader("Review Prompt")
+    st.markdown("<div class='section-sub'>Create row-level AI tags that become new review columns.</div>",unsafe_allow_html=True)
 
-                st.markdown("**Delighters detected**")
-                st.markdown(
-                    "<div class='chip-wrap'>" + "".join([f"<span class='chip green'>{_safe(lab)} · evidence {len((rec.get('Detected_Evidence_Delighters', {}) or {}).get(lab, []))}</span>" for lab in rec.get("Detected_Delighters", [])]) + "</div>",
-                    unsafe_allow_html=True,
-                )
-                st.caption(str(rec.get("Delighter_Status", "")))
+    with st.container(border=True):
+        st.markdown("**Prompt library**")
+        starter_cols = st.columns([1.2,1.2,1])
+        if starter_cols[0].button("Add starter pack",use_container_width=True,key="prompt_add_starter"):
+            new_rows = pd.DataFrame(REVIEW_PROMPT_STARTER_ROWS)
+            existing_names = set(st.session_state["prompt_definitions_df"]["column_name"].astype(str))
+            to_add = new_rows[~new_rows["column_name"].isin(existing_names)]
+            if not to_add.empty:
+                st.session_state["prompt_definitions_df"] = pd.concat([st.session_state["prompt_definitions_df"],to_add],ignore_index=True)
+            st.rerun()
+        if starter_cols[1].button("Reset to starter",use_container_width=True,key="prompt_reset_starter"):
+            st.session_state["prompt_definitions_df"]=pd.DataFrame(REVIEW_PROMPT_STARTER_ROWS); st.rerun()
+        if starter_cols[2].button("Clear all",use_container_width=True,key="prompt_clear_all"):
+            st.session_state["prompt_definitions_df"]=pd.DataFrame(columns=["column_name","prompt","labels"]); st.rerun()
 
-                st.markdown("**Written to workbook**")
-                st.markdown(
-                    "<div class='chip-wrap'>"
-                    + "".join([f"<span class='chip red'>{_safe(lab)}</span>" for lab in rec.get("Added_Detractors", [])])
-                    + "".join([f"<span class='chip green'>{_safe(lab)}</span>" for lab in rec.get("Added_Delighters", [])])
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
-                if rec.get("NewCand_Delighters") or rec.get("NewCand_Detractors"):
-                    st.markdown("**New symptom candidates**")
-                    chips = "<div class='chip-wrap'>"
-                    for x in rec.get("NewCand_Delighters", []) or []:
-                        chips += f"<span class='chip green'>{_safe(x)}</span>"
-                    for x in rec.get("NewCand_Detractors", []) or []:
-                        chips += f"<span class='chip red'>{_safe(x)}</span>"
-                    chips += "</div>"
-                    st.markdown(chips, unsafe_allow_html=True)
-                if rec.get("AliasSuggestions"):
-                    st.markdown("**Alias suggestions**")
-                    chips = "<div class='chip-wrap'>"
-                    for tgt, alias, _, _ in rec["AliasSuggestions"]:
-                        chips += f"<span class='chip yellow'>{_safe(alias)} → {_safe(tgt)}</span>"
-                    chips += "</div>"
-                    st.markdown(chips, unsafe_allow_html=True)
-                with st.expander("Evidence snippets", expanded=False):
-                    if rec.get("Detected_Evidence_Detractors"):
-                        st.markdown("**Detractor evidence**")
-                        for lab, evs in rec["Detected_Evidence_Detractors"].items():
-                            for e in evs:
-                                st.write(f"- {lab}: {e}")
-                    if rec.get("Detected_Evidence_Delighters"):
-                        st.markdown("**Delighter evidence**")
-                        for lab, evs in rec["Detected_Evidence_Delighters"].items():
-                            for e in evs:
-                                st.write(f"- {lab}: {e}")
-    elif int(st.session_state.get("ui_log_limit", 40)) == 0:
-        st.info("Review log is disabled (fastest mode). Increase 'Show last N processed reviews' in the sidebar to see row-level details.")
-    else:
-        st.info("No processed reviews yet in this session.")
-
-with tab_inbox:
-    st.markdown("<div class='section-title'>Inbox: new symptoms and alias suggestions</div>", unsafe_allow_html=True)
-    whitelist_all = set(DELIGHTERS + DETRACTORS)
-    alias_all = set([a for lst in ALIASES.values() for a in lst]) if ALIASES else set()
-    wl_canon = {_canon_simple(x) for x in whitelist_all}
-    ali_canon = {_canon_simple(x) for x in alias_all}
-
-    def _is_existing_label_or_alias(s: str) -> bool:
-        k = _canon_simple(s)
-        return (k in wl_canon) or (k in ali_canon)
-
-    def _filter_new_symptom_candidates(cands: Dict[Tuple[str, str], Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for (lab, side), rec in cands.items():
-            lab2 = normalize_theme_label(lab, side)
-            if not lab2 or _is_existing_label_or_alias(lab2):
-                continue
-            out[(lab2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        seen: Dict[Tuple[str, str], str] = {}
-        for (lab, side), rec in out.items():
-            key = _canon_simple(lab)
-            k2 = (key, side)
-            if k2 in seen:
-                prev_lab = seen[k2]
-                mrec = merged.setdefault((prev_lab, side), {"count": 0, "refs": []})
-                mrec["count"] += int(rec.get("count", 0))
-                for ridx in rec.get("refs", [])[:50]:
-                    if len(mrec["refs"]) < 50 and ridx not in mrec["refs"]:
-                        mrec["refs"].append(ridx)
-            else:
-                merged[(lab, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-                seen[k2] = lab
-        final: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for (lab, side), rec in merged.items():
-            try:
-                m = difflib.get_close_matches(lab, list(whitelist_all), n=1, cutoff=float(sim_threshold_lex))
-                if m:
-                    continue
-            except Exception:
-                pass
-            final[(lab, side)] = rec
-        return final
-
-    def _filter_alias_candidates(cands: Dict[Tuple[str, str, str], Dict[str, Any]]) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-        out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        for (tgt, alias, side), rec in cands.items():
-            tgt2 = str(tgt).strip()
-            alias2 = normalize_theme_label(alias, side, singularize=True)
-            if not tgt2 or not alias2:
-                continue
-            if _canon_simple(alias2) == _canon_simple(tgt2):
-                continue
-            if _is_existing_label_or_alias(alias2):
-                continue
-            out[(tgt2, alias2, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-        merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        seen: Set[Tuple[str, str, str]] = set()
-        for (tgt, alias, side), rec in out.items():
-            key = (tgt, _canon_simple(alias), side)
-            if key in seen:
-                for kk in list(merged.keys()):
-                    if kk[0] == tgt and _canon_simple(kk[1]) == _canon_simple(alias) and kk[2] == side:
-                        merged[kk]["count"] += int(rec.get("count", 0))
-                        for ridx in rec.get("refs", [])[:50]:
-                            if len(merged[kk]["refs"]) < 50 and ridx not in merged[kk]["refs"]:
-                                merged[kk]["refs"].append(ridx)
-                        break
-            else:
-                merged[(tgt, alias, side)] = {"count": int(rec.get("count", 0)), "refs": list(rec.get("refs", []))}
-                seen.add(key)
-        return merged
-
-    new_symptom_candidates_f = _filter_new_symptom_candidates(st.session_state.get("new_symptom_candidates", {}) or {})
-    alias_suggestion_candidates_f = _filter_alias_candidates(st.session_state.get("alias_suggestion_candidates", {}) or {})
-
-    if not new_symptom_candidates_f and not alias_suggestion_candidates_f:
-        st.info("No inbox items yet. Run symptomization first, then review new symptom candidates and alias suggestions here.")
-    else:
-        tabs_inbox = st.tabs(["New Symptoms", "Alias Suggestions"])
-
-        def _mk_examples(refs: List[int], n: int = 3) -> str:
-            ex: List[str] = []
-            for ridx in refs[:n]:
-                try:
-                    ex.append(str(df.loc[ridx, "Verbatim"])[:200])
-                except Exception:
-                    pass
-            return " | ".join(["— " + e for e in ex])
-
-        with tabs_inbox[0]:
-            rows_tbl = []
-            for (lab, side), rec in sorted(new_symptom_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0])):
-                rows_tbl.append({"Add": False, "Label": lab, "Side": side, "Count": int(rec.get("count", 0)), "Examples": _mk_examples(list(rec.get("refs", [])))})
-            tbl_new = pd.DataFrame(rows_tbl) if rows_tbl else pd.DataFrame(columns=["Add", "Label", "Side", "Count", "Examples"])
-            editor_new = st.data_editor(
-                tbl_new,
-                num_rows="fixed",
-                use_container_width=True,
-                column_config={
-                    "Add": st.column_config.CheckboxColumn(help="Select to add as a new symptom"),
-                    "Label": st.column_config.TextColumn(),
-                    "Side": st.column_config.SelectboxColumn(options=["Delighter", "Detractor"]),
-                    "Count": st.column_config.NumberColumn(format="%d"),
-                    "Examples": st.column_config.TextColumn(width="large"),
-                },
-                key="inbox_new_editor",
-            )
-
-        with tabs_inbox[1]:
-            rows_tbl2 = []
-            for (tgt, alias, side), rec in sorted(alias_suggestion_candidates_f.items(), key=lambda kv: (-int(kv[1].get("count", 0)), kv[0][0], kv[0][1])):
-                rows_tbl2.append({"Add": False, "Target Symptom": tgt, "Alias": alias, "Side": side, "Count": int(rec.get("count", 0)), "Examples": _mk_examples(list(rec.get("refs", [])))})
-            tbl_alias = pd.DataFrame(rows_tbl2) if rows_tbl2 else pd.DataFrame(columns=["Add", "Target Symptom", "Alias", "Side", "Count", "Examples"])
-            editor_alias = st.data_editor(
-                tbl_alias,
-                num_rows="fixed",
-                use_container_width=True,
-                column_config={
-                    "Add": st.column_config.CheckboxColumn(help="Select to add as an alias"),
-                    "Target Symptom": st.column_config.TextColumn(disabled=True),
-                    "Alias": st.column_config.TextColumn(),
-                    "Side": st.column_config.SelectboxColumn(options=["Delighter", "Detractor"]),
-                    "Count": st.column_config.NumberColumn(format="%d"),
-                    "Examples": st.column_config.TextColumn(width="large"),
-                },
-                key="inbox_alias_editor",
-            )
-
-        with st.form("apply_inbox_updates_form", clear_on_submit=False):
-            st.markdown("Apply the selected updates to the **Symptoms** sheet and download the updated workbook.")
-            apply_btn = st.form_submit_button("✅ Apply selected updates")
-
-        if apply_btn:
-            new_to_add: List[Tuple[str, str]] = []
-            alias_to_add: List[Tuple[str, str]] = []
-            try:
-                if isinstance(editor_new, pd.DataFrame) and not editor_new.empty:
-                    for _, r_ in editor_new.iterrows():
-                        if bool(r_.get("Add", False)) and str(r_.get("Label", "")).strip():
-                            lab = normalize_theme_label(str(r_["Label"]).strip(), str(r_.get("Side", "Delighter")))
-                            side = str(r_.get("Side", "Delighter")).strip()
-                            if lab and not _is_existing_label_or_alias(lab):
-                                new_to_add.append((lab, side))
-            except Exception:
-                pass
-            try:
-                if isinstance(editor_alias, pd.DataFrame) and not editor_alias.empty:
-                    for _, r_ in editor_alias.iterrows():
-                        if bool(r_.get("Add", False)) and str(r_.get("Alias", "")).strip() and str(r_.get("Target Symptom", "")).strip():
-                            tgt = str(r_["Target Symptom"]).strip()
-                            als = normalize_theme_label(str(r_["Alias"]).strip(), str(r_.get("Side", "Detractor")))
-                            if tgt and als and not _is_existing_label_or_alias(als) and _canon_simple(als) != _canon_simple(tgt):
-                                alias_to_add.append((tgt, als))
-            except Exception:
-                pass
-
-            if new_to_add or alias_to_add:
-                updated_bytes = apply_symptoms_updates_to_workbook(st.session_state["uploaded_bytes"], new_symptoms=new_to_add, alias_additions=alias_to_add)
-                st.download_button(
-                    "⬇️ Download updated Symptoms workbook",
-                    data=updated_bytes,
-                    file_name="Symptoms_Updated.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.success(f"Applied {len(new_to_add)} new symptom(s) and {len(alias_to_add)} alias addition(s).")
-            else:
-                st.info("No updates were selected.")
-
-with tab_export:
-    st.markdown("<div class='section-title'>Exports</div>", unsafe_allow_html=True)
-    ex1, ex2 = st.columns(2)
-    with ex1:
-        st.markdown("<div class='info-card tight'><div class='title'>Symptomized workbook</div><div class='muted'>Build the XLSX once, then download it. The export preserves your original workbook and writes AI output to the exact template columns.</div></div>", unsafe_allow_html=True)
-        prep = st.button("🧾 Prepare XLSX export", use_container_width=True, key="prepare_export_btn")
-        if prep:
-            with st.spinner("Building XLSX export…"):
-                st.session_state["export_bytes"] = generate_template_workbook_bytes(
-                    st.session_state["uploaded_bytes"],
-                    st.session_state["df_work"],
-                    processed_idx=st.session_state.get("processed_idx_set", set()) or None,
-                    overwrite_processed_slots=False,
-                )
-            st.success("Export prepared.")
-        export_bytes = st.session_state.get("export_bytes", None)
-        st.download_button(
-            "⬇️ Download symptomized workbook",
-            data=(export_bytes or b""),
-            file_name=f"{file_base}_Symptomized.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            disabled=(export_bytes is None),
-        )
-
-    with ex2:
-        st.markdown("<div class='info-card tight'><div class='title'>Symptoms catalog</div><div class='muted'>Quick export of the current Symptoms sheet, including aliases when present.</div></div>", unsafe_allow_html=True)
-        sym_df = pd.DataFrame({
-            "Symptom": (DELIGHTERS + DETRACTORS),
-            "Type": ["Delighter"] * len(DELIGHTERS) + ["Detractor"] * len(DETRACTORS),
+    st.markdown("#### Prompt definitions")
+    edited_df = st.data_editor(st.session_state["prompt_definitions_df"],use_container_width=True,
+        num_rows="dynamic",hide_index=True,key="prompt_definition_editor",height=360,
+        column_config={
+            "column_name":st.column_config.TextColumn("Column name",width="medium"),
+            "prompt":st.column_config.TextColumn("Review prompt",width="large"),
+            "labels":st.column_config.TextColumn("Labels (comma-separated)",width="large"),
         })
-        if ALIASES:
-            alias_rows = [{"Symptom": k, "Aliases": " | ".join(v)} for k, v in ALIASES.items()]
-            alias_df = pd.DataFrame(alias_rows)
-            sym_df = sym_df.merge(alias_df, how="left", on="Symptom")
-        sym_bytes = io.BytesIO()
-        with pd.ExcelWriter(sym_bytes, engine="openpyxl") as xw:
-            sym_df.to_excel(xw, index=False, sheet_name="Symptoms")
-        sym_bytes.seek(0)
-        st.download_button(
-            "⬇️ Download symptoms catalog",
-            sym_bytes.getvalue(),
-            file_name=f"{file_base}_Symptoms_Catalog.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.session_state["prompt_definitions_df"]=edited_df
 
-st.divider()
-st.caption(
-    "v8.0 — rewritten for a smoother and more accurate workflow. Safer overwrite, cleaner run center, batch symptomization, prelearn, inbox, exact template export, and session persistence."
-)
+    try:
+        prompt_definitions = _normalize_prompt_definitions(st.session_state["prompt_definitions_df"],overall_df.columns)
+    except ReviewDownloaderError as exc:
+        st.error(str(exc)); prompt_definitions=[]
+
+    api_key = settings.get("api_key")
+    client  = _get_openai_client()
+
+    with st.container(border=True):
+        scope_cols = st.columns([1.25,1.0,1.0,2.45])
+        tagging_scope = scope_cols[0].selectbox("Tagging scope",["Current filtered reviews","All loaded reviews"],index=0,key="prompt_tagging_scope")
+        scope_df = filtered_df if tagging_scope=="Current filtered reviews" else overall_df
+        batch_size= int(st.session_state.get("sym_batch_size",5))
+        est_calls = math.ceil(len(scope_df)/max(1,batch_size)) if len(scope_df) else 0
+        scope_cols[1].metric("Reviews in scope",f"{len(scope_df):,}")
+        scope_cols[2].metric("Planned requests",f"{est_calls:,}")
+        scope_cols[3].caption(f"Scope: {tagging_scope.lower()}. Filters: {filter_description}.")
+        run_disabled = (not api_key) or (not prompt_definitions) or len(scope_df)==0
+        if st.button("▶️ Run Review Prompt",type="primary",use_container_width=True,disabled=run_disabled,key="prompt_run_btn"):
+            overlay = _show_thinking("Classifying each review…")
+            try:
+                prompt_results_df = _run_review_prompt_tagging(client=client,
+                    source_df=scope_df.reset_index(drop=True),
+                    prompt_definitions=prompt_definitions,chunk_size=batch_size)
+                updated = _merge_prompt_results(overall_df,prompt_results_df,prompt_definitions)
+                dataset = dict(st.session_state["analysis_dataset"])
+                dataset["reviews_df"]=updated; st.session_state["analysis_dataset"]=dataset
+                summary_df=_summarize_prompt_results(prompt_results_df,prompt_definitions,source_df=scope_df)
+                st.session_state["prompt_run_artifacts"]=dict(
+                    definitions=prompt_definitions, summary_df=summary_df,
+                    scope_label=tagging_scope, scope_filter_description=filter_description,
+                    scope_review_ids=list(prompt_results_df["review_id"].astype(str)),
+                    definition_signature=json.dumps([dict(col=p["column_name"],prompt=p["prompt"],labels=p["labels"])
+                                                     for p in prompt_definitions],sort_keys=True),
+                    review_count=len(prompt_results_df),
+                    generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                )
+                st.session_state["master_export_bundle"]=None
+                st.session_state["prompt_run_notice"]=f"Finished tagging {len(prompt_results_df):,} reviews."
+            except Exception as exc:
+                st.error(f"Review Prompt run failed: {exc}")
+            finally:
+                overlay.empty()
+            st.rerun()
+
+    notice = st.session_state.pop("prompt_run_notice",None)
+    if notice: st.success(notice)
+
+    prompt_artifacts = st.session_state.get("prompt_run_artifacts")
+    if not prompt_artifacts:
+        st.info("Run Review Prompt to generate AI columns."); return
+
+    current_sig = json.dumps([dict(col=p["column_name"],prompt=p["prompt"],labels=p["labels"])
+                               for p in prompt_definitions],sort_keys=True) if prompt_definitions else ""
+    if current_sig!=prompt_artifacts.get("definition_signature"):
+        st.info("Prompt definitions changed — re-run to refresh.")
+
+    updated_overall_df = st.session_state["analysis_dataset"]["reviews_df"]
+    review_ids = set(str(x) for x in prompt_artifacts.get("scope_review_ids",[]))
+    result_scope_df = updated_overall_df[updated_overall_df["review_id"].astype(str).isin(review_ids)].copy()
+    bundle = _get_master_bundle(summary, updated_overall_df, prompt_artifacts)
+    st.download_button("⬇️ Download tagged review file",data=bundle["excel_bytes"],
+        file_name=bundle["excel_name"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption(f"Latest run: {prompt_artifacts.get('generated_utc')} | Scope: {prompt_artifacts.get('scope_label')} | Reviews: {prompt_artifacts.get('review_count'):,}")
+
+    prompt_lookup = {p["display_name"]:p for p in prompt_artifacts["definitions"]}
+    prompt_names  = list(prompt_lookup.keys())
+    if not prompt_names: st.info("No prompt results yet."); return
+    if st.session_state.get("prompt_result_view") not in prompt_names:
+        st.session_state["prompt_result_view"]=prompt_names[0]
+    selected_prompt_name = st.radio("Prompt result view",options=prompt_names,horizontal=True,
+        key="prompt_result_view",label_visibility="collapsed")
+    prompt = prompt_lookup[selected_prompt_name]
+    prompt_col = prompt["column_name"]
+    base_view_df = result_scope_df[result_scope_df[prompt_col].notna()].copy() if prompt_col in result_scope_df.columns else result_scope_df.iloc[0:0]
+
+    label_options = [str(l) for l in prompt_artifacts["summary_df"][prompt_artifacts["summary_df"]["column_name"]==prompt_col]["label"].tolist()]
+    selected_labels = st.multiselect("Labels",options=label_options,default=label_options,key=f"prompt_labels_{prompt_col}")
+    preview_df = base_view_df[base_view_df[prompt_col].isin(selected_labels)] if selected_labels else base_view_df.iloc[0:0]
+
+    prompt_summary = pd.DataFrame()
+    total = max(len(base_view_df),1)
+    rows = []
+    for label in prompt["labels"]:
+        sub = preview_df[preview_df[prompt_col]==label] if prompt_col in preview_df.columns else preview_df.iloc[0:0]
+        rows.append(dict(label=label,review_count=len(sub),share=_safe_pct(len(sub),total),
+                         avg_rating=_safe_mean(sub["rating"]) if "rating" in sub.columns else None))
+    prompt_summary = pd.DataFrame(rows)
+
+    chart_col, table_col = st.columns([1.45,1.05])
+    with chart_col:
+        with st.container(border=True):
+            if prompt_summary.empty: st.info("No tagged reviews match current filters.")
+            else:
+                fig = px.pie(prompt_summary,names="label",values="review_count",hole=0.42)
+                fig.update_layout(margin=dict(l=20,r=20,t=20,b=20))
+                st.plotly_chart(fig,use_container_width=True)
+    with table_col:
+        with st.container(border=True):
+            st.markdown(f"**Column** `{prompt_col}`")
+            st.write(prompt["prompt"])
+            if not prompt_summary.empty:
+                ds = prompt_summary.copy()
+                ds["avg_rating"] = ds["avg_rating"].map(lambda x: f"{x:.2f}★" if pd.notna(x) else "—")
+                ds["share"]      = ds["share"].map(_format_pct)
+                st.dataframe(ds[["label","review_count","avg_rating","share"]],
+                             use_container_width=True,hide_index=True,height=260)
+
+    preview_cols = [c for c in ["review_id","rating","incentivized_review","submission_time",
+                                 "content_locale","title","review_text",prompt_col] if c in preview_df.columns]
+    st.markdown("**Tagged review preview**")
+    st.dataframe(preview_df[preview_cols].head(50),use_container_width=True,hide_index=True,height=320)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SYMPTOMIZER — TAB (5th tab)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filter_description) -> None:
+    st.subheader("Symptomizer")
+    st.markdown(
+        "<div class='section-sub'>Row-level AI tagging of delighters and detractors. "
+        "Tags are written back into the shared review dataframe so the Dashboard and Explorer reflect them.</div>",
+        unsafe_allow_html=True)
+
+    client  = _get_openai_client()
+    api_key = settings.get("api_key")
+
+    # ── Step 1: Symptoms catalog ────────────────────────────────────────────
+    st.markdown("### Step 1 — Symptoms catalog")
+
+    dataset = st.session_state.get("analysis_dataset") or {}
+    source_type = dataset.get("source_type","")
+
+    # Try to load from uploaded file if it's an xlsx
+    def _try_load_symptoms_from_file():
+        """Attempt to read Symptoms sheet from the uploaded workbook bytes."""
+        if source_type not in {"uploaded","bazaarvoice"}: return
+        # For uploaded files: if any uploaded file is xlsx, try reading Symptoms sheet
+        uploaded_files_bytes = st.session_state.get("_uploaded_raw_bytes")
+        if uploaded_files_bytes:
+            dels, dets, aliases = _get_symptom_whitelists_from_file(uploaded_files_bytes)
+            if dels or dets:
+                st.session_state["sym_delighters"] = dels
+                st.session_state["sym_detractors"] = dets
+                st.session_state["sym_aliases"]    = aliases
+                st.session_state["sym_symptoms_source"] = "file"
+                return True
+        return False
+
+    # Auto-load symptoms from file once
+    if st.session_state.get("sym_symptoms_source")=="none":
+        _try_load_symptoms_from_file()
+
+    sym_source = st.session_state.get("sym_symptoms_source","none")
+    delighters = list(st.session_state.get("sym_delighters") or [])
+    detractors = list(st.session_state.get("sym_detractors") or [])
+
+    # ── Symptoms status banner ──────────────────────────────────────────────
+    if not delighters and not detractors:
+        st.warning("⚠️ No symptoms defined yet. Use the options below to add them — or proceed without a catalog and the AI will still attempt to tag reviews using its built-in knowledge.")
+    else:
+        st.markdown(
+            _chip_html([
+                (f"{len(delighters)} delighters","green"),
+                (f"{len(detractors)} detractors","red"),
+                (f"Source: {sym_source}","blue"),
+            ]),
+            unsafe_allow_html=True)
+
+    # ── Three options for defining symptoms ────────────────────────────────
+    sym_tabs = st.tabs(["📄 Upload workbook", "✏️ Manual entry", "🤖 AI-assisted builder"])
+
+    with sym_tabs[0]:
+        st.markdown("**Upload an Excel workbook that contains a 'Symptoms' sheet.**")
+        sym_upload = st.file_uploader("Upload workbook with Symptoms sheet", type=["xlsx"],
+                                      key="sym_file_uploader")
+        if sym_upload:
+            raw_bytes = sym_upload.getvalue()
+            st.session_state["_uploaded_raw_bytes"] = raw_bytes
+            dels, dets, aliases = _get_symptom_whitelists_from_file(raw_bytes)
+            if dels or dets:
+                st.session_state["sym_delighters"] = dels
+                st.session_state["sym_detractors"] = dets
+                st.session_state["sym_aliases"]    = aliases
+                st.session_state["sym_symptoms_source"] = "file"
+                st.success(f"Loaded {len(dels)} delighters and {len(dets)} detractors from the Symptoms sheet.")
+                st.rerun()
+            else:
+                st.error("No Symptoms sheet found, or it was empty. Make sure the sheet is named 'Symptoms' and has columns for Symptom, Type (Delighter/Detractor), and optionally Aliases.")
+
+    with sym_tabs[1]:
+        st.markdown("**Enter delighters and detractors as comma- or newline-separated lists.**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("🟢 **Delighters** (positive themes)")
+            del_text = st.text_area("Delighters (one per line or comma-separated)",
+                value="\n".join(delighters), height=220, key="sym_del_manual_text")
+        with col2:
+            st.markdown("🔴 **Detractors** (negative themes)")
+            det_text = st.text_area("Detractors (one per line or comma-separated)",
+                value="\n".join(detractors), height=220, key="sym_det_manual_text")
+        if st.button("💾 Save manual symptoms", use_container_width=True, key="sym_save_manual"):
+            def _parse_list(t: str) -> List[str]:
+                items = re.split(r"[\n,;|]+", t)
+                return [i.strip() for i in items if i.strip()]
+            st.session_state["sym_delighters"] = _parse_list(del_text)
+            st.session_state["sym_detractors"] = _parse_list(det_text)
+            st.session_state["sym_symptoms_source"] = "manual"
+            st.success(f"Saved {len(st.session_state['sym_delighters'])} delighters and {len(st.session_state['sym_detractors'])} detractors.")
+            st.rerun()
+
+    with sym_tabs[2]:
+        st.markdown("**Describe the product and optionally provide a few sample reviews. The AI will generate a first-cut symptom list.**")
+        if not api_key:
+            st.warning("OpenAI API key required for AI-assisted builder.")
+        else:
+            product_desc = st.text_area("Product description",
+                value=st.session_state.get("sym_product_profile",""),
+                placeholder="e.g. 'SharkNinja Ninja Air Fryer XL — a 6-in-1 countertop air fryer with 6 qt basket'",
+                height=80, key="sym_product_desc_input")
+            sample_reviews_text = ""
+            if not overall_df.empty and "review_text" in overall_df.columns:
+                sample_reviews_text = "\n---\n".join(
+                    overall_df["review_text"].fillna("").astype(str).head(20).tolist())
+                st.caption(f"Will use up to 20 sample reviews from the loaded workspace to guide the AI.")
+            if st.button("🤖 Generate symptom list", use_container_width=True,
+                         disabled=(not api_key), key="sym_ai_build_btn"):
+                overlay = _show_thinking("Generating symptom catalog for your product…")
+                try:
+                    sample_list = [r for r in sample_reviews_text.split("---") if r.strip()][:20]
+                    result = _ai_build_symptom_list(client=client,
+                                                    product_description=product_desc,
+                                                    sample_reviews=sample_list)
+                    st.session_state["sym_ai_build_result"] = result
+                    st.session_state["sym_product_profile"] = product_desc
+                except Exception as exc:
+                    st.error(f"AI builder failed: {exc}")
+                finally:
+                    overlay.empty()
+                st.rerun()
+
+            ai_result = st.session_state.get("sym_ai_build_result")
+            if ai_result:
+                st.markdown("**AI-generated symptoms — review and accept:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("🟢 Delighters")
+                    ai_del_text = st.text_area("Edit delighters",
+                        value="\n".join(ai_result.get("delighters",[])),
+                        height=200, key="sym_ai_del_edit")
+                with col2:
+                    st.markdown("🔴 Detractors")
+                    ai_det_text = st.text_area("Edit detractors",
+                        value="\n".join(ai_result.get("detractors",[])),
+                        height=200, key="sym_ai_det_edit")
+                if st.button("✅ Accept AI-generated symptoms", use_container_width=True, key="sym_accept_ai"):
+                    def _parse_list(t: str) -> List[str]:
+                        items = re.split(r"[\n,;|]+", t)
+                        return [i.strip() for i in items if i.strip()]
+                    st.session_state["sym_delighters"] = _parse_list(ai_del_text)
+                    st.session_state["sym_detractors"] = _parse_list(ai_det_text)
+                    st.session_state["sym_symptoms_source"] = "ai"
+                    st.session_state.pop("sym_ai_build_result", None)
+                    st.success(f"Accepted {len(st.session_state['sym_delighters'])} delighters and {len(st.session_state['sym_detractors'])} detractors.")
+                    st.rerun()
+
+    st.divider()
+
+    # ── Step 2: Run configuration ───────────────────────────────────────────
+    st.markdown("### Step 2 — Configure and run")
+
+    delighters = list(st.session_state.get("sym_delighters") or [])
+    detractors = list(st.session_state.get("sym_detractors") or [])
+
+    # build working dataframe with missing flags
+    colmap = _detect_symptom_columns(overall_df)
+    work   = _detect_missing(overall_df, colmap)
+
+    # apply scope filter
+    scope_choice = st.selectbox("Symptomization scope",
+        ["Missing both","Any missing","All loaded reviews","Current filtered reviews"],
+        key="sym_scope_choice")
+    if scope_choice=="Missing both":
+        target_df = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+    elif scope_choice=="Any missing":
+        target_df = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
+    elif scope_choice=="Current filtered reviews":
+        filtered_ids = set(filtered_df["review_id"].astype(str))
+        target_df = work[work["review_id"].astype(str).isin(filtered_ids)]
+    else:
+        target_df = work
+
+    run_cols = st.columns([1.5,1.0,1.0,1.5])
+    n_to_process = run_cols[0].number_input("How many reviews to process",
+        min_value=1, max_value=max(1,len(target_df)), step=1, key="sym_n_to_process")
+    batch_size = int(st.session_state.get("sym_batch_size",5))
+    est_batches = max(1,math.ceil(int(n_to_process)/batch_size)) if n_to_process else 0
+    run_cols[1].metric("In scope",f"{len(target_df):,}")
+    run_cols[2].metric("Est. batches",f"{est_batches:,}")
+    run_cols[3].caption(f"Scope: {scope_choice}")
+
+    # Stats
+    need_both = int(work["Needs_Symptomization"].sum())
+    need_del  = int(work["Needs_Delighters"].sum())
+    need_det  = int(work["Needs_Detractors"].sum())
+    st.markdown(
+        f"""<div class='hero-grid' style='grid-template-columns:repeat(4,minmax(0,1fr));margin-top:0;'>
+          <div class='hero-stat'><div class='label'>Total reviews</div><div class='value'>{len(overall_df):,}</div></div>
+          <div class='hero-stat'><div class='label'>Need delighters</div><div class='value'>{need_del:,}</div></div>
+          <div class='hero-stat'><div class='label'>Need detractors</div><div class='value'>{need_det:,}</div></div>
+          <div class='hero-stat accent'><div class='label'>Missing both</div><div class='value'>{need_both:,}</div></div>
+        </div>""",
+        unsafe_allow_html=True)
+
+    run_disabled = (not api_key) or (len(target_df)==0)
+    run_btn = st.button(f"▶️ Run Symptomizer on {min(int(n_to_process),len(target_df)):,} review(s)",
+                        type="primary", use_container_width=True, disabled=run_disabled, key="sym_run_btn")
+
+    if run_disabled and not api_key:
+        st.warning("Add OPENAI_API_KEY to Streamlit secrets to enable Symptomizer.")
+    elif run_disabled and len(target_df)==0:
+        st.info("No reviews match the current scope.")
+
+    notice = st.session_state.pop("sym_run_notice", None)
+    if notice: st.success(notice)
+
+    if run_btn:
+        rows_to_process = target_df.head(int(n_to_process)).copy()
+        prog    = st.progress(0.0, text="Starting Symptomizer…")
+        status  = st.empty()
+        eta_box = st.empty()
+        processed_rows_local: List[Dict] = []
+        t0 = time.perf_counter()
+        total_n = max(1, len(rows_to_process))
+        done = 0
+
+        # Prepare working df
+        updated_df = _ensure_ai_columns(overall_df.copy())
+        product_profile = st.session_state.get("sym_product_profile","")
+
+        rows_list   = list(rows_to_process.iterrows())
+        batches_idx = list(range(0, len(rows_list), batch_size))
+
+        for bi, start in enumerate(batches_idx, 1):
+            batch = rows_list[start:start+batch_size]
+            items = []
+            for idx, row in batch:
+                vb = _clean_text(row.get("review_text","") or row.get("title_and_text",""))
+                items.append(dict(idx=int(idx), review=vb,
+                                  needs_del=bool(row.get("Needs_Delighters",True)),
+                                  needs_det=bool(row.get("Needs_Detractors",True))))
+            status.info(f"Batch {bi}/{len(batches_idx)} — rows {start+1}–{min(start+batch_size,len(rows_list))}")
+            outs: Dict[int,Dict] = {}
+            if client is not None:
+                try:
+                    outs = _call_symptomizer_batch(
+                        client=client, items=items,
+                        allowed_delighters=delighters or DEFAULT_PRIORITY_DELIGHTERS,
+                        allowed_detractors=detractors or DEFAULT_PRIORITY_DETRACTORS,
+                        product_profile=product_profile,
+                        max_ev_chars=int(st.session_state.get("sym_max_ev_chars",120)))
+                except Exception as exc:
+                    status.warning(f"Batch {bi} failed: {exc}")
+
+            for it in items:
+                idx   = int(it["idx"])
+                out   = outs.get(idx, dict(dels=[],dets=[],ev_del={},ev_det={},
+                                            unl_dels=[],unl_dets=[],
+                                            safety="Not Mentioned",reliability="Not Mentioned",sessions="Unknown"))
+                wrote_dets = list(out.get("dets",[]))[:10]
+                wrote_dels = list(out.get("dels",[]))[:10]
+                for j, lab in enumerate(wrote_dets):
+                    updated_df.loc[idx, f"AI Symptom Detractor {j+1}"] = lab
+                for j, lab in enumerate(wrote_dels):
+                    updated_df.loc[idx, f"AI Symptom Delighter {j+1}"] = lab
+                updated_df.loc[idx,"AI Safety"]       = out.get("safety","Not Mentioned")
+                updated_df.loc[idx,"AI Reliability"]  = out.get("reliability","Not Mentioned")
+                updated_df.loc[idx,"AI # of Sessions"]= out.get("sessions","Unknown")
+
+                for lab in (out.get("unl_dels",[]) or []) + (out.get("unl_dets",[]) or []):
+                    lab = lab.strip()
+                    if lab:
+                        rec = st.session_state["sym_new_candidates"].setdefault(lab,{"count":0,"refs":[]})
+                        rec["count"]+=1
+                        if len(rec["refs"])<50: rec["refs"].append(idx)
+
+                processed_rows_local.append(dict(
+                    idx=idx, wrote_dets=wrote_dets, wrote_dels=wrote_dels,
+                    safety=out.get("safety",""), reliability=out.get("reliability",""),
+                    sessions=out.get("sessions",""),
+                    ev_det=out.get("ev_det",{}), ev_del=out.get("ev_del",{}),
+                    unl_dels=out.get("unl_dels",[]), unl_dets=out.get("unl_dets",[]),
+                ))
+                done += 1
+
+            prog.progress(done/total_n, text=f"{done}/{total_n} reviews processed")
+            elapsed = time.perf_counter()-t0
+            rate = done/elapsed if elapsed>0 else 0
+            rem  = (total_n-done)/rate if rate>0 else 0
+            eta_box.markdown(f"**Speed:** {rate*60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem)}")
+
+        # Write back to shared dataset
+        dataset = dict(st.session_state["analysis_dataset"])
+        dataset["reviews_df"] = updated_df
+        st.session_state["analysis_dataset"]   = dataset
+        st.session_state["sym_processed_rows"] = processed_rows_local
+        st.session_state["master_export_bundle"] = None  # invalidate cache
+        status.success(f"✅ Symptomized {done:,} reviews.")
+        st.session_state["sym_run_notice"] = f"Symptomized {done:,} reviews. Tags are now visible in Review Explorer."
+        st.rerun()
+
+    st.divider()
+
+    # ── Step 3: Results ─────────────────────────────────────────────────────
+    processed = st.session_state.get("sym_processed_rows") or []
+    if processed:
+        st.markdown("### Step 3 — Results")
+
+        # Summary chips
+        total_tags = sum(len(r.get("wrote_dets",[])) + len(r.get("wrote_dels",[])) for r in processed)
+        st.markdown(
+            _chip_html([
+                (f"{len(processed)} reviews tagged","green"),
+                (f"{total_tags} total labels written","blue"),
+            ]),
+            unsafe_allow_html=True)
+        st.markdown("")
+
+        # New symptom candidates inbox
+        new_cands = {k:v for k,v in (st.session_state.get("sym_new_candidates") or {}).items()
+                     if k.strip() and k.strip() not in (delighters+detractors)}
+        if new_cands:
+            with st.expander(f"🟡 New symptom candidates ({len(new_cands)})", expanded=False):
+                st.caption("These labels were suggested by the AI but don't appear in your current catalog. Add them to your symptom list if relevant.")
+                cand_df = pd.DataFrame([
+                    dict(Add=False, Label=lab, Count=int(rec.get("count",0)))
+                    for lab, rec in sorted(new_cands.items(), key=lambda kv:-int(kv[1].get("count",0)))
+                ])
+                edited_cands = st.data_editor(cand_df, num_rows="fixed", use_container_width=True,
+                    hide_index=True, key="sym_cand_editor",
+                    column_config={"Add":st.column_config.CheckboxColumn(),
+                                   "Label":st.column_config.TextColumn(),
+                                   "Count":st.column_config.NumberColumn(format="%d")})
+                if st.button("Add selected to Detractors", key="sym_add_cands_det"):
+                    to_add = [str(r["Label"]) for _,r in edited_cands.iterrows()
+                              if bool(r.get("Add",False)) and str(r.get("Label","")).strip()]
+                    if to_add:
+                        st.session_state["sym_detractors"] = list(dict.fromkeys(detractors+to_add))
+                        st.success(f"Added {len(to_add)} labels to detractors.")
+                        st.rerun()
+
+        # Processed review log
+        with st.expander(f"📋 Processed review log ({len(processed)} reviews)", expanded=True):
+            for rec in processed[-20:]:
+                idx = rec.get("idx","?")
+                head = (f"Row {idx} — det: {len(rec.get('wrote_dets',[]))} · "
+                        f"del: {len(rec.get('wrote_dels',[]))}")
+                with st.expander(head):
+                    # Try to show verbatim
+                    try:
+                        verbatim = str(overall_df.loc[int(idx),"review_text"])[:600]
+                        st.markdown("**Verbatim**"); st.write(verbatim)
+                    except Exception: pass
+                    st.markdown(
+                        "<div class='chip-wrap'>"
+                        +f"<span class='chip yellow'>Safety: {_safe_html(rec.get('safety',''))}</span>"
+                        +f"<span class='chip blue'>Reliability: {_safe_html(rec.get('reliability',''))}</span>"
+                        +f"<span class='chip purple'>Sessions: {_safe_html(rec.get('sessions',''))}</span>"
+                        +"</div>", unsafe_allow_html=True)
+                    det_chips = "".join([f"<span class='chip red'>{_safe_html(l)}</span>"
+                                         for l in rec.get("wrote_dets",[])])
+                    del_chips = "".join([f"<span class='chip green'>{_safe_html(l)}</span>"
+                                         for l in rec.get("wrote_dels",[])])
+                    if det_chips or del_chips:
+                        st.markdown(f"<div class='chip-wrap'>{det_chips}{del_chips}</div>",unsafe_allow_html=True)
+                    ev_det = rec.get("ev_det",{}) or {}
+                    ev_del = rec.get("ev_del",{}) or {}
+                    for lab, evs in {**ev_det,**ev_del}.items():
+                        for e in (evs or []):
+                            st.caption(f"  · {lab}: {e}")
+
+        # Export with symptomizer output
+        st.markdown("**Download tagged workbook**")
+        sym_exp_cols = st.columns([1.5,3])
+        if sym_exp_cols[0].button("🧾 Prepare symptomized export", use_container_width=True, key="sym_prepare_export"):
+            updated_reviews_df = st.session_state["analysis_dataset"]["reviews_df"]
+            # Try to get original workbook bytes for template export
+            original_bytes = st.session_state.get("_uploaded_raw_bytes")
+            if original_bytes:
+                sym_export_bytes = _generate_symptomized_workbook(original_bytes, updated_reviews_df)
+            else:
+                # Fall back to master Excel export
+                sym_export_bytes = _build_master_excel(summary, updated_reviews_df)
+            st.session_state["sym_export_bytes"] = sym_export_bytes
+            st.success("Export prepared.")
+        sym_export = st.session_state.get("sym_export_bytes")
+        sym_exp_cols[0].download_button("⬇️ Download symptomized file",
+            data=sym_export or b"",
+            file_name=f"{summary.product_id}_Symptomized.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=(sym_export is None), key="sym_download_btn")
+        sym_exp_cols[1].caption(
+            "The export writes AI Symptom Detractor / Delighter columns and Safety / Reliability / # of Sessions "
+            "to the exact template column positions (K–AD, AE–AG). If you uploaded the original workbook, "
+            "the export preserves all original data.")
+    else:
+        st.info("Run the Symptomizer above to see results here.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN APP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    st.title(APP_TITLE)
+    st.caption(
+        "Build a review workspace from a SharkNinja product URL or an uploaded review export, "
+        "then filter the voice of customer, explore reviews, chat with an AI analyst, "
+        "create row-level AI tags, and run the Symptomizer for structured delighter/detractor tagging.")
+
+    # ── Workspace source selector ───────────────────────────────────────────
+    dataset = st.session_state.get("analysis_dataset")
+
+    if dataset:
+        cols = st.columns([4.2,1.0])
+        cols[0].caption(f"Current workspace · {dataset.get('source_type','').title()} · {dataset.get('source_label','')}")
+        if cols[1].button("Clear workspace", use_container_width=True, key="ws_clear"):
+            for k in ["analysis_dataset","chat_messages","chat_scope_signature","master_export_bundle",
+                      "prompt_run_artifacts","sym_processed_rows","sym_new_candidates",
+                      "sym_product_profile","sym_symptoms_source","sym_delighters","sym_detractors",
+                      "_uploaded_raw_bytes","sym_export_bytes"]:
+                st.session_state[k] = (None if k=="analysis_dataset" else
+                                       [] if k in {"chat_messages","sym_processed_rows"} else
+                                       {} if k in {"sym_new_candidates","sym_delighters","sym_detractors"} else
+                                       "none" if k=="sym_symptoms_source" else
+                                       "" if k in {"sym_product_profile"} else None)
+            st.rerun()
+
+    source_mode = st.radio("Workspace source",["SharkNinja product URL","Uploaded review file"],
+                           horizontal=True, key="workspace_source_mode")
+
+    if source_mode=="SharkNinja product URL":
+        product_url = st.text_input("Product URL",
+            value="https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html",
+            help="Example: https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html")
+        if st.button("Build review workspace", type="primary", key="ws_build_url"):
+            try:
+                new_dataset = _load_product_reviews(product_url)
+                st.session_state["analysis_dataset"] = new_dataset
+                st.session_state["chat_messages"] = []
+                st.session_state["master_export_bundle"] = None
+                st.session_state["prompt_run_artifacts"] = None
+                st.session_state["sym_processed_rows"] = []
+                st.session_state["sym_new_candidates"] = {}
+                st.session_state["sym_symptoms_source"] = "none"
+                st.rerun()
+            except requests.HTTPError as exc: st.error(f"HTTP error: {exc}")
+            except ReviewDownloaderError as exc: st.error(str(exc))
+            except Exception as exc: st.exception(exc)
+    else:
+        uploaded_files = st.file_uploader("Upload review export files",
+            type=["csv","xlsx","xls"], accept_multiple_files=True,
+            help="Supports Axion-style exports and similar CSV/XLSX review files.")
+        st.caption("Mapped columns include: Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, Retailer.")
+        if st.button("Build review workspace from file", type="primary", key="ws_build_file"):
+            try:
+                new_dataset = _load_uploaded_files(uploaded_files or [])
+                st.session_state["analysis_dataset"] = new_dataset
+                st.session_state["chat_messages"] = []
+                st.session_state["master_export_bundle"] = None
+                st.session_state["prompt_run_artifacts"] = None
+                st.session_state["sym_processed_rows"] = []
+                st.session_state["sym_new_candidates"] = {}
+                st.session_state["sym_symptoms_source"] = "none"
+                # store raw bytes for symptomizer template export
+                if uploaded_files and len(uploaded_files)==1:
+                    fname = getattr(uploaded_files[0],"name","")
+                    if fname.lower().endswith(".xlsx"):
+                        st.session_state["_uploaded_raw_bytes"] = uploaded_files[0].getvalue()
+                st.rerun()
+            except ReviewDownloaderError as exc: st.error(str(exc))
+            except Exception as exc: st.exception(exc)
+
+    # ── Sidebar + filtered data ──────────────────────────────────────────────
+    dataset = st.session_state.get("analysis_dataset")
+    settings = _render_shared_sidebar(dataset["reviews_df"] if dataset else None)
+
+    if not dataset:
+        st.info("Build a review workspace to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.")
+        return
+
+    summary: ReviewBatchSummary = dataset["summary"]
+    overall_df: pd.DataFrame    = dataset["reviews_df"]
+    source_type  = dataset.get("source_type","bazaarvoice")
+    source_label = dataset.get("source_label","")
+
+    # Map review source mode to incentivized_mode
+    src_map = {"All reviews":"All reviews","Organic only":"Non-incentivized only","Incentivized only":"Incentivized only"}
+    filtered_df = _apply_filters(overall_df,
+        selected_ratings=settings["selected_ratings"],
+        incentivized_mode=src_map.get(settings["review_source_mode"],"All reviews"),
+        selected_products=settings["selected_products"],
+        selected_locales=settings["selected_locales"],
+        recommendation_mode=settings["recommendation_mode"],
+        syndicated_mode="All", media_mode="All",
+        date_range=settings["date_range"],
+        text_query=settings["text_query"])
+    filter_description = _describe_filters(
+        selected_ratings=settings["selected_ratings"],
+        selected_products=settings["selected_products"],
+        review_source_mode=settings["review_source_mode"],
+        selected_locales=settings["selected_locales"],
+        recommendation_mode=settings["recommendation_mode"],
+        date_range=settings["date_range"],
+        text_query=settings["text_query"])
+
+    _render_workspace_header(summary, overall_df, st.session_state.get("prompt_run_artifacts"),
+                             source_type=source_type, source_label=source_label)
+    _render_top_metrics(overall_df, filtered_df)
+    st.caption(f"Filter status: {filter_description}. Showing {len(filtered_df):,} of {len(overall_df):,} reviews.")
+
+    # ── Navigation ───────────────────────────────────────────────────────────
+    VIEWS = ["Dashboard","Review Explorer","AI Analyst","Review Prompt","Symptomizer"]
+    if st.session_state.get("workspace_view_selector") not in VIEWS:
+        st.session_state["workspace_view_selector"] = "Dashboard"
+    st.radio("Workspace view", options=VIEWS, horizontal=True, key="workspace_view_selector")
+    st.session_state["active_main_view"] = st.session_state["workspace_view_selector"]
+
+    active_view = st.session_state.get("active_main_view","Dashboard")
+    common_kwargs = dict(settings=settings, overall_df=overall_df, filtered_df=filtered_df,
+                         summary=summary, filter_description=filter_description)
+
+    if active_view=="Dashboard":
+        _render_dashboard(filtered_df)
+    elif active_view=="Review Explorer":
+        _render_review_explorer(summary=summary, overall_df=overall_df, filtered_df=filtered_df,
+                                prompt_artifacts=st.session_state.get("prompt_run_artifacts"))
+    elif active_view=="AI Analyst":
+        _render_ai_tab(**common_kwargs)
+    elif active_view=="Review Prompt":
+        _render_review_prompt_tab(**common_kwargs)
+    elif active_view=="Symptomizer":
+        _render_symptomizer_tab(**common_kwargs)
+
+
+if __name__ == "__main__":
+    main()
