@@ -1141,7 +1141,10 @@ def analyze_symptoms_fast(df_in: pd.DataFrame, symptom_cols: List[str]) -> pd.Da
         long = block.stack().reset_index()
     long.columns = ["__idx", "__col", "symptom"]
     s = long["symptom"].astype("string").str.strip()
-    mask = s.map(lambda v: bool(v and str(v).upper() not in _INVALID and not str(v).startswith("<")))
+    mask = s.map(
+        lambda v: str(v).strip().upper() not in _INVALID and not str(v).startswith("<"),
+        na_action="ignore",
+    ).fillna(False)
     long = long.loc[mask, ["__idx"]].copy()
     long["symptom"] = s[mask].str.title()
     if long.empty:
