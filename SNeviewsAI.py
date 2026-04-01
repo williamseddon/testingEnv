@@ -1429,9 +1429,75 @@ def _render_symptom_dashboard(filtered_df: pd.DataFrame,
                 "detractors first · Amplify high-mention high-star delighters.</div>",
                 unsafe_allow_html=True)
 
+    # ── Opportunity Matrix ───────────────────────────────────────────────────
+    st.markdown("<hr class='sw-divider'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>🎯 Opportunity Matrix</div>",
+                unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Mentions vs Avg ★ · Fix high-mention "
+                "low-star detractors first · Amplify high-mention high-star delighters.</div>",
+                unsafe_allow_html=True)
+
+    _GRID = "rgba(148,163,184,0.18)"
+
+    def _style(fig: go.Figure) -> go.Figure:
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          font=dict(family="Inter, system-ui, sans-serif"),
+                          margin=dict(l=44, r=20, t=44, b=36))
+        fig.update_xaxes(gridcolor=_GRID, zerolinecolor=_GRID)
+        fig.update_yaxes(gridcolor=_GRID, zerolinecolor=_GRID)
+        return fig
+
+    def _opp_scatter(tbl: pd.DataFrame, kind: str, base: float) -> None:
+        if tbl is None or tbl.empty:
+            st.info("No data available."); return
+        d = tbl.copy()
+        d["Mentions"] = pd.to_numeric(d.get("Mentions"), errors="coerce").fillna(0)
+        d["Avg Star"] = pd.to_numeric(d.get("Avg Star"), errors="coerce")
+        d = d.dropna(subset=["Avg Star"])
+        if d.empty:
+            st.info("No data available."); return
+        x     = d["Mentions"].astype(float).to_numpy()
+        y     = d["Avg Star"].astype(float).to_numpy()
+        names = d["Item"].astype(str).to_numpy()
+        score = (x * np.clip(base - y, 0, None) if kind == "detractors"
+                 else x * np.clip(y - base, 0, None))
+        show_labels = st.toggle("Show labels", value=False, key=f"opp_lbl_{kind}")
+        labels_arr  = np.array([""] * len(d), dtype=object)
+        if show_labels:
+            top_idx = np.argsort(-score)[:10]
+            labels_arr[top_idx] = names[top_idx]
+        mx   = max(float(np.nanmax(x)), 1e-9)
+        size = (np.sqrt(x) / np.sqrt(mx)) * 24 + 8
+        color = "#ef4444" if kind == "detractors" else "#22c55e"
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=x, y=y,
+            mode="markers+text" if show_labels else "markers",
+            text=labels_arr, textposition="top center", textfont=dict(size=10),
+            customdata=np.stack([names], axis=1),
+            hovertemplate="%{customdata[0]}<br>Mentions=%{x:.0f}<br>Avg ★=%{y:.2f}<extra></extra>",
+            marker=dict(size=size, color=color, opacity=0.76,
+                        line=dict(width=1, color="rgba(148,163,184,0.38)")),
+        ))
+        fig.add_hline(y=base, line_dash="dash", opacity=0.45,
+                      annotation_text=f"Avg ★ {base:.2f}",
+                      annotation_position="right", annotation_font_size=11)
+        fig.update_layout(height=420, xaxis_title="Mentions", yaxis_title="Avg ★")
+        _style(fig)
+        st.plotly_chart(fig, use_container_width=True)
+        label = ("Fix first — high mentions × below-baseline ★"
+                 if kind == "detractors" else "Amplify — high mentions × above-baseline ★")
+        top15 = d.copy(); top15["Score"] = score
+        top15 = top15.sort_values("Score", ascending=False).head(15)
+        with st.expander(f"📋 {label}", expanded=False):
+            ds = top15[["Item", "Mentions", "Avg Star", "Score"]].copy()
+            ds["Avg Star"] = ds["Avg Star"].map(lambda v: f"{float(v):.1f}" if pd.notna(v) else "—")
+            ds["Score"]    = ds["Score"].map(lambda v: f"{float(v):.1f}")
+            st.dataframe(ds, use_container_width=True, hide_index=True)
+
     opp_t1, opp_t2 = st.tabs(["🔴 Detractors", "🟢 Delighters"])
-    with opp_t1: _render_opportunity_scatter(det_tbl, "detractors", avg_star)
-    with opp_t2: _render_opportunity_scatter(del_tbl, "delighters", avg_star)
+    with opp_t1: _opp_scatter(det_tbl, "detractors", avg_star)
+    with opp_t2: _opp_scatter(del_tbl, "delighters", avg_star)
 
 def _apply_filters(df,*,selected_ratings,incentivized_mode,selected_products,
                    selected_locales,recommendation_mode,syndicated_mode,
