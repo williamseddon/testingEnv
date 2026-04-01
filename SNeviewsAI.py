@@ -468,13 +468,19 @@ def _get_api_key():
     except: pass
     return os.getenv("OPENAI_API_KEY")
 
+@st.cache_resource(show_spinner=False)
+def _make_openai_client(api_key:str):
+    """Cached — only reconstructed when the API key string changes."""
+    if not (_HAS_OPENAI and api_key): return None
+    try: return OpenAI(api_key=api_key,timeout=60,max_retries=3)
+    except TypeError:
+        try: return OpenAI(api_key=api_key)
+        except: return None
+
 def _get_client():
     key=_get_api_key()
     if not (_HAS_OPENAI and key): return None
-    try: return OpenAI(api_key=key,timeout=60,max_retries=3)
-    except TypeError:
-        try: return OpenAI(api_key=key)
-        except: return None
+    return _make_openai_client(key)
 
 def _shared_model(): return st.session_state.get("shared_model",DEFAULT_MODEL)
 
@@ -1292,17 +1298,26 @@ def _build_ai_context(*,overall_df,filtered_df,summary,filter_description,questi
         tok=_estimate_tokens(full_json)
     return full_json
 
-def _call_analyst(*,question,overall_df,filtered_df,summary,filter_description,chat_history,persona_name=None):
+def _call_analyst(*,question,overall_df,filtered_df,summary,filter_description,chat_history,persona_name=None,report_length="Medium"):
     client=_get_client()
     if client is None: raise ReviewDownloaderError("No OpenAI API key configured.")
-    instructions=_persona_instructions(persona_name)
+    _length_tokens={"Short":600,"Medium":1400,"Long":2800}
+    _length_note={
+        "Short":"IMPORTANT: Keep your entire response under 150 words. Be direct — one key insight, one action.",
+        "Medium":"Keep your response to 300–400 words.",
+        "Long":"Provide a thorough 600–800 word response with detailed evidence, examples, and a full Next Steps section.",
+    }
+    base_instructions=_persona_instructions(persona_name)
+    length_suffix=f"\n\n{_length_note.get(report_length,'')}"
+    instructions=base_instructions+length_suffix
+    max_tok=_length_tokens.get(report_length,1400)
     ai_ctx=_build_ai_context(overall_df=overall_df,filtered_df=filtered_df,
                               summary=summary,filter_description=filter_description,question=question)
     msgs=[{"role":m["role"],"content":m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role":"user","content":f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})
     result=_chat_complete(client,model=_shared_model(),
         messages=[{"role":"system","content":instructions},*msgs],
-        temperature=0.0,max_tokens=1400)
+        temperature=0.0,max_tokens=max_tok)
     if not result: raise ReviewDownloaderError("OpenAI returned empty answer.")
     return result
 
@@ -1695,7 +1710,8 @@ def _init_state():
         sym_delighters=[],sym_detractors=[],sym_aliases={},sym_symptoms_source="none",
         sym_processed_rows=[],sym_new_candidates={},sym_product_profile="",
         sym_scope_choice="Missing both",sym_n_to_process=10,
-        sym_batch_size=5,sym_max_ev_chars=120,sym_run_notice=None)
+        sym_batch_size=5,sym_max_ev_chars=120,sym_run_notice=None,
+        _prompt_defs_cache={},_prompt_bundle_ready=False)
     for k,v in defaults.items():
         st.session_state.setdefault(k,v)
 
@@ -1938,20 +1954,16 @@ def _render_dashboard(filtered_df,overall_df=None):
     # ── Symptom state banner — always at the top ─────────────────────────────
     sym_state=_detect_symptom_state(od)
     if sym_state=="none":
-        bc1,bc2=st.columns([4,1])
-        with bc1:
-            st.markdown("""<div class="sym-state-banner" style="padding:1rem 1.4rem;text-align:left;display:flex;align-items:center;gap:14px;margin-bottom:0;">
-              <div style="font-size:1.8rem;flex-shrink:0;">💊</div>
-              <div>
-                <div class="title" style="margin-bottom:2px;">No symptoms tagged yet</div>
-                <div class="sub" style="max-width:none;font-size:12.5px;">Run the Symptomizer to AI-tag delighters &amp; detractors — they'll surface here once complete.</div>
-              </div>
-            </div>""",unsafe_allow_html=True)
-        with bc2:
-            st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
-            if st.button("💊 Symptomizer →",type="primary",use_container_width=True,key="dash_go_sym"):
-                st.session_state["_nav_to_symptomizer"]=True; st.rerun()
-    st.markdown("<div style='height:.9rem'></div>",unsafe_allow_html=True)
+        st.markdown("""<div class="sym-state-banner" style="padding:1.5rem 1.8rem;text-align:left;display:flex;align-items:center;gap:16px;margin-bottom:.5rem;">
+          <div style="font-size:2.2rem;flex-shrink:0;">💊</div>
+          <div style="flex:1;">
+            <div class="title" style="margin-bottom:4px;font-size:15px;">No symptoms tagged yet</div>
+            <div class="sub" style="max-width:none;font-size:12.5px;">Run the Symptomizer to AI-tag delighters &amp; detractors — they'll surface here once complete.</div>
+          </div>
+        </div>""",unsafe_allow_html=True)
+        if st.button("💊 Go to Symptomizer →",type="primary",key="dash_go_sym",use_container_width=False):
+            st.session_state["_nav_to_symptomizer"]=True; st.rerun()
+        st.markdown("<div style='height:.5rem'></div>",unsafe_allow_html=True)
 
     scope=st.radio("Scope",["All matching reviews","Organic only"],horizontal=True,key="dashboard_scope")
     chart_df=filtered_df.copy()
@@ -1992,7 +2004,13 @@ def _render_dashboard(filtered_df,overall_df=None):
                 fig_c.update_yaxes(ticksuffix="%")
                 st.plotly_chart(fig_c,use_container_width=True)
 
-    # ── Row 2: Volume + Rolling Avg — FULL WIDTH ─────────────────────────────
+    # ── Row 2: Symptom analytics (detractors/delighters) ─────────────────────
+    # Shown here so symptoms appear ABOVE trend charts. If no symptoms, shows
+    # the "go to Symptomizer" call-to-action inline with the rest of the page.
+    st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
+    _render_symptom_dashboard(filtered_df,od)
+
+    # ── Row 4: Volume + Rolling Avg — FULL WIDTH ─────────────────────────────
     st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
     with st.container(border=True):
         vel_df=_rolling_velocity(chart_df)
@@ -2015,7 +2033,7 @@ def _render_dashboard(filtered_df,overall_df=None):
             fig2.update_yaxes(title_text="Avg ★",range=[1,5],secondary_y=True,showgrid=False)
             st.plotly_chart(fig2,use_container_width=True)
 
-    # ── Row 3: Sentiment drift + Market breakdown ─────────────────────────────
+    # ── Row 5: Sentiment drift + Market breakdown ─────────────────────────────
     st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
     st.markdown("<div class='section-title' style='font-size:15px;'>📊 Sentiment & Market</div>",unsafe_allow_html=True)
     sa1,sa2=st.columns(2)
@@ -2059,7 +2077,7 @@ def _render_dashboard(filtered_df,overall_df=None):
                     xaxis_title="Reviews",yaxis_title="",legend=dict(orientation="h",y=1.08,x=0))
                 st.plotly_chart(fig_loc,use_container_width=True)
 
-    # ── Row 4: Review depth + Top locations ───────────────────────────────────
+    # ── Row 6: Review depth + Top locations ───────────────────────────────────
     st.markdown("<div style='height:.75rem'></div>",unsafe_allow_html=True)
     rd1,rd2=st.columns([1.3,1])
     with rd1:
@@ -2099,12 +2117,15 @@ def _render_review_explorer(*,summary,overall_df,filtered_df,prompt_artifacts):
     st.markdown("<div class='section-title'>Review Explorer</div>",unsafe_allow_html=True)
     st.markdown(f"<div class='section-sub'>Showing <strong>{len(filtered_df):,}</strong> reviews · Use sidebar filters to narrow the stream.</div>",unsafe_allow_html=True)
     bundle=_get_master_bundle(summary,overall_df,prompt_artifacts)
-    tc=st.columns([1.3,1.35,1.0,2.05])
+    tc=st.columns([1.3,1.35,0.9,1.1,0.85])
     tc[0].download_button("⬇️ Download reviews",data=bundle["excel_bytes"],file_name=bundle["excel_name"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key="explorer_dl")
     sort_mode=tc[1].selectbox("Sort",["Newest","Oldest","Highest rating","Lowest rating","Longest"],key="review_explorer_sort")
     per_page=int(tc[2].selectbox("Per page",[10,20,30,50],key="review_explorer_per_page"))
-    tc[3].caption("Symptomizer tags appear as colored chips on each review card.")
+    tc[3].markdown("<div style='height:4px'></div>",unsafe_allow_html=True)
+    show_ev=tc[3].toggle("Evidence highlights",value=True,key="re_show_highlights",
+        help="Highlight Symptomizer evidence in yellow — hover to see the AI tag")
+    tc[4].markdown("<div style='height:4px'></div>",unsafe_allow_html=True)
     ordered_df=_sort_reviews(filtered_df,sort_mode).reset_index(drop=True)
     if ordered_df.empty: st.info("No reviews match the current filters."); return
     page_count=max(1,math.ceil(len(ordered_df)/max(per_page,1)))
@@ -2113,8 +2134,9 @@ def _render_review_explorer(*,summary,overall_df,filtered_df,prompt_artifacts):
     # Build evidence lookup ONCE per render (not per card — perf fix)
     ev_lookup=_build_evidence_lookup(st.session_state.get("sym_processed_rows") or [])
     for orig_idx,row in page_df.iterrows():
-        ev_items=ev_lookup.get(str(orig_idx)) or ev_lookup.get(str(row.get("review_id","")))
+        ev_items=(ev_lookup.get(str(orig_idx)) or ev_lookup.get(str(row.get("review_id","")))) if show_ev else None
         _render_review_card(row,evidence_items=ev_items)
+        st.markdown("<div style='height:6px'></div>",unsafe_allow_html=True)
     st.markdown("<div style='height:.4rem'></div>",unsafe_allow_html=True)
     with st.container(border=True):
         pc=st.columns([0.8,0.8,2.9,0.85,0.8,0.8])
@@ -2176,7 +2198,11 @@ def _render_ai_tab(*,settings,overall_df,filtered_df,summary,filter_description)
         for col,(label,config) in zip(acols,quick_actions.items()):
             if col.button(label,use_container_width=True,help=config["help"],key=f"ai_q_{_slugify(label)}"):
                 quick_trigger=(config["persona"],label,config["prompt"])
-        st.caption("Each report is grounded in the filtered review text and cites review IDs for material claims.")
+        lc1,lc2=st.columns([2,2])
+        report_length=lc1.radio("Report length",["Short","Medium","Long"],horizontal=True,
+            index=1,key="ai_report_length",
+            help="Short ≈150 words · Medium ≈350 words · Long ≈700 words")
+        lc2.caption("Each report is grounded in the filtered review text and cites review IDs for material claims.")
     with st.container(border=True):
         if not st.session_state["chat_messages"]: st.info("Start with a quick report above, or type a question below.")
         for msg in st.session_state["chat_messages"]:
@@ -2195,7 +2221,8 @@ def _render_ai_tab(*,settings,overall_df,filtered_df,summary,filter_description)
         overlay=_show_thinking("Reviewing the filtered review text…")
         try:
             answer=_call_analyst(question=prompt_to_send,overall_df=overall_df,filtered_df=filtered_df,
-                summary=summary,filter_description=filter_description,chat_history=prior,persona_name=persona_name)
+                summary=summary,filter_description=filter_description,chat_history=prior,
+                persona_name=persona_name,report_length=st.session_state.get("ai_report_length","Medium"))
             if persona_name: answer=f"## {persona_name} report\n\n{answer}"
         except Exception as exc: answer=f"OpenAI request failed: {exc}"
         finally: overlay.empty()
@@ -2229,8 +2256,21 @@ def _render_review_prompt_tab(*,settings,overall_df,filtered_df,summary,filter_d
                        "prompt":st.column_config.TextColumn("Prompt",width="large"),
                        "labels":st.column_config.TextColumn("Labels (comma-separated)",width="large")})
     st.session_state["prompt_definitions_df"]=edited_df
-    try: prompt_defs=_normalize_prompt_defs(st.session_state["prompt_definitions_df"],overall_df.columns)
-    except ReviewDownloaderError as exc: st.error(str(exc)); prompt_defs=[]
+
+    # FIX: cache normalize result by a hash of the editor df to avoid re-running on every keystroke
+    _pd_sig=edited_df.to_json() if not edited_df.empty else ""
+    _cached_defs=st.session_state.get("_prompt_defs_cache",{})
+    if _cached_defs.get("sig")==_pd_sig and _cached_defs.get("cols")==list(overall_df.columns):
+        prompt_defs=_cached_defs["defs"]
+        prompt_defs_error=_cached_defs.get("error")
+    else:
+        prompt_defs_error=None
+        try: prompt_defs=_normalize_prompt_defs(edited_df,overall_df.columns)
+        except ReviewDownloaderError as exc: prompt_defs=[]; prompt_defs_error=str(exc)
+        st.session_state["_prompt_defs_cache"]=dict(sig=_pd_sig,cols=list(overall_df.columns),
+                                                     defs=prompt_defs,error=prompt_defs_error)
+    if prompt_defs_error: st.error(prompt_defs_error)
+
     api_key=settings.get("api_key"); client=_get_client()
     with st.container(border=True):
         sc=st.columns([1.25,1,1,2.45])
@@ -2250,12 +2290,15 @@ def _render_review_prompt_tab(*,settings,overall_df,filtered_df,summary,filter_d
                 dataset=dict(st.session_state["analysis_dataset"]); dataset["reviews_df"]=updated
                 st.session_state["analysis_dataset"]=dataset
                 summary_df=_summarize_prompt_results(prd,prompt_defs,source_df=scope_df)
+                defsig=json.dumps([dict(col=p["column_name"],prompt=p["prompt"],labels=p["labels"]) for p in prompt_defs],sort_keys=True)
                 st.session_state["prompt_run_artifacts"]=dict(definitions=prompt_defs,summary_df=summary_df,
                     scope_label=tagging_scope,scope_filter_description=filter_description,
                     scope_review_ids=list(prd["review_id"].astype(str)),
-                    definition_signature=json.dumps([dict(col=p["column_name"],prompt=p["prompt"],labels=p["labels"]) for p in prompt_defs],sort_keys=True),
+                    definition_signature=defsig,
                     review_count=len(prd),generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
+                # Invalidate export bundle so it rebuilds next time download is requested
                 st.session_state["master_export_bundle"]=None
+                st.session_state["_prompt_bundle_ready"]=False
                 st.session_state["prompt_run_notice"]=f"Finished tagging {len(prd):,} reviews."
             except Exception as exc: st.error(f"Review Prompt run failed: {exc}")
             finally: overlay.empty()
@@ -2266,35 +2309,69 @@ def _render_review_prompt_tab(*,settings,overall_df,filtered_df,summary,filter_d
     if not pa: st.info("Run Review Prompt to generate AI columns."); return
     cur_sig=json.dumps([dict(col=p["column_name"],prompt=p["prompt"],labels=p["labels"]) for p in prompt_defs],sort_keys=True) if prompt_defs else ""
     if cur_sig!=pa.get("definition_signature"): st.info("Prompt definitions changed — re-run to refresh.")
+
+    # FIX: lazy bundle — only build the Excel when user explicitly requests it
     updated_overall=st.session_state["analysis_dataset"]["reviews_df"]
-    rids=set(str(x) for x in pa.get("scope_review_ids",[]))
-    result_scope=updated_overall[updated_overall["review_id"].astype(str).isin(rids)].copy()
-    bundle=_get_master_bundle(summary,updated_overall,pa)
-    hc=st.columns([1.3,4])
-    hc[0].download_button("⬇️ Download tagged file",data=bundle["excel_bytes"],file_name=bundle["excel_name"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    hc[1].caption(f"Run: {pa.get('generated_utc')} · Scope: {pa.get('scope_label')} · Reviews: {pa.get('review_count'):,}")
+    hc=st.columns([1.4,1.4,4])
+    hc[2].caption(f"Run: {pa.get('generated_utc')} · Scope: {pa.get('scope_label')} · Reviews: {pa.get('review_count'):,}")
+    if hc[0].button("🔄 Prepare download",use_container_width=True,key="prompt_prep_dl"):
+        with st.spinner("Building export…"):
+            _get_master_bundle(summary,updated_overall,pa)  # builds & caches
+        st.session_state["_prompt_bundle_ready"]=True; st.rerun()
+    bundle=st.session_state.get("master_export_bundle")
+    dl_ready=bundle is not None
+    hc[1].download_button("⬇️ Download tagged file",
+        data=bundle["excel_bytes"] if dl_ready else b"",
+        file_name=bundle["excel_name"] if dl_ready else "tagged.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=not dl_ready,key="prompt_dl_btn")
+    if not dl_ready:
+        st.caption("Click **Prepare download** first to build the export file.")
+
     plookup={p["display_name"]:p for p in pa["definitions"]}; pnames=list(plookup.keys())
     if not pnames: st.info("No prompt results yet."); return
     if st.session_state.get("prompt_result_view") not in pnames:
         st.session_state["prompt_result_view"]=pnames[0]
     sel=st.radio("Prompt result view",options=pnames,horizontal=True,key="prompt_result_view",label_visibility="collapsed")
     prompt=plookup[sel]; pc_col=prompt["column_name"]
-    base_df=result_scope[result_scope[pc_col].notna()].copy() if pc_col in result_scope.columns else result_scope.iloc[0:0]
+
+    # FIX: lazy result_scope — don't copy the full df on every render; use a boolean mask
+    rids=set(str(x) for x in pa.get("scope_review_ids",[]))
+    if rids:
+        mask=updated_overall["review_id"].astype(str).isin(rids)
+        result_scope=updated_overall.loc[mask]   # view, not copy
+    else:
+        result_scope=updated_overall.iloc[0:0]
+
     lopts=[str(l) for l in pa["summary_df"][pa["summary_df"]["column_name"]==pc_col]["label"].tolist()]
     sel_labels=st.multiselect("Labels",options=lopts,default=lopts,key=f"plabels_{pc_col}")
-    preview_df=base_df[base_df[pc_col].isin(sel_labels)] if sel_labels else base_df.iloc[0:0]
-    total=max(len(base_df),1)
+
+    # FIX: replace O(n_labels × n_rows) loop with vectorised value_counts + groupby
+    if pc_col in result_scope.columns and not result_scope.empty:
+        _slab=result_scope[pc_col]
+        if sel_labels:
+            _view=result_scope[_slab.isin(sel_labels)]
+        else:
+            _view=result_scope.iloc[0:0]
+        _vc=_slab.value_counts() if not result_scope.empty else pd.Series(dtype=int)
+        _ar=(result_scope.groupby(pc_col)["rating"].mean()
+             if "rating" in result_scope.columns and not result_scope.empty
+             else pd.Series(dtype=float))
+    else:
+        _view=result_scope.iloc[0:0]; _vc=pd.Series(dtype=int); _ar=pd.Series(dtype=float)
+
+    total=max(len(result_scope),1)
     ps_rows=[dict(label=l,
-        review_count=len(preview_df[preview_df[pc_col]==l]) if pc_col in preview_df.columns else 0,
-        share=_safe_pct(len(preview_df[preview_df[pc_col]==l]) if pc_col in preview_df.columns else 0,total),
-        avg_rating=_safe_mean(preview_df[preview_df[pc_col]==l]["rating"]) if pc_col in preview_df.columns else None)
+        review_count=int(_vc.get(l,0)),
+        share=_safe_pct(int(_vc.get(l,0)),total),
+        avg_rating=float(_ar[l]) if l in _ar.index and pd.notna(_ar[l]) else None)
         for l in prompt["labels"]]
     ps=pd.DataFrame(ps_rows)
+
     cc,tc_col=st.columns([1.45,1.05])
     with cc:
         with st.container(border=True):
-            if ps.empty: st.info("No tagged reviews match current filters.")
+            if ps.empty or ps["review_count"].sum()==0: st.info("No tagged reviews match current filters.")
             else:
                 fig=px.pie(ps,names="label",values="review_count",hole=0.44,
                     color_discrete_sequence=["#6366f1","#10b981","#f59e0b","#ef4444","#3b82f6","#8b5cf6"])
@@ -2305,12 +2382,12 @@ def _render_review_prompt_tab(*,settings,overall_df,filtered_df,summary,filter_d
             st.markdown(f"**Column** `{pc_col}`"); st.write(prompt["prompt"])
             if not ps.empty:
                 ds=ps.copy()
-                ds["avg_rating"]=ds["avg_rating"].map(lambda x:f"{x:.2f}★" if pd.notna(x) else "—")
+                ds["avg_rating"]=ds["avg_rating"].map(lambda x:f"{x:.2f}★" if pd.notna(x) and x is not None else "—")
                 ds["share"]=ds["share"].map(_fmt_pct)
                 st.dataframe(ds[["label","review_count","avg_rating","share"]],use_container_width=True,hide_index=True,height=240)
-    prevcols=[c for c in ["review_id","rating","incentivized_review","submission_time","content_locale","title","review_text",pc_col] if c in preview_df.columns]
+    prevcols=[c for c in ["review_id","rating","incentivized_review","submission_time","content_locale","title","review_text",pc_col] if c in _view.columns]
     st.markdown("**Tagged review preview**")
-    st.dataframe(preview_df[prevcols].head(50),use_container_width=True,hide_index=True,height=300)
+    st.dataframe(_view[prevcols].head(50),use_container_width=True,hide_index=True,height=300)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: SYMPTOMIZER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2508,7 +2585,19 @@ def _render_symptomizer_tab(*,settings,overall_df,filtered_df,summary,filter_des
             head=f"Row {idx} — {len(rec.get('wrote_dets',[]))} issues · {len(rec.get('wrote_dels',[]))} strengths"
             st.markdown("<div style='margin-bottom:6px;'>",unsafe_allow_html=True)
             with st.expander(head):
-                try: vb=str(overall_df.loc[int(idx),"review_text"])[:600]; st.write(vb)
+                # Build evidence items for this record
+                all_ev_items=[]
+                for lab,evs in {**rec.get("ev_det",{}),**rec.get("ev_del",{})}.items():
+                    for e in (evs or []):
+                        if e and e.strip(): all_ev_items.append((e.strip(),lab))
+                # Show review text — highlighted if evidence exists
+                try:
+                    vb=str(overall_df.loc[int(idx),"review_text"])[:800]
+                    if all_ev_items:
+                        st.markdown(_highlight_evidence(vb,all_ev_items),unsafe_allow_html=True)
+                        st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
+                    else:
+                        st.markdown(f"<div class='review-body'>{html.escape(vb)}</div>",unsafe_allow_html=True)
                 except: pass
                 # Meta chips
                 st.markdown("<div class='chip-wrap' style='margin-bottom:6px;'>"+
@@ -2651,7 +2740,6 @@ def main():
         </script>""",unsafe_allow_html=True)
     with tab1:
         _render_dashboard(filtered_df,overall_df)
-        _render_symptom_dashboard(filtered_df,overall_df)
     with tab2:
         _render_review_explorer(summary=summary,overall_df=overall_df,filtered_df=filtered_df,
             prompt_artifacts=st.session_state.get("prompt_run_artifacts"))
