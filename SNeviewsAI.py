@@ -156,12 +156,15 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .pill .muted{color:var(--slate-500);font-weight:700;}
 .small-muted{font-size:12px;color:var(--slate-500);}
 .ref-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px;margin-right:2px;line-height:1;z-index:40;isolation:isolate;}
-.ref-wrap::after{content:"";position:absolute;left:50%;transform:translateX(-50%);top:100%;width:min(460px,calc(100vw - 28px));height:14px;background:transparent;}
+.ref-wrap:hover,.ref-wrap:focus-within{z-index:3600;}
+.ref-wrap::after{content:"";position:absolute;left:50%;transform:translateX(-50%);top:100%;width:min(500px,calc(100vw - 24px));height:26px;background:transparent;z-index:1;}
 .ref-tile{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:11.5px;font-weight:700;line-height:1;cursor:help;white-space:nowrap;position:relative;z-index:2;}
-.ref-tip{position:absolute;left:50%;transform:translateX(-50%);top:calc(100% + 2px);width:min(460px,calc(100vw - 28px));max-height:min(360px,68vh);overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;box-sizing:border-box;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius-md);padding:10px 11px;box-shadow:var(--shadow-lg);z-index:1200;opacity:0;visibility:hidden;pointer-events:auto;transition:opacity .12s ease, visibility .12s ease;white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
+.ref-tip{position:absolute;left:50%;transform:translateX(-50%);top:calc(100% + 8px);width:min(500px,calc(100vw - 24px));box-sizing:border-box;border:1px solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);z-index:3700;opacity:0;visibility:hidden;pointer-events:auto;transition:opacity .12s ease, visibility .12s ease;white-space:normal;overflow:visible;background:rgba(255,255,255,.992);backdrop-filter:blur(6px);overflow-wrap:anywhere;word-break:break-word;}
+.ref-tip::before{content:"";position:absolute;inset:0;background:rgba(255,255,255,.992);border-radius:inherit;z-index:0;}
+.ref-tip-inner{position:relative;z-index:1;max-height:min(380px,70vh);overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 11px;}
 .ref-wrap:hover .ref-tip,.ref-wrap:focus-within .ref-tip,.ref-tip:hover{opacity:1;visibility:visible;}
-.ref-tip::-webkit-scrollbar{width:10px;}
-.ref-tip::-webkit-scrollbar-thumb{background:rgba(100,116,139,.35);border-radius:999px;}
+.ref-tip-inner::-webkit-scrollbar{width:10px;}
+.ref-tip-inner::-webkit-scrollbar-thumb{background:rgba(100,116,139,.35);border-radius:999px;}
 .ref-item{padding:7px 0;border-bottom:1px solid var(--border);}
 .ref-item:last-child{border-bottom:none;padding-bottom:0;}
 .ref-item:first-child{padding-top:0;}
@@ -169,10 +172,10 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .ref-title{font-size:12px;font-weight:700;color:var(--navy);margin-bottom:3px;line-height:1.35;overflow-wrap:anywhere;word-break:break-word;}
 .ref-snippet{font-size:11.5px;line-height:1.45;color:var(--slate-600);white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
 .ref-empty{font-size:11.5px;color:var(--slate-500);line-height:1.4;overflow-wrap:anywhere;word-break:break-word;}
-[data-testid="stChatMessage"],[data-testid="stChatMessageContent"]{overflow:visible!important;}
+[data-testid="stChatMessage"],[data-testid="stChatMessageContent"]{overflow:visible!important;position:relative!important;z-index:0!important;}
 [data-testid="stMarkdownContainer"]{overflow:visible!important;overflow-wrap:anywhere!important;word-break:break-word!important;}
-[data-testid="stChatMessageContent"] p,[data-testid="stChatMessageContent"] li{font-size:12.8px;line-height:1.58;}
-[data-testid="stChatMessageContent"] h1,[data-testid="stChatMessageContent"] h2,[data-testid="stChatMessageContent"] h3,[data-testid="stChatMessageContent"] h4{font-size:13px;line-height:1.45;font-weight:700;margin:.5rem 0 .2rem;letter-spacing:-.01em;}
+[data-testid="stChatMessageContent"] p,[data-testid="stChatMessageContent"] li{font-size:12.35px;line-height:1.58;}
+[data-testid="stChatMessageContent"] h1,[data-testid="stChatMessageContent"] h2,[data-testid="stChatMessageContent"] h3,[data-testid="stChatMessageContent"] h4{font-size:12.45px;line-height:1.45;font-weight:700;margin:.42rem 0 .18rem;letter-spacing:-.005em;}
 [data-testid="stChatMessageContent"] ul,[data-testid="stChatMessageContent"] ol{margin:.2rem 0 .55rem 1rem;}
 .workspace-nav-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:12px 14px;box-shadow:var(--shadow-sm);margin:1.05rem 0 1.25rem;}
 @keyframes tw-spin{to{transform:rotate(360deg);}}
@@ -686,6 +689,23 @@ def _shared_reasoning():
         cur = "none" if "none" in allowed else allowed[0]
         st.session_state["shared_reasoning"] = cur
     return cur
+
+
+def _coerce_ai_target_words(value, default=1200):
+    try:
+        n = int(value)
+    except Exception:
+        n = int(default)
+    return max(250, min(2400, n))
+
+
+def _ai_target_token_budget(target_words: int) -> int:
+    words = _coerce_ai_target_words(target_words)
+    return max(900, min(7000, int(round(words * 2.35))))
+
+
+def _current_ai_target_words() -> int:
+    return _coerce_ai_target_words(st.session_state.get("ai_response_words", 1200))
 
 
 def _model_supports_reasoning(model: str) -> bool:
@@ -3381,7 +3401,7 @@ GENERAL_INSTRUCTIONS = textwrap.dedent("""
     • Cite review IDs inline: (review_ids: 12345, 67890).
     • For every quantitative claim state the count or percentage from the data.
     • Mark inferences: [INFERRED].
-    • Keep responses ≤ 400 words unless the user explicitly asks for depth.
+    • Follow the caller-specified response-length target. If no target is given, prefer a detailed answer over a terse one.
     • End every response with a "**Next Steps**" section: 2–3 concrete actions.
     GUARDRAILS
     • Do not invent review IDs, quotes, counts, or trends not in the evidence.
@@ -3477,19 +3497,21 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
     return full_json
 
 
-def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, report_length="Medium"):
+def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200):
     client = _get_client()
     if client is None:
         raise ReviewDownloaderError("No OpenAI API key configured.")
-    _length_tokens = {"Short": 600, "Medium": 1200, "Long": 2200}
-    _length_note = {
-        "Short": "IMPORTANT: Keep your entire response under 150 words. Be direct — one key insight, one action.",
-        "Medium": "Keep your response to 300–400 words.",
-        "Long": "Provide a thorough 600–800 word response with detailed evidence, examples, and a full Next Steps section.",
-    }
+    target_words = _coerce_ai_target_words(target_words)
+    floor_words = max(220, int(round(target_words * 0.8)))
+    ceiling_words = min(2600, int(round(target_words * 1.15)))
+    max_tok = _ai_target_token_budget(target_words)
     base_instructions = _persona_instructions(persona_name)
-    instructions = base_instructions + "\n\n" + _length_note.get(report_length, "")
-    max_tok = _length_tokens.get(report_length, 1200)
+    length_note = (
+        "RESPONSE LENGTH OVERRIDE: ignore any shorter length caps that may appear earlier in these instructions. "
+        f"Aim for about {target_words:,} words, with a practical range of roughly {floor_words:,} to {ceiling_words:,} words. "
+        "Use detailed evidence, concrete examples, and a full Next Steps section. Do not compress the answer into a short summary unless the user explicitly asks for that."
+    )
+    instructions = base_instructions + "\n\n" + length_note
     ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question)
     msgs = [{"role": m["role"], "content": m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role": "user", "content": f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})
@@ -4141,6 +4163,8 @@ def _init_state():
         review_filter_signature=None,
         shared_model=DEFAULT_MODEL,
         shared_reasoning=DEFAULT_REASONING,
+        ai_response_preset="Large (1200 words)",
+        ai_response_words=1200,
         workspace_source_mode=SOURCE_MODE_URL,
         workspace_product_url=DEFAULT_PRODUCT_URL,
         workspace_file_uploader_nonce=0,
@@ -4325,7 +4349,8 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             if cur_reasoning not in effort_options:
                 cur_reasoning = "none" if "none" in effort_options else effort_options[0]
                 st.session_state["shared_reasoning"] = cur_reasoning
-            st.selectbox("Reasoning effort", options=effort_options, index=effort_options.index(cur_reasoning), key="shared_reasoning", help="Applied to GPT-5 family models.")
+            st.selectbox("Reasoning effort", options=effort_options, index=effort_options.index(cur_reasoning), key="shared_reasoning", help="Applied to GPT-5 family models. Raising this usually improves quality on nuanced and long-form analysis, but may be a bit slower.")
+            st.caption("Tip: higher reasoning generally produces better long-form AI Analyst answers.")
             if api_key:
                 st.markdown("<div class='chip green' style='margin-top:4px'>✓ API key loaded</div>", unsafe_allow_html=True)
             else:
@@ -4468,7 +4493,7 @@ def _reference_tile_html_from_ids(review_ids: Sequence[str], df: pd.DataFrame, *
         if extra:
             bits.append(f"<div class='ref-item'><div class='ref-empty'>+{extra} more referenced review(s)</div></div>")
         tip = "".join(bits)
-    return f"<span class='ref-wrap' tabindex='0' role='button' aria-label='{_esc(label)} review reference'><span class='ref-tile'>{_esc(label)}</span><span class='ref-tip'>{tip}</span></span>"
+    return f"<span class='ref-wrap' tabindex='0' role='button' aria-label='{_esc(label)} review reference'><span class='ref-tile'>{_esc(label)}</span><span class='ref-tip'><span class='ref-tip-inner'>{tip}</span></span></span>"
 
 
 def _normalize_ai_answer_display(text: str) -> str:
@@ -4508,7 +4533,7 @@ def _reference_tile_html_for_row(row) -> str:
         + f"<div class='ref-snippet'>{_esc(snippet)}</div>"
         + "</div>"
     )
-    return f"<span class='ref-wrap'><span class='ref-tile'>Reference</span><span class='ref-tip'>{tip}</span></span>"
+    return f"<span class='ref-wrap'><span class='ref-tile'>Reference</span><span class='ref-tip'><span class='ref-tip-inner'>{tip}</span></span></span>"
 
 
 def _replace_review_citations_with_reference_tiles(text: str, df: pd.DataFrame) -> str:
@@ -4863,7 +4888,7 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
                     else:
                         st.markdown(msg["content"])
     quick_actions = {
-        "Executive summary": dict(prompt="Create a concise executive summary. Lead with biggest strengths, biggest risks, key consumer insight, and top 3 actions.", help="Leadership readout.", persona=None),
+        "Executive summary": dict(prompt="Create an executive summary. Lead with biggest strengths, biggest risks, key consumer insight, and top 3 actions.", help="Leadership readout.", persona=None),
         "Product Development": dict(prompt=PERSONAS["Product Development"]["prompt"], help=PERSONAS["Product Development"]["blurb"], persona="Product Development"),
         "Quality Engineer": dict(prompt=PERSONAS["Quality Engineer"]["prompt"], help=PERSONAS["Quality Engineer"]["blurb"], persona="Quality Engineer"),
         "Consumer Insights": dict(prompt=PERSONAS["Consumer Insights"]["prompt"], help=PERSONAS["Consumer Insights"]["blurb"], persona="Consumer Insights"),
@@ -4877,9 +4902,22 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
             for cidx, (col, (label, config)) in enumerate(zip(acols, row)):
                 if col.button(label, use_container_width=True, help=config["help"], key=f"ai_q_{ridx}_{cidx}_{_slugify(label)}"):
                     quick_trigger = (config["persona"], label, config["prompt"])
-        lc1, lc2 = st.columns([2, 2])
-        lc1.radio("Report length", ["Short", "Medium", "Long"], horizontal=True, index=1, key="ai_report_length", help="Short ≈150 words · Medium ≈350 words · Long ≈700 words")
-        lc2.caption("Each report is grounded in the filtered review text and cites review IDs for material claims.")
+        size_cols = st.columns([1.35, 1.1, 1.55])
+        preset_options = ["Large (1200 words)", "Deep dive (1600 words)", "Custom"]
+        cur_preset = st.session_state.get("ai_response_preset", "Large (1200 words)")
+        if cur_preset not in preset_options:
+            cur_preset = "Large (1200 words)"
+            st.session_state["ai_response_preset"] = cur_preset
+        size_cols[0].selectbox("Response size", preset_options, index=preset_options.index(cur_preset), key="ai_response_preset", help="Large is the default because the shorter outputs were not detailed enough.")
+        if st.session_state.get("ai_response_preset") == "Deep dive (1600 words)":
+            st.session_state["ai_response_words"] = 1600
+        elif st.session_state.get("ai_response_preset") == "Large (1200 words)":
+            st.session_state["ai_response_words"] = 1200
+        size_cols[1].number_input("Target words", min_value=250, max_value=2400, step=100, value=_current_ai_target_words(), key="ai_response_words", help="You can type your own target word count. Around 1200 words is the default large report.", disabled=st.session_state.get("ai_response_preset") != "Custom")
+        size_cols[2].caption(f"Target: {_current_ai_target_words():,} words · approx. {int(round(_current_ai_target_words() * 6.2)):,} characters. Reports stay grounded in the filtered review text and still cite review references inline.")
+        reasoning_now = _shared_reasoning()
+        tone = "warning" if reasoning_now in {"none", "minimal", "low"} else "info"
+        getattr(st, tone)("Accuracy tip: raise **Reasoning effort** in the sidebar AI settings for higher-confidence synthesis, especially on long reports, root-cause questions, and mixed sentiment datasets.")
     helper_cols = st.columns([2, 1, 1])
     helper_cols[0].caption(f"Scope: {filter_description}")
     if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat"):
@@ -4897,7 +4935,7 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
         st.session_state["chat_messages"].append({"role": "user", "content": visible_user_message})
         overlay = _show_thinking("Reviewing the filtered review text…")
         try:
-            answer = _call_analyst(question=prompt_to_send, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, chat_history=prior, persona_name=persona_name, report_length=st.session_state.get("ai_report_length", "Medium"))
+            answer = _call_analyst(question=prompt_to_send, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, chat_history=prior, persona_name=persona_name, target_words=_current_ai_target_words())
             if persona_name:
                 answer = f"**{persona_name} report**\n\n{answer}"
         except Exception as exc:
