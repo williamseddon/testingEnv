@@ -891,7 +891,14 @@ def _chat_complete_with_fallback_models(client, *, model, messages, structured=F
 # ═══════════════════════════════════════════════════════════════════════════════
 def _get_session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+    })
     return s
 
 
@@ -1333,6 +1340,242 @@ def _extract_generic_bv_product_id(url: str, html: str) -> Optional[str]:
             return tok
     return None
 
+
+def _is_incentivized(r):
+    badges = [str(b).lower() for b in (r.get("BadgesOrder") or [])]
+    if any("incentivized" in b for b in badges):
+        return True
+    ctx = r.get("ContextDataValues") or {}
+    if isinstance(ctx, dict):
+        for k, v in ctx.items():
+            if "incentivized" in str(k).lower():
+                flag = str((v.get("Value", "") if isinstance(v, dict) else v)).strip().lower()
+                if flag in {"", "true", "1", "yes"}:
+                    return True
+    return False
+
+def _flatten_review(r):
+    photos = r.get("Photos") or []
+    urls = []
+    for p in photos:
+        sz = p.get("Sizes") or {}
+        for sn in ["large", "normal", "thumbnail"]:
+            u = (sz.get(sn) or {}).get("Url")
+            if u:
+                urls.append(u)
+                break
+    syn = r.get("SyndicationSource") or {}
+    return dict(
+        review_id=r.get("Id"),
+        product_id=r.get("ProductId"),
+        original_product_name=r.get("OriginalProductName"),
+        title=_safe_text(r.get("Title")),
+        review_text=_safe_text(r.get("ReviewText")),
+        rating=r.get("Rating"),
+        is_recommended=r.get("IsRecommended"),
+        user_nickname=r.get("UserNickname"),
+        author_id=r.get("AuthorId"),
+        user_location=r.get("UserLocation"),
+        content_locale=r.get("ContentLocale"),
+        submission_time=r.get("SubmissionTime"),
+        moderation_status=r.get("ModerationStatus"),
+        campaign_id=r.get("CampaignId"),
+        source_client=r.get("SourceClient"),
+        is_featured=r.get("IsFeatured"),
+        is_syndicated=r.get("IsSyndicated"),
+        syndication_source_name=syn.get("Name"),
+        is_ratings_only=r.get("IsRatingsOnly"),
+        total_positive_feedback_count=r.get("TotalPositiveFeedbackCount"),
+        badges=", ".join(str(x) for x in (r.get("BadgesOrder") or [])),
+        context_data_json=json.dumps(r.get("ContextDataValues") or {}, ensure_ascii=False),
+        photos_count=len(photos),
+        photo_urls=" | ".join(urls),
+        incentivized_review=_is_incentivized(r),
+        raw_json=json.dumps(r, ensure_ascii=False),
+    )
+
+def _ensure_cols(df, cols):
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df
+
+def _extract_age_group(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    payload = val
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if not stripped:
+            return None
+        try:
+            payload = json.loads(stripped)
+        except Exception:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    for k, raw in payload.items():
+        if "age" not in str(k).lower():
+            continue
+        candidate = raw.get("Value") or raw.get("Label") if isinstance(raw, dict) else raw
+        candidate = _safe_text(candidate)
+        if candidate and candidate.lower() not in {"nan", "none", "null", "unknown", "prefer not to say"}:
+            return candidate
+    return None
+
+def _finalize_df(df):
+    required = [
+        "review_id", "product_id", "base_sku", "sku_item", "product_or_sku",
+        "original_product_name", "title", "review_text", "rating", "is_recommended",
+        "content_locale", "submission_time", "submission_date", "submission_month",
+        "incentivized_review", "is_syndicated", "photos_count", "photo_urls",
+        "title_and_text", "retailer", "post_link", "age_group", "user_nickname",
+        "user_location", "total_positive_feedback_count", "source_system", "source_file",
+    ]
+    df = _ensure_cols(df.copy(), required)
+    if df.empty:
+        for c in ["has_photos", "has_media", "review_length_chars", "review_length_words", "rating_label", "year_month_sort"]:
+            if c not in df.columns:
+                df[c] = pd.Series(dtype="object")
+        return df
+
+    df["review_id"] = df["review_id"].fillna("").astype(str).str.strip()
+    missing = df["review_id"].eq("") | df["review_id"].str.lower().isin({"nan", "none", "null"})
+    if missing.any():
+        df.loc[missing, "review_id"] = [f"review_{i + 1}" for i in range(int(missing.sum()))]
+    if "context_data_json" in df.columns:
+        df["age_group"] = df["age_group"].fillna(df["context_data_json"].map(_extract_age_group))
+    df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
+    df["incentivized_review"] = df["incentivized_review"].fillna(False).astype(bool)
+    df["is_syndicated"] = df["is_syndicated"].fillna(False).astype(bool)
+    df["photos_count"] = pd.to_numeric(df["photos_count"], errors="coerce").fillna(0).astype(int)
+    df["title"] = df["title"].fillna("").astype(str)
+    df["review_text"] = df["review_text"].fillna("").astype(str)
+    df["submission_time"] = pd.to_datetime(df["submission_time"], errors="coerce", utc=True).dt.tz_convert(None)
+    df["submission_date"] = df["submission_time"].dt.date
+    df["submission_month"] = df["submission_time"].dt.to_period("M").astype(str)
+    df["content_locale"] = df["content_locale"].fillna("").astype(str).replace({"": pd.NA})
+    df["base_sku"] = df.get("base_sku", pd.Series(dtype="str")).fillna("").astype(str).str.strip()
+    df["sku_item"] = df.get("sku_item", pd.Series(dtype="str")).fillna("").astype(str).str.strip()
+    df["product_id"] = df["product_id"].fillna("").astype(str).str.strip()
+    fallback = df["base_sku"].where(df["base_sku"].ne(""), df["product_id"])
+    df["product_or_sku"] = df["sku_item"].where(df["sku_item"].ne(""), fallback)
+    df["product_or_sku"] = df["product_or_sku"].fillna("").astype(str).str.strip().replace({"": pd.NA})
+    df["title_and_text"] = (df["title"].str.strip() + " " + df["review_text"].str.strip()).str.strip()
+    df["has_photos"] = df["photos_count"] > 0
+    df["has_media"] = df["has_photos"]
+    df["review_length_chars"] = df["review_text"].str.len()
+    df["review_length_words"] = df["review_text"].str.split().str.len().fillna(0).astype(int)
+    df["rating_label"] = df["rating"].map(lambda x: f"{int(x)} star" if pd.notna(x) else "Unknown")
+    df["year_month_sort"] = pd.to_datetime(df["submission_month"], format="%Y-%m", errors="coerce")
+    sc = [c for c in ["submission_time", "review_id"] if c in df.columns]
+    if sc:
+        df = df.sort_values(sc, ascending=[False, False], na_position="last").reset_index(drop=True)
+    return df
+
+def _pick_col(df, aliases):
+    lk = {str(c).strip().lower(): c for c in df.columns}
+    for a in aliases:
+        c = lk.get(str(a).strip().lower())
+        if c:
+            return c
+    return None
+
+def _series_alias(df, aliases):
+    c = _pick_col(df, aliases)
+    if c is None:
+        return pd.Series([pd.NA] * len(df), index=df.index)
+    return df[c]
+
+def _parse_flag(v, *, pos, neg):
+    t = _safe_text(v).lower()
+    if t in {"", "nan", "none", "null", "n/a"}:
+        return pd.NA
+    if any(t == x.lower() for x in neg):
+        return False
+    if any(t == x.lower() for x in pos):
+        return True
+    if t.startswith(("not ", "non ")):
+        return False
+    return True
+
+def _normalize_uploaded_df(raw, *, source_name=""):
+    w = raw.copy()
+    w.columns = [str(c).strip() for c in w.columns]
+    n = pd.DataFrame(index=w.index)
+    n["review_id"] = _series_alias(w, ["Event Id", "Event ID", "Review ID", "Review Id", "Id"])
+    n["product_id"] = _series_alias(w, ["Base SKU", "Product ID", "Product Id", "ProductId", "BaseSKU"])
+    n["base_sku"] = _series_alias(w, ["Base SKU", "BaseSKU"])
+    n["sku_item"] = _series_alias(w, ["SKU Item", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No"])
+    n["original_product_name"] = _series_alias(w, ["Product Name", "Product", "Name"])
+    n["review_text"] = _series_alias(w, ["Review Text", "Review", "Body", "Content"])
+    n["title"] = _series_alias(w, ["Title", "Review Title", "Headline"])
+    n["post_link"] = _series_alias(w, ["Post Link", "URL", "Review URL", "Product URL"])
+    n["rating"] = _series_alias(w, ["Rating (num)", "Rating", "Stars", "Star Rating"])
+    n["submission_time"] = _series_alias(w, ["Opened date", "Opened Date", "Submission Time", "Review Date", "Date"])
+    n["content_locale"] = _series_alias(w, ["Content Locale", "Locale", "Location", "Country"])
+    n["retailer"] = _series_alias(w, ["Retailer", "Merchant", "Channel"])
+    n["age_group"] = _series_alias(w, ["Age Group", "Age", "Age Range"])
+    n["user_location"] = _series_alias(w, ["Location", "Country"])
+    n["user_nickname"] = pd.NA
+    n["total_positive_feedback_count"] = pd.NA
+    n["is_recommended"] = pd.NA
+    n["photos_count"] = 0
+    n["photo_urls"] = pd.NA
+    n["source_file"] = source_name or pd.NA
+    n["source_system"] = "Uploaded file"
+    seeded = _series_alias(w, ["Seeded Flag", "Seeded", "Incentivized"])
+    n["incentivized_review"] = seeded.map(lambda v: _parse_flag(v,
+        pos=["seeded", "incentivized", "yes", "true", "1"],
+        neg=["not seeded", "not incentivized", "no", "false", "0"]))
+    syndicated = _series_alias(w, ["Syndicated Flag", "Syndicated"])
+    n["is_syndicated"] = syndicated.map(lambda v: _parse_flag(v,
+        pos=["syndicated", "yes", "true", "1"],
+        neg=["not syndicated", "no", "false", "0"]))
+    return _finalize_df(n)
+
+def _read_uploaded_file(f):
+    fname = getattr(f, "name", "uploaded_file")
+    raw = f.getvalue()
+    suffix = fname.lower().rsplit(".", 1)[-1] if "." in fname else "csv"
+    if suffix == "csv":
+        try:
+            raw_df = pd.read_csv(io.BytesIO(raw))
+        except UnicodeDecodeError:
+            raw_df = pd.read_csv(io.BytesIO(raw), encoding="latin-1")
+    elif suffix in {"xlsx", "xls", "xlsm"}:
+        raw_df = pd.read_excel(io.BytesIO(raw))
+    else:
+        raise ReviewDownloaderError(f"Unsupported: {fname}")
+    if raw_df.empty:
+        raise ReviewDownloaderError(f"{fname} is empty.")
+    return _normalize_uploaded_df(raw_df, source_name=fname)
+
+def _load_uploaded_files(files):
+    if not files:
+        raise ReviewDownloaderError("Upload at least one file.")
+    with st.spinner("Reading files…"):
+        frames = [_read_uploaded_file(f) for f in files]
+    combined = pd.concat(frames, ignore_index=True)
+    combined["review_id"] = combined["review_id"].astype(str)
+    combined = combined.drop_duplicates(subset=["review_id"], keep="first").reset_index(drop=True)
+    combined = _finalize_df(combined)
+    pid = (
+        _first_non_empty(combined["base_sku"].fillna("")) or
+        _first_non_empty(combined["product_id"].fillna("")) or
+        "UPLOADED_REVIEWS"
+    )
+    names = [getattr(f, "name", "file") for f in files]
+    src = names[0] if len(names) == 1 else f"{len(names)} uploaded files"
+    summary = ReviewBatchSummary(
+        product_url="",
+        product_id=pid,
+        total_reviews=len(combined),
+        page_size=max(len(combined), 1),
+        requests_needed=0,
+        reviews_downloaded=len(combined),
+    )
+    return dict(summary=summary, reviews_df=combined, source_type="uploaded", source_label=src)
 
 def _apply_source_metadata(df: pd.DataFrame, *, retailer: str = "", source_system: str = "", post_link: str = "") -> pd.DataFrame:
     out = df.copy()
@@ -1859,13 +2102,19 @@ def _load_product_reviews(product_url):
         return _load_powerreviews_api_url(product_url)
 
     session = _get_session()
+    product_html = ""
+    page_fetch_error = None
     with st.spinner("Loading product page…"):
-        resp = session.get(product_url, timeout=35)
-        resp.raise_for_status()
-        product_html = resp.text
+        try:
+            resp = session.get(product_url, timeout=35)
+            resp.raise_for_status()
+            product_html = resp.text or ""
+        except Exception as exc:
+            page_fetch_error = exc
+            product_html = ""
 
     # First: if the page source embeds a review API URL, use that directly.
-    embedded_urls = _extract_embedded_review_api_urls(product_html)
+    embedded_urls = _extract_embedded_review_api_urls(product_html) if product_html else []
     if embedded_urls:
         for api_url in embedded_urls:
             try:
@@ -1876,9 +2125,14 @@ def _load_product_reviews(product_url):
             except Exception:
                 continue
 
-    # Site-specific fallbacks.
+    # Site-specific fallbacks that can work even when the retailer blocks page scraping.
     if "costco.com" in host:
-        return _load_bazaarvoice_product_page(session, product_url=product_url, product_html=product_html, cfg={**COSTCO_BV_CONFIG, "kind": "action", "source_system": "Bazaarvoice", "retailer": "Costco"})
+        return _load_bazaarvoice_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={**COSTCO_BV_CONFIG, "kind": "action", "source_system": "Bazaarvoice", "retailer": "Costco"},
+        )
 
     if "sephora.com" in host:
         sephora_candidates = []
@@ -1958,22 +2212,30 @@ def _load_product_reviews(product_url):
     generic_candidates = []
     generic_candidates.extend(_extract_candidate_tokens_from_url(product_url))
     generic_candidates.extend(_extract_candidate_tokens_from_html(product_html))
-    return _load_bazaarvoice_product_page(
-        session,
-        product_url=product_url,
-        product_html=product_html,
-        cfg={
-            "kind": "action",
-            "passkey": DEFAULT_PASSKEY,
-            "displaycode": DEFAULT_DISPLAYCODE,
-            "api_version": DEFAULT_API_VERSION,
-            "sort": DEFAULT_SORT,
-            "content_locales": DEFAULT_CONTENT_LOCALES,
-            "retailer": "SharkNinja",
-            "source_system": "Bazaarvoice",
-        },
-        extra_candidates=generic_candidates,
-    )
+    try:
+        return _load_bazaarvoice_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={
+                "kind": "action",
+                "passkey": DEFAULT_PASSKEY,
+                "displaycode": DEFAULT_DISPLAYCODE,
+                "api_version": DEFAULT_API_VERSION,
+                "sort": DEFAULT_SORT,
+                "content_locales": DEFAULT_CONTENT_LOCALES,
+                "retailer": "SharkNinja",
+                "source_system": "Bazaarvoice",
+            },
+            extra_candidates=generic_candidates,
+        )
+    except Exception:
+        if page_fetch_error is not None:
+            if isinstance(page_fetch_error, requests.HTTPError):
+                raise
+            raise ReviewDownloaderError(f"Could not load product page or match a review feed: {page_fetch_error}")
+        raise
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
