@@ -570,13 +570,37 @@ def _safe_json_load(s):
     return {}
 
 
+def _prepare_messages_for_model(model: str, messages):
+    prepared = []
+    use_developer = _safe_text(model).lower().startswith("gpt-5")
+    for msg in list(messages or []):
+        if not isinstance(msg, dict):
+            continue
+        item = dict(msg)
+        if use_developer and item.get("role") == "system":
+            item["role"] = "developer"
+        prepared.append(item)
+    return prepared
+
+
+def _build_completion_token_kwargs(max_tokens):
+    try:
+        limit = int(max_tokens) if max_tokens is not None else None
+    except Exception:
+        limit = None
+    if limit is None or limit <= 0:
+        return {}
+    return {"max_completion_tokens": limit}
+
+
 def _chat_complete(client, *, model, messages, temperature=0.0, response_format=None,
                    max_tokens=1200, reasoning_effort=None, _max_retries=3):
     if client is None:
         return ""
 
     effort = _normalize_reasoning_effort_for_model(model, reasoning_effort)
-    kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
+    kwargs = dict(model=model, messages=_prepare_messages_for_model(model, messages))
+    kwargs.update(_build_completion_token_kwargs(max_tokens))
     if response_format:
         kwargs["response_format"] = response_format
     if effort:
@@ -596,16 +620,41 @@ def _chat_complete(client, *, model, messages, temperature=0.0, response_format=
             last_exc = exc
             err = str(exc).lower()
 
+            if "max_completion_tokens" in kwargs and any(k in err for k in (
+                "unexpected keyword argument 'max_completion_tokens'",
+                'unsupported parameter: "max_completion_tokens"',
+                "unsupported parameter: 'max_completion_tokens'",
+                "unknown parameter: max_completion_tokens",
+                "max_completion_tokens is not supported",
+            )):
+                token_limit = kwargs.pop("max_completion_tokens", None)
+                if token_limit is not None:
+                    kwargs["max_tokens"] = token_limit
+                continue
+
+            if "max_tokens" in kwargs and any(k in err for k in (
+                "unexpected keyword argument 'max_tokens'",
+                'unsupported parameter: "max_tokens"',
+                "unsupported parameter: 'max_tokens'",
+                "use 'max_completion_tokens' instead",
+                "deprecated in favor of `max_completion_tokens`",
+                "not compatible with o-series models",
+                "not compatible with reasoning models",
+            )):
+                token_limit = kwargs.pop("max_tokens", None)
+                if token_limit is not None:
+                    kwargs["max_completion_tokens"] = token_limit
+                continue
+
             if reasoning_enabled and any(k in err for k in (
                 "reasoning_effort",
-                "unexpected keyword argument",
-                "unknown parameter",
-                "unsupported",
-                "does not support",
-                "not support",
-                "extra inputs are not permitted",
+                "unknown parameter: reasoning_effort",
+                'unsupported parameter: "reasoning_effort"',
+                "unsupported parameter: 'reasoning_effort'",
                 "invalid reasoning",
                 "invalid value for reasoning",
+                "does not support reasoning effort",
+                "not support reasoning effort",
             )):
                 kwargs.pop("reasoning_effort", None)
                 reasoning_enabled = False
@@ -1319,36 +1368,87 @@ def _cumulative_avg_region_trend(df, *, organic_only=False, top_n=2, smoothing_l
     return trend.sort_values("day").reset_index(drop=True), regions
 
 
+def _build_volume_bar_series(trend, volume_mode):
+    if trend is None or trend.empty:
+        return pd.DataFrame(columns=["x", "volume", "width_ms", "label"]), "Reviews/day"
+
+    w = trend[["day", "daily_volume"]].copy()
+    w["day"] = pd.to_datetime(w["day"], errors="coerce")
+    w["daily_volume"] = pd.to_numeric(w["daily_volume"], errors="coerce").fillna(0)
+    w = w.dropna(subset=["day"])
+    if w.empty:
+        return pd.DataFrame(columns=["x", "volume", "width_ms", "label"]), "Reviews/day"
+
+    mode = _safe_text(volume_mode) or "Reviews/day"
+    if mode == "Reviews/week":
+        w["bucket_start"] = w["day"].dt.to_period("W-SUN").dt.start_time
+        grouped = w.groupby("bucket_start", as_index=False).agg(volume=("daily_volume", "sum"))
+        grouped["bucket_days"] = 7.0
+        grouped["label"] = grouped["bucket_start"].dt.strftime("Week of %Y-%m-%d")
+        axis_title = "Reviews/week"
+    elif mode == "Reviews/month":
+        w["bucket_start"] = w["day"].dt.to_period("M").dt.start_time
+        grouped = w.groupby("bucket_start", as_index=False).agg(volume=("daily_volume", "sum"))
+        grouped["bucket_days"] = grouped["bucket_start"].dt.days_in_month.astype(float)
+        grouped["label"] = grouped["bucket_start"].dt.strftime("%Y-%m")
+        axis_title = "Reviews/month"
+    else:
+        grouped = w.rename(columns={"day": "bucket_start", "daily_volume": "volume"}).copy()
+        grouped["bucket_days"] = 1.0
+        grouped["label"] = grouped["bucket_start"].dt.strftime("%Y-%m-%d")
+        axis_title = "Reviews/day"
+
+    grouped["x"] = grouped["bucket_start"] + pd.to_timedelta(grouped["bucket_days"] / 2.0, unit="D")
+    grouped["width_ms"] = grouped["bucket_days"].map(lambda d: int(pd.Timedelta(days=max(float(d) - 0.15, 0.35)).total_seconds() * 1000))
+    grouped["volume"] = pd.to_numeric(grouped["volume"], errors="coerce").fillna(0).astype(int)
+    return grouped[["x", "volume", "width_ms", "label"]], axis_title
+
+
+def _add_axis_break_indicator(fig, *, side="right"):
+    if side == "right":
+        x0, x1 = 0.988, 0.998
+    else:
+        x0, x1 = 0.002, 0.012
+    y0 = 0.08
+    fig.add_shape(type="line", xref="paper", yref="paper", x0=x0, y0=y0, x1=x1, y1=y0 + 0.02, line=dict(color="rgba(71,85,105,0.92)", width=2), layer="above")
+    fig.add_shape(type="line", xref="paper", yref="paper", x0=x0, y0=y0 + 0.028, x1=x1, y1=y0 + 0.048, line=dict(color="rgba(71,85,105,0.92)", width=2), layer="above")
+
+
 def _render_reviews_over_time_chart(df):
     with st.container(border=True):
         st.markdown("<div class='section-title'>📈 Cumulative Avg ★ Over Time by Region (Weighted)</div>", unsafe_allow_html=True)
-        st.markdown("<div class='section-sub'>Includes subtle volume bars (review count per day) on a secondary axis.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-sub'>Volume bars stay on the left axis and cumulative average stays on the right axis.</div>", unsafe_allow_html=True)
 
-        c0, c1, c2, c3, c4 = st.columns([1.15, 1, 1, 1, 1.25])
+        c0, c1, c2, c3, c4, c5 = st.columns([1.05, 1, 1, 1, 1.15, 1.3])
         smoothing = c0.selectbox("Smoothing", ["7-day", "14-day", "30-day", "None"], index=0, key="ot_smoothing")
         show_overall = c1.toggle("Show overall", value=True, key="ot_show_overall")
         show_volume = c2.toggle("Show volume bars", value=True, key="ot_show_volume")
         organic_only = c3.toggle("Organic only", value=False, key="ot_organic_only")
-        y_view = c4.radio("Y-axis view", ["Zoomed-in", "Full scale"], horizontal=True, key="ot_y_view")
+        volume_mode = c4.selectbox("Volume bars", ["Reviews/day", "Reviews/week", "Reviews/month"], index=0, key="ot_volume_mode")
+        y_view = c5.radio("Y-axis view", ["Zoomed-in", "Full scale"], horizontal=True, key="ot_y_view")
 
         trend, regions = _cumulative_avg_region_trend(df, organic_only=organic_only, top_n=2, smoothing_label=smoothing)
         if trend.empty:
             st.info("No dated reviews available for the over-time chart.")
             return
 
+        volume_bars, volume_axis_title = _build_volume_bar_series(trend, volume_mode)
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        if show_volume:
+        if show_volume and not volume_bars.empty:
             fig.add_trace(
                 go.Bar(
-                    x=trend["day"],
-                    y=trend["daily_volume"],
-                    name="Daily volume",
+                    x=volume_bars["x"],
+                    y=volume_bars["volume"],
+                    width=volume_bars["width_ms"],
+                    name=volume_axis_title,
                     marker_color="rgba(226,232,240,0.95)",
-                    opacity=0.6,
-                    hovertemplate="%{x|%Y-%m-%d}<br>Daily volume: %{y:,}<extra></extra>",
+                    marker_line_color="rgba(226,232,240,0.95)",
+                    opacity=0.72,
+                    customdata=np.stack([volume_bars["label"]], axis=-1),
+                    hovertemplate="%{customdata[0]}<br>Reviews: %{y:,}<extra></extra>",
                 ),
-                secondary_y=True,
+                secondary_y=False,
             )
 
         region_colors = ["#f97316", "#10b981", "#3b82f6", "#ef4444"]
@@ -1365,7 +1465,7 @@ def _render_reviews_over_time_chart(df):
                     line=dict(color=region_colors[idx % len(region_colors)], width=2),
                     hovertemplate=f"{region}<br>%{{x|%Y-%m-%d}}<br>Cumulative Avg ★: %{{y:.3f}}<extra></extra>",
                 ),
-                secondary_y=False,
+                secondary_y=True,
             )
 
         if show_overall and "overall_cum_avg" in trend.columns:
@@ -1378,7 +1478,7 @@ def _render_reviews_over_time_chart(df):
                     line=dict(color="#8b5cf6", width=3),
                     hovertemplate="Overall<br>%{x|%Y-%m-%d}<br>Cumulative Avg ★: %{y:.3f}<extra></extra>",
                 ),
-                secondary_y=False,
+                secondary_y=True,
             )
 
         fig.update_layout(
@@ -1388,6 +1488,7 @@ def _render_reviews_over_time_chart(df):
             paper_bgcolor="rgba(0,0,0,0)",
             font_family="Inter",
             legend=dict(orientation="h", y=1.07, x=0),
+            bargap=0.06,
         )
         fig.update_xaxes(title_text="", showgrid=False)
 
@@ -1407,8 +1508,11 @@ def _render_reviews_over_time_chart(df):
                 ymax = min(5.0, mid + 0.09)
             y_range = [ymin, ymax]
 
-        fig.update_yaxes(title_text="Cumulative Avg ★", range=y_range, secondary_y=False, showgrid=True, gridcolor="rgba(148,163,184,0.15)")
-        fig.update_yaxes(title_text="Reviews/day" if show_volume else "", secondary_y=True, showgrid=False, rangemode="tozero", visible=show_volume)
+        fig.update_yaxes(title_text=volume_axis_title if show_volume else "", secondary_y=False, showgrid=False, rangemode="tozero", visible=show_volume)
+        fig.update_yaxes(title_text="Cumulative Avg ★", range=y_range, secondary_y=True, showgrid=True, gridcolor="rgba(148,163,184,0.15)")
+
+        if y_view == "Zoomed-in" and y_range[0] > 1.05:
+            _add_axis_break_indicator(fig, side="right")
 
         st.plotly_chart(fig, use_container_width=True)
 
@@ -2562,6 +2666,7 @@ def _init_state():
         workspace_product_url=DEFAULT_PRODUCT_URL,
         workspace_file_uploader_nonce=0,
         workspace_active_tab=TAB_DASHBOARD,
+        workspace_tab_request=None,
         ai_scroll_to_top=False,
         sym_delighters=[],
         sym_detractors=[],
@@ -2592,6 +2697,7 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["prompt_run_notice"] = None
     st.session_state["review_explorer_page"] = 1
     st.session_state["workspace_active_tab"] = TAB_DASHBOARD
+    st.session_state["workspace_tab_request"] = None
     st.session_state["ai_scroll_to_top"] = False
     st.session_state["sym_processed_rows"] = []
     st.session_state["sym_new_candidates"] = {}
@@ -2851,10 +2957,10 @@ def _render_review_card(row, evidence_items=None):
     review_text = _safe_text(row.get("review_text"), "—") or "—"
     meta_bits = [b for b in [_safe_text(row.get("submission_date")), _safe_text(row.get("content_locale")), _safe_text(row.get("retailer")), _safe_text(row.get("product_or_sku"))] if b]
     is_organic = not _safe_bool(row.get("incentivized_review"), False)
-    status_chips = f"<span class='chip {'green' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
+    status_chips = f"<span class='chip {'gray' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
     rec = row.get("is_recommended")
     if not _is_missing(rec):
-        status_chips += f"<span class='chip {'green' if _safe_bool(rec, False) else 'red'}'>{'Recommended' if _safe_bool(rec, False) else 'Not recommended'}</span>"
+        status_chips += f"<span class='chip {'gray' if _safe_bool(rec, False) else 'red'}'>{'Recommended' if _safe_bool(rec, False) else 'Not recommended'}</span>"
     det_tags = [str(row.get(f"AI Symptom Detractor {j}", "")) for j in range(1, 11) if _is_filled(row.get(f"AI Symptom Detractor {j}"))]
     del_tags = [str(row.get(f"AI Symptom Delighter {j}", "")) for j in range(1, 11) if _is_filled(row.get(f"AI Symptom Delighter {j}"))]
     with st.container(border=True):
@@ -2890,7 +2996,7 @@ def _render_review_card(row, evidence_items=None):
 def _render_dashboard(filtered_df, overall_df=None):
     od = overall_df if overall_df is not None else filtered_df
     st.markdown("<div class='section-title'>Dashboard</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Rating mix, volume trend, and cohort analytics for the current filter set.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Rating mix, over-time trend, and cohort analytics for the current filter set.</div>", unsafe_allow_html=True)
     sym_state = _detect_symptom_state(od)
     if sym_state == "none":
         st.markdown("""<div class="sym-state-banner" style="padding:1.5rem 1.8rem;text-align:left;display:flex;align-items:center;gap:16px;margin-bottom:.5rem;">
@@ -2901,7 +3007,7 @@ def _render_dashboard(filtered_df, overall_df=None):
           </div>
         </div>""", unsafe_allow_html=True)
         if st.button("💊 Go to Symptomizer →", type="primary", key="dash_go_sym", use_container_width=False):
-            st.session_state["workspace_active_tab"] = TAB_SYMPTOMIZER
+            st.session_state["workspace_tab_request"] = TAB_SYMPTOMIZER
             st.rerun()
         st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
@@ -2941,22 +3047,6 @@ def _render_dashboard(filtered_df, overall_df=None):
 
     st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
     _render_symptom_dashboard(chart_df, od)
-
-    st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
-    with st.container(border=True):
-        vel_df = _rolling_velocity(chart_df)
-        if vel_df.empty:
-            st.info("No dated reviews for volume chart.")
-        else:
-            fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig2.add_trace(go.Bar(x=vel_df["month_start"], y=vel_df["review_count"], name="Volume", marker_color="#6366f1", opacity=.45), secondary_y=False)
-            fig2.add_trace(go.Scatter(x=vel_df["month_start"], y=vel_df["rolling_avg"], name="3-mo avg", mode="lines", line=dict(color="#6366f1", width=2, dash="dot")), secondary_y=False)
-            fig2.add_trace(go.Scatter(x=vel_df["month_start"], y=vel_df["avg_rating"], name="Avg ★", mode="lines+markers", line=dict(color="#0f172a", width=2), marker=dict(size=5)), secondary_y=True)
-            fig2.update_layout(title="Review volume + 3-month rolling average", margin=dict(l=24, r=24, t=52, b=20), hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", legend=dict(orientation="h", y=1.04, x=0))
-            fig2.update_xaxes(title_text="", showgrid=False)
-            fig2.update_yaxes(title_text="Reviews", secondary_y=False, showgrid=True, gridcolor="rgba(148,163,184,0.15)")
-            fig2.update_yaxes(title_text="Avg ★", range=[1, 5], secondary_y=True, showgrid=False)
-            st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
     st.markdown("<div class='section-title' style='font-size:15px;'>📊 Sentiment & Market</div>", unsafe_allow_html=True)
@@ -3614,7 +3704,7 @@ def main():
         if st.button("Build review workspace", type="primary", key="ws_build_url"):
             try:
                 nd = _load_product_reviews(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
-                st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD)
+                st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None)
                 st.rerun()
             except requests.HTTPError as exc:
                 st.error(f"HTTP error: {exc}")
@@ -3629,7 +3719,7 @@ def main():
         if st.button("Build review workspace from file", type="primary", key="ws_build_file"):
             try:
                 nd = _load_uploaded_files(uploaded_files or [])
-                st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD)
+                st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None)
                 if uploaded_files and len(uploaded_files) == 1:
                     fname = getattr(uploaded_files[0], "name", "")
                     if fname.lower().endswith(".xlsx"):
@@ -3660,6 +3750,11 @@ def main():
     _render_workspace_header(summary, overall_df, st.session_state.get("prompt_run_artifacts"), source_type=source_type, source_label=source_label)
     _render_top_metrics(overall_df, filtered_df)
     _render_status_bar(filter_description, filtered_df, overall_df)
+    pending_tab = st.session_state.pop("workspace_tab_request", None)
+    if pending_tab in WORKSPACE_TABS:
+        st.session_state["workspace_active_tab"] = pending_tab
+    elif st.session_state.get("workspace_active_tab") not in WORKSPACE_TABS:
+        st.session_state["workspace_active_tab"] = TAB_DASHBOARD
     st.markdown("<div class='nav-tabs-wrap'><div class='nav-tabs-label'>Workspace</div></div>", unsafe_allow_html=True)
     active_tab = st.radio("Workspace tab", WORKSPACE_TABS, horizontal=True, key="workspace_active_tab", label_visibility="collapsed")
     common = dict(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
