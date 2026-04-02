@@ -155,22 +155,29 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--slate-50);border:1px solid var(--border);font-size:11.5px;font-weight:600;color:var(--navy);}
 .pill .muted{color:var(--slate-500);font-weight:700;}
 .small-muted{font-size:12px;color:var(--slate-500);}
-.ref-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px;margin-right:2px;z-index:20;}
-.ref-tile{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:11.5px;font-weight:700;line-height:1;cursor:help;white-space:nowrap;}
-.ref-tip{position:absolute;left:50%;transform:translateX(-50%);top:calc(100% + 8px);width:min(420px,calc(100vw - 36px));max-height:min(320px,60vh);overflow-y:auto;overflow-x:hidden;box-sizing:border-box;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:10px 11px;box-shadow:var(--shadow-lg);z-index:1100;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .12s ease;white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
-.ref-wrap:hover .ref-tip,.ref-wrap:focus-within .ref-tip{opacity:1;visibility:visible;}
+.ref-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px;margin-right:2px;line-height:1;z-index:40;isolation:isolate;}
+.ref-wrap::after{content:"";position:absolute;left:50%;transform:translateX(-50%);top:100%;width:min(460px,calc(100vw - 28px));height:14px;background:transparent;}
+.ref-tile{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:11.5px;font-weight:700;line-height:1;cursor:help;white-space:nowrap;position:relative;z-index:2;}
+.ref-tip{position:absolute;left:50%;transform:translateX(-50%);top:calc(100% + 2px);width:min(460px,calc(100vw - 28px));max-height:min(360px,68vh);overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;box-sizing:border-box;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius-md);padding:10px 11px;box-shadow:var(--shadow-lg);z-index:1200;opacity:0;visibility:hidden;pointer-events:auto;transition:opacity .12s ease, visibility .12s ease;white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
+.ref-wrap:hover .ref-tip,.ref-wrap:focus-within .ref-tip,.ref-tip:hover{opacity:1;visibility:visible;}
+.ref-tip::-webkit-scrollbar{width:10px;}
+.ref-tip::-webkit-scrollbar-thumb{background:rgba(100,116,139,.35);border-radius:999px;}
 .ref-item{padding:7px 0;border-bottom:1px solid var(--border);}
 .ref-item:last-child{border-bottom:none;padding-bottom:0;}
 .ref-item:first-child{padding-top:0;}
 .ref-meta{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--slate-500);font-weight:700;margin-bottom:3px;}
-.ref-title{font-size:12px;font-weight:700;color:var(--navy);margin-bottom:3px;line-height:1.35;}
+.ref-title{font-size:12px;font-weight:700;color:var(--navy);margin-bottom:3px;line-height:1.35;overflow-wrap:anywhere;word-break:break-word;}
 .ref-snippet{font-size:11.5px;line-height:1.45;color:var(--slate-600);white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
-.ref-empty{font-size:11.5px;color:var(--slate-500);line-height:1.4;}
-[data-testid="stChatMessage"],[data-testid="stChatMessageContent"],[data-testid="stMarkdownContainer"]{overflow:visible!important;}
+.ref-empty{font-size:11.5px;color:var(--slate-500);line-height:1.4;overflow-wrap:anywhere;word-break:break-word;}
+[data-testid="stChatMessage"],[data-testid="stChatMessageContent"]{overflow:visible!important;}
+[data-testid="stMarkdownContainer"]{overflow:visible!important;overflow-wrap:anywhere!important;word-break:break-word!important;}
+[data-testid="stChatMessageContent"] p,[data-testid="stChatMessageContent"] li{font-size:12.8px;line-height:1.58;}
+[data-testid="stChatMessageContent"] h1,[data-testid="stChatMessageContent"] h2,[data-testid="stChatMessageContent"] h3,[data-testid="stChatMessageContent"] h4{font-size:13px;line-height:1.45;font-weight:700;margin:.5rem 0 .2rem;letter-spacing:-.01em;}
+[data-testid="stChatMessageContent"] ul,[data-testid="stChatMessageContent"] ol{margin:.2rem 0 .55rem 1rem;}
 .workspace-nav-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:12px 14px;box-shadow:var(--shadow-sm);margin:1.05rem 0 1.25rem;}
 @keyframes tw-spin{to{transform:rotate(360deg);}}
 @media(max-width:1100px){.hero-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
-@media(max-width:768px){.hero-grid{grid-template-columns:1fr;}.ref-tip{left:0;transform:none;width:min(320px,calc(100vw - 32px));}}
+@media(max-width:768px){.hero-grid{grid-template-columns:1fr;}.ref-wrap{display:inline-block;max-width:100%;}.ref-tip{left:0;transform:none;width:min(340px,calc(100vw - 24px));max-height:min(52vh,340px);}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -3328,13 +3335,19 @@ def _render_active_filter_summary(filter_state: Dict[str, Any], overall_df: pd.D
 
 def _render_workspace_nav() -> str:
     current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
-    rows = [
-        [TAB_DASHBOARD, TAB_REVIEW_EXPLORER],
-        [TAB_AI_ANALYST, TAB_REVIEW_PROMPT],
-        [TAB_SYMPTOMIZER],
-    ]
     with st.container(border=True):
         st.markdown("<div class='nav-tabs-label'>Workspace</div>", unsafe_allow_html=True)
+        dash_kwargs = {"use_container_width": True, "key": "workspace_nav_dashboard"}
+        if current == TAB_DASHBOARD:
+            dash_kwargs["type"] = "primary"
+        if st.button(TAB_DASHBOARD, **dash_kwargs):
+            current = TAB_DASHBOARD
+            st.session_state["workspace_active_tab"] = TAB_DASHBOARD
+        st.markdown("<div style='height:.45rem'></div>", unsafe_allow_html=True)
+        rows = [
+            [TAB_REVIEW_EXPLORER, TAB_AI_ANALYST],
+            [TAB_REVIEW_PROMPT, TAB_SYMPTOMIZER],
+        ]
         for ridx, row in enumerate(rows):
             cols = st.columns(len(row))
             for cidx, (col, label) in enumerate(zip(cols, row)):
@@ -3363,7 +3376,7 @@ GENERAL_INSTRUCTIONS = textwrap.dedent("""
     ROLE: Synthesise consumer review data into sharp, actionable insights.
     Prioritise evidence from the supplied dataset over generic assumptions.
     ANSWER FORMAT
-    • Use clear markdown headings (##, ###).
+    • Use compact markdown. Prefer short bold section labels instead of large headings.
     • Lead with the most important insight — do not bury the lede.
     • Cite review IDs inline: (review_ids: 12345, 67890).
     • For every quantitative claim state the count or percentage from the data.
@@ -4399,6 +4412,7 @@ def _reference_preview_rows(review_ids: Sequence[str], df: pd.DataFrame, max_ite
     lookup = df.copy()
     lookup["review_id"] = lookup["review_id"].astype(str)
     lookup["__rid_norm"] = lookup["review_id"].astype(str).str.strip().str.lower()
+    lookup["__rid_simple"] = lookup["__rid_norm"].str.replace(r"[^a-z0-9]+", "", regex=True)
     out = []
     used = set()
     for rid in review_ids:
@@ -4410,6 +4424,10 @@ def _reference_preview_rows(review_ids: Sequence[str], df: pd.DataFrame, max_ite
             continue
         used.add(rid_norm)
         hit = lookup[lookup["__rid_norm"] == rid_norm]
+        if hit.empty:
+            rid_simple = re.sub(r"[^a-z0-9]+", "", rid_norm)
+            if rid_simple:
+                hit = lookup[lookup["__rid_simple"] == rid_simple]
         if hit.empty:
             hit = lookup[lookup["review_id"].astype(str).str.contains(re.escape(cleaned), case=False, na=False)].head(1)
         if hit.empty:
@@ -4450,7 +4468,24 @@ def _reference_tile_html_from_ids(review_ids: Sequence[str], df: pd.DataFrame, *
         if extra:
             bits.append(f"<div class='ref-item'><div class='ref-empty'>+{extra} more referenced review(s)</div></div>")
         tip = "".join(bits)
-    return f"<span class='ref-wrap'><span class='ref-tile'>{_esc(label)}</span><span class='ref-tip'>{tip}</span></span>"
+    return f"<span class='ref-wrap' tabindex='0' role='button' aria-label='{_esc(label)} review reference'><span class='ref-tile'>{_esc(label)}</span><span class='ref-tip'>{tip}</span></span>"
+
+
+def _normalize_ai_answer_display(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    lines = []
+    for line in raw.splitlines():
+        if re.match(r"^\s{0,3}#{1,6}\s+", line):
+            section = re.sub(r"^\s{0,3}#{1,6}\s+", "", line).strip()
+            section = section.rstrip(":")
+            lines.append(f"**{section}**" if section else "")
+        else:
+            lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _reference_tile_html_for_row(row) -> str:
@@ -4477,10 +4512,18 @@ def _reference_tile_html_for_row(row) -> str:
 
 
 def _replace_review_citations_with_reference_tiles(text: str, df: pd.DataFrame) -> str:
-    safe = html.escape(str(text or ""), quote=False)
+    normalized = _normalize_ai_answer_display(text)
+    safe = html.escape(normalized, quote=False)
     def repl(match):
         raw = match.group(1)
-        ids = [p.strip() for p in re.split(r"[,;]", raw) if p.strip()]
+        ids = [p.strip() for p in re.split(r"[,;\n|]+", raw) if p.strip()]
+        if len(ids) <= 1:
+            token_ids = [
+                tok for tok in re.findall(r"[A-Za-z0-9_-]{3,}", raw)
+                if tok.lower() not in {"review", "reviews", "reviewid", "reviewids", "review_id", "review_ids", "id", "ids"}
+            ]
+            if token_ids:
+                ids = token_ids
         return _reference_tile_html_from_ids(ids, df, label="Reference")
     return _REVIEW_REF_PATTERN.sub(repl, safe)
 
@@ -4786,8 +4829,7 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
     notice = st.session_state.pop("chat_scope_notice", None)
     if notice:
         st.info(notice)
-    if st.session_state.pop("ai_scroll_to_top", False):
-        st.markdown("<script>window.scrollTo({top:0,behavior:'smooth'});window.parent.scrollTo({top:0,behavior:'smooth'});</script>", unsafe_allow_html=True)
+    st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
     with st.container(border=True):
         sc = st.columns([1, 1, 1, 2])
         sc[0].metric("In scope", f"{len(filtered_df):,}")
@@ -4829,10 +4871,12 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
     quick_trigger = None
     with st.container(border=True):
         st.markdown("**Quick reports**")
-        acols = st.columns(4)
-        for col, (label, config) in zip(acols, quick_actions.items()):
-            if col.button(label, use_container_width=True, help=config["help"], key=f"ai_q_{_slugify(label)}"):
-                quick_trigger = (config["persona"], label, config["prompt"])
+        action_rows = [list(quick_actions.items())[:2], list(quick_actions.items())[2:]]
+        for ridx, row in enumerate(action_rows):
+            acols = st.columns(len(row))
+            for cidx, (col, (label, config)) in enumerate(zip(acols, row)):
+                if col.button(label, use_container_width=True, help=config["help"], key=f"ai_q_{ridx}_{cidx}_{_slugify(label)}"):
+                    quick_trigger = (config["persona"], label, config["prompt"])
         lc1, lc2 = st.columns([2, 2])
         lc1.radio("Report length", ["Short", "Medium", "Long"], horizontal=True, index=1, key="ai_report_length", help="Short ≈150 words · Medium ≈350 words · Long ≈700 words")
         lc2.caption("Each report is grounded in the filtered review text and cites review IDs for material claims.")
@@ -4840,7 +4884,7 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
     helper_cols[0].caption(f"Scope: {filter_description}")
     if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat"):
         st.session_state["chat_messages"] = []
-        st.session_state["ai_scroll_to_top"] = False
+        st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
         st.rerun()
     user_message = st.chat_input("Ask about drivers, risks, opportunities, or voice-of-customer themes…", key="ai_chat_input")
     prompt_to_send = visible_user_message = persona_name = None
@@ -4855,13 +4899,13 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
         try:
             answer = _call_analyst(question=prompt_to_send, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, chat_history=prior, persona_name=persona_name, report_length=st.session_state.get("ai_report_length", "Medium"))
             if persona_name:
-                answer = f"## {persona_name} report\n\n{answer}"
+                answer = f"**{persona_name} report**\n\n{answer}"
         except Exception as exc:
             answer = f"OpenAI request failed: {exc}"
         finally:
             overlay.empty()
         st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
-        st.session_state["ai_scroll_to_top"] = True
+        st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
         st.rerun()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: REVIEW PROMPT
