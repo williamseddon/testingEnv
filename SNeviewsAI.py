@@ -24,7 +24,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import numpy as np
 import pandas as pd
@@ -187,7 +187,7 @@ DEFAULT_CONTENT_LOCALES = (
 )
 BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
 
-DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/shark-silkipro-hair-straightener-and-dryer-in-plum/HT400PU.html"
+DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html"
 SOURCE_MODE_URL = "SharkNinja product URL"
 SOURCE_MODE_FILE = "Uploaded review file"
 
@@ -800,6 +800,294 @@ def _fetch_reviews_page(session, *, product_id, passkey, displaycode, api_versio
     return payload
 
 
+def _url_base(url: str) -> str:
+    p = urlparse(url)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, "", p.fragment))
+
+
+def _query_pairs(url: str) -> List[Tuple[str, str]]:
+    return list(parse_qsl(urlparse(url).query, keep_blank_values=True))
+
+
+def _first_query_value(pairs: Sequence[Tuple[str, str]], names: Sequence[str]) -> Optional[str]:
+    lookup = {str(n).lower() for n in names}
+    for k, v in pairs:
+        if str(k).lower() in lookup:
+            return v
+    return None
+
+
+def _set_query_value(pairs: Sequence[Tuple[str, str]], names: Sequence[str], value: Any, default_name: str) -> List[Tuple[str, str]]:
+    lookup = {str(n).lower() for n in names}
+    preserved_name = next((k for k, _ in pairs if str(k).lower() in lookup), default_name)
+    out: List[Tuple[str, str]] = []
+    inserted = False
+    for k, v in pairs:
+        if str(k).lower() in lookup:
+            if not inserted:
+                out.append((preserved_name, str(value)))
+                inserted = True
+        else:
+            out.append((k, v))
+    if not inserted:
+        out.append((preserved_name, str(value)))
+    return out
+
+
+def _fetch_json_page_from_url(session, url: str, *, query_pairs: Sequence[Tuple[str, str]], timeout: int = 45) -> Dict[str, Any]:
+    resp = session.get(_url_base(url), params=list(query_pairs), timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _extract_bv_product_id_from_pairs(pairs: Sequence[Tuple[str, str]]) -> Optional[str]:
+    direct = _first_query_value(pairs, ["productid", "ProductId"])
+    if direct:
+        return direct.strip()
+    for key, val in pairs:
+        if str(key).lower() not in {"filter", "filter_reviews"}:
+            continue
+        m = re.search(r"productid(?::eq)?:(.+)$", str(val), flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _guess_powerreviews_retailer(url: str) -> str:
+    m = re.search(r"/m/(\d+)/", urlparse(url).path)
+    merchant_id = m.group(1) if m else ""
+    known = {
+        "6406": "Ulta",
+        "437772": "Hoka",
+    }
+    if merchant_id in known:
+        return known[merchant_id]
+    return "PowerReviews"
+
+
+def _detect_review_source(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if "api.bazaarvoice.com" in host and path.endswith("/data/reviews.json"):
+        return "bazaarvoice_api"
+    if "display.powerreviews.com" in host and "/product/" in path and path.endswith("/reviews"):
+        return "powerreviews_api"
+    return "html_product"
+
+
+def _powerreviews_parse_bool(value):
+    t = _safe_text(value).strip().lower()
+    if t in {"yes", "true", "1", "recommended"}:
+        return True
+    if t in {"no", "false", "0", "not recommended"}:
+        return False
+    return pd.NA
+
+
+def _powerreviews_media_urls(review: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+    for item in (review.get("media") or []):
+        if not isinstance(item, dict):
+            continue
+        direct = item.get("url") or item.get("src") or item.get("image_url")
+        if direct:
+            urls.append(str(direct))
+            continue
+        sizes = item.get("sizes") or {}
+        if isinstance(sizes, dict):
+            for name in ["large", "normal", "thumbnail", "original"]:
+                candidate = sizes.get(name)
+                if isinstance(candidate, dict) and candidate.get("url"):
+                    urls.append(str(candidate.get("url")))
+                    break
+                if isinstance(candidate, str) and candidate:
+                    urls.append(candidate)
+                    break
+    return urls
+
+
+def _powerreviews_context_json(details: Dict[str, Any]) -> str:
+    props = {}
+    for prop in (details.get("properties") or []):
+        if not isinstance(prop, dict):
+            continue
+        key = _safe_text(prop.get("label") or prop.get("key"))
+        value = prop.get("value")
+        if isinstance(value, list):
+            value = " | ".join(_safe_text(v) for v in value if _safe_text(v))
+        value = _safe_text(value)
+        if key and value:
+            props[key] = {"Value": value, "Label": key}
+    return json.dumps(props, ensure_ascii=False)
+
+
+def _flatten_powerreviews_review(review: Dict[str, Any], *, fallback_product_id: str = "", retailer: str = "", source_url: str = "") -> Dict[str, Any]:
+    details = review.get("details") or {}
+    metrics = review.get("metrics") or {}
+    badges = review.get("badges") or {}
+    photos = _powerreviews_media_urls(review)
+    product_id = _safe_text(details.get("product_page_id") or review.get("page_id") or fallback_product_id)
+    return dict(
+        review_id=review.get("review_id") or review.get("ugc_id") or review.get("legacy_id") or review.get("internal_review_id"),
+        product_id=product_id,
+        base_sku=product_id,
+        sku_item=product_id,
+        original_product_name=_safe_text(details.get("product_name")),
+        title=_safe_text(details.get("headline")),
+        review_text=_safe_text(details.get("comments")),
+        rating=metrics.get("rating"),
+        is_recommended=_powerreviews_parse_bool(details.get("bottom_line")),
+        user_nickname=_safe_text(details.get("nickname")),
+        author_id=review.get("author_id"),
+        user_location=_safe_text(details.get("location")),
+        content_locale=_safe_text(details.get("locale")),
+        submission_time=pd.to_datetime(details.get("created_date"), unit="ms", errors="coerce"),
+        moderation_status=_safe_text(review.get("moderation_status") or review.get("status")),
+        source_client=retailer,
+        is_featured=False,
+        is_syndicated=False,
+        syndication_source_name=pd.NA,
+        is_ratings_only=False,
+        total_positive_feedback_count=metrics.get("helpful_votes"),
+        badges=", ".join(k for k, v in badges.items() if bool(v)),
+        context_data_json=_powerreviews_context_json(details),
+        photos_count=len(photos),
+        photo_urls=" | ".join(photos),
+        incentivized_review=False,
+        retailer=retailer,
+        post_link=source_url,
+        source_system="PowerReviews API",
+        raw_json=json.dumps(review, ensure_ascii=False),
+    )
+
+
+def _powerreviews_reviews_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    reviews: List[Dict[str, Any]] = []
+    for block in (payload.get("results") or []):
+        if isinstance(block, dict) and isinstance(block.get("reviews"), list):
+            reviews.extend([r for r in block.get("reviews") or [] if isinstance(r, dict)])
+    return reviews
+
+
+def _load_bazaarvoice_api_reviews(api_url: str):
+    session = _get_session()
+    base_pairs = _query_pairs(api_url)
+    page_size = max(1, min(100, _safe_int(_first_query_value(base_pairs, ["limit", "Limit"]), DEFAULT_PAGE_SIZE)))
+    page0_pairs = _set_query_value(base_pairs, ["offset", "Offset"], 0, "offset")
+    page0_pairs = _set_query_value(page0_pairs, ["limit", "Limit"], page_size, "limit")
+
+    with st.spinner("Checking review volume…"):
+        first_payload = _fetch_json_page_from_url(session, api_url, query_pairs=page0_pairs)
+    if first_payload.get("HasErrors"):
+        raise ReviewDownloaderError(f"BV error: {first_payload.get('Errors')}")
+
+    total = int(first_payload.get("TotalResults", 0))
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, page_size)) or [0]
+    raw_reviews: List[Dict[str, Any]] = []
+
+    for i, offset in enumerate(offsets, 1):
+        if i == 1:
+            page = first_payload
+        else:
+            status.info(f"Pulling page {i}/{len(offsets)}")
+            page_pairs = _set_query_value(page0_pairs, ["offset", "Offset"], offset, "offset")
+            page = _fetch_json_page_from_url(session, api_url, query_pairs=page_pairs)
+            if page.get("HasErrors"):
+                raise ReviewDownloaderError(f"BV error: {page.get('Errors')}")
+        raw_reviews.extend(page.get("Results") or [])
+        progress.progress(i / len(offsets))
+
+    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+    df = _finalize_df(pd.DataFrame([_flatten_review(r) for r in raw_reviews]))
+    product_id = (
+        _first_non_empty(df.get("product_id", pd.Series(dtype="object")).fillna("")) or
+        _extract_bv_product_id_from_pairs(base_pairs) or
+        "BAZAARVOICE_PRODUCT"
+    )
+    retailer = _first_non_empty(df.get("source_client", pd.Series(dtype="object")).fillna("")) or "Bazaarvoice"
+    retailer_label = retailer.title() if retailer and retailer.islower() else retailer
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["product_id"] = df["product_id"].fillna(product_id)
+        if "retailer" not in df.columns:
+            df["retailer"] = retailer_label
+        else:
+            df["retailer"] = df["retailer"].fillna("").replace("", pd.NA).fillna(retailer_label)
+        df["source_system"] = "Bazaarvoice API"
+        df["post_link"] = df.get("post_link", pd.Series(index=df.index, dtype="object")).fillna(api_url)
+    summary = ReviewBatchSummary(
+        product_url=api_url,
+        product_id=product_id,
+        total_reviews=total,
+        page_size=page_size,
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice_api", source_label=f"{retailer_label} API")
+
+
+def _load_powerreviews_api_reviews(api_url: str):
+    session = _get_session()
+    base_pairs = _query_pairs(api_url)
+    page_size = max(1, _safe_int(_first_query_value(base_pairs, ["paging.size"]), 25))
+    page0_pairs = _set_query_value(base_pairs, ["paging.from"], 0, "paging.from")
+    page0_pairs = _set_query_value(page0_pairs, ["paging.size"], page_size, "paging.size")
+
+    with st.spinner("Checking review volume…"):
+        first_payload = _fetch_json_page_from_url(session, api_url, query_pairs=page0_pairs)
+
+    paging = first_payload.get("paging") or {}
+    total = int(paging.get("total_results", 0))
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, page_size)) or [0]
+    retailer = _guess_powerreviews_retailer(api_url)
+    path_match = re.search(r"/product/([^/]+)/reviews", urlparse(api_url).path, flags=re.IGNORECASE)
+    fallback_product_id = path_match.group(1) if path_match else "POWERREVIEWS_PRODUCT"
+    raw_reviews: List[Dict[str, Any]] = []
+
+    for i, offset in enumerate(offsets, 1):
+        if i == 1:
+            payload = first_payload
+        else:
+            status.info(f"Pulling page {i}/{len(offsets)}")
+            page_pairs = _set_query_value(page0_pairs, ["paging.from"], offset, "paging.from")
+            payload = _fetch_json_page_from_url(session, api_url, query_pairs=page_pairs)
+        raw_reviews.extend(_powerreviews_reviews_from_payload(payload))
+        progress.progress(i / len(offsets))
+
+    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+    rows = [_flatten_powerreviews_review(r, fallback_product_id=fallback_product_id, retailer=retailer, source_url=api_url) for r in raw_reviews]
+    df = _finalize_df(pd.DataFrame(rows))
+    product_id = (
+        _first_non_empty(df.get("product_id", pd.Series(dtype="object")).fillna("")) or
+        fallback_product_id or
+        "POWERREVIEWS_PRODUCT"
+    )
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["product_id"] = df["product_id"].fillna(product_id)
+        df["retailer"] = df.get("retailer", pd.Series(index=df.index, dtype="object")).fillna(retailer)
+        df["source_system"] = "PowerReviews API"
+        df["post_link"] = df.get("post_link", pd.Series(index=df.index, dtype="object")).fillna(api_url)
+    summary = ReviewBatchSummary(
+        product_url=api_url,
+        product_id=product_id,
+        total_reviews=total,
+        page_size=page_size,
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="powerreviews_api", source_label=f"{retailer} API")
+
+
 def _is_incentivized(r):
     badges = [str(b).lower() for b in (r.get("BadgesOrder") or [])]
     if any("incentivized" in b for b in badges):
@@ -825,6 +1113,7 @@ def _flatten_review(r):
                 urls.append(u)
                 break
     syn = r.get("SyndicationSource") or {}
+    source_client = _safe_text(r.get("SourceClient"))
     return dict(
         review_id=r.get("Id"),
         product_id=r.get("ProductId"),
@@ -840,7 +1129,7 @@ def _flatten_review(r):
         submission_time=r.get("SubmissionTime"),
         moderation_status=r.get("ModerationStatus"),
         campaign_id=r.get("CampaignId"),
-        source_client=r.get("SourceClient"),
+        source_client=source_client,
         is_featured=r.get("IsFeatured"),
         is_syndicated=r.get("IsSyndicated"),
         syndication_source_name=syn.get("Name"),
@@ -851,6 +1140,8 @@ def _flatten_review(r):
         photos_count=len(photos),
         photo_urls=" | ".join(urls),
         incentivized_review=_is_incentivized(r),
+        retailer=(source_client.title() if source_client else pd.NA),
+        source_system="Bazaarvoice API",
         raw_json=json.dumps(r, ensure_ascii=False),
     )
 
@@ -1051,6 +1342,13 @@ def _load_product_reviews(product_url):
     product_url = product_url.strip()
     if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
         product_url = "https://" + product_url
+
+    provider = _detect_review_source(product_url)
+    if provider == "bazaarvoice_api":
+        return _load_bazaarvoice_api_reviews(product_url)
+    if provider == "powerreviews_api":
+        return _load_powerreviews_api_reviews(product_url)
+
     session = _get_session()
     with st.spinner("Loading product page…"):
         resp = session.get(product_url, timeout=30)
@@ -1098,6 +1396,8 @@ def _load_product_reviews(product_url):
         df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
         df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
         df["product_id"] = df["product_id"].fillna(pid)
+        df["retailer"] = df.get("retailer", pd.Series(index=df.index, dtype="object")).fillna("SharkNinja")
+        df["source_system"] = "Bazaarvoice API"
     summary = ReviewBatchSummary(
         product_url=product_url,
         product_id=pid,
@@ -1106,7 +1406,7 @@ def _load_product_reviews(product_url):
         requests_needed=len(offsets),
         reviews_downloaded=len(df),
     )
-    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label=product_url)
+    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label="SharkNinja product URL")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ANALYTICS
@@ -3170,7 +3470,7 @@ def _render_workspace_header(summary, overall_df, prompt_artifacts, *, source_ty
     product_name = _product_name(summary, overall_df)
     organic = int((~overall_df["incentivized_review"].fillna(False)).sum()) if not overall_df.empty else 0
     n = len(overall_df)
-    src_chip = f"Uploaded · {source_label}" if source_type == "uploaded" else f"Bazaarvoice · {summary.product_id}"
+    src_chip = f"Uploaded · {source_label}" if source_type == "uploaded" else (source_label or f"Bazaarvoice · {summary.product_id}")
     st.markdown(f"""<div class="hero-card">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
         <div>
@@ -4111,7 +4411,8 @@ def main():
     dataset = st.session_state.get("analysis_dataset")
     if dataset:
         bc = st.columns([4.2, 1.0])
-        bc[0].caption(f"Active workspace · {dataset.get('source_type', '').title()} · {dataset.get('source_label', '')}")
+        active_label = dataset.get("source_label") or dataset.get("source_type", "")
+        bc[0].caption(f"Active workspace · {active_label}")
         if bc[1].button("Clear workspace", use_container_width=True, key="ws_clear"):
             _reset_workspace_state(reset_source=True)
             st.rerun()
@@ -4121,7 +4422,7 @@ def main():
 
     source_mode = st.radio("Workspace source", [SOURCE_MODE_URL, SOURCE_MODE_FILE], horizontal=True, key="workspace_source_mode")
     if source_mode == SOURCE_MODE_URL:
-        st.text_input("Product URL", key="workspace_product_url")
+        st.text_input("Product or review API URL", key="workspace_product_url")
         if st.button("Build review workspace", type="primary", key="ws_build_url"):
             try:
                 nd = _load_product_reviews(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
@@ -4159,7 +4460,7 @@ def main():
         st.markdown("""<div style="margin-top:2rem;padding:2rem;background:var(--surface,#fff);border:1px solid #dde1e8;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.08);">
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:.4rem;">No workspace loaded</div>
-          <div style="font-size:13px;color:#64748b;">Enter a SharkNinja product URL or upload a review export above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.</div>
+          <div style="font-size:13px;color:#64748b;">Enter a SharkNinja product URL, a Bazaarvoice / PowerReviews review API URL, or upload a review export above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.</div>
         </div>""", unsafe_allow_html=True)
         return
 
@@ -4201,4 +4502,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
