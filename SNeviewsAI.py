@@ -3,7 +3,7 @@ SharkNinja Review Analyst + Symptomizer — Updated and optimized
 Updated with:
 - Live sidebar filter system with timeframe, stars, core filters, dynamic extra filters, and active filter summary
 - Symptom filters shown only when symptom data exists
-- Short hoverable Reference tiles (cards + AI Analyst citations)
+- Short hoverable Reference tiles (AI Analyst citations only)
 - More stable model fallbacks for batch / structured operations
 - Symptomizer result cards now show detractors and delighters at the bottom like Review Explorer
 """
@@ -100,7 +100,7 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .hero-stat.accent{border-color:rgba(99,102,241,.40);background:linear-gradient(145deg,#eef2ff,var(--surface));}
 .hero-stat .label{color:var(--slate-500);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 .hero-stat .value{font-size:24px;font-weight:800;margin-top:4px;color:var(--navy);letter-spacing:-.035em;}
-.stButton>button{border-radius:var(--radius-sm)!important;font-weight:600!important;font-size:13.5px!important;height:38px!important;border:1.5px solid var(--border-strong)!important;background:var(--surface)!important;color:var(--navy-soft)!important;box-shadow:var(--shadow-xs)!important;transition:all .14s ease!important;letter-spacing:-.01em!important;}
+.stButton>button{border-radius:var(--radius-sm)!important;font-weight:600!important;font-size:13.5px!important;min-height:38px!important;height:auto!important;border:1.5px solid var(--border-strong)!important;background:var(--surface)!important;color:var(--navy-soft)!important;box-shadow:var(--shadow-xs)!important;transition:all .14s ease!important;letter-spacing:-.01em!important;white-space:normal!important;line-height:1.2!important;padding:8px 12px!important;}
 .stButton>button:hover{border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(99,102,241,.13)!important;color:var(--accent)!important;}
 [data-testid="baseButton-primary"],[data-testid="baseButton-primary"]:hover{background:var(--navy)!important;color:var(--surface)!important;border-color:var(--navy)!important;}
 [data-testid="baseButton-primary"]:hover{background:var(--navy-mid)!important;border-color:var(--navy-mid)!important;box-shadow:0 0 0 3px rgba(15,23,42,.14)!important;}
@@ -155,19 +155,22 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--slate-50);border:1px solid var(--border);font-size:11.5px;font-weight:600;color:var(--navy);}
 .pill .muted{color:var(--slate-500);font-weight:700;}
 .small-muted{font-size:12px;color:var(--slate-500);}
-.ref-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px;margin-right:2px;}
+.ref-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px;margin-right:2px;z-index:20;}
 .ref-tile{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:11.5px;font-weight:700;line-height:1;cursor:help;white-space:nowrap;}
-.ref-tip{position:absolute;left:0;top:calc(100% + 8px);width:min(380px,72vw);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:10px 11px;box-shadow:var(--shadow-lg);z-index:1100;opacity:0;pointer-events:none;transition:opacity .12s ease;}
-.ref-wrap:hover .ref-tip{opacity:1;}
+.ref-tip{position:absolute;left:50%;transform:translateX(-50%);top:calc(100% + 8px);width:min(420px,calc(100vw - 36px));max-height:min(320px,60vh);overflow-y:auto;overflow-x:hidden;box-sizing:border-box;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:10px 11px;box-shadow:var(--shadow-lg);z-index:1100;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .12s ease;white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
+.ref-wrap:hover .ref-tip,.ref-wrap:focus-within .ref-tip{opacity:1;visibility:visible;}
 .ref-item{padding:7px 0;border-bottom:1px solid var(--border);}
 .ref-item:last-child{border-bottom:none;padding-bottom:0;}
 .ref-item:first-child{padding-top:0;}
 .ref-meta{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--slate-500);font-weight:700;margin-bottom:3px;}
 .ref-title{font-size:12px;font-weight:700;color:var(--navy);margin-bottom:3px;line-height:1.35;}
-.ref-snippet{font-size:11.5px;line-height:1.45;color:var(--slate-600);white-space:normal;}
+.ref-snippet{font-size:11.5px;line-height:1.45;color:var(--slate-600);white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
 .ref-empty{font-size:11.5px;color:var(--slate-500);line-height:1.4;}
+[data-testid="stChatMessage"],[data-testid="stChatMessageContent"],[data-testid="stMarkdownContainer"]{overflow:visible!important;}
+.workspace-nav-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:12px 14px;box-shadow:var(--shadow-sm);margin:1.05rem 0 1.25rem;}
 @keyframes tw-spin{to{transform:rotate(360deg);}}
 @media(max-width:1100px){.hero-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:768px){.hero-grid{grid-template-columns:1fr;}.ref-tip{left:0;transform:none;width:min(320px,calc(100vw - 32px));}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -187,6 +190,7 @@ DEFAULT_CONTENT_LOCALES = (
 )
 BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
 POWERREVIEWS_BASE = "https://display.powerreviews.com"
+POWERREVIEWS_MAX_PAGE_SIZE = 25
 UK_EU_BV_PASSKEY = "capxzF3xnCmhSCHhkomxF1sQkZmh2zK2fNb8D1VDNl3hY"
 COSTCO_BV_PASSKEY = "bai25xto36hkl5erybga10t99"
 SEPHORA_BV_PASSKEY = "calXm2DyQVjcCy9agq85vmTJv5ELuuBCF2sdg4BnJzJus"
@@ -1037,7 +1041,7 @@ def _fetch_bazaarvoice_raw_page(session, *, api_url, params):
 
 
 def _fetch_powerreviews_page(session, *, merchant_id, locale, product_id,
-                             apikey, paging_from=0, page_size=100,
+                             apikey, paging_from=0, page_size=POWERREVIEWS_MAX_PAGE_SIZE,
                              sort="Newest", filters="", search="",
                              image_only=False):
     endpoint = POWERREVIEWS_ENDPOINT_TEMPLATE.format(
@@ -1045,9 +1049,10 @@ def _fetch_powerreviews_page(session, *, merchant_id, locale, product_id,
         locale=locale,
         product_id=product_id,
     )
+    safe_page_size = max(1, min(int(page_size or POWERREVIEWS_MAX_PAGE_SIZE), POWERREVIEWS_MAX_PAGE_SIZE))
     params = {
         "paging.from": int(paging_from),
-        "paging.size": int(page_size),
+        "paging.size": safe_page_size,
         "filters": filters or "",
         "search": search or "",
         "sort": sort or "Newest",
@@ -1768,7 +1773,7 @@ def _load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", reta
     if not apikey:
         raise ReviewDownloaderError("PowerReviews API URL missing apikey.")
     sort = _query_first_ci(params, ["sort"], default="Newest") or "Newest"
-    page_size = int(_query_first_ci(params, ["paging.size"], default=100) or 100)
+    page_size = min(int(_query_first_ci(params, ["paging.size"], default=POWERREVIEWS_MAX_PAGE_SIZE) or POWERREVIEWS_MAX_PAGE_SIZE), POWERREVIEWS_MAX_PAGE_SIZE)
     first = _fetch_powerreviews_page(
         session,
         merchant_id=merchant_id,
@@ -1980,7 +1985,7 @@ def _probe_powerreviews_candidates(session, *, product_url: str, candidates: Seq
 
 
 def _fetch_all_powerreviews_for_candidate(session, *, product_url: str, product_id: str, cfg: Dict[str, Any]):
-    page_size = 100
+    page_size = POWERREVIEWS_MAX_PAGE_SIZE
     first = _fetch_powerreviews_page(
         session,
         merchant_id=cfg["merchant_id"],
@@ -2453,12 +2458,27 @@ def _sw_style_fig(fig):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter, system-ui, sans-serif"),
-        margin=dict(l=44, r=20, t=44, b=36),
+        font=dict(family="Inter, system-ui, sans-serif", size=12),
+        margin=dict(l=26, r=18, t=46, b=76),
+        title=dict(x=0, xanchor="left", font=dict(size=15)),
+        legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top", bgcolor="rgba(255,255,255,0.78)", bordercolor="rgba(148,163,184,0.22)", borderwidth=1, font=dict(size=11)),
+        hoverlabel=dict(font=dict(family="Inter, system-ui, sans-serif", size=12)),
     )
-    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID)
-    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID)
+    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, automargin=True)
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID, automargin=True)
     return fig
+
+
+def _show_plotly(fig):
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+            "responsive": True,
+            "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d", "toggleSpikelines"],
+        },
+    )
 
 
 REGION_NAME_MAP = {
@@ -2669,8 +2689,9 @@ def _render_reviews_over_time_chart(df):
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
             font_family="Inter",
-            legend=dict(orientation="h", y=1.07, x=0),
+            legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top", bgcolor="rgba(255,255,255,0.8)"),
             bargap=0.06,
+            height=430,
         )
         fig.update_xaxes(title_text="", showgrid=False)
 
@@ -2696,7 +2717,7 @@ def _render_reviews_over_time_chart(df):
         if y_view == "Zoomed-in" and y_range[0] > 1.05:
             _add_axis_break_indicator(fig, side="right")
 
-        st.plotly_chart(fig, use_container_width=True)
+        _show_plotly(fig)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYMPTOM ANALYTICS
@@ -2844,7 +2865,7 @@ def _opp_scatter(tbl, kind, baseline_avg, *, container_key=""):
     fig.add_hline(y=float(baseline_avg), line_dash="dash", opacity=0.45, annotation_text=f"Avg ★ {baseline_avg:.2f}", annotation_position="right", annotation_font_size=11)
     fig.update_layout(height=420, xaxis_title="Mentions", yaxis_title="Avg ★")
     _sw_style_fig(fig)
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
     label = "Fix first — high mentions × below-baseline ★" if kind == "detractors" else "Amplify — high mentions × above-baseline ★"
     top15 = d.copy()
     top15["Score"] = score
@@ -2869,7 +2890,7 @@ def _render_symptom_bar_chart(tbl, title, color, denom, show_pct):
     fig = go.Figure(go.Bar(x=x_vals, y=t["Item"][::-1], orientation="h", marker_color=color, opacity=0.80, customdata=t["Item"][::-1].astype(str).tolist(), hovertemplate=hover))
     fig.update_layout(title=title, height=max(300, 28 * len(t) + 80), xaxis_title=x_label, yaxis_title="", margin=dict(l=160, r=20, t=46, b=30))
     _sw_style_fig(fig)
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
 
 def _render_symptom_dashboard(filtered_df, overall_df=None):
@@ -3304,6 +3325,27 @@ def _render_active_filter_summary(filter_state: Dict[str, Any], overall_df: pd.D
 """,
         unsafe_allow_html=True,
     )
+
+def _render_workspace_nav() -> str:
+    current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
+    rows = [
+        [TAB_DASHBOARD, TAB_REVIEW_EXPLORER],
+        [TAB_AI_ANALYST, TAB_REVIEW_PROMPT],
+        [TAB_SYMPTOMIZER],
+    ]
+    with st.container(border=True):
+        st.markdown("<div class='nav-tabs-label'>Workspace</div>", unsafe_allow_html=True)
+        for ridx, row in enumerate(rows):
+            cols = st.columns(len(row))
+            for cidx, (col, label) in enumerate(zip(cols, row)):
+                kwargs = {"use_container_width": True, "key": f"workspace_nav_{ridx}_{cidx}_{_slugify(label, fallback='tab')}"}
+                if current == label:
+                    kwargs["type"] = "primary"
+                if col.button(label, **kwargs):
+                    current = label
+                    st.session_state["workspace_active_tab"] = label
+    return current
+
 
 
 def _product_name(summary, df):
@@ -4150,24 +4192,6 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
     api_key = _get_api_key()
     filter_state = {"filtered_df": df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(), "active_items": [], "filter_seconds": 0.0, "description": "No active filters"}
     with st.sidebar:
-        st.markdown("### 🤖 AI Model")
-        cur_model = st.session_state.get("shared_model", DEFAULT_MODEL)
-        if cur_model not in MODEL_OPTIONS:
-            cur_model = DEFAULT_MODEL
-            st.session_state["shared_model"] = cur_model
-        st.selectbox("Model", options=MODEL_OPTIONS, index=MODEL_OPTIONS.index(cur_model), key="shared_model", help="Used by AI Analyst, Review Prompt, and Symptomizer.")
-        effort_options = _reasoning_options_for_model(st.session_state.get("shared_model", DEFAULT_MODEL))
-        cur_reasoning = _safe_text(st.session_state.get("shared_reasoning", DEFAULT_REASONING)).lower() or DEFAULT_REASONING
-        if cur_reasoning not in effort_options:
-            cur_reasoning = "none" if "none" in effort_options else effort_options[0]
-            st.session_state["shared_reasoning"] = cur_reasoning
-        st.selectbox("Reasoning effort", options=effort_options, index=effort_options.index(cur_reasoning), key="shared_reasoning", help="Applied to GPT-5 family models.")
-        if api_key:
-            st.markdown("<div class='chip green' style='margin-top:4px'>✓ API key loaded</div>", unsafe_allow_html=True)
-        else:
-            st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
-
-        st.divider()
         st.markdown("### 🔍 Review Filters")
         st.caption("Applies live to every workspace tab.")
         if st.button("🧹 Clear all filters", use_container_width=True, key="rf_clear_btn"):
@@ -4277,10 +4301,25 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
 
             filter_state = _apply_live_review_filters(df)
 
-        st.divider()
-        st.markdown("### ⚡ Symptomizer")
-        st.slider("Batch size", 1, 12, key="sym_batch_size")
-        st.slider("Max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
+        with st.expander("🤖 AI Model & Symptomizer", expanded=False):
+            cur_model = st.session_state.get("shared_model", DEFAULT_MODEL)
+            if cur_model not in MODEL_OPTIONS:
+                cur_model = DEFAULT_MODEL
+                st.session_state["shared_model"] = cur_model
+            st.selectbox("Model", options=MODEL_OPTIONS, index=MODEL_OPTIONS.index(cur_model), key="shared_model", help="Used by AI Analyst, Review Prompt, and Symptomizer.")
+            effort_options = _reasoning_options_for_model(st.session_state.get("shared_model", DEFAULT_MODEL))
+            cur_reasoning = _safe_text(st.session_state.get("shared_reasoning", DEFAULT_REASONING)).lower() or DEFAULT_REASONING
+            if cur_reasoning not in effort_options:
+                cur_reasoning = "none" if "none" in effort_options else effort_options[0]
+                st.session_state["shared_reasoning"] = cur_reasoning
+            st.selectbox("Reasoning effort", options=effort_options, index=effort_options.index(cur_reasoning), key="shared_reasoning", help="Applied to GPT-5 family models.")
+            if api_key:
+                st.markdown("<div class='chip green' style='margin-top:4px'>✓ API key loaded</div>", unsafe_allow_html=True)
+            else:
+                st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
+            st.markdown("<div style='height:.25rem'></div>", unsafe_allow_html=True)
+            st.slider("Symptomizer batch size", 1, 12, key="sym_batch_size")
+            st.slider("Symptomizer max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
     return {"api_key": api_key, "review_filters": filter_state}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4350,15 +4389,29 @@ _REVIEW_REF_PATTERN = re.compile(r"\(review_ids?\s*:\s*([^)]+)\)", flags=re.IGNO
 def _reference_preview_rows(review_ids: Sequence[str], df: pd.DataFrame, max_items: int = 4) -> List[Dict[str, str]]:
     if df is None or df.empty:
         return []
+
+    def _clean_rid(value: Any) -> str:
+        rid = str(value or "").strip()
+        rid = re.sub(r'^[`\'"\s]+', '', rid)
+        rid = re.sub(r'[`\'"\s.,;:()\[\]{}]+$', '', rid)
+        return rid.strip()
+
     lookup = df.copy()
     lookup["review_id"] = lookup["review_id"].astype(str)
+    lookup["__rid_norm"] = lookup["review_id"].astype(str).str.strip().str.lower()
     out = []
     used = set()
     for rid in review_ids:
-        if rid in used:
+        cleaned = _clean_rid(rid)
+        if not cleaned:
             continue
-        used.add(rid)
-        hit = lookup[lookup["review_id"] == str(rid)]
+        rid_norm = cleaned.lower()
+        if rid_norm in used:
+            continue
+        used.add(rid_norm)
+        hit = lookup[lookup["__rid_norm"] == rid_norm]
+        if hit.empty:
+            hit = lookup[lookup["review_id"].astype(str).str.contains(re.escape(cleaned), case=False, na=False)].head(1)
         if hit.empty:
             continue
         row = hit.iloc[0]
@@ -4381,7 +4434,8 @@ def _reference_tile_html_from_ids(review_ids: Sequence[str], df: pd.DataFrame, *
     ids = [str(x).strip() for x in review_ids if str(x).strip()]
     previews = _reference_preview_rows(ids, df)
     if not previews:
-        tip = "<div class='ref-empty'>Referenced review preview not available in the loaded dataset.</div>"
+        raw_ids = ", ".join(ids[:4]) + ("…" if len(ids) > 4 else "")
+        tip = f"<div class='ref-empty'>Referenced review preview not available in the loaded dataset. {_esc(raw_ids) if raw_ids else ""}</div>"
     else:
         bits = []
         for item in previews:
@@ -4545,11 +4599,15 @@ def _render_review_card(row, evidence_items=None):
         tag_html = _symptom_tags_html(det_tags, del_tags)
         if tag_html:
             st.markdown(tag_html, unsafe_allow_html=True)
-        footer_bits = [_reference_tile_html_for_row(row)]
+        footer_bits = []
+        rid = _safe_text(row.get("review_id"))
+        if rid:
+            footer_bits.append(f"<span style='font-size:11.5px;color:var(--slate-400);'>ID {_esc(rid)}</span>")
         loc = _safe_text(row.get("user_location"))
         if loc:
             footer_bits.append(f"<span style='font-size:11.5px;color:var(--slate-400);'>{_esc(loc)}</span>")
-        st.markdown(f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;'>{''.join(footer_bits)}</div>", unsafe_allow_html=True)
+        if footer_bits:
+            st.markdown(f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;'>{' · '.join(footer_bits)}</div>", unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4593,7 +4651,7 @@ def _render_dashboard(filtered_df, overall_df=None):
             fig = px.bar(rating_df, x="rating_label", y="review_count", text="count_pct_label", title="Rating distribution", category_orders={"rating_label": ["1★", "2★", "3★", "4★", "5★"]}, color="rating", color_discrete_map={"1": "#ef4444", "2": "#f97316", "3": "#eab308", "4": "#84cc16", "5": "#22c55e"}, hover_data={"share": ":.1%", "review_count": True})
             fig.update_traces(textposition="outside", cliponaxis=False, showlegend=False)
             fig.update_layout(margin=dict(l=24, r=24, t=52, b=20), xaxis_title="", yaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
-            st.plotly_chart(fig, use_container_width=True)
+            _show_plotly(fig)
     with c2:
         with st.container(border=True):
             cohort_df = _cohort_by_incentivized(chart_df)
@@ -4601,9 +4659,9 @@ def _render_dashboard(filtered_df, overall_df=None):
                 st.info("No cohort data.")
             else:
                 fig_c = px.bar(cohort_df, x="star", y="pct", color="cohort", barmode="group", title="Rating split: Organic vs Incentivized", labels={"star": "Star", "pct": "% of cohort", "cohort": "Cohort"}, color_discrete_map={"Organic": "#6366f1", "Incentivized": "#f59e0b"})
-                fig_c.update_layout(xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5], ticktext=["1★", "2★", "3★", "4★", "5★"]), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=20), legend=dict(orientation="h", y=1.08, x=0))
+                fig_c.update_layout(xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5], ticktext=["1★", "2★", "3★", "4★", "5★"]), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=78), legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top"), height=350)
                 fig_c.update_yaxes(ticksuffix="%")
-                st.plotly_chart(fig_c, use_container_width=True)
+                _show_plotly(fig_c)
 
     st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
     _render_symptom_dashboard(chart_df, od)
@@ -4620,9 +4678,9 @@ def _render_dashboard(filtered_df, overall_df=None):
                 fig_sb = go.Figure()
                 fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_low"], name="% 1-2★", mode="lines+markers", line=dict(color="#ef4444", width=2), marker=dict(size=4), fill="tozeroy", fillcolor="rgba(239,68,68,0.08)"))
                 fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_high"], name="% 4-5★", mode="lines+markers", line=dict(color="#22c55e", width=2), marker=dict(size=4)))
-                fig_sb.update_layout(title="Sentiment drift: 1-2★ vs 4-5★ over time", hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=20), legend=dict(orientation="h", y=1.08, x=0))
+                fig_sb.update_layout(title="Sentiment drift: 1-2★ vs 4-5★ over time", hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=78), legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top"), height=350)
                 fig_sb.update_yaxes(ticksuffix="%", title="% of monthly reviews")
-                st.plotly_chart(fig_sb, use_container_width=True)
+                _show_plotly(fig_sb)
     with sa2:
         with st.container(border=True):
             locale_df = _locale_breakdown(chart_df, top_n=10)
@@ -4631,9 +4689,9 @@ def _render_dashboard(filtered_df, overall_df=None):
             else:
                 fig_loc = go.Figure()
                 fig_loc.add_trace(go.Bar(x=locale_df["count"], y=locale_df["content_locale"], orientation="h", name="Reviews", marker_color="#6366f1", opacity=0.75, hovertemplate="%{y}<br>%{x:,} reviews<extra></extra>"))
-                fig_loc.add_trace(go.Scatter(x=locale_df["avg_rating"] * locale_df["count"].max() / 5, y=locale_df["content_locale"], mode="markers", name="Avg ★ (scaled)", marker=dict(color=locale_df["avg_rating"], colorscale="RdYlGn", cmin=1, cmax=5, size=9, showscale=True, colorbar=dict(title="Avg ★", len=0.6, x=1.02)), hovertemplate="%{y}<br>Avg ★: %{text}<extra></extra>", text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
-                fig_loc.update_layout(title="Top markets by review volume", height=max(260, 26 * len(locale_df) + 80), margin=dict(l=80, r=60, t=52, b=20), barmode="overlay", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", xaxis_title="Reviews", yaxis_title="", legend=dict(orientation="h", y=1.08, x=0))
-                st.plotly_chart(fig_loc, use_container_width=True)
+                fig_loc.add_trace(go.Scatter(x=locale_df["avg_rating"] * locale_df["count"].max() / 5, y=locale_df["content_locale"], mode="markers", name="Avg ★ (scaled)", marker=dict(color=locale_df["avg_rating"], colorscale="RdYlGn", cmin=1, cmax=5, size=9, showscale=True, colorbar=dict(title="Avg ★", len=0.45, x=1.01)), hovertemplate="%{y}<br>Avg ★: %{text}<extra></extra>", text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
+                fig_loc.update_layout(title="Top markets by review volume", height=max(300, 26 * len(locale_df) + 110), margin=dict(l=80, r=42, t=52, b=78), barmode="overlay", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", xaxis_title="Reviews", yaxis_title="", legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top"))
+                _show_plotly(fig_loc)
 
     st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
     rd1, rd2 = st.columns([1.3, 1])
@@ -4645,8 +4703,8 @@ def _render_dashboard(filtered_df, overall_df=None):
             else:
                 fig_len = go.Figure()
                 fig_len.add_trace(go.Bar(x=len_df["Length Quartile"], y=len_df["avg_rating"], text=[f"{v:.2f}★" for v in len_df["avg_rating"]], textposition="outside", marker_color=["#ef4444" if v < 3.5 else "#eab308" if v < 4.2 else "#22c55e" for v in len_df["avg_rating"]], hovertemplate="%{x}<br>Avg ★: %{y:.2f}<br>n=%{customdata}<extra></extra>", customdata=len_df["count"]))
-                fig_len.update_layout(title="Review depth vs satisfaction", yaxis_range=[1, 5.2], yaxis_title="Avg ★", xaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=20))
-                st.plotly_chart(fig_len, use_container_width=True)
+                fig_len.update_layout(title="Review depth vs satisfaction", yaxis_range=[1, 5.2], yaxis_title="Avg ★", xaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=34), height=340)
+                _show_plotly(fig_len)
     with rd2:
         with st.container(border=True):
             locs = _top_locations(chart_df, top_n=10)
@@ -4945,7 +5003,7 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
             else:
                 fig = px.pie(ps, names="label", values="review_count", hole=0.44, color_discrete_sequence=["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#3b82f6", "#8b5cf6"])
                 fig.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
-                st.plotly_chart(fig, use_container_width=True)
+                _show_plotly(fig)
     with tc_col:
         with st.container(border=True):
             st.markdown(f"**Column** `{pc_col}`")
@@ -5321,8 +5379,7 @@ def main():
         st.session_state["workspace_active_tab"] = pending_tab
     elif st.session_state.get("workspace_active_tab") not in WORKSPACE_TABS:
         st.session_state["workspace_active_tab"] = TAB_DASHBOARD
-    st.markdown("<div class='nav-tabs-wrap'><div class='nav-tabs-label'>Workspace</div></div>", unsafe_allow_html=True)
-    active_tab = st.radio("Workspace tab", WORKSPACE_TABS, horizontal=True, key="workspace_active_tab", label_visibility="collapsed")
+    active_tab = _render_workspace_nav()
     common = dict(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
     if active_tab == TAB_DASHBOARD:
         _render_dashboard(filtered_df, overall_df)
