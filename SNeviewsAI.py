@@ -3,7 +3,7 @@ SharkNinja Review Analyst + Symptomizer — Updated and optimized
 Updated with:
 - Live sidebar filter system with timeframe, stars, core filters, dynamic extra filters, and active filter summary
 - Symptom filters shown only when symptom data exists
-- Short hoverable Reference tiles for AI Analyst citations only
+- Short hoverable Reference tiles (cards + AI Analyst citations)
 - More stable model fallbacks for batch / structured operations
 - Symptomizer result cards now show detractors and delighters at the bottom like Review Explorer
 """
@@ -24,7 +24,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import numpy as np
 import pandas as pd
@@ -186,9 +186,41 @@ DEFAULT_CONTENT_LOCALES = (
     "tr*,vi*,en_AU,en_CA,en_GB"
 )
 BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
+POWERREVIEWS_ENDPOINT_TEMPLATE = "https://display.powerreviews.com/m/{merchant_id}/l/{locale}/product/{product_id}/reviews"
 
-DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/shark-silkipro-hair-straightener-and-dryer-in-plum/HT400PU.html"
-SOURCE_MODE_URL = "SharkNinja product URL"
+COSTCO_BV_CONFIG = dict(
+    passkey="bai25xto36hkl5erybga10t99",
+    displaycode="2070_2_0-en_us",
+    api_version="5.5",
+    content_locales="en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,tr*,vi*",
+    sort="relevancy:a1",
+    retailer="Costco",
+)
+SEPHORA_BV_CONFIG = dict(
+    passkey="calXm2DyQVjcCy9agq85vmTJv5ELuuBCF2sdg4BnJzJus",
+    api_version="5.4",
+    locale="en_US",
+    include="Products,Comments",
+    sort="SubmissionTime:desc",
+    retailer="Sephora",
+)
+ULTA_PR_CONFIG = dict(
+    merchant_id="6406",
+    locale="en_US",
+    apikey="daa0f241-c242-4483-afb7-4449942d1a2b",
+    sort="Newest",
+    retailer="Ulta",
+)
+HOKA_PR_CONFIG = dict(
+    merchant_id="437772",
+    locale="en_US",
+    apikey="ea283fa2-3fdc-4127-863c-b1e2397f7a77",
+    sort="Newest",
+    retailer="HOKA",
+)
+
+DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html"
+SOURCE_MODE_URL = "Product URL / Review API URL"
 SOURCE_MODE_FILE = "Uploaded review file"
 
 TAB_DASHBOARD = "📊  Dashboard"
@@ -1047,15 +1079,563 @@ def _load_uploaded_files(files):
     return dict(summary=summary, reviews_df=combined, source_type="uploaded", source_label=src)
 
 
-def _load_product_reviews(product_url):
-    product_url = product_url.strip()
-    if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
-        product_url = "https://" + product_url
+def _dedupe_preserve(seq):
+    out = []
+    seen = set()
+    for item in list(seq or []):
+        s = _safe_text(item)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _extract_page_product_name(product_html, fallback=""):
+    try:
+        soup = BeautifulSoup(product_html or "", "html.parser")
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og and og.get("content"):
+            return _safe_text(og.get("content"))
+        tw = soup.find("meta", attrs={"name": "twitter:title"})
+        if tw and tw.get("content"):
+            return _safe_text(tw.get("content"))
+        h1 = soup.find("h1")
+        if h1:
+            return _safe_text(h1.get_text(" ", strip=True))
+        title = soup.find("title")
+        if title:
+            return _safe_text(title.get_text(" ", strip=True))
+    except Exception:
+        pass
+    return _safe_text(fallback)
+
+
+def _host_matches(host, *needles):
+    h = _safe_text(host).lower()
+    return any(n in h for n in needles)
+
+
+def _looks_like_bazaarvoice_api_url(url):
+    p = urlparse(url)
+    return _host_matches(p.netloc, "api.bazaarvoice.com") and p.path.lower().endswith("/reviews.json")
+
+
+def _looks_like_powerreviews_api_url(url):
+    p = urlparse(url)
+    return _host_matches(p.netloc, "display.powerreviews.com") and "/reviews" in p.path.lower()
+
+
+def _bv_fetch_page_from_query(session, endpoint_url, query_params, *, page_size, offset):
+    params = {k: (list(v) if isinstance(v, list) else [v]) for k, v in (query_params or {}).items()}
+    limit_key = "limit" if "limit" in params else ("Limit" if "Limit" in params else None)
+    offset_key = "offset" if "offset" in params else ("Offset" if "Offset" in params else None)
+    if limit_key is not None:
+        params[limit_key] = [str(int(page_size))]
+    if offset_key is not None:
+        params[offset_key] = [str(int(offset))]
+    flat = []
+    for k, values in params.items():
+        vals = values if isinstance(values, list) else [values]
+        for v in vals:
+            flat.append((k, v))
+    resp = session.get(endpoint_url, params=flat, timeout=45)
+    resp.raise_for_status()
+    payload = resp.json()
+    if isinstance(payload, dict) and payload.get("HasErrors"):
+        raise ReviewDownloaderError(f"BV error: {payload.get('Errors')}")
+    return payload
+
+
+def _load_bazaarvoice_api_url(api_url):
     session = _get_session()
-    with st.spinner("Loading product page…"):
-        resp = session.get(product_url, timeout=30)
+    parsed = urlparse(api_url)
+    endpoint_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    query = parse_qs(parsed.query, keep_blank_values=True)
+
+    with st.spinner("Checking review volume…"):
+        payload = _bv_fetch_page_from_query(session, endpoint_url, query, page_size=1, offset=0)
+        total = int((payload or {}).get("TotalResults") or 0)
+
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, DEFAULT_PAGE_SIZE)) or [0]
+    raw_reviews = []
+    for i, offset in enumerate(offsets, 1):
+        status.info(f"Pulling page {i}/{len(offsets)}")
+        page = _bv_fetch_page_from_query(session, endpoint_url, query, page_size=DEFAULT_PAGE_SIZE, offset=offset)
+        raw_reviews.extend((page or {}).get("Results") or [])
+        progress.progress(i / max(len(offsets), 1))
+
+    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+    df = _finalize_df(pd.DataFrame([_flatten_review(r) for r in raw_reviews]))
+    pid = _first_non_empty(df.get("product_id", pd.Series(dtype="object")).fillna("")) or "BAZAARVOICE_API"
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["product_id"] = df["product_id"].fillna(pid)
+        df["source_system"] = "Bazaarvoice API"
+    summary = ReviewBatchSummary(
+        product_url=api_url,
+        product_id=pid,
+        total_reviews=total,
+        page_size=DEFAULT_PAGE_SIZE,
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label="Bazaarvoice API")
+
+
+def _powerreviews_review_to_row(review, *, product_id="", product_name="", retailer="", post_link=""):
+    details = review.get("details") or {}
+    metrics = review.get("metrics") or {}
+    media = review.get("media") or []
+    photo_urls = []
+    for m in media:
+        if not isinstance(m, dict):
+            continue
+        for key in ["url", "original_url", "large_url", "thumbnail_url", "small_url"]:
+            u = _safe_text(m.get(key))
+            if u:
+                photo_urls.append(u)
+                break
+    created = details.get("created_date")
+    submission_time = None
+    try:
+        if created is not None and str(created).strip() != "":
+            created_num = float(created)
+            if created_num > 10_000_000_000:
+                submission_time = pd.to_datetime(created_num, unit="ms", utc=True).isoformat()
+            else:
+                submission_time = pd.to_datetime(created_num, unit="s", utc=True).isoformat()
+    except Exception:
+        try:
+            submission_time = pd.to_datetime(created, utc=True).isoformat()
+        except Exception:
+            submission_time = None
+    bottom_line = _safe_text(details.get("bottom_line")).lower()
+    if bottom_line == "yes":
+        is_recommended = True
+    elif bottom_line == "no":
+        is_recommended = False
+    else:
+        is_recommended = pd.NA
+    properties = details.get("properties") or []
+    return dict(
+        review_id=review.get("review_id") or review.get("ugc_id") or review.get("legacy_id"),
+        product_id=details.get("product_page_id") or product_id,
+        base_sku=details.get("product_page_id") or product_id,
+        sku_item=details.get("product_page_id") or product_id,
+        original_product_name=product_name,
+        title=_safe_text(details.get("headline")),
+        review_text=_safe_text(details.get("comments")),
+        rating=metrics.get("rating"),
+        is_recommended=is_recommended,
+        user_nickname=_safe_text(details.get("nickname")),
+        user_location=_safe_text(details.get("location")),
+        content_locale=_safe_text(details.get("locale")),
+        submission_time=submission_time,
+        moderation_status=pd.NA,
+        campaign_id=pd.NA,
+        source_client=retailer or "PowerReviews",
+        is_featured=pd.NA,
+        is_syndicated=False,
+        syndication_source_name=pd.NA,
+        is_ratings_only=False,
+        total_positive_feedback_count=metrics.get("helpful_votes"),
+        badges=json.dumps(review.get("badges") or {}, ensure_ascii=False),
+        context_data_json=json.dumps({"properties": properties}, ensure_ascii=False),
+        photos_count=len(photo_urls),
+        photo_urls=" | ".join(photo_urls),
+        incentivized_review=False,
+        raw_json=json.dumps(review, ensure_ascii=False),
+        retailer=retailer or "PowerReviews",
+        post_link=post_link or pd.NA,
+        source_system="PowerReviews API",
+    )
+
+
+def _fetch_powerreviews_page(session, *, merchant_id, locale, product_id, apikey, page_from=0, page_size=25, sort="Newest"):
+    endpoint = POWERREVIEWS_ENDPOINT_TEMPLATE.format(merchant_id=merchant_id, locale=locale, product_id=quote(str(product_id), safe=""))
+    params = {
+        "paging.from": int(page_from),
+        "paging.size": int(page_size),
+        "filters": "",
+        "search": "",
+        "sort": sort,
+        "image_only": "false",
+        "page_locale": locale,
+        "_noconfig": "true",
+        "apikey": apikey,
+    }
+    resp = session.get(endpoint, params=params, timeout=45)
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict) or "results" not in payload:
+        raise ReviewDownloaderError("Unexpected PowerReviews response.")
+    return payload, endpoint
+
+
+def _load_powerreviews_api_url(api_url):
+    session = _get_session()
+    parsed = urlparse(api_url)
+    m = re.search(r"/m/([^/]+)/l/([^/]+)/product/([^/]+)/reviews", parsed.path, flags=re.IGNORECASE)
+    if not m:
+        raise ReviewDownloaderError("Could not parse PowerReviews API URL.")
+    merchant_id, locale, product_id = m.group(1), m.group(2), m.group(3)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    page_size = _safe_int((query.get("paging.size") or [25])[0], 25)
+    sort = _safe_text((query.get("sort") or ["Newest"])[0]) or "Newest"
+    apikey = _safe_text((query.get("apikey") or [""])[0])
+    if not apikey:
+        raise ReviewDownloaderError("PowerReviews API URL is missing apikey.")
+
+    with st.spinner("Checking review volume…"):
+        payload, _ = _fetch_powerreviews_page(session, merchant_id=merchant_id, locale=locale, product_id=product_id, apikey=apikey, page_from=0, page_size=1, sort=sort)
+        total = int(((payload.get("paging") or {}).get("total_results")) or 0)
+
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, max(page_size, 1))) or [0]
+    rows = []
+    for i, offset in enumerate(offsets, 1):
+        status.info(f"Pulling page {i}/{len(offsets)}")
+        page, endpoint = _fetch_powerreviews_page(session, merchant_id=merchant_id, locale=locale, product_id=product_id, apikey=apikey, page_from=offset, page_size=page_size, sort=sort)
+        for bucket in (page.get("results") or []):
+            for review in (bucket.get("reviews") or []):
+                rows.append(_powerreviews_review_to_row(review, product_id=product_id, product_name=product_id, retailer="PowerReviews", post_link=endpoint))
+        progress.progress(i / max(len(offsets), 1))
+
+    status.success(f"Downloaded {len(rows)} reviews.")
+    df = _finalize_df(pd.DataFrame(rows))
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["product_id"] = df["product_id"].fillna(product_id)
+        df["source_system"] = "PowerReviews API"
+    summary = ReviewBatchSummary(
+        product_url=api_url,
+        product_id=product_id,
+        total_reviews=total,
+        page_size=max(page_size, 1),
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="powerreviews", source_label="PowerReviews API")
+
+
+def _probe_bazaarvoice_candidate(session, *, product_id, passkey, displaycode, api_version, content_locales, sort):
+    try:
+        payload = _fetch_reviews_page(
+            session,
+            product_id=product_id,
+            passkey=passkey,
+            displaycode=displaycode,
+            api_version=api_version,
+            page_size=1,
+            offset=0,
+            sort=sort,
+            content_locales=content_locales,
+        )
+        return int((payload or {}).get("TotalResults") or 0)
+    except Exception:
+        return -1
+
+
+def _probe_sephora_candidate(session, *, product_id, passkey, api_version, locale, sort, include):
+    params = {
+        "Filter": [f"ProductId:{product_id}", "contentlocale:en*"],
+        "Sort": sort,
+        "Limit": 1,
+        "Offset": 0,
+        "Include": include,
+        "Stats": "Reviews",
+        "passkey": passkey,
+        "apiversion": api_version,
+        "Locale": locale,
+    }
+    try:
+        resp = session.get(BAZAARVOICE_ENDPOINT, params=params, timeout=45)
         resp.raise_for_status()
-        product_html = resp.text
+        payload = resp.json()
+        if payload.get("HasErrors"):
+            return -1
+        return int((payload or {}).get("TotalResults") or 0)
+    except Exception:
+        return -1
+
+
+def _load_sephora_product_reviews(product_url, product_html, *, config):
+    session = _get_session()
+    raw_candidates = []
+    path = urlparse(product_url).path
+    raw_candidates.extend(re.findall(r"-(P[A-Z0-9]+)(?:$|[/?#])", path, flags=re.IGNORECASE))
+    raw_candidates.extend(re.findall(r'"productId"\s*:\s*"(P[A-Z0-9]+)"', product_html or "", flags=re.IGNORECASE))
+    raw_candidates.extend(re.findall(r'"ProductId"\s*:\s*"(P[A-Z0-9]+)"', product_html or "", flags=re.IGNORECASE))
+    candidates = []
+    for c in _dedupe_preserve(raw_candidates):
+        candidates.extend(_dedupe_preserve([c, c.upper(), c.lower()]))
+    candidates = _dedupe_preserve(candidates)
+    if not candidates:
+        raise ReviewDownloaderError("Could not find Sephora product ID.")
+
+    scored = []
+    with st.spinner("Resolving Sephora review source…"):
+        for cand in candidates:
+            total = _probe_sephora_candidate(
+                session,
+                product_id=cand,
+                passkey=config["passkey"],
+                api_version=config["api_version"],
+                locale=config["locale"],
+                sort=config["sort"],
+                include=config["include"],
+            )
+            if total >= 0:
+                scored.append((total, cand))
+    if not scored:
+        raise ReviewDownloaderError("Could not resolve Sephora review API for this page.")
+    total, pid = sorted(scored, key=lambda x: (x[0], len(str(x[1]))), reverse=True)[0]
+
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, DEFAULT_PAGE_SIZE)) or [0]
+    raw_reviews = []
+    for i, offset in enumerate(offsets, 1):
+        status.info(f"Pulling page {i}/{len(offsets)}")
+        params = {
+            "Filter": [f"ProductId:{pid}", "contentlocale:en*"],
+            "Sort": config["sort"],
+            "Limit": DEFAULT_PAGE_SIZE,
+            "Offset": offset,
+            "Include": config["include"],
+            "Stats": "Reviews",
+            "passkey": config["passkey"],
+            "apiversion": config["api_version"],
+            "Locale": config["locale"],
+        }
+        resp = session.get(BAZAARVOICE_ENDPOINT, params=params, timeout=45)
+        resp.raise_for_status()
+        page = resp.json()
+        if page.get("HasErrors"):
+            raise ReviewDownloaderError(f"BV error: {page.get('Errors')}")
+        raw_reviews.extend(page.get("Results") or [])
+        progress.progress(i / max(len(offsets), 1))
+
+    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+    df = _finalize_df(pd.DataFrame([_flatten_review(r) for r in raw_reviews]))
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["product_id"] = df["product_id"].fillna(pid)
+        df["source_system"] = "Bazaarvoice API"
+        df["retailer"] = df.get("retailer", pd.Series(index=df.index, dtype="object")).fillna(config.get("retailer", "Sephora"))
+    summary = ReviewBatchSummary(
+        product_url=product_url,
+        product_id=pid,
+        total_reviews=total,
+        page_size=DEFAULT_PAGE_SIZE,
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label="Sephora")
+
+
+def _load_costco_product_reviews(product_url, product_html, *, config):
+    session = _get_session()
+    path = urlparse(product_url).path
+    raw_candidates = []
+    raw_candidates.extend(re.findall(r"/(\d{6,})", path))
+    raw_candidates.extend(re.findall(r"Item\s+(\d{5,})", product_html or "", flags=re.IGNORECASE))
+    raw_candidates.extend(re.findall(r"Model\s+([A-Z0-9_-]{3,})", product_html or "", flags=re.IGNORECASE))
+    raw_candidates.extend(re.findall(r'"productId"\s*:\s*"([A-Z0-9_-]{3,})"', product_html or "", flags=re.IGNORECASE))
+    candidates = _dedupe_preserve(raw_candidates)
+    if not candidates:
+        raise ReviewDownloaderError("Could not find Costco product ID candidates.")
+
+    scored = []
+    with st.spinner("Resolving Costco review source…"):
+        for cand in candidates:
+            total = _probe_bazaarvoice_candidate(
+                session,
+                product_id=cand,
+                passkey=config["passkey"],
+                displaycode=config["displaycode"],
+                api_version=config["api_version"],
+                content_locales=config["content_locales"],
+                sort=config["sort"],
+            )
+            if total >= 0:
+                scored.append((total, cand))
+    if not scored:
+        raise ReviewDownloaderError("Could not resolve Costco review API for this page.")
+    total, pid = sorted(scored, key=lambda x: (x[0], str(x[1]).isdigit(), len(str(x[1]))), reverse=True)[0]
+
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, DEFAULT_PAGE_SIZE)) or [0]
+    raw_reviews = []
+    for i, offset in enumerate(offsets, 1):
+        status.info(f"Pulling page {i}/{len(offsets)}")
+        page = _fetch_reviews_page(
+            session,
+            product_id=pid,
+            passkey=config["passkey"],
+            displaycode=config["displaycode"],
+            api_version=config["api_version"],
+            page_size=DEFAULT_PAGE_SIZE,
+            offset=offset,
+            sort=config["sort"],
+            content_locales=config["content_locales"],
+        )
+        raw_reviews.extend(page.get("Results") or [])
+        progress.progress(i / max(len(offsets), 1))
+
+    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+    df = _finalize_df(pd.DataFrame([_flatten_review(r) for r in raw_reviews]))
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["product_id"] = df["product_id"].fillna(pid)
+        df["source_system"] = "Bazaarvoice API"
+    summary = ReviewBatchSummary(
+        product_url=product_url,
+        product_id=pid,
+        total_reviews=total,
+        page_size=DEFAULT_PAGE_SIZE,
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label="Costco")
+
+
+def _probe_powerreviews_candidate(session, *, merchant_id, locale, apikey, product_id, sort):
+    try:
+        payload, _ = _fetch_powerreviews_page(
+            session,
+            merchant_id=merchant_id,
+            locale=locale,
+            product_id=product_id,
+            apikey=apikey,
+            page_from=0,
+            page_size=1,
+            sort=sort,
+        )
+        return int(((payload.get("paging") or {}).get("total_results")) or 0)
+    except Exception:
+        return -1
+
+
+def _load_powerreviews_product_page(product_url, product_html, *, config, candidate_builder):
+    session = _get_session()
+    product_name = _extract_page_product_name(product_html, fallback=config.get("retailer", "Product"))
+    candidates = _dedupe_preserve(candidate_builder(product_url, product_html))
+    if not candidates:
+        raise ReviewDownloaderError("Could not find review product ID candidates on this page.")
+
+    scored = []
+    with st.spinner(f"Resolving {config.get('retailer', 'PowerReviews')} review source…"):
+        for cand in candidates:
+            total = _probe_powerreviews_candidate(
+                session,
+                merchant_id=config["merchant_id"],
+                locale=config["locale"],
+                apikey=config["apikey"],
+                product_id=cand,
+                sort=config.get("sort", "Newest"),
+            )
+            if total >= 0:
+                scored.append((total, cand))
+    if not scored:
+        raise ReviewDownloaderError("Could not resolve PowerReviews product ID for this page.")
+    total, pid = sorted(scored, key=lambda x: (x[0], str(x[1]).isdigit(), len(str(x[1]))), reverse=True)[0]
+
+    page_size = 25
+    progress = st.progress(0.0, text="Downloading…")
+    status = st.empty()
+    offsets = list(range(0, total, page_size)) or [0]
+    rows = []
+    endpoint = None
+    for i, offset in enumerate(offsets, 1):
+        status.info(f"Pulling page {i}/{len(offsets)}")
+        payload, endpoint = _fetch_powerreviews_page(
+            session,
+            merchant_id=config["merchant_id"],
+            locale=config["locale"],
+            product_id=pid,
+            apikey=config["apikey"],
+            page_from=offset,
+            page_size=page_size,
+            sort=config.get("sort", "Newest"),
+        )
+        for bucket in (payload.get("results") or []):
+            for review in (bucket.get("reviews") or []):
+                rows.append(_powerreviews_review_to_row(
+                    review,
+                    product_id=pid,
+                    product_name=product_name,
+                    retailer=config.get("retailer", "PowerReviews"),
+                    post_link=product_url or endpoint or pd.NA,
+                ))
+        progress.progress(i / max(len(offsets), 1))
+
+    status.success(f"Downloaded {len(rows)} reviews.")
+    df = _finalize_df(pd.DataFrame(rows))
+    if not df.empty:
+        df["review_id"] = df["review_id"].astype(str)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
+        df["product_id"] = df["product_id"].fillna(pid)
+        df["source_system"] = "PowerReviews API"
+    summary = ReviewBatchSummary(
+        product_url=product_url,
+        product_id=pid,
+        total_reviews=total,
+        page_size=page_size,
+        requests_needed=len(offsets),
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="powerreviews", source_label=config.get("retailer", "PowerReviews"))
+
+
+def _ulta_candidate_ids(product_url, product_html):
+    parsed = urlparse(product_url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    raw = []
+    raw.extend(query.get("sku") or [])
+    raw.extend(re.findall(r"Item\s+(\d{6,})", product_html or "", flags=re.IGNORECASE))
+    slug_match = re.search(r"/p/[^/?#]*-([A-Za-z0-9]+)(?:$|[?#])", parsed.path, flags=re.IGNORECASE)
+    if slug_match:
+        raw.append(slug_match.group(1))
+    raw.extend(re.findall(r"(pimprod\d+)", product_html or "", flags=re.IGNORECASE))
+    raw.extend(re.findall(r"(xlsImpprod\d+)", product_html or "", flags=re.IGNORECASE))
+    raw.extend(re.findall(r'"productId"\s*:\s*"([A-Za-z0-9_-]{3,})"', product_html or "", flags=re.IGNORECASE))
+    out = []
+    for item in _dedupe_preserve(raw):
+        out.extend(_dedupe_preserve([item, item.lower(), item.upper()]))
+        digits = re.sub(r"\D+", "", item)
+        if digits and digits != item:
+            out.extend(_dedupe_preserve([digits, f"pimprod{digits}", f"sku{digits}", f"p{digits}"]))
+    return _dedupe_preserve(out)
+
+
+def _hoka_candidate_ids(product_url, product_html):
+    parsed = urlparse(product_url)
+    raw = []
+    m = re.search(r"/(\d{5,})\.html", parsed.path)
+    if m:
+        raw.append(m.group(1))
+    raw.extend(re.findall(r"Item\s*No\.?\s*(\d{5,})", product_html or "", flags=re.IGNORECASE))
+    raw.extend(re.findall(r'"productId"\s*:\s*"([A-Za-z0-9_-]{3,})"', product_html or "", flags=re.IGNORECASE))
+    return _dedupe_preserve(raw)
+
+
+def _load_default_sharkninja_reviews(product_url, product_html):
+    session = _get_session()
     pid = _extract_pid_from_url(product_url) or _extract_pid_from_html(product_html)
     if not pid:
         raise ReviewDownloaderError("Could not find product ID.")
@@ -1074,7 +1654,7 @@ def _load_product_reviews(product_url):
         total = int(payload.get("TotalResults", 0))
     progress = st.progress(0.0, text="Downloading…")
     status = st.empty()
-    offsets = list(range(0, total, DEFAULT_PAGE_SIZE))
+    offsets = list(range(0, total, DEFAULT_PAGE_SIZE)) or [0]
     raw_reviews = []
     for i, offset in enumerate(offsets, 1):
         status.info(f"Pulling page {i}/{len(offsets)}")
@@ -1090,7 +1670,7 @@ def _load_product_reviews(product_url):
             content_locales=DEFAULT_CONTENT_LOCALES,
         )
         raw_reviews.extend(page.get("Results") or [])
-        progress.progress(i / len(offsets))
+        progress.progress(i / max(len(offsets), 1))
     status.success(f"Downloaded {len(raw_reviews)} reviews.")
     df = _finalize_df(pd.DataFrame([_flatten_review(r) for r in raw_reviews]))
     if not df.empty:
@@ -1098,6 +1678,7 @@ def _load_product_reviews(product_url):
         df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
         df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
         df["product_id"] = df["product_id"].fillna(pid)
+        df["source_system"] = "Bazaarvoice API"
     summary = ReviewBatchSummary(
         product_url=product_url,
         product_id=pid,
@@ -1107,6 +1688,35 @@ def _load_product_reviews(product_url):
         reviews_downloaded=len(df),
     )
     return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label=product_url)
+
+
+def _load_product_reviews(product_url):
+    product_url = product_url.strip()
+    if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
+        product_url = "https://" + product_url
+
+    if _looks_like_bazaarvoice_api_url(product_url):
+        return _load_bazaarvoice_api_url(product_url)
+    if _looks_like_powerreviews_api_url(product_url):
+        return _load_powerreviews_api_url(product_url)
+
+    session = _get_session()
+    with st.spinner("Loading product page…"):
+        resp = session.get(product_url, timeout=30)
+        resp.raise_for_status()
+        product_html = resp.text
+
+    host = urlparse(product_url).netloc.lower()
+    if _host_matches(host, "costco.com"):
+        return _load_costco_product_reviews(product_url, product_html, config=COSTCO_BV_CONFIG)
+    if _host_matches(host, "sephora.com"):
+        return _load_sephora_product_reviews(product_url, product_html, config=SEPHORA_BV_CONFIG)
+    if _host_matches(host, "ulta.com"):
+        return _load_powerreviews_product_page(product_url, product_html, config=ULTA_PR_CONFIG, candidate_builder=_ulta_candidate_ids)
+    if _host_matches(host, "hoka.com"):
+        return _load_powerreviews_product_page(product_url, product_html, config=HOKA_PR_CONFIG, candidate_builder=_hoka_candidate_ids)
+
+    return _load_default_sharkninja_reviews(product_url, product_html)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ANALYTICS
@@ -3408,12 +4018,11 @@ def _render_review_card(row, evidence_items=None):
         tag_html = _symptom_tags_html(det_tags, del_tags)
         if tag_html:
             st.markdown(tag_html, unsafe_allow_html=True)
+        footer_bits = [_reference_tile_html_for_row(row)]
         loc = _safe_text(row.get("user_location"))
         if loc:
-            st.markdown(
-                f"<div style='font-size:11.5px;color:var(--slate-400);margin-top:8px;'>{_esc(loc)}</div>",
-                unsafe_allow_html=True,
-            )
+            footer_bits.append(f"<span style='font-size:11.5px;color:var(--slate-400);'>{_esc(loc)}</span>")
+        st.markdown(f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;'>{''.join(footer_bits)}</div>", unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4121,7 +4730,7 @@ def main():
 
     source_mode = st.radio("Workspace source", [SOURCE_MODE_URL, SOURCE_MODE_FILE], horizontal=True, key="workspace_source_mode")
     if source_mode == SOURCE_MODE_URL:
-        st.text_input("Product URL", key="workspace_product_url")
+        st.text_input("Product URL or Review API URL", key="workspace_product_url")
         if st.button("Build review workspace", type="primary", key="ws_build_url"):
             try:
                 nd = _load_product_reviews(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
@@ -4159,7 +4768,7 @@ def main():
         st.markdown("""<div style="margin-top:2rem;padding:2rem;background:var(--surface,#fff);border:1px solid #dde1e8;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.08);">
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:.4rem;">No workspace loaded</div>
-          <div style="font-size:13px;color:#64748b;">Enter a SharkNinja product URL or upload a review export above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.</div>
+          <div style="font-size:13px;color:#64748b;">Enter a product page URL, a Bazaarvoice / PowerReviews review API URL, or upload a review export above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.</div>
         </div>""", unsafe_allow_html=True)
         return
 
