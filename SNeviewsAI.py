@@ -187,7 +187,7 @@ DEFAULT_CONTENT_LOCALES = (
 )
 BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
 
-DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html"
+DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/shark-silkipro-hair-straightener-and-dryer-in-plum/HT400PU.html"
 SOURCE_MODE_URL = "SharkNinja product URL"
 SOURCE_MODE_FILE = "Uploaded review file"
 
