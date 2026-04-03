@@ -11,3 +11,4 @@ scikit-learn>=1.4.0
 wordcloud>=1.9.3
 matplotlib>=3.8.0   # if you add charts beyond plotly
 xlsxwriter>=3.2.0   # if you need advanced Excel formatting
+playwright 
