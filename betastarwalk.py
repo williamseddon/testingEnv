@@ -2561,6 +2561,16 @@ def _show_plotly(fig):
     )
 
 
+def _render_chart_header(title: str, subtitle: str = ""):
+    st.markdown(
+        f"<div style='padding:2px 2px 10px 2px;'>"
+        f"<div style='font-size:13px;font-weight:800;color:var(--navy);line-height:1.25;'>{_esc(title)}</div>"
+        + (f"<div style='font-size:11.5px;color:var(--slate-500);margin-top:3px;line-height:1.35;'>{_esc(subtitle)}</div>" if subtitle else "")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 REGION_NAME_MAP = {
     "US": "USA",
     "USA": "USA",
@@ -4355,7 +4365,7 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             extra_candidates = _extra_filter_candidates(df)
             current_extra = [c for c in (st.session_state.get("rf_extra_filter_cols", []) or []) if c in extra_candidates]
             st.session_state["rf_extra_filter_cols"] = current_extra
-            with st.expander("➕ Add Filters", expanded=False):
+            with st.expander("➕ Add Filters (power user)", expanded=False):
                 st.caption("Choose additional columns to surface as filters.")
                 st.multiselect("Available columns", options=extra_candidates, default=current_extra, key="rf_extra_filter_cols")
             extra_cols = st.session_state.get("rf_extra_filter_cols", []) or []
@@ -4858,50 +4868,56 @@ def _render_dashboard(filtered_df, overall_df=None):
             rating_df["rating_label"] = rating_df["rating"].map(lambda v: f"{int(v)}★")
             rating_df["count_pct_label"] = rating_df.apply(lambda r: f"{int(r['review_count']):,} · {_fmt_pct(r['share'])}", axis=1)
             with st.container(border=True):
+                _render_chart_header("Rating distribution", "Volume and share by star rating for the current view.")
                 fig = px.bar(
                     rating_df,
                     x="rating_label",
                     y="review_count",
                     text="count_pct_label",
-                    title="Rating distribution",
                     category_orders={"rating_label": ["1★", "2★", "3★", "4★", "5★"]},
                     color="rating",
                     color_discrete_map={"1": "#ef4444", "2": "#f97316", "3": "#eab308", "4": "#84cc16", "5": "#22c55e"},
                     hover_data={"share": ":.1%", "review_count": True},
                 )
                 fig.update_traces(textposition="outside", cliponaxis=False, showlegend=False)
-                fig.update_layout(margin=dict(l=20, r=18, t=30, b=20), xaxis_title="", yaxis_title="Reviews", height=330, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
+                fig.update_layout(title=None, margin=dict(l=20, r=18, t=18, b=20), xaxis_title="", yaxis_title="Reviews", height=330, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
                 fig = _sw_style_fig(fig)
+                fig.update_layout(title=None, margin=dict(l=24, r=18, t=18, b=32))
                 _show_plotly(fig)
 
         with dash_tabs[1]:
             cohort_df = _cohort_by_incentivized(chart_df)
             with st.container(border=True):
+                _render_chart_header("Rating split: Organic vs Incentivized", "Compare cohort distributions without crowding the plot area.")
                 if cohort_df.empty:
                     st.info("No cohort data.")
                 else:
-                    fig_c = px.bar(cohort_df, x="star", y="pct", color="cohort", barmode="group", title="Rating split: Organic vs Incentivized", labels={"star": "Star", "pct": "% of cohort", "cohort": "Cohort"}, color_discrete_map={"Organic": "#6366f1", "Incentivized": "#f59e0b"})
-                    fig_c.update_layout(xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5], ticktext=["1★", "2★", "3★", "4★", "5★"]), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=30, b=30), height=330)
+                    fig_c = px.bar(cohort_df, x="star", y="pct", color="cohort", barmode="group", labels={"star": "Star", "pct": "% of cohort", "cohort": "Cohort"}, color_discrete_map={"Organic": "#6366f1", "Incentivized": "#f59e0b"})
+                    fig_c.update_layout(xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5], ticktext=["1★", "2★", "3★", "4★", "5★"]), title=None, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=18, b=48), height=330)
                     fig_c.update_yaxes(ticksuffix="%")
                     fig_c = _sw_style_fig(fig_c)
+                    fig_c.update_layout(title=None, legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top", font=dict(size=11)), margin=dict(l=24, r=18, t=18, b=78))
                     _show_plotly(fig_c)
 
         with dash_tabs[2]:
             sb_df = _star_band_trend(chart_df)
             with st.container(border=True):
+                _render_chart_header("Sentiment drift over time", "Track how low-star and high-star mix moves by month.")
                 if sb_df.empty:
                     st.info("Insufficient date data for sentiment trend.")
                 else:
                     fig_sb = go.Figure()
                     fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_low"], name="% 1-2★", mode="lines+markers", line=dict(color="#ef4444", width=2), marker=dict(size=4), fill="tozeroy", fillcolor="rgba(239,68,68,0.08)"))
                     fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_high"], name="% 4-5★", mode="lines+markers", line=dict(color="#22c55e", width=2), marker=dict(size=4)))
-                    fig_sb.update_layout(title="Sentiment drift: 1-2★ vs 4-5★ over time", hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=30, b=30), height=330)
+                    fig_sb.update_layout(title=None, hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=18, b=48), height=330)
                     fig_sb.update_yaxes(ticksuffix="%", title="% of monthly reviews")
                     fig_sb = _sw_style_fig(fig_sb)
+                    fig_sb.update_layout(title=None, legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top", font=dict(size=11)), margin=dict(l=24, r=18, t=18, b=78))
                     _show_plotly(fig_sb)
 
         with dash_tabs[3]:
             with st.container(border=True):
+                _render_chart_header("Top markets by review volume", "Review count by locale, with average rating shown as scaled markers.")
                 locale_df = _locale_breakdown(chart_df, top_n=10)
                 if locale_df.empty:
                     st.info("No locale data.")
@@ -4909,8 +4925,9 @@ def _render_dashboard(filtered_df, overall_df=None):
                     fig_loc = go.Figure()
                     fig_loc.add_trace(go.Bar(x=locale_df["count"], y=locale_df["content_locale"], orientation="h", name="Reviews", marker_color="#6366f1", opacity=0.82, hovertemplate="%{y}<br>%{x:,} reviews<extra></extra>"))
                     fig_loc.add_trace(go.Scatter(x=locale_df["avg_rating"] * locale_df["count"].max() / 5, y=locale_df["content_locale"], mode="markers", name="Avg ★ (scaled)", marker=dict(color=locale_df["avg_rating"], colorscale="RdYlGn", cmin=1, cmax=5, size=9, showscale=True, colorbar=dict(title="Avg ★", len=0.42, x=1.01)), hovertemplate="%{y}<br>Avg ★: %{text}<extra></extra>", text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
-                    fig_loc.update_layout(title="Top markets by review volume", height=max(320, 26 * len(locale_df) + 100), margin=dict(l=70, r=40, t=30, b=30), barmode="overlay", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", xaxis_title="Reviews", yaxis_title="")
+                    fig_loc.update_layout(title=None, height=max(320, 26 * len(locale_df) + 100), margin=dict(l=70, r=40, t=18, b=48), barmode="overlay", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", xaxis_title="Reviews", yaxis_title="")
                     fig_loc = _sw_style_fig(fig_loc)
+                    fig_loc.update_layout(title=None, legend=dict(orientation="h", y=-0.18, x=0, xanchor="left", yanchor="top", font=dict(size=11)), margin=dict(l=74, r=58, t=18, b=84))
                     _show_plotly(fig_loc)
                 st.markdown("<div style='height:.35rem'></div>", unsafe_allow_html=True)
                 locs = _top_locations(chart_df, top_n=10)
@@ -4923,14 +4940,16 @@ def _render_dashboard(filtered_df, overall_df=None):
 
         with dash_tabs[4]:
             with st.container(border=True):
+                _render_chart_header("Review depth vs satisfaction", "Longer reviews often signal different satisfaction patterns and complexity.")
                 len_df = _review_length_cohort(chart_df)
                 if len_df.empty:
                     st.info("Insufficient data for review-length analysis.")
                 else:
                     fig_len = go.Figure()
                     fig_len.add_trace(go.Bar(x=len_df["Length Quartile"], y=len_df["avg_rating"], text=[f"{v:.2f}★" for v in len_df["avg_rating"]], textposition="outside", marker_color=["#ef4444" if v < 3.5 else "#eab308" if v < 4.2 else "#22c55e" for v in len_df["avg_rating"]], hovertemplate="%{x}<br>Avg ★: %{y:.2f}<br>n=%{customdata}<extra></extra>", customdata=len_df["count"]))
-                    fig_len.update_layout(title="Review depth vs satisfaction", yaxis_range=[1, 5.2], yaxis_title="Avg ★", xaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=30, b=24), height=330)
+                    fig_len.update_layout(title=None, yaxis_range=[1, 5.2], yaxis_title="Avg ★", xaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=18, b=24), height=330)
                     fig_len = _sw_style_fig(fig_len)
+                    fig_len.update_layout(title=None, margin=dict(l=24, r=18, t=18, b=34))
                     _show_plotly(fig_len)
 
 # ═══════════════════════════════════════════════════════════════════════════════
