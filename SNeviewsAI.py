@@ -4228,6 +4228,7 @@ def _init_state():
         ai_response_preset="Large (1200 words)",
         ai_response_words=1200,
         ai_include_references=False,
+        ot_show_volume=False,
         workspace_source_mode=SOURCE_MODE_URL,
         workspace_product_url=DEFAULT_PRODUCT_URL,
         workspace_file_uploader_nonce=0,
@@ -4276,6 +4277,8 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["_uploaded_raw_bytes"] = None
     st.session_state["sym_export_bytes"] = None
     st.session_state["_prompt_bundle_ready"] = False
+    st.session_state["ai_include_references"] = False
+    st.session_state["ot_show_volume"] = False
     st.session_state.pop("sym_ai_build_result", None)
     _reset_review_filters()
     if reset_source:
@@ -5062,7 +5065,7 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
         elif st.session_state.get("ai_response_preset") == "Large (1200 words)":
             st.session_state["ai_response_words"] = 1200
         size_cols[1].number_input("Target words", min_value=250, max_value=2400, step=100, value=_current_ai_target_words(), key="ai_response_words", help="You can type your own target word count. Around 1200 words is the default large report.", disabled=st.session_state.get("ai_response_preset") != "Custom")
-        size_cols[2].toggle("Include references · Beta", value=bool(st.session_state.get("ai_include_references", False)), key="ai_include_references", help="Beta feature. When on, the assistant includes hoverable Reference previews in the AI Analyst output. Off by default for a cleaner reading view.")
+        size_cols[2].toggle("Include references · Beta", value=bool(st.session_state.get("ai_include_references", False)), key="ai_include_references", help="AI Analyst only. Beta feature. When on, the assistant includes hoverable Reference previews in the answer. Off by default for a cleaner reading view.")
         size_cols[3].caption(f"Target: {_current_ai_target_words():,} words · approx. {int(round(_current_ai_target_words() * 6.2)):,} characters. References are {'on' if st.session_state.get('ai_include_references') else 'off'}.")
         if st.session_state.get("ai_include_references"):
             st.caption("**Beta:** hoverable review references are enabled for AI Analyst answers.")
@@ -5557,7 +5560,7 @@ def main():
                 try:
                     nd = _load_product_reviews(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
                     _reset_review_filters()
-                    st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None)
+                    st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False)
                     st.rerun()
                 except requests.HTTPError as exc:
                     st.error(f"HTTP error: {exc}")
@@ -5573,7 +5576,7 @@ def main():
                 try:
                     nd = _load_uploaded_files(uploaded_files or [])
                     _reset_review_filters()
-                    st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None)
+                    st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False)
                     if uploaded_files and len(uploaded_files) == 1:
                         fname = getattr(uploaded_files[0], "name", "")
                         if fname.lower().endswith(".xlsx"):
