@@ -4355,7 +4355,7 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             extra_candidates = _extra_filter_candidates(df)
             current_extra = [c for c in (st.session_state.get("rf_extra_filter_cols", []) or []) if c in extra_candidates]
             st.session_state["rf_extra_filter_cols"] = current_extra
-            with st.expander("➕ Add Filters (power user)", expanded=False):
+            with st.expander("➕ Add Filters", expanded=False):
                 st.caption("Choose additional columns to surface as filters.")
                 st.multiselect("Available columns", options=extra_candidates, default=current_extra, key="rf_extra_filter_cols")
             extra_cols = st.session_state.get("rf_extra_filter_cols", []) or []
