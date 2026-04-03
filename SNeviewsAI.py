@@ -1,5 +1,11 @@
 """
 SharkNinja Review Analyst + Symptomizer — Updated and optimized
+Updated with:
+- Live sidebar filter system with timeframe, stars, core filters, dynamic extra filters, and active filter summary
+- Symptom filters shown only when symptom data exists
+- Short hoverable Reference tiles (AI Analyst citations only)
+- More stable model fallbacks for batch / structured operations
+- Symptomizer result cards now show detractors and delighters at the bottom like Review Explorer
 """
 from __future__ import annotations
 
@@ -16,9 +22,9 @@ import textwrap
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
 import pandas as pd
@@ -94,7 +100,7 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .hero-stat.accent{border-color:rgba(99,102,241,.40);background:linear-gradient(145deg,#eef2ff,var(--surface));}
 .hero-stat .label{color:var(--slate-500);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
 .hero-stat .value{font-size:24px;font-weight:800;margin-top:4px;color:var(--navy);letter-spacing:-.035em;}
-.stButton>button{border-radius:var(--radius-sm)!important;font-weight:600!important;font-size:13.5px!important;height:38px!important;border:1.5px solid var(--border-strong)!important;background:var(--surface)!important;color:var(--navy-soft)!important;box-shadow:var(--shadow-xs)!important;transition:all .14s ease!important;letter-spacing:-.01em!important;}
+.stButton>button{border-radius:var(--radius-sm)!important;font-weight:600!important;font-size:13.5px!important;min-height:38px!important;height:auto!important;border:1.5px solid var(--border-strong)!important;background:var(--surface)!important;color:var(--navy-soft)!important;box-shadow:var(--shadow-xs)!important;transition:all .14s ease!important;letter-spacing:-.01em!important;white-space:normal!important;line-height:1.2!important;padding:8px 12px!important;}
 .stButton>button:hover{border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(99,102,241,.13)!important;color:var(--accent)!important;}
 [data-testid="baseButton-primary"],[data-testid="baseButton-primary"]:hover{background:var(--navy)!important;color:var(--surface)!important;border-color:var(--navy)!important;}
 [data-testid="baseButton-primary"]:hover{background:var(--navy-mid)!important;border-color:var(--navy-mid)!important;box-shadow:0 0 0 3px rgba(15,23,42,.14)!important;}
@@ -144,8 +150,53 @@ html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:va
 .thinking-sub{color:var(--slate-500);font-size:.92rem;line-height:1.4;}
 .nav-tabs-wrap{background:var(--surface);border-radius:var(--radius-xl);padding:8px 10px;border:1px solid var(--border);box-shadow:var(--shadow-sm);margin:1.1rem 0 1.4rem;}
 .nav-tabs-label{font-size:11px;color:var(--slate-500);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}
+.soft-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px 14px;box-shadow:var(--shadow-xs);margin:.55rem 0 .95rem;}
+.pill-row{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px;align-items:center;}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--slate-50);border:1px solid var(--border);font-size:11.5px;font-weight:600;color:var(--navy);}
+.pill .muted{color:var(--slate-500);font-weight:700;}
+.small-muted{font-size:12px;color:var(--slate-500);}
+.ref-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px;margin-right:2px;line-height:1;z-index:40;isolation:isolate;contain:paint;}
+.ref-wrap:hover,.ref-wrap:focus-within{z-index:2147483000!important;}
+.ref-wrap::after{content:"";position:absolute;left:50%;transform:translateX(-50%);top:100%;width:min(500px,calc(100vw - 24px));height:26px;background:transparent;z-index:1;}
+.ref-tile{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:11.5px;font-weight:700;line-height:1;cursor:help;white-space:nowrap;position:relative;z-index:2;}
+.ref-tip{position:absolute;left:50%;transform:translateX(-50%);top:calc(100% + 8px);width:min(500px,calc(100vw - 24px));box-sizing:border-box;border:1px solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);z-index:2147483600!important;opacity:0;visibility:hidden;pointer-events:auto;transition:opacity .12s ease, visibility .12s ease;white-space:normal;overflow:hidden;background:#fff;backdrop-filter:blur(6px);overflow-wrap:anywhere;word-break:break-word;isolation:isolate;contain:layout paint;}
+.ref-tip::before{content:"";position:absolute;inset:0;background:#fff;border-radius:inherit;z-index:0;}
+.ref-tip-inner{position:relative;z-index:2;max-height:min(380px,70vh);overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 11px;background:#fff;}
+.ref-wrap:hover .ref-tip,.ref-wrap:focus-within .ref-tip,.ref-tip:hover{opacity:1;visibility:visible;}
+.ref-tip-inner::-webkit-scrollbar{width:10px;}
+.ref-tip-inner::-webkit-scrollbar-thumb{background:rgba(100,116,139,.35);border-radius:999px;}
+.ref-item{padding:7px 0;border-bottom:1px solid var(--border);position:relative;z-index:2;background:#fff;}
+.ref-item:last-child{border-bottom:none;padding-bottom:0;}
+.ref-item:first-child{padding-top:0;}
+.ref-meta{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--slate-500);font-weight:700;margin-bottom:3px;}
+.ref-title{font-size:12px;font-weight:700;color:var(--navy);margin-bottom:3px;line-height:1.35;overflow-wrap:anywhere;word-break:break-word;}
+.ref-snippet{font-size:11.5px;line-height:1.45;color:var(--slate-600);white-space:normal;overflow-wrap:anywhere;word-break:break-word;}
+.ref-empty{font-size:11.5px;color:var(--slate-500);line-height:1.4;overflow-wrap:anywhere;word-break:break-word;}
+[data-testid="stChatMessage"],[data-testid="stChatMessageContent"]{overflow:visible!important;position:relative!important;z-index:0!important;}
+[data-testid="stMarkdownContainer"]{overflow:visible!important;overflow-wrap:anywhere!important;word-break:break-word!important;}
+[data-testid="stChatMessageContent"] p,[data-testid="stChatMessageContent"] li{font-size:12.35px;line-height:1.58;}
+[data-testid="stChatMessageContent"] h1,[data-testid="stChatMessageContent"] h2,[data-testid="stChatMessageContent"] h3,[data-testid="stChatMessageContent"] h4{font-size:12.45px;line-height:1.45;font-weight:700;margin:.42rem 0 .18rem;letter-spacing:-.005em;}
+[data-testid="stChatMessageContent"] ul,[data-testid="stChatMessageContent"] ol{margin:.2rem 0 .55rem 1rem;}
+.workspace-nav-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:12px 14px;box-shadow:var(--shadow-sm);margin:1.05rem 0 1.25rem;}
+.builder-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:16px 18px;box-shadow:var(--shadow-sm);margin:.3rem 0 1rem;}
+.builder-kicker{font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);font-weight:700;margin-bottom:4px;}
+.builder-title{font-size:18px;font-weight:800;letter-spacing:-.02em;color:var(--navy);margin-bottom:4px;}
+.builder-sub{font-size:13px;color:var(--slate-500);line-height:1.5;margin-bottom:10px;}
+.summary-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:.2rem 0 .85rem;}
+.summary-item{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px 13px;box-shadow:var(--shadow-xs);min-height:96px;}
+.summary-item .label{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--slate-500);font-weight:700;margin-bottom:4px;}
+.summary-item .value{font-size:18px;font-weight:800;letter-spacing:-.025em;color:var(--navy);line-height:1.2;}
+.summary-item .sub{font-size:12px;color:var(--slate-500);line-height:1.45;margin-top:5px;}
+.sidebar-scope-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:10px 12px;margin:0 0 .65rem;box-shadow:var(--shadow-xs);}
+.sidebar-scope-title{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--slate-500);font-weight:700;margin-bottom:4px;}
+.sidebar-scope-value{font-size:13px;font-weight:700;color:var(--navy);line-height:1.35;}
+.workspace-nav-sub{font-size:12px;color:var(--slate-500);margin:-2px 0 8px;line-height:1.45;}
+.section-note{font-size:12.5px;color:var(--slate-500);line-height:1.5;margin:0 0 10px;}
+.helper-chip-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px;}
+.helper-chip{display:inline-flex;align-items:center;padding:4px 9px;border-radius:999px;background:var(--slate-50);border:1px solid var(--border);font-size:11px;font-weight:700;color:var(--slate-600);}
 @keyframes tw-spin{to{transform:rotate(360deg);}}
-@media(max-width:1100px){.hero-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:1100px){.hero-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:768px){.hero-grid{grid-template-columns:1fr;}.summary-grid{grid-template-columns:1fr;}.builder-card{padding:14px 14px 15px;}.hero-title{font-size:20px;}.metric-card{min-height:94px;}.ref-wrap{display:inline-block;max-width:100%;}.ref-tip{left:0;transform:none;width:min(340px,calc(100vw - 24px));max-height:min(52vh,340px);}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -164,9 +215,164 @@ DEFAULT_CONTENT_LOCALES = (
     "tr*,vi*,en_AU,en_CA,en_GB"
 )
 BAZAARVOICE_ENDPOINT = "https://api.bazaarvoice.com/data/reviews.json"
+POWERREVIEWS_BASE = "https://display.powerreviews.com"
+POWERREVIEWS_MAX_PAGE_SIZE = 25
+UK_EU_BV_PASSKEY = "capxzF3xnCmhSCHhkomxF1sQkZmh2zK2fNb8D1VDNl3hY"
+COSTCO_BV_PASSKEY = "bai25xto36hkl5erybga10t99"
+SEPHORA_BV_PASSKEY = "calXm2DyQVjcCy9agq85vmTJv5ELuuBCF2sdg4BnJzJus"
+ULTA_POWERREVIEWS_API_KEY = "daa0f241-c242-4483-afb7-4449942d1a2b"
+HOKA_POWERREVIEWS_API_KEY = "ea283fa2-3fdc-4127-863c-b1e2397f7a77"
+
+SITE_REVIEW_CONFIGS = [
+    {
+        "key": "sharkninja_us",
+        "provider": "bazaarvoice",
+        "bv_style": "revstats",
+        "label": "SharkNinja US",
+        "domains": ["sharkninja.com", "www.sharkninja.com", "sharkclean.com", "www.sharkclean.com", "ninjakitchen.com", "www.ninjakitchen.com"],
+        "passkey": DEFAULT_PASSKEY,
+        "displaycode": DEFAULT_DISPLAYCODE,
+        "api_version": DEFAULT_API_VERSION,
+        "content_locales": DEFAULT_CONTENT_LOCALES,
+        "sort": DEFAULT_SORT,
+        "retailer": "SharkNinja US",
+    },
+    {
+        "key": "sharkninja_uk_eu",
+        "provider": "bazaarvoice",
+        "bv_style": "simple",
+        "label": "SharkNinja UK/EU",
+        "domains": [
+            "sharkclean.co.uk", "www.sharkclean.co.uk", "ninjakitchen.co.uk", "www.ninjakitchen.co.uk",
+            "sharkclean.eu", "www.sharkclean.eu", "ninjakitchen.eu", "www.ninjakitchen.eu",
+            "sharkclean.de", "www.sharkclean.de", "ninjakitchen.de", "www.ninjakitchen.de",
+            "sharkclean.fr", "www.sharkclean.fr", "ninjakitchen.fr", "www.ninjakitchen.fr",
+            "sharkclean.es", "www.sharkclean.es", "ninjakitchen.es", "www.ninjakitchen.es",
+            "sharkclean.it", "www.sharkclean.it", "ninjakitchen.it", "www.ninjakitchen.it",
+            "sharkclean.nl", "www.sharkclean.nl", "ninjakitchen.nl", "www.ninjakitchen.nl",
+        ],
+        "passkey": UK_EU_BV_PASSKEY,
+        "api_version": "5.4",
+        "sort": "SubmissionTime:desc",
+        "locale": "en_GB",
+        "retailer": "SharkNinja UK/EU",
+    },
+    {
+        "key": "costco",
+        "provider": "bazaarvoice",
+        "bv_style": "revstats",
+        "label": "Costco",
+        "domains": ["costco.com", "www.costco.com"],
+        "passkey": COSTCO_BV_PASSKEY,
+        "displaycode": "2070_2_0-en_us",
+        "api_version": "5.5",
+        "content_locales": "en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,tr*,vi*",
+        "sort": "SubmissionTime:desc",
+        "retailer": "Costco",
+    },
+    {
+        "key": "sephora",
+        "provider": "bazaarvoice",
+        "bv_style": "simple",
+        "label": "Sephora",
+        "domains": ["sephora.com", "www.sephora.com"],
+        "passkey": SEPHORA_BV_PASSKEY,
+        "api_version": "5.4",
+        "sort": "SubmissionTime:desc",
+        "locale": "en_US",
+        "retailer": "Sephora",
+        "extra_filters": ["contentlocale:en*"],
+    },
+    {
+        "key": "ulta",
+        "provider": "powerreviews",
+        "label": "Ulta",
+        "domains": ["ulta.com", "www.ulta.com"],
+        "merchant_id": "6406",
+        "locale": "en_US",
+        "page_locale": "en_US",
+        "api_key": ULTA_POWERREVIEWS_API_KEY,
+        "sort": "Newest",
+        "retailer": "Ulta",
+    },
+    {
+        "key": "hoka",
+        "provider": "powerreviews",
+        "label": "Hoka",
+        "domains": ["hoka.com", "www.hoka.com"],
+        "merchant_id": "437772",
+        "locale": "en_US",
+        "page_locale": "en_US",
+        "api_key": HOKA_POWERREVIEWS_API_KEY,
+        "sort": "Newest",
+        "retailer": "Hoka",
+    },
+]
+
+POWERREVIEWS_ENDPOINT = "https://display.powerreviews.com"
+SHARK_EUUK_BV_PASSKEY = "capxzF3xnCmhSCHhkomxF1sQkZmh2zK2fNb8D1VDNl3hY"
+SHARK_EUUK_BV_API_VERSION = "5.4"
+SHARK_EUUK_BV_CONFIG = {
+    "style": "simple",
+    "passkey": SHARK_EUUK_BV_PASSKEY,
+    "api_version": SHARK_EUUK_BV_API_VERSION,
+    "locale": "en_GB",
+    "sort": "SubmissionTime:desc",
+    "extra_filters": [],
+}
+COSTCO_BV_CONFIG = {
+    "style": "revstats",
+    "passkey": "bai25xto36hkl5erybga10t99",
+    "displaycode": "2070_2_0-en_us",
+    "api_version": "5.5",
+    "sort": "relevancy:a1",
+    "content_locales": "en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,tr*,vi*",
+}
+SEPHORA_BV_CONFIG = {
+    "style": "simple",
+    "passkey": "calXm2DyQVjcCy9agq85vmTJv5ELuuBCF2sdg4BnJzJus",
+    "api_version": "5.4",
+    "locale": "en_US",
+    "sort": "SubmissionTime:desc",
+    "extra_filters": ["contentlocale:en*"],
+}
+ULTA_POWERREVIEWS_CONFIG = {
+    "merchant_id": "6406",
+    "locale": "en_US",
+    "page_locale": "en_US",
+    "apikey": "daa0f241-c242-4483-afb7-4449942d1a2b",
+    "sort": "Newest",
+}
+HOKA_POWERREVIEWS_CONFIG = {
+    "merchant_id": "437772",
+    "locale": "en_US",
+    "page_locale": "en_US",
+    "apikey": "ea283fa2-3fdc-4127-863c-b1e2397f7a77",
+    "sort": "Newest",
+}
+POWERREVIEWS_ENDPOINT_TEMPLATE = "https://display.powerreviews.com/m/{merchant_id}/l/{locale}/product/{product_id}/reviews"
+SHARKNINJA_UK_EU_BV_CONFIG = {
+    "passkey": UK_EU_BV_PASSKEY,
+    "api_version": "5.4",
+    "locale": "en_GB",
+    "include": "Products,Comments",
+    "sort": "SubmissionTime:desc",
+    "content_locale": "en*",
+    "retailer": "SharkNinja UK/EU",
+}
+ULTA_PR_CONFIG = {
+    **ULTA_POWERREVIEWS_CONFIG,
+    "apikey": ULTA_POWERREVIEWS_CONFIG.get("apikey") or ULTA_POWERREVIEWS_API_KEY,
+    "retailer": "Ulta",
+}
+HOKA_PR_CONFIG = {
+    **HOKA_POWERREVIEWS_CONFIG,
+    "apikey": HOKA_POWERREVIEWS_CONFIG.get("apikey") or HOKA_POWERREVIEWS_API_KEY,
+    "retailer": "Hoka",
+}
 
 DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html"
-SOURCE_MODE_URL = "SharkNinja product URL"
+SOURCE_MODE_URL = "Product / review URL"
 SOURCE_MODE_FILE = "Uploaded review file"
 
 TAB_DASHBOARD = "📊  Dashboard"
@@ -197,8 +403,9 @@ MODEL_OPTIONS = [
 ]
 DEFAULT_MODEL = "gpt-5.4-mini"
 DEFAULT_REASONING = "none"
+STRUCTURED_FALLBACK_MODEL = "gpt-5.4-mini"
 AI_VISIBLE_CHAT_MESSAGES = 2
-AI_CONTEXT_TOKEN_BUDGET = 14_000
+AI_CONTEXT_TOKEN_BUDGET = 10_000
 NON_VALUES = {"<NA>","NA","N/A","NONE","-","","NAN","NULL"}
 STOPWORDS = {
     "a","about","after","again","all","also","am","an","and","any","are","as","at",
@@ -276,6 +483,15 @@ REVIEW_PROMPT_STARTER_ROWS = [
     {"column_name":"reliability_risk_signal",
      "prompt":"Does the review mention a product reliability or durability risk? Risk Mentioned, Positive Reliability, or Not Mentioned.",
      "labels":"Risk Mentioned, Positive Reliability, Not Mentioned"},
+    {"column_name":"product_usage_sessions_if_mentioned",
+     "prompt":"If mentioned, how many times has the customer used the product? Choose the closest bucket. Use Unknown if the review does not say.",
+     "labels":"0, 1, 2–3, 4–9, 10+, Unknown"},
+    {"column_name":"safety_signal_if_mentioned",
+     "prompt":"Does the review mention a product safety concern or a positive safety statement? Concern, Positive, or Not Mentioned.",
+     "labels":"Concern, Positive, Not Mentioned"},
+    {"column_name":"ownership_period_if_mentioned",
+     "prompt":"If mentioned, how long has the customer owned or used the product? Choose the closest bucket. Use Unknown if not stated.",
+     "labels":"First Use, Under 1 Week, 1–4 Weeks, 1–3 Months, 3+ Months, Unknown"},
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -500,6 +716,23 @@ def _shared_reasoning():
     return cur
 
 
+def _coerce_ai_target_words(value, default=1200):
+    try:
+        n = int(value)
+    except Exception:
+        n = int(default)
+    return max(250, min(2400, n))
+
+
+def _ai_target_token_budget(target_words: int) -> int:
+    words = _coerce_ai_target_words(target_words)
+    return max(900, min(7000, int(round(words * 2.35))))
+
+
+def _current_ai_target_words() -> int:
+    return _coerce_ai_target_words(st.session_state.get("ai_response_words", 1200))
+
+
 def _model_supports_reasoning(model: str) -> bool:
     return _safe_text(model).lower().startswith("gpt-5")
 
@@ -570,13 +803,37 @@ def _safe_json_load(s):
     return {}
 
 
+def _prepare_messages_for_model(model: str, messages):
+    prepared = []
+    use_developer = _safe_text(model).lower().startswith("gpt-5")
+    for msg in list(messages or []):
+        if not isinstance(msg, dict):
+            continue
+        item = dict(msg)
+        if use_developer and item.get("role") == "system":
+            item["role"] = "developer"
+        prepared.append(item)
+    return prepared
+
+
+def _build_completion_token_kwargs(max_tokens):
+    try:
+        limit = int(max_tokens) if max_tokens is not None else None
+    except Exception:
+        limit = None
+    if limit is None or limit <= 0:
+        return {}
+    return {"max_completion_tokens": limit}
+
+
 def _chat_complete(client, *, model, messages, temperature=0.0, response_format=None,
                    max_tokens=1200, reasoning_effort=None, _max_retries=3):
     if client is None:
         return ""
 
     effort = _normalize_reasoning_effort_for_model(model, reasoning_effort)
-    kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
+    kwargs = dict(model=model, messages=_prepare_messages_for_model(model, messages))
+    kwargs.update(_build_completion_token_kwargs(max_tokens))
     if response_format:
         kwargs["response_format"] = response_format
     if effort:
@@ -596,16 +853,41 @@ def _chat_complete(client, *, model, messages, temperature=0.0, response_format=
             last_exc = exc
             err = str(exc).lower()
 
+            if "max_completion_tokens" in kwargs and any(k in err for k in (
+                "unexpected keyword argument 'max_completion_tokens'",
+                'unsupported parameter: "max_completion_tokens"',
+                "unsupported parameter: 'max_completion_tokens'",
+                "unknown parameter: max_completion_tokens",
+                "max_completion_tokens is not supported",
+            )):
+                token_limit = kwargs.pop("max_completion_tokens", None)
+                if token_limit is not None:
+                    kwargs["max_tokens"] = token_limit
+                continue
+
+            if "max_tokens" in kwargs and any(k in err for k in (
+                "unexpected keyword argument 'max_tokens'",
+                'unsupported parameter: "max_tokens"',
+                "unsupported parameter: 'max_tokens'",
+                "use 'max_completion_tokens' instead",
+                "deprecated in favor of `max_completion_tokens`",
+                "not compatible with o-series models",
+                "not compatible with reasoning models",
+            )):
+                token_limit = kwargs.pop("max_tokens", None)
+                if token_limit is not None:
+                    kwargs["max_completion_tokens"] = token_limit
+                continue
+
             if reasoning_enabled and any(k in err for k in (
                 "reasoning_effort",
-                "unexpected keyword argument",
-                "unknown parameter",
-                "unsupported",
-                "does not support",
-                "not support",
-                "extra inputs are not permitted",
+                "unknown parameter: reasoning_effort",
+                'unsupported parameter: "reasoning_effort"',
+                "unsupported parameter: 'reasoning_effort'",
                 "invalid reasoning",
                 "invalid value for reasoning",
+                "does not support reasoning effort",
+                "not support reasoning effort",
             )):
                 kwargs.pop("reasoning_effort", None)
                 reasoning_enabled = False
@@ -631,17 +913,94 @@ def _chat_complete(client, *, model, messages, temperature=0.0, response_format=
         raise last_exc
     return ""
 
+
+def _model_candidates_for_task(selected_model: str, *, structured: bool = False) -> List[str]:
+    preferred = _safe_text(selected_model) or DEFAULT_MODEL
+    fallbacks = [preferred]
+    if structured:
+        fallbacks += [STRUCTURED_FALLBACK_MODEL, DEFAULT_MODEL, "gpt-4.1"]
+    else:
+        fallbacks += [DEFAULT_MODEL]
+    out = []
+    seen = set()
+    for m in fallbacks:
+        if m and m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+
+def _chat_complete_with_fallback_models(client, *, model, messages, structured=False, **kwargs):
+    last_exc = None
+    for candidate in _model_candidates_for_task(model, structured=structured):
+        try:
+            return _chat_complete(client, model=candidate, messages=messages, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if last_exc:
+        raise last_exc
+    return ""
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DATA LAYER
 # ═══════════════════════════════════════════════════════════════════════════════
 def _get_session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+    })
     return s
 
 
+def _ordered_unique(values):
+    out = []
+    seen = set()
+    for raw in list(values or []):
+        val = _safe_text(raw).strip().strip("/")
+        val = re.sub(r"\.html?$", "", val, flags=re.IGNORECASE)
+        if not val:
+            continue
+        key = val.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(val)
+    return out
+
+
+def _domain_matches(host: str, domain: str) -> bool:
+    host = _safe_text(host).lower()
+    domain = _safe_text(domain).lower()
+    return bool(host == domain or host.endswith("." + domain))
+
+
+def _site_config_from_url(url: str) -> Optional[Dict[str, Any]]:
+    host = urlparse(_safe_text(url)).netloc.lower()
+    for cfg in SITE_REVIEW_CONFIGS:
+        if any(_domain_matches(host, d) for d in cfg.get("domains", [])):
+            return dict(cfg)
+    return None
+
+
+def _is_bv_api_url(url: str) -> bool:
+    parsed = urlparse(_safe_text(url))
+    return "api.bazaarvoice.com" in parsed.netloc.lower() and parsed.path.lower().endswith("/reviews.json")
+
+
+def _is_powerreviews_api_url(url: str) -> bool:
+    parsed = urlparse(_safe_text(url))
+    return "display.powerreviews.com" in parsed.netloc.lower() and "/product/" in parsed.path.lower() and parsed.path.lower().endswith("/reviews")
+
+
 def _extract_pid_from_url(url):
-    path = urlparse(url).path
+    parsed = urlparse(url.strip())
+    path = parsed.path
     m = re.search(r"/([A-Za-z0-9_-]+)\.html(?:$|[?#])", path)
     if m:
         c = m.group(1).strip().upper()
@@ -699,6 +1058,346 @@ def _fetch_reviews_page(session, *, product_id, passkey, displaycode, api_versio
     return payload
 
 
+def _fetch_bv_simple_page(session, *, product_id, passkey, api_version,
+                          page_size, offset, sort, content_locale="en*",
+                          locale="en_US", include="Products,Comments"):
+    params: Dict[str, Any] = {
+        "apiversion": api_version,
+        "passkey": passkey,
+        "Include": include,
+        "Stats": "Reviews",
+        "Limit": int(page_size),
+        "Offset": int(offset),
+        "Sort": sort,
+        "Filter": [f"ProductId:{product_id}"],
+    }
+    if content_locale:
+        params["Filter"].insert(0, f"contentlocale:{content_locale}")
+    if locale:
+        params["Locale"] = locale
+    resp = session.get(BAZAARVOICE_ENDPOINT, params=params, timeout=45)
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("HasErrors"):
+        raise ReviewDownloaderError(f"BV error: {payload.get('Errors')}")
+    return payload
+
+
+def _fetch_bazaarvoice_raw_page(session, *, api_url, params):
+    resp = session.get(api_url, params=params, timeout=45)
+    resp.raise_for_status()
+    payload = resp.json()
+    if isinstance(payload, dict) and payload.get("HasErrors"):
+        raise ReviewDownloaderError(f"BV error: {payload.get('Errors')}")
+    return payload
+
+
+def _fetch_powerreviews_page(session, *, merchant_id, locale, product_id,
+                             apikey, paging_from=0, page_size=POWERREVIEWS_MAX_PAGE_SIZE,
+                             sort="Newest", filters="", search="",
+                             image_only=False):
+    endpoint = POWERREVIEWS_ENDPOINT_TEMPLATE.format(
+        merchant_id=merchant_id,
+        locale=locale,
+        product_id=product_id,
+    )
+    safe_page_size = max(1, min(int(page_size or POWERREVIEWS_MAX_PAGE_SIZE), POWERREVIEWS_MAX_PAGE_SIZE))
+    params = {
+        "paging.from": int(paging_from),
+        "paging.size": safe_page_size,
+        "filters": filters or "",
+        "search": search or "",
+        "sort": sort or "Newest",
+        "image_only": "true" if image_only else "false",
+        "page_locale": locale,
+        "_noconfig": "true",
+        "apikey": apikey,
+    }
+    resp = session.get(endpoint, params=params, timeout=45)
+    resp.raise_for_status()
+    payload = resp.json()
+    if isinstance(payload, dict) and payload.get("errors"):
+        raise ReviewDownloaderError(f"PowerReviews error: {payload.get('errors')}")
+    return payload
+
+
+def _find_ci_key(mapping, candidates):
+    wanted = {str(c).lower() for c in candidates}
+    for k in mapping.keys():
+        if str(k).lower() in wanted:
+            return k
+    return None
+
+
+def _query_first_ci(mapping, candidates, default=None):
+    key = _find_ci_key(mapping, candidates)
+    if key is None:
+        return default
+    val = mapping.get(key)
+    if isinstance(val, list):
+        return val[0] if val else default
+    return val if val not in (None, "") else default
+
+
+def _set_ci_param(mapping, candidates, value):
+    key = _find_ci_key(mapping, candidates) or list(candidates)[0]
+    mapping[key] = value
+    return key
+
+
+def _clone_params(mapping):
+    out = {}
+    for k, v in mapping.items():
+        out[k] = list(v) if isinstance(v, list) else v
+    return out
+
+
+def _dedupe_keep_order(values):
+    out = []
+    seen = set()
+    for v in values or []:
+        s = str(v).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _normalize_input_url(product_url: str) -> str:
+    product_url = (product_url or "").strip()
+    if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
+        product_url = "https://" + product_url
+    return product_url
+
+
+def _strip_www(host: str) -> str:
+    host = (host or "").lower().strip()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _host_matches(host: str, tokens: Sequence[str]) -> bool:
+    h = _strip_www(host)
+    return any(tok in h for tok in tokens)
+
+
+def _is_bazaarvoice_api_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return "api.bazaarvoice.com" in (parsed.netloc or "").lower() and parsed.path.endswith("/reviews.json")
+
+
+def _is_powerreviews_api_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return "display.powerreviews.com" in (parsed.netloc or "").lower() and "/product/" in (parsed.path or "") and parsed.path.endswith("/reviews")
+
+
+def _looks_like_sharkninja_uk_eu(host: str) -> bool:
+    h = _strip_www(host)
+    if h in {
+        "sharkclean.co.uk", "ninjakitchen.co.uk", "sharkclean.eu", "ninjakitchen.eu",
+        "sharkclean.de", "ninjakitchen.de", "sharkclean.fr", "ninjakitchen.fr",
+        "sharkclean.nl", "ninjakitchen.nl", "sharkclean.ie", "ninjakitchen.ie",
+    }:
+        return True
+    return ("sharkclean" in h or "ninjakitchen" in h) and not h.endswith(".com")
+
+
+def _looks_like_sharkninja_us(host: str) -> bool:
+    h = _strip_www(host)
+    return h in {"sharkclean.com", "www.sharkclean.com", "ninjakitchen.com", "www.ninjakitchen.com", "sharkninja.com", "www.sharkninja.com"} or h.endswith("sharkclean.com") or h.endswith("ninjakitchen.com")
+
+
+def _safe_candidate_token(raw: Any) -> Optional[str]:
+    s = _safe_text(raw)
+    s = s.strip().strip("\"' ")
+    s = re.sub(r"\.html?$", "", s, flags=re.IGNORECASE)
+    s = s.strip()
+    if not s or len(s) < 3 or len(s) > 80:
+        return None
+    if re.search(r"\s", s):
+        return None
+    if s.lower() in {"product", "products", "reviews", "review", "home", "en", "us", "uk", "gb"}:
+        return None
+    return s
+
+
+def _extract_embedded_review_api_urls(html: str) -> List[str]:
+    text = (html or "")
+    if not text:
+        return []
+    norm = (
+        text.replace(r"\/", "/")
+            .replace("&amp;", "&")
+            .replace(r"\u0026", "&")
+            .replace(r"\x26", "&")
+    )
+    hits: List[str] = []
+    patterns = [
+        r"https://api\.bazaarvoice\.com/data/reviews\.json[^\"'<>\s]+",
+        r"https://display\.powerreviews\.com/m/\d+/l/[A-Za-z_]+/product/[^\"'<>\s]+/reviews[^\"'<>\s]*",
+        r"//display\.powerreviews\.com/m/\d+/l/[A-Za-z_]+/product/[^\"'<>\s]+/reviews[^\"'<>\s]*",
+        r"/m/\d+/l/[A-Za-z_]+/product/[^\"'<>\s]+/reviews[^\"'<>\s]*apikey=[^\"'<>\s]+",
+    ]
+    for pat in patterns:
+        for match in re.findall(pat, norm, flags=re.IGNORECASE):
+            url = str(match).strip().strip('"\' ,)')
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/m/"):
+                url = "https://display.powerreviews.com" + url
+            hits.append(url)
+    return _dedupe_keep_order(hits)
+
+
+def _extract_powerreviews_embeds(html: str) -> List[Dict[str, str]]:
+    text = (html or "")
+    if not text:
+        return []
+    norm = (
+        text.replace(r"\/", "/")
+            .replace("&amp;", "&")
+            .replace(r"\u0026", "&")
+            .replace(r"\x26", "&")
+    )
+    found: List[Dict[str, str]] = []
+    for m in re.finditer(r"(?:https?:)?//display\.powerreviews\.com/m/(\d+)/l/([A-Za-z_]+)/product/([^/?\"'&<>]+)/reviews([^\"'<>]*)", norm, flags=re.IGNORECASE):
+        merchant_id, locale, product_id, rest = m.groups()
+        api_match = re.search(r"[?&]apikey=([^&#\"']+)", rest or "", flags=re.IGNORECASE)
+        if merchant_id and locale and product_id and api_match:
+            found.append({
+                "merchant_id": merchant_id,
+                "locale": locale,
+                "product_id": product_id,
+                "apikey": api_match.group(1),
+            })
+    return found
+
+
+def _extract_bazaarvoice_product_id_from_params(params: Dict[str, Any]) -> Optional[str]:
+    direct = _query_first_ci(params, ["productid", "productId", "ProductId", "pid", "id"])
+    if direct:
+        return _safe_candidate_token(direct)
+    for key, vals in params.items():
+        if str(key).lower() not in {"filter", "filter_reviews", "filterreviews"}:
+            continue
+        vals_list = vals if isinstance(vals, list) else [vals]
+        for val in vals_list:
+            txt = str(val)
+            m = re.search(r"productid(?::eq)?:([^,&]+)", txt, flags=re.IGNORECASE)
+            if m:
+                return _safe_candidate_token(m.group(1))
+    return None
+
+
+def _extract_candidate_tokens_from_url(url: str) -> List[str]:
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    cands: List[str] = []
+
+    for key, values in params.items():
+        lk = key.lower()
+        if lk in {"productid", "product_id", "itemid", "item_id", "pid", "id", "sku"}:
+            cands.extend(values)
+        dw = re.match(r"dwvar_([^_]+)_", key, flags=re.IGNORECASE)
+        if dw:
+            cands.append(dw.group(1))
+
+    path = parsed.path or ""
+    zid_match = re.search(r"[_\-]zid([A-Za-z0-9\-_]+)$", path, flags=re.IGNORECASE)
+    if zid_match:
+        cands.append(zid_match.group(1))
+
+    segments = [s for s in path.split("/") if s]
+    if segments:
+        last = re.sub(r"\.html?$", "", segments[-1], flags=re.IGNORECASE)
+        cands.append(last)
+        for token in re.findall(r"([A-Za-z0-9]{4,30})", last):
+            cands.append(token)
+        if len(segments) >= 2:
+            cands.append(re.sub(r"\.html?$", "", segments[-2], flags=re.IGNORECASE))
+
+    out = []
+    for raw in cands:
+        tok = _safe_candidate_token(raw)
+        if tok:
+            out.append(tok)
+    return _dedupe_keep_order(out)
+
+
+def _extract_candidate_tokens_from_html(html: str) -> List[str]:
+    if not html:
+        return []
+    text = html.replace(r"\/", "/")
+    soup = BeautifulSoup(html, "html.parser")
+    visible = soup.get_text(" ", strip=True)
+    cands: List[str] = []
+
+    patterns = [
+        r'Item\s*No\.?\s*([A-Za-z0-9_-]{4,40})',
+        r'Item\s*([A-Za-z0-9_-]{4,40})',
+        r'"productId"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'"product_id"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'"ProductId"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'"page_id"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'"product_page_id"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'"masterId"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'"styleNumber"\s*[:=]\s*"([A-Za-z0-9_-]{3,40})"',
+        r'data-product-id=["\']([^"\']+)',
+        r'data-sku=["\']([^"\']+)',
+        r'display\.powerreviews\.com/m/\d+/l/[A-Za-z_]+/product/([^/\"\'&?<>]+)/reviews',
+        r'api\.bazaarvoice\.com/data/reviews\.json[^\"\']*productid(?::eq)?:([^,&\"\']+)',
+        r'\b(P\d{5,10})\b',
+        r'\b(pimprod\d{5,12})\b',
+        r'\b(xlsImpprod\d{5,12})\b',
+    ]
+    for pat in patterns:
+        for match in re.findall(pat, text, flags=re.IGNORECASE):
+            cands.append(match)
+        for match in re.findall(pat, visible, flags=re.IGNORECASE):
+            cands.append(match)
+
+    # Look for numeric or SKU-like ids near review / powerreviews / bazaarvoice references.
+    windows = re.findall(r"(?i)(.{0,140}(?:powerreviews|bazaarvoice|reviews|review snapshot).{0,240})", text)
+    for window in windows:
+        cands.extend(re.findall(r"\b([A-Za-z]*\d[A-Za-z0-9_-]{3,30})\b", window))
+
+    out = []
+    for raw in cands:
+        tok = _safe_candidate_token(raw)
+        if tok:
+            out.append(tok)
+    return _dedupe_keep_order(out)
+
+
+def _extract_generic_bv_product_id(url: str, html: str) -> Optional[str]:
+    parsed = urlparse(url.strip())
+    params = parse_qs(parsed.query)
+    for key in ["productId", "product_id", "itemId", "item_id", "pid", "id", "sku"]:
+        if key in params and params[key]:
+            tok = _safe_candidate_token(params[key][0])
+            if tok:
+                return tok
+    zid_match = re.search(r"[_\-]zid([A-Z0-9\-_]+)$", parsed.path, re.IGNORECASE)
+    if zid_match:
+        tok = _safe_candidate_token(zid_match.group(1))
+        if tok:
+            return tok
+    html_cands = _extract_candidate_tokens_from_html(html)
+    for tok in html_cands:
+        if re.fullmatch(r"[A-Za-z0-9_-]{4,40}", tok):
+            return tok
+    segments = [s for s in parsed.path.split("/") if s]
+    if segments:
+        last = re.sub(r"\.html?$", "", segments[-1], flags=re.IGNORECASE)
+        trailing = re.search(r"([A-Z0-9]{4,20})$", last, re.IGNORECASE)
+        if trailing:
+            return trailing.group(1)
+        tok = _safe_candidate_token(last)
+        if tok:
+            return tok
+    return None
+
+
 def _is_incentivized(r):
     badges = [str(b).lower() for b in (r.get("BadgesOrder") or [])]
     if any("incentivized" in b for b in badges):
@@ -711,7 +1410,6 @@ def _is_incentivized(r):
                 if flag in {"", "true", "1", "yes"}:
                     return True
     return False
-
 
 def _flatten_review(r):
     photos = r.get("Photos") or []
@@ -753,13 +1451,11 @@ def _flatten_review(r):
         raw_json=json.dumps(r, ensure_ascii=False),
     )
 
-
 def _ensure_cols(df, cols):
     for c in cols:
         if c not in df.columns:
             df[c] = pd.NA
     return df
-
 
 def _extract_age_group(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -783,7 +1479,6 @@ def _extract_age_group(val):
         if candidate and candidate.lower() not in {"nan", "none", "null", "unknown", "prefer not to say"}:
             return candidate
     return None
-
 
 def _finalize_df(df):
     required = [
@@ -835,7 +1530,6 @@ def _finalize_df(df):
         df = df.sort_values(sc, ascending=[False, False], na_position="last").reset_index(drop=True)
     return df
 
-
 def _pick_col(df, aliases):
     lk = {str(c).strip().lower(): c for c in df.columns}
     for a in aliases:
@@ -844,13 +1538,11 @@ def _pick_col(df, aliases):
             return c
     return None
 
-
 def _series_alias(df, aliases):
     c = _pick_col(df, aliases)
     if c is None:
         return pd.Series([pd.NA] * len(df), index=df.index)
     return df[c]
-
 
 def _parse_flag(v, *, pos, neg):
     t = _safe_text(v).lower()
@@ -863,7 +1555,6 @@ def _parse_flag(v, *, pos, neg):
     if t.startswith(("not ", "non ")):
         return False
     return True
-
 
 def _normalize_uploaded_df(raw, *, source_name=""):
     w = raw.copy()
@@ -900,7 +1591,6 @@ def _normalize_uploaded_df(raw, *, source_name=""):
         neg=["not syndicated", "no", "false", "0"]))
     return _finalize_df(n)
 
-
 def _read_uploaded_file(f):
     fname = getattr(f, "name", "uploaded_file")
     raw = f.getvalue()
@@ -917,7 +1607,6 @@ def _read_uploaded_file(f):
     if raw_df.empty:
         raise ReviewDownloaderError(f"{fname} is empty.")
     return _normalize_uploaded_df(raw_df, source_name=fname)
-
 
 def _load_uploaded_files(files):
     if not files:
@@ -945,67 +1634,666 @@ def _load_uploaded_files(files):
     )
     return dict(summary=summary, reviews_df=combined, source_type="uploaded", source_label=src)
 
+def _apply_source_metadata(df: pd.DataFrame, *, retailer: str = "", source_system: str = "", post_link: str = "") -> pd.DataFrame:
+    out = df.copy()
+    if retailer:
+        if "retailer" not in out.columns:
+            out["retailer"] = retailer
+        else:
+            out["retailer"] = out["retailer"].fillna("").astype(str)
+            out.loc[out["retailer"].str.strip().eq(""), "retailer"] = retailer
+    if source_system:
+        out["source_system"] = source_system
+    if post_link:
+        if "post_link" not in out.columns:
+            out["post_link"] = post_link
+        else:
+            out["post_link"] = out["post_link"].fillna("").astype(str)
+            out.loc[out["post_link"].str.strip().eq(""), "post_link"] = post_link
+    return out
 
-def _load_product_reviews(product_url):
-    product_url = product_url.strip()
-    if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
-        product_url = "https://" + product_url
-    session = _get_session()
-    with st.spinner("Loading product page…"):
-        resp = session.get(product_url, timeout=30)
-        resp.raise_for_status()
-        product_html = resp.text
-    pid = _extract_pid_from_url(product_url) or _extract_pid_from_html(product_html)
-    if not pid:
-        raise ReviewDownloaderError("Could not find product ID.")
-    with st.spinner("Checking review volume…"):
-        payload = _fetch_reviews_page(
-            session,
-            product_id=pid,
-            passkey=DEFAULT_PASSKEY,
-            displaycode=DEFAULT_DISPLAYCODE,
-            api_version=DEFAULT_API_VERSION,
-            page_size=1,
-            offset=0,
-            sort=DEFAULT_SORT,
-            content_locales=DEFAULT_CONTENT_LOCALES,
-        )
-        total = int(payload.get("TotalResults", 0))
-    progress = st.progress(0.0, text="Downloading…")
-    status = st.empty()
-    offsets = list(range(0, total, DEFAULT_PAGE_SIZE))
-    raw_reviews = []
-    for i, offset in enumerate(offsets, 1):
-        status.info(f"Pulling page {i}/{len(offsets)}")
-        page = _fetch_reviews_page(
-            session,
-            product_id=pid,
-            passkey=DEFAULT_PASSKEY,
-            displaycode=DEFAULT_DISPLAYCODE,
-            api_version=DEFAULT_API_VERSION,
-            page_size=DEFAULT_PAGE_SIZE,
-            offset=offset,
-            sort=DEFAULT_SORT,
-            content_locales=DEFAULT_CONTENT_LOCALES,
-        )
-        raw_reviews.extend(page.get("Results") or [])
-        progress.progress(i / len(offsets))
-    status.success(f"Downloaded {len(raw_reviews)} reviews.")
+
+def _build_bv_dataset(raw_reviews: List[Dict[str, Any]], *, product_url: str, product_id: str,
+                      total: int, page_size: int, requests_needed: int,
+                      source_label: str, retailer: str = "", source_system: str = "Bazaarvoice"):
     df = _finalize_df(pd.DataFrame([_flatten_review(r) for r in raw_reviews]))
     if not df.empty:
         df["review_id"] = df["review_id"].astype(str)
-        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
-        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(pid)
-        df["product_id"] = df["product_id"].fillna(pid)
+        df["product_or_sku"] = df.get("product_or_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["base_sku"] = df.get("base_sku", pd.Series(index=df.index, dtype="object")).fillna(product_id)
+        df["product_id"] = df["product_id"].fillna(product_id)
+        df = _apply_source_metadata(df, retailer=retailer, source_system=source_system, post_link=product_url)
     summary = ReviewBatchSummary(
         product_url=product_url,
-        product_id=pid,
+        product_id=product_id,
         total_reviews=total,
-        page_size=DEFAULT_PAGE_SIZE,
-        requests_needed=len(offsets),
+        page_size=page_size,
+        requests_needed=requests_needed,
         reviews_downloaded=len(df),
     )
-    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label=product_url)
+    return dict(summary=summary, reviews_df=df, source_type="bazaarvoice", source_label=source_label or product_url)
+
+
+def _powerreviews_bool_from_bottom_line(value):
+    t = _safe_text(value).lower()
+    if t in {"yes", "recommended", "true"}:
+        return True
+    if t in {"no", "false", "not recommended"}:
+        return False
+    return pd.NA
+
+
+def _powerreviews_media_urls(media_items):
+    urls = []
+    for item in media_items or []:
+        if not isinstance(item, dict):
+            continue
+        for key in [
+            "large_url", "normal_url", "thumbnail_url", "url",
+            "fullsize_url", "media_url", "src", "link",
+        ]:
+            val = item.get(key)
+            if val:
+                urls.append(str(val))
+                break
+    return urls
+
+
+def _powerreviews_submission_iso(value):
+    ts = pd.to_datetime(value, unit="ms", utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    try:
+        return ts.isoformat()
+    except Exception:
+        return str(ts)
+
+
+def _flatten_powerreviews_review(review, *, page_id="", product_name="", retailer="", product_url=""):
+    details = review.get("details") or {}
+    metrics = review.get("metrics") or {}
+    media = review.get("media") or []
+    photo_urls = _powerreviews_media_urls(media)
+    product_id = _safe_text(details.get("product_page_id") or review.get("page_id") or page_id)
+
+    incentivized = False
+    badges = review.get("badges") or {}
+    for key, val in badges.items():
+        lk = str(key).lower()
+        if any(tok in lk for tok in ["sampling", "sample", "sweepstakes", "incentivized", "influencer"]):
+            if bool(val):
+                incentivized = True
+                break
+
+    return dict(
+        review_id=review.get("review_id") or review.get("ugc_id") or review.get("internal_review_id") or review.get("legacy_id"),
+        product_id=product_id,
+        base_sku=product_id,
+        sku_item=product_id,
+        original_product_name=_safe_text(product_name),
+        title=_safe_text(details.get("headline") or review.get("headline")),
+        review_text=_safe_text(details.get("comments") or review.get("comments")),
+        rating=metrics.get("rating") or details.get("rating"),
+        is_recommended=_powerreviews_bool_from_bottom_line(details.get("bottom_line") or review.get("bottom_line")),
+        user_nickname=_safe_text(details.get("nickname") or review.get("nickname")),
+        author_id=review.get("author_id"),
+        user_location=_safe_text(details.get("location") or review.get("location")),
+        content_locale=_safe_text(details.get("locale") or review.get("locale")),
+        submission_time=_powerreviews_submission_iso(details.get("created_date") or review.get("created_date")),
+        moderation_status=review.get("status") or pd.NA,
+        campaign_id=pd.NA,
+        source_client=pd.NA,
+        is_featured=pd.NA,
+        is_syndicated=bool(review.get("is_syndicated") or badges.get("is_syndicated") or False),
+        syndication_source_name=pd.NA,
+        is_ratings_only=False,
+        total_positive_feedback_count=metrics.get("helpful_votes"),
+        badges=", ".join([str(k) for k, v in (badges or {}).items() if bool(v)]),
+        context_data_json=json.dumps(details.get("properties") or [], ensure_ascii=False),
+        photos_count=len(photo_urls),
+        photo_urls=" | ".join(photo_urls),
+        incentivized_review=incentivized,
+        raw_json=json.dumps(review, ensure_ascii=False),
+        retailer=retailer,
+        post_link=product_url,
+        source_system="PowerReviews",
+    )
+
+
+def _build_powerreviews_dataset(reviews: List[Dict[str, Any]], *, product_url: str, product_id: str,
+                                total: int, page_size: int, requests_needed: int,
+                                source_label: str, product_name: str = "", retailer: str = "",
+                                source_system: str = "PowerReviews"):
+    rows = [_flatten_powerreviews_review(r, page_id=product_id, product_name=product_name, retailer=retailer, product_url=product_url) for r in reviews]
+    df = _finalize_df(pd.DataFrame(rows))
+    if not df.empty:
+        df = _apply_source_metadata(df, retailer=retailer, source_system=source_system, post_link=product_url)
+    summary = ReviewBatchSummary(
+        product_url=product_url,
+        product_id=product_id,
+        total_reviews=total,
+        page_size=page_size,
+        requests_needed=requests_needed,
+        reviews_downloaded=len(df),
+    )
+    return dict(summary=summary, reviews_df=df, source_type="powerreviews", source_label=source_label or product_url)
+
+
+def _load_bazaarvoice_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = ""):
+    session = _get_session()
+    parsed = urlparse(api_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    page_size = int(_query_first_ci(params, ["limit", "Limit"], default=DEFAULT_PAGE_SIZE) or DEFAULT_PAGE_SIZE)
+    product_id = _extract_bazaarvoice_product_id_from_params(params) or "UNKNOWN_PRODUCT"
+    first = _fetch_bazaarvoice_raw_page(session, api_url=base_url, params=params)
+    total = int(first.get("TotalResults", 0) or 0)
+    raw_reviews = list(first.get("Results") or [])
+    if total > len(raw_reviews):
+        offsets = list(range(len(raw_reviews), total, page_size))
+        progress = st.progress(0.0, text="Downloading…")
+        for i, offset in enumerate(offsets, 1):
+            q = _clone_params(params)
+            _set_ci_param(q, ["offset", "Offset"], int(offset))
+            _set_ci_param(q, ["limit", "Limit"], int(page_size))
+            payload = _fetch_bazaarvoice_raw_page(session, api_url=base_url, params=q)
+            raw_reviews.extend(payload.get("Results") or [])
+            progress.progress(i / max(len(offsets), 1))
+    source_label = product_url_hint or api_url
+    return _build_bv_dataset(
+        raw_reviews,
+        product_url=product_url_hint or api_url,
+        product_id=product_id,
+        total=total,
+        page_size=page_size,
+        requests_needed=max(1, math.ceil(total / max(page_size, 1))) if total else 1,
+        source_label=source_label,
+        retailer=retailer_hint,
+        source_system="Bazaarvoice API",
+    )
+
+
+def _load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = ""):
+    session = _get_session()
+    parsed = urlparse(api_url)
+    m = re.search(r"/m/(\d+)/l/([A-Za-z_]+)/product/([^/]+)/reviews", parsed.path)
+    if not m:
+        raise ReviewDownloaderError("Could not parse PowerReviews API URL.")
+    merchant_id, locale, product_id = m.groups()
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    apikey = _query_first_ci(params, ["apikey"])
+    if not apikey:
+        raise ReviewDownloaderError("PowerReviews API URL missing apikey.")
+    sort = _query_first_ci(params, ["sort"], default="Newest") or "Newest"
+    page_size = min(int(_query_first_ci(params, ["paging.size"], default=POWERREVIEWS_MAX_PAGE_SIZE) or POWERREVIEWS_MAX_PAGE_SIZE), POWERREVIEWS_MAX_PAGE_SIZE)
+    first = _fetch_powerreviews_page(
+        session,
+        merchant_id=merchant_id,
+        locale=locale,
+        product_id=product_id,
+        apikey=apikey,
+        paging_from=0,
+        page_size=page_size,
+        sort=sort,
+    )
+    paging = first.get("paging") or {}
+    total = int(paging.get("total_results", 0) or 0)
+    results = first.get("results") or []
+    product_name = _safe_text((results[0].get("rollup") or {}).get("name") if results else "")
+    all_reviews: List[Dict[str, Any]] = []
+    for result in results:
+        all_reviews.extend(result.get("reviews") or [])
+    if total > len(all_reviews):
+        offsets = list(range(len(all_reviews), total, page_size))
+        progress = st.progress(0.0, text="Downloading…")
+        for i, start in enumerate(offsets, 1):
+            payload = _fetch_powerreviews_page(
+                session,
+                merchant_id=merchant_id,
+                locale=locale,
+                product_id=product_id,
+                apikey=apikey,
+                paging_from=int(start),
+                page_size=page_size,
+                sort=sort,
+            )
+            for result in payload.get("results") or []:
+                all_reviews.extend(result.get("reviews") or [])
+            progress.progress(i / max(len(offsets), 1))
+    source_label = product_url_hint or api_url
+    return _build_powerreviews_dataset(
+        all_reviews,
+        product_url=product_url_hint or api_url,
+        product_id=product_id,
+        total=total,
+        page_size=page_size,
+        requests_needed=max(1, math.ceil(total / max(page_size, 1))) if total else 1,
+        source_label=source_label,
+        product_name=product_name,
+        retailer=retailer_hint,
+        source_system="PowerReviews API",
+    )
+
+
+def _probe_bazaarvoice_candidates(session, *, product_url: str, candidates: Sequence[str], cfg: Dict[str, Any]):
+    tried = []
+    zero_match = None
+    for candidate in _dedupe_keep_order(candidates):
+        try:
+            if cfg.get("kind") == "action":
+                payload = _fetch_reviews_page(
+                    session,
+                    product_id=candidate,
+                    passkey=cfg["passkey"],
+                    displaycode=cfg["displaycode"],
+                    api_version=cfg.get("api_version", DEFAULT_API_VERSION),
+                    page_size=1,
+                    offset=0,
+                    sort=cfg.get("sort", DEFAULT_SORT),
+                    content_locales=cfg.get("content_locales", DEFAULT_CONTENT_LOCALES),
+                )
+            else:
+                payload = _fetch_bv_simple_page(
+                    session,
+                    product_id=candidate,
+                    passkey=cfg["passkey"],
+                    api_version=cfg.get("api_version", "5.4"),
+                    page_size=1,
+                    offset=0,
+                    sort=cfg.get("sort", "SubmissionTime:desc"),
+                    content_locale=cfg.get("content_locale", ""),
+                    locale=cfg.get("locale", "en_US"),
+                    include=cfg.get("include", "Products,Comments"),
+                )
+            total = int(payload.get("TotalResults", 0) or 0)
+            has_products = bool(((payload.get("Includes") or {}).get("Products") or {}))
+            if total > 0 or has_products:
+                return candidate, payload
+            if zero_match is None:
+                zero_match = (candidate, payload)
+        except Exception as exc:
+            tried.append(f"{candidate}: {exc}")
+    if zero_match is not None:
+        return zero_match
+    raise ReviewDownloaderError("Could not match a Bazaarvoice product ID. Tried: " + "; ".join(tried[:8]))
+
+
+def _fetch_all_bazaarvoice_for_candidate(session, *, product_url: str, product_id: str, cfg: Dict[str, Any]):
+    if cfg.get("kind") == "action":
+        first = _fetch_reviews_page(
+            session,
+            product_id=product_id,
+            passkey=cfg["passkey"],
+            displaycode=cfg["displaycode"],
+            api_version=cfg.get("api_version", DEFAULT_API_VERSION),
+            page_size=DEFAULT_PAGE_SIZE,
+            offset=0,
+            sort=cfg.get("sort", DEFAULT_SORT),
+            content_locales=cfg.get("content_locales", DEFAULT_CONTENT_LOCALES),
+        )
+        total = int(first.get("TotalResults", 0) or 0)
+        raw_reviews = list(first.get("Results") or [])
+        offsets = list(range(len(raw_reviews), total, DEFAULT_PAGE_SIZE))
+        progress = st.progress(0.0, text="Downloading…") if offsets else None
+        for i, offset in enumerate(offsets, 1):
+            page = _fetch_reviews_page(
+                session,
+                product_id=product_id,
+                passkey=cfg["passkey"],
+                displaycode=cfg["displaycode"],
+                api_version=cfg.get("api_version", DEFAULT_API_VERSION),
+                page_size=DEFAULT_PAGE_SIZE,
+                offset=offset,
+                sort=cfg.get("sort", DEFAULT_SORT),
+                content_locales=cfg.get("content_locales", DEFAULT_CONTENT_LOCALES),
+            )
+            raw_reviews.extend(page.get("Results") or [])
+            if progress is not None:
+                progress.progress(i / max(len(offsets), 1))
+        return _build_bv_dataset(
+            raw_reviews,
+            product_url=product_url,
+            product_id=product_id,
+            total=total,
+            page_size=DEFAULT_PAGE_SIZE,
+            requests_needed=max(1, math.ceil(total / DEFAULT_PAGE_SIZE)) if total else 1,
+            source_label=product_url,
+            retailer=cfg.get("retailer", ""),
+            source_system=cfg.get("source_system", "Bazaarvoice"),
+        )
+
+    first = _fetch_bv_simple_page(
+        session,
+        product_id=product_id,
+        passkey=cfg["passkey"],
+        api_version=cfg.get("api_version", "5.4"),
+        page_size=DEFAULT_PAGE_SIZE,
+        offset=0,
+        sort=cfg.get("sort", "SubmissionTime:desc"),
+        content_locale=cfg.get("content_locale", ""),
+        locale=cfg.get("locale", "en_US"),
+        include=cfg.get("include", "Products,Comments"),
+    )
+    total = int(first.get("TotalResults", 0) or 0)
+    raw_reviews = list(first.get("Results") or [])
+    offsets = list(range(len(raw_reviews), total, DEFAULT_PAGE_SIZE))
+    progress = st.progress(0.0, text="Downloading…") if offsets else None
+    for i, offset in enumerate(offsets, 1):
+        page = _fetch_bv_simple_page(
+            session,
+            product_id=product_id,
+            passkey=cfg["passkey"],
+            api_version=cfg.get("api_version", "5.4"),
+            page_size=DEFAULT_PAGE_SIZE,
+            offset=offset,
+            sort=cfg.get("sort", "SubmissionTime:desc"),
+            content_locale=cfg.get("content_locale", ""),
+            locale=cfg.get("locale", "en_US"),
+            include=cfg.get("include", "Products,Comments"),
+        )
+        raw_reviews.extend(page.get("Results") or [])
+        if progress is not None:
+            progress.progress(i / max(len(offsets), 1))
+    return _build_bv_dataset(
+        raw_reviews,
+        product_url=product_url,
+        product_id=product_id,
+        total=total,
+        page_size=DEFAULT_PAGE_SIZE,
+        requests_needed=max(1, math.ceil(total / DEFAULT_PAGE_SIZE)) if total else 1,
+        source_label=product_url,
+        retailer=cfg.get("retailer", ""),
+        source_system=cfg.get("source_system", "Bazaarvoice"),
+    )
+
+
+def _probe_powerreviews_candidates(session, *, product_url: str, candidates: Sequence[str], cfg: Dict[str, Any]):
+    tried = []
+    zero_match = None
+    for candidate in _dedupe_keep_order(candidates):
+        try:
+            payload = _fetch_powerreviews_page(
+                session,
+                merchant_id=cfg["merchant_id"],
+                locale=cfg.get("locale", "en_US"),
+                product_id=candidate,
+                apikey=cfg["apikey"],
+                paging_from=0,
+                page_size=5,
+                sort=cfg.get("sort", "Newest"),
+            )
+            paging = payload.get("paging") or {}
+            total = int(paging.get("total_results", 0) or 0)
+            results = payload.get("results") or []
+            if total > 0 or results:
+                return candidate, payload
+            if zero_match is None:
+                zero_match = (candidate, payload)
+        except Exception as exc:
+            tried.append(f"{candidate}: {exc}")
+    if zero_match is not None:
+        return zero_match
+    raise ReviewDownloaderError("Could not match a PowerReviews product ID. Tried: " + "; ".join(tried[:8]))
+
+
+def _fetch_all_powerreviews_for_candidate(session, *, product_url: str, product_id: str, cfg: Dict[str, Any]):
+    page_size = POWERREVIEWS_MAX_PAGE_SIZE
+    first = _fetch_powerreviews_page(
+        session,
+        merchant_id=cfg["merchant_id"],
+        locale=cfg.get("locale", "en_US"),
+        product_id=product_id,
+        apikey=cfg["apikey"],
+        paging_from=0,
+        page_size=page_size,
+        sort=cfg.get("sort", "Newest"),
+    )
+    paging = first.get("paging") or {}
+    total = int(paging.get("total_results", 0) or 0)
+    results = first.get("results") or []
+    product_name = _safe_text((results[0].get("rollup") or {}).get("name") if results else "")
+    all_reviews: List[Dict[str, Any]] = []
+    for result in results:
+        all_reviews.extend(result.get("reviews") or [])
+    offsets = list(range(len(all_reviews), total, page_size))
+    progress = st.progress(0.0, text="Downloading…") if offsets else None
+    for i, start in enumerate(offsets, 1):
+        payload = _fetch_powerreviews_page(
+            session,
+            merchant_id=cfg["merchant_id"],
+            locale=cfg.get("locale", "en_US"),
+            product_id=product_id,
+            apikey=cfg["apikey"],
+            paging_from=int(start),
+            page_size=page_size,
+            sort=cfg.get("sort", "Newest"),
+        )
+        for result in payload.get("results") or []:
+            all_reviews.extend(result.get("reviews") or [])
+        if progress is not None:
+            progress.progress(i / max(len(offsets), 1))
+    return _build_powerreviews_dataset(
+        all_reviews,
+        product_url=product_url,
+        product_id=product_id,
+        total=total,
+        page_size=page_size,
+        requests_needed=max(1, math.ceil(total / page_size)) if total else 1,
+        source_label=product_url,
+        product_name=product_name,
+        retailer=cfg.get("retailer", ""),
+        source_system=cfg.get("source_system", "PowerReviews"),
+    )
+
+
+def _load_bazaarvoice_product_page(session, *, product_url: str, product_html: str, cfg: Dict[str, Any], extra_candidates: Optional[Sequence[str]] = None):
+    embedded_urls = [u for u in _extract_embedded_review_api_urls(product_html) if _is_bazaarvoice_api_url(u)]
+    for api_url in embedded_urls:
+        try:
+            return _load_bazaarvoice_api_url(api_url, product_url_hint=product_url, retailer_hint=cfg.get("retailer", ""))
+        except Exception:
+            continue
+
+    candidates = []
+    candidates.extend(extra_candidates or [])
+    candidates.extend(_extract_candidate_tokens_from_url(product_url))
+    candidates.extend(_extract_candidate_tokens_from_html(product_html))
+    fallback_pid = _extract_generic_bv_product_id(product_url, product_html)
+    if fallback_pid:
+        candidates.insert(0, fallback_pid)
+    product_id, _ = _probe_bazaarvoice_candidates(session, product_url=product_url, candidates=candidates, cfg=cfg)
+    return _fetch_all_bazaarvoice_for_candidate(session, product_url=product_url, product_id=product_id, cfg=cfg)
+
+
+def _load_powerreviews_product_page(session, *, product_url: str, product_html: str, cfg: Dict[str, Any], extra_candidates: Optional[Sequence[str]] = None):
+    embedded_urls = [u for u in _extract_embedded_review_api_urls(product_html) if _is_powerreviews_api_url(u)]
+    for api_url in embedded_urls:
+        try:
+            return _load_powerreviews_api_url(api_url, product_url_hint=product_url, retailer_hint=cfg.get("retailer", ""))
+        except Exception:
+            continue
+
+    embeds = _extract_powerreviews_embeds(product_html)
+    for embed in embeds:
+        try:
+            cfg2 = dict(cfg)
+            cfg2.update({k: v for k, v in embed.items() if v})
+            return _fetch_all_powerreviews_for_candidate(
+                session,
+                product_url=product_url,
+                product_id=cfg2["product_id"],
+                cfg=cfg2,
+            )
+        except Exception:
+            continue
+
+    candidates = []
+    candidates.extend(extra_candidates or [])
+    candidates.extend(_extract_candidate_tokens_from_html(product_html))
+    candidates.extend(_extract_candidate_tokens_from_url(product_url))
+    product_id, _ = _probe_powerreviews_candidates(session, product_url=product_url, candidates=candidates, cfg=cfg)
+    return _fetch_all_powerreviews_for_candidate(session, product_url=product_url, product_id=product_id, cfg=cfg)
+
+
+def _load_product_reviews(product_url):
+    product_url = _normalize_input_url(product_url)
+    parsed = urlparse(product_url)
+    host = _strip_www(parsed.netloc)
+    retailer_hint = ""
+    if "costco.com" in host:
+        retailer_hint = "Costco"
+    elif "sephora.com" in host:
+        retailer_hint = "Sephora"
+    elif "ulta.com" in host:
+        retailer_hint = "Ulta"
+    elif "hoka.com" in host:
+        retailer_hint = "Hoka"
+    elif _looks_like_sharkninja_uk_eu(host):
+        retailer_hint = "SharkNinja UK/EU"
+    elif _looks_like_sharkninja_us(host):
+        retailer_hint = "SharkNinja"
+
+    if _is_bazaarvoice_api_url(product_url):
+        return _load_bazaarvoice_api_url(product_url)
+    if _is_powerreviews_api_url(product_url):
+        return _load_powerreviews_api_url(product_url)
+
+    session = _get_session()
+    product_html = ""
+    page_fetch_error = None
+    with st.spinner("Loading product page…"):
+        try:
+            resp = session.get(product_url, timeout=35)
+            resp.raise_for_status()
+            product_html = resp.text or ""
+        except Exception as exc:
+            page_fetch_error = exc
+            product_html = ""
+
+    # First: if the page source embeds a review API URL, use that directly.
+    embedded_urls = _extract_embedded_review_api_urls(product_html) if product_html else []
+    if embedded_urls:
+        for api_url in embedded_urls:
+            try:
+                if _is_bazaarvoice_api_url(api_url):
+                    return _load_bazaarvoice_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint)
+                if _is_powerreviews_api_url(api_url):
+                    return _load_powerreviews_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint)
+            except Exception:
+                continue
+
+    # Site-specific fallbacks that can work even when the retailer blocks page scraping.
+    if "costco.com" in host:
+        return _load_bazaarvoice_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={**COSTCO_BV_CONFIG, "kind": "action", "source_system": "Bazaarvoice", "retailer": "Costco"},
+        )
+
+    if "sephora.com" in host:
+        sephora_candidates = []
+        sephora_candidates.extend(re.findall(r"\b(P\d{5,10})\b", product_url, flags=re.IGNORECASE))
+        sephora_candidates.extend(re.findall(r"\b(P\d{5,10})\b", product_html or "", flags=re.IGNORECASE))
+        return _load_bazaarvoice_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={**SEPHORA_BV_CONFIG, "kind": "simple", "content_locale": "en*", "source_system": "Bazaarvoice", "retailer": "Sephora"},
+            extra_candidates=sephora_candidates,
+        )
+
+    if "ulta.com" in host:
+        ulta_candidates = []
+        q = parse_qs(parsed.query)
+        ulta_candidates.extend(q.get("sku", []))
+        ulta_candidates.extend(re.findall(r"\b(pimprod\d{5,12})\b", product_html or "", flags=re.IGNORECASE))
+        ulta_candidates.extend(re.findall(r"\b(pimprod\d{5,12})\b", product_url, flags=re.IGNORECASE))
+        ulta_candidates.extend(re.findall(r"\b(xlsImpprod\d{5,12})\b", product_url, flags=re.IGNORECASE))
+        return _load_powerreviews_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={**ULTA_PR_CONFIG, "source_system": "PowerReviews"},
+            extra_candidates=ulta_candidates,
+        )
+
+    if "hoka.com" in host:
+        hoka_candidates = []
+        hoka_candidates.extend(re.findall(r"/(\d+)\.html", parsed.path))
+        hoka_candidates.extend(re.findall(r"dwvar_(\d+)_", product_url))
+        hoka_candidates.extend(re.findall(r"Item\s*No\.?\s*(\d{5,10})", product_html or "", flags=re.IGNORECASE))
+        hoka_candidates.extend(re.findall(r'"product_page_id"\s*[:=]\s*"?(\d{5,10})', product_html or "", flags=re.IGNORECASE))
+        hoka_candidates.extend(re.findall(r'"page_id"\s*[:=]\s*"?(\d{5,10})', product_html or "", flags=re.IGNORECASE))
+        return _load_powerreviews_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={**HOKA_PR_CONFIG, "source_system": "PowerReviews"},
+            extra_candidates=hoka_candidates,
+        )
+
+    if _looks_like_sharkninja_uk_eu(host):
+        uk_pid = _extract_generic_bv_product_id(product_url, product_html)
+        return _load_bazaarvoice_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={**SHARKNINJA_UK_EU_BV_CONFIG, "kind": "simple", "source_system": "Bazaarvoice"},
+            extra_candidates=[uk_pid] if uk_pid else None,
+        )
+
+    # Default SharkNinja US / generic Bazaarvoice product pages.
+    pid = _extract_pid_from_url(product_url) or _extract_pid_from_html(product_html)
+    if pid:
+        try:
+            return _fetch_all_bazaarvoice_for_candidate(
+                session,
+                product_url=product_url,
+                product_id=pid,
+                cfg={
+                    "kind": "action",
+                    "passkey": DEFAULT_PASSKEY,
+                    "displaycode": DEFAULT_DISPLAYCODE,
+                    "api_version": DEFAULT_API_VERSION,
+                    "sort": DEFAULT_SORT,
+                    "content_locales": DEFAULT_CONTENT_LOCALES,
+                    "retailer": "SharkNinja",
+                    "source_system": "Bazaarvoice",
+                },
+            )
+        except Exception:
+            pass
+
+    # Last chance: generic embedded/candidate Bazaarvoice probes.
+    generic_candidates = []
+    generic_candidates.extend(_extract_candidate_tokens_from_url(product_url))
+    generic_candidates.extend(_extract_candidate_tokens_from_html(product_html))
+    try:
+        return _load_bazaarvoice_product_page(
+            session,
+            product_url=product_url,
+            product_html=product_html,
+            cfg={
+                "kind": "action",
+                "passkey": DEFAULT_PASSKEY,
+                "displaycode": DEFAULT_DISPLAYCODE,
+                "api_version": DEFAULT_API_VERSION,
+                "sort": DEFAULT_SORT,
+                "content_locales": DEFAULT_CONTENT_LOCALES,
+                "retailer": "SharkNinja",
+                "source_system": "Bazaarvoice",
+            },
+            extra_candidates=generic_candidates,
+        )
+    except Exception:
+        if page_fetch_error is not None:
+            if isinstance(page_fetch_error, requests.HTTPError):
+                raise
+            raise ReviewDownloaderError(f"Could not load product page or match a review feed: {page_fetch_error}")
+        raise
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ANALYTICS
@@ -1219,15 +2507,58 @@ def _star_band_trend(df):
 
 def _sw_style_fig(fig):
     GRID = "rgba(148,163,184,0.18)"
+    trace_count = len(getattr(fig, "data", []) or [])
+    if trace_count > 3:
+        legend_cfg = dict(
+            orientation="v",
+            y=1.0,
+            x=1.01,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.86)",
+            bordercolor="rgba(148,163,184,0.22)",
+            borderwidth=1,
+            font=dict(size=11),
+        )
+        margin = dict(l=26, r=108, t=56, b=44)
+    else:
+        legend_cfg = dict(
+            orientation="h",
+            y=1.12,
+            x=0,
+            xanchor="left",
+            yanchor="bottom",
+            bgcolor="rgba(255,255,255,0.84)",
+            bordercolor="rgba(148,163,184,0.18)",
+            borderwidth=1,
+            font=dict(size=11),
+        )
+        margin = dict(l=26, r=18, t=64, b=44)
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter, system-ui, sans-serif"),
-        margin=dict(l=44, r=20, t=44, b=36),
+        font=dict(family="Inter, system-ui, sans-serif", size=12),
+        margin=margin,
+        title=dict(x=0, xanchor="left", font=dict(size=15)),
+        legend=legend_cfg,
+        hoverlabel=dict(font=dict(family="Inter, system-ui, sans-serif", size=12)),
     )
-    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID)
-    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID)
+    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, automargin=True, title_standoff=10)
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID, automargin=True, title_standoff=10)
     return fig
+
+
+def _show_plotly(fig):
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+            "displayModeBar": False,
+            "responsive": True,
+            "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d", "toggleSpikelines"],
+        },
+    )
 
 
 REGION_NAME_MAP = {
@@ -1319,36 +2650,88 @@ def _cumulative_avg_region_trend(df, *, organic_only=False, top_n=2, smoothing_l
     return trend.sort_values("day").reset_index(drop=True), regions
 
 
+def _build_volume_bar_series(trend, volume_mode):
+    if trend is None or trend.empty:
+        return pd.DataFrame(columns=["x", "volume", "width_ms", "label"]), "Reviews/day"
+
+    w = trend[["day", "daily_volume"]].copy()
+    w["day"] = pd.to_datetime(w["day"], errors="coerce")
+    w["daily_volume"] = pd.to_numeric(w["daily_volume"], errors="coerce").fillna(0)
+    w = w.dropna(subset=["day"])
+    if w.empty:
+        return pd.DataFrame(columns=["x", "volume", "width_ms", "label"]), "Reviews/day"
+
+    mode = _safe_text(volume_mode) or "Reviews/day"
+    if mode == "Reviews/week":
+        w["bucket_start"] = w["day"].dt.to_period("W-SUN").dt.start_time
+        grouped = w.groupby("bucket_start", as_index=False).agg(volume=("daily_volume", "sum"))
+        grouped["bucket_days"] = 7.0
+        grouped["label"] = grouped["bucket_start"].dt.strftime("Week of %Y-%m-%d")
+        axis_title = "Reviews/week"
+    elif mode == "Reviews/month":
+        w["bucket_start"] = w["day"].dt.to_period("M").dt.start_time
+        grouped = w.groupby("bucket_start", as_index=False).agg(volume=("daily_volume", "sum"))
+        grouped["bucket_days"] = grouped["bucket_start"].dt.days_in_month.astype(float)
+        grouped["label"] = grouped["bucket_start"].dt.strftime("%Y-%m")
+        axis_title = "Reviews/month"
+    else:
+        grouped = w.rename(columns={"day": "bucket_start", "daily_volume": "volume"}).copy()
+        grouped["bucket_days"] = 1.0
+        grouped["label"] = grouped["bucket_start"].dt.strftime("%Y-%m-%d")
+        axis_title = "Reviews/day"
+
+    grouped["x"] = grouped["bucket_start"] + pd.to_timedelta(grouped["bucket_days"] / 2.0, unit="D")
+    grouped["width_ms"] = grouped["bucket_days"].map(lambda d: int(pd.Timedelta(days=max(float(d) - 0.15, 0.35)).total_seconds() * 1000))
+    grouped["volume"] = pd.to_numeric(grouped["volume"], errors="coerce").fillna(0).astype(int)
+    return grouped[["x", "volume", "width_ms", "label"]], axis_title
+
+
+def _add_axis_break_indicator(fig, *, side="right"):
+    if side == "right":
+        x0, x1 = 0.988, 0.998
+    else:
+        x0, x1 = 0.002, 0.012
+    y0 = 0.08
+    fig.add_shape(type="line", xref="paper", yref="paper", x0=x0, y0=y0, x1=x1, y1=y0 + 0.02, line=dict(color="rgba(71,85,105,0.92)", width=2), layer="above")
+    fig.add_shape(type="line", xref="paper", yref="paper", x0=x0, y0=y0 + 0.028, x1=x1, y1=y0 + 0.048, line=dict(color="rgba(71,85,105,0.92)", width=2), layer="above")
+
+
 def _render_reviews_over_time_chart(df):
     with st.container(border=True):
         st.markdown("<div class='section-title'>📈 Cumulative Avg ★ Over Time by Region (Weighted)</div>", unsafe_allow_html=True)
-        st.markdown("<div class='section-sub'>Includes subtle volume bars (review count per day) on a secondary axis.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-sub'>Cumulative average stays on the right axis. Volume bars are optional and use the left axis.</div>", unsafe_allow_html=True)
 
-        c0, c1, c2, c3, c4 = st.columns([1.15, 1, 1, 1, 1.25])
-        smoothing = c0.selectbox("Smoothing", ["7-day", "14-day", "30-day", "None"], index=0, key="ot_smoothing")
-        show_overall = c1.toggle("Show overall", value=True, key="ot_show_overall")
-        show_volume = c2.toggle("Show volume bars", value=True, key="ot_show_volume")
-        organic_only = c3.toggle("Organic only", value=False, key="ot_organic_only")
-        y_view = c4.radio("Y-axis view", ["Zoomed-in", "Full scale"], horizontal=True, key="ot_y_view")
+        r1c0, r1c1, r1c2 = st.columns(3)
+        r2c0, r2c1, r2c2 = st.columns(3)
+        smoothing = r1c0.selectbox("Smoothing", ["7-day", "14-day", "30-day", "None"], index=0, key="ot_smoothing")
+        show_overall = r1c1.toggle("Show overall", value=True, key="ot_show_overall")
+        show_volume = r1c2.toggle("Show volume bars", value=False, key="ot_show_volume")
+        organic_only = r2c0.toggle("Organic only", value=False, key="ot_organic_only")
+        volume_mode = r2c1.selectbox("Volume bars", ["Reviews/day", "Reviews/week", "Reviews/month"], index=0, key="ot_volume_mode")
+        y_view = r2c2.radio("Y-axis view", ["Zoomed-in", "Full scale"], horizontal=True, key="ot_y_view")
 
         trend, regions = _cumulative_avg_region_trend(df, organic_only=organic_only, top_n=2, smoothing_label=smoothing)
         if trend.empty:
             st.info("No dated reviews available for the over-time chart.")
             return
 
+        volume_bars, volume_axis_title = _build_volume_bar_series(trend, volume_mode)
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        if show_volume:
+        if show_volume and not volume_bars.empty:
             fig.add_trace(
                 go.Bar(
-                    x=trend["day"],
-                    y=trend["daily_volume"],
-                    name="Daily volume",
-                    marker_color="rgba(226,232,240,0.95)",
-                    opacity=0.6,
-                    hovertemplate="%{x|%Y-%m-%d}<br>Daily volume: %{y:,}<extra></extra>",
+                    x=volume_bars["x"],
+                    y=volume_bars["volume"],
+                    width=volume_bars["width_ms"],
+                    name=volume_axis_title,
+                    marker_color="rgba(100,116,139,0.46)",
+                    marker_line_color="rgba(71,85,105,0.58)",
+                    opacity=0.88,
+                    customdata=np.stack([volume_bars["label"]], axis=-1),
+                    hovertemplate="%{customdata[0]}<br>Reviews: %{y:,}<extra></extra>",
                 ),
-                secondary_y=True,
+                secondary_y=False,
             )
 
         region_colors = ["#f97316", "#10b981", "#3b82f6", "#ef4444"]
@@ -1365,7 +2748,7 @@ def _render_reviews_over_time_chart(df):
                     line=dict(color=region_colors[idx % len(region_colors)], width=2),
                     hovertemplate=f"{region}<br>%{{x|%Y-%m-%d}}<br>Cumulative Avg ★: %{{y:.3f}}<extra></extra>",
                 ),
-                secondary_y=False,
+                secondary_y=True,
             )
 
         if show_overall and "overall_cum_avg" in trend.columns:
@@ -1378,7 +2761,7 @@ def _render_reviews_over_time_chart(df):
                     line=dict(color="#8b5cf6", width=3),
                     hovertemplate="Overall<br>%{x|%Y-%m-%d}<br>Cumulative Avg ★: %{y:.3f}<extra></extra>",
                 ),
-                secondary_y=False,
+                secondary_y=True,
             )
 
         fig.update_layout(
@@ -1387,7 +2770,9 @@ def _render_reviews_over_time_chart(df):
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
             font_family="Inter",
-            legend=dict(orientation="h", y=1.07, x=0),
+            legend=dict(orientation="h", y=-0.22, x=0, xanchor="left", yanchor="top", bgcolor="rgba(255,255,255,0.8)"),
+            bargap=0.06,
+            height=430,
         )
         fig.update_xaxes(title_text="", showgrid=False)
 
@@ -1407,10 +2792,13 @@ def _render_reviews_over_time_chart(df):
                 ymax = min(5.0, mid + 0.09)
             y_range = [ymin, ymax]
 
-        fig.update_yaxes(title_text="Cumulative Avg ★", range=y_range, secondary_y=False, showgrid=True, gridcolor="rgba(148,163,184,0.15)")
-        fig.update_yaxes(title_text="Reviews/day" if show_volume else "", secondary_y=True, showgrid=False, rangemode="tozero", visible=show_volume)
+        fig.update_yaxes(title_text=volume_axis_title if show_volume else "", secondary_y=False, showgrid=False, rangemode="tozero", visible=show_volume)
+        fig.update_yaxes(title_text="Cumulative Avg ★", range=y_range, secondary_y=True, showgrid=True, gridcolor="rgba(148,163,184,0.15)")
 
-        st.plotly_chart(fig, use_container_width=True)
+        if y_view == "Zoomed-in" and y_range[0] > 1.05:
+            _add_axis_break_indicator(fig, side="right")
+
+        _show_plotly(fig)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYMPTOM ANALYTICS
@@ -1558,7 +2946,7 @@ def _opp_scatter(tbl, kind, baseline_avg, *, container_key=""):
     fig.add_hline(y=float(baseline_avg), line_dash="dash", opacity=0.45, annotation_text=f"Avg ★ {baseline_avg:.2f}", annotation_position="right", annotation_font_size=11)
     fig.update_layout(height=420, xaxis_title="Mentions", yaxis_title="Avg ★")
     _sw_style_fig(fig)
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
     label = "Fix first — high mentions × below-baseline ★" if kind == "detractors" else "Amplify — high mentions × above-baseline ★"
     top15 = d.copy()
     top15["Score"] = score
@@ -1583,7 +2971,7 @@ def _render_symptom_bar_chart(tbl, title, color, denom, show_pct):
     fig = go.Figure(go.Bar(x=x_vals, y=t["Item"][::-1], orientation="h", marker_color=color, opacity=0.80, customdata=t["Item"][::-1].astype(str).tolist(), hovertemplate=hover))
     fig.update_layout(title=title, height=max(300, 28 * len(t) + 80), xaxis_title=x_label, yaxis_title="", margin=dict(l=160, r=20, t=46, b=30))
     _sw_style_fig(fig)
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
 
 def _render_symptom_dashboard(filtered_df, overall_df=None):
@@ -1675,77 +3063,377 @@ def _render_symptom_dashboard(filtered_df, overall_df=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FILTERS
 # ═══════════════════════════════════════════════════════════════════════════════
-def _apply_filters(df, *, selected_ratings, incentivized_mode, selected_products,
-                   selected_locales, recommendation_mode, syndicated_mode,
-                   media_mode, date_range, text_query):
-    if df.empty:
-        return df.copy()
-    f = df.copy()
-    if selected_ratings:
-        f = f[f["rating"].isin(selected_ratings)]
-    if selected_products and "product_or_sku" in f.columns:
-        f = f[f["product_or_sku"].fillna("").isin(selected_products)]
-    if incentivized_mode == "Non-incentivized only":
-        f = f[~f["incentivized_review"].fillna(False)]
-    elif incentivized_mode == "Incentivized only":
-        f = f[f["incentivized_review"].fillna(False)]
-    if selected_locales:
-        f = f[f["content_locale"].fillna("Unknown").isin(selected_locales)]
-    if recommendation_mode == "Recommended only":
-        f = f[f["is_recommended"].fillna(False)]
-    elif recommendation_mode == "Not recommended only":
-        f = f[f["is_recommended"].notna() & ~f["is_recommended"].fillna(False)]
-    if syndicated_mode == "Syndicated only":
-        f = f[f["is_syndicated"].fillna(False)]
-    elif syndicated_mode == "Non-syndicated only":
-        f = f[~f["is_syndicated"].fillna(False)]
-    if media_mode == "With photos only":
-        f = f[f["has_photos"].fillna(False)]
-    elif media_mode == "No photos only":
-        f = f[~f["has_photos"].fillna(False)]
-    if date_range and date_range[0] and date_range[1] and "submission_date" in f.columns:
-        f = f[f["submission_date"].notna() & (f["submission_date"] >= date_range[0]) & (f["submission_date"] <= date_range[1])]
-    q = text_query.strip()
-    if q:
-        f = f[f["title_and_text"].fillna("").str.contains(re.escape(q), case=False, na=False, regex=True)]
-    return f.reset_index(drop=True)
+CORE_REVIEW_FILTER_SPECS = [
+    {"key": "product_or_sku", "label": "SKU / Product", "kind": "column", "column": "product_or_sku"},
+    {"key": "content_locale", "label": "Market / Locale", "kind": "column", "column": "content_locale"},
+    {"key": "retailer", "label": "Retailer", "kind": "column", "column": "retailer"},
+    {"key": "source_system", "label": "Source System", "kind": "column", "column": "source_system"},
+    {"key": "source_file", "label": "Source File", "kind": "column", "column": "source_file"},
+    {"key": "age_group", "label": "Age Group", "kind": "column", "column": "age_group"},
+    {"key": "user_location", "label": "Reviewer Location", "kind": "column", "column": "user_location"},
+    {"key": "review_type", "label": "Review Type", "kind": "derived"},
+    {"key": "recommendation", "label": "Recommendation", "kind": "derived"},
+    {"key": "syndication", "label": "Syndication", "kind": "derived"},
+    {"key": "media", "label": "Media", "kind": "derived"},
+]
 
 
-def _build_filter_options(df):
-    vd = df["submission_date"].dropna() if "submission_date" in df.columns else pd.Series(dtype="object")
-    pg = sorted({str(v).strip() for v in df["product_or_sku"].dropna().astype(str) if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}}) if not df.empty else []
-    return dict(
-        ratings=[1, 2, 3, 4, 5],
-        product_groups=pg,
-        locales=sorted(str(l) for l in df["content_locale"].dropna().unique()) if not df.empty else [],
-        min_date=vd.min() if not vd.empty else None,
-        max_date=vd.max() if not vd.empty else None,
+def _series_matches_any(series: pd.Series, values: Sequence[str]) -> pd.Series:
+    lookup = {str(v).strip().lower() for v in values if str(v).strip()}
+    s = series.astype("string").fillna("").str.strip().str.lower()
+    return s.isin(lookup)
+
+
+def _sanitize_multiselect(key: str, options: Sequence[Any], default: Optional[Sequence[Any]] = None):
+    opts = list(options or [])
+    default_vals = list(default or ["ALL"])
+    cur = st.session_state.get(key, default_vals)
+    if not isinstance(cur, list):
+        cur = [cur]
+    cur = [x for x in cur if x in opts]
+    if not cur:
+        cur = default_vals
+    if "ALL" in cur and len(cur) > 1:
+        cur = [x for x in cur if x != "ALL"]
+    st.session_state[key] = cur
+
+
+def _sanitize_multiselect_sym(key: str, options: Sequence[str], default: Optional[Sequence[str]] = None):
+    opts = list(options or [])
+    default_vals = list(default or ["All"])
+    cur = st.session_state.get(key, default_vals)
+    if not isinstance(cur, list):
+        cur = [cur]
+    cur = [x for x in cur if x in opts]
+    if not cur:
+        cur = default_vals
+    if "All" in cur and len(cur) > 1:
+        cur = [x for x in cur if x != "All"]
+    st.session_state[key] = cur
+
+
+def _reset_review_filters():
+    for key in list(st.session_state.keys()):
+        if key.startswith("rf_"):
+            st.session_state.pop(key, None)
+    st.session_state["review_explorer_page"] = 1
+    st.session_state["review_filter_signature"] = None
+
+
+def _filter_series_for_spec(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.Series:
+    key = spec["key"]
+    if spec["kind"] == "column":
+        s = df[spec["column"]].astype("string").fillna("Unknown").str.strip()
+        return s.replace("", "Unknown")
+    if key == "review_type":
+        raw = df.get("incentivized_review", pd.Series(False, index=df.index)).astype("boolean")
+        return raw.map({True: "Incentivized", False: "Organic"}).fillna("Unknown")
+    if key == "recommendation":
+        raw = df.get("is_recommended", pd.Series(pd.NA, index=df.index)).astype("boolean")
+        return raw.map({True: "Recommended", False: "Not Recommended"}).fillna("Unknown")
+    if key == "syndication":
+        raw = df.get("is_syndicated", pd.Series(pd.NA, index=df.index)).astype("boolean")
+        return raw.map({True: "Syndicated", False: "Not Syndicated"}).fillna("Unknown")
+    if key == "media":
+        raw = df.get("has_photos", pd.Series(False, index=df.index)).astype("boolean")
+        return raw.map({True: "With Photos", False: "No Photos"}).fillna("Unknown")
+    return pd.Series("Unknown", index=df.index)
+
+
+def _core_filter_specs_for_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    for spec in CORE_REVIEW_FILTER_SPECS:
+        if spec["kind"] == "column" and spec.get("column") not in df.columns:
+            continue
+        s = _filter_series_for_spec(df, spec)
+        opts = [x for x in sorted({str(v).strip() for v in s.dropna().astype(str) if str(v).strip()}, key=lambda x: x.lower()) if x]
+        if not opts:
+            continue
+        if len(opts) == 1 and opts[0] == "Unknown":
+            continue
+        specs.append({**spec, "options": ["ALL"] + opts})
+    return specs
+
+
+def _col_options(df: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -> List[str]:
+    if col not in df.columns:
+        return ["ALL"]
+    s = df[col]
+    vals = s.astype("string").fillna("Unknown").str.strip().replace("", "Unknown").tolist()
+    uniq = list(dict.fromkeys(v for v in vals if str(v).strip()))
+    uniq = sorted(uniq, key=lambda x: str(x).lower())
+    if max_vals is not None:
+        uniq = uniq[: int(max_vals)]
+    return ["ALL"] + uniq
+
+
+def _infer_extra_filter_kind(df: pd.DataFrame, col: str) -> str:
+    if col not in df.columns:
+        return "categorical"
+    s = df[col]
+    name = str(col).lower()
+    try:
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return "date"
+    except Exception:
+        pass
+    looks_datey = any(tok in name for tok in ["date", "time", "day", "month", "year"])
+    if looks_datey and not pd.api.types.is_numeric_dtype(s):
+        try:
+            as_dt = pd.to_datetime(s, errors="coerce")
+            if as_dt.notna().mean() >= 0.75 and as_dt.nunique(dropna=True) > 2:
+                return "date"
+        except Exception:
+            pass
+    try:
+        num = pd.to_numeric(s, errors="coerce")
+        if num.notna().mean() >= 0.9 and num.nunique(dropna=True) > 6:
+            return "numeric"
+    except Exception:
+        pass
+    return "categorical"
+
+
+def _extra_filter_candidates(df: pd.DataFrame) -> List[str]:
+    det_cols, del_cols = _get_symptom_col_lists(df)
+    excluded = {
+        "review_id", "title", "review_text", "title_and_text", "rating", "rating_label",
+        "submission_time", "submission_date", "submission_month", "year_month_sort",
+        "incentivized_review", "is_recommended", "is_syndicated", "has_photos", "has_media",
+        "photo_urls", "raw_json", "context_data_json", "review_length_chars", "review_length_words",
+        "AI Safety", "AI Reliability", "AI # of Sessions",
+    }
+    excluded.update({spec["column"] for spec in CORE_REVIEW_FILTER_SPECS if spec.get("kind") == "column"})
+    excluded.update(set(det_cols + del_cols))
+    excluded.update({c for c in df.columns if str(c).startswith("AI Symptom ") or str(c).startswith("Symptom ")})
+    return sorted([str(c) for c in df.columns if str(c) not in excluded], key=lambda x: x.lower())
+
+
+def _symptom_filter_options(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str], List[str]]:
+    det_cols, del_cols = _get_symptom_col_lists(df)
+    def _values(cols: Sequence[str]) -> List[str]:
+        vals: List[str] = []
+        for col in cols:
+            if col not in df.columns:
+                continue
+            s = df[col].astype("string").fillna("").str.strip()
+            good = s[(s != "") & (~s.str.upper().isin(NON_VALUES))]
+            vals.extend(good.tolist())
+        return sorted(list(dict.fromkeys(vals)), key=lambda x: x.lower())
+    return _values(det_cols), _values(del_cols), list(det_cols), list(del_cols)
+
+
+def _collect_active_filter_items(df: pd.DataFrame, *, core_specs: Sequence[Dict[str, Any]], extra_cols: Sequence[str], tf: str, start_date, end_date) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = []
+    if tf != "All Time":
+        if tf == "Custom Range" and start_date and end_date:
+            items.append(("Timeframe", f"{start_date} → {end_date}"))
+        else:
+            items.append(("Timeframe", tf))
+
+    sr_raw = st.session_state.get("rf_sr", ["All"])
+    sr_list = sr_raw if isinstance(sr_raw, list) else [sr_raw]
+    sr_sel = [x for x in sr_list if str(x).strip() and str(x).lower() != "all"]
+    if sr_sel:
+        items.append(("Stars", ", ".join(str(x) for x in sr_sel)))
+
+    for spec in core_specs:
+        sel = st.session_state.get(f"rf_{spec['key']}", ["ALL"])
+        sel_list = sel if isinstance(sel, list) else [sel]
+        sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
+        if sel_clean:
+            items.append((spec["label"], ", ".join(str(x) for x in sel_clean[:4]) + ("" if len(sel_clean) <= 4 else f" +{len(sel_clean) - 4}")))
+
+    for col in extra_cols:
+        if col not in df.columns:
+            continue
+        kind = _infer_extra_filter_kind(df, col)
+        rk = f"rf_{col}_range"
+        dk = f"rf_{col}_date_range"
+        ck = f"rf_{col}_contains"
+        if kind == "numeric":
+            num = pd.to_numeric(df[col], errors="coerce").dropna()
+            if not num.empty and rk in st.session_state and isinstance(st.session_state.get(rk), (tuple, list)) and len(st.session_state.get(rk)) == 2:
+                lo, hi = st.session_state[rk]
+                base_lo, base_hi = float(num.min()), float(num.max())
+                if round(float(lo), 10) != round(base_lo, 10) or round(float(hi), 10) != round(base_hi, 10):
+                    items.append((col, f"{float(lo):g} → {float(hi):g}"))
+            continue
+        if kind == "date":
+            dt = pd.to_datetime(df[col], errors="coerce").dropna()
+            if not dt.empty and dk in st.session_state and isinstance(st.session_state.get(dk), (tuple, list)) and len(st.session_state.get(dk)) == 2:
+                lo, hi = st.session_state[dk]
+                base_lo, base_hi = dt.min().date(), dt.max().date()
+                if lo and hi and (lo != base_lo or hi != base_hi):
+                    items.append((col, f"{lo} → {hi}"))
+            continue
+        cv = _safe_text(st.session_state.get(ck))
+        if cv:
+            items.append((col, f"contains: {cv}"))
+            continue
+        sel = st.session_state.get(f"rf_{col}", ["ALL"])
+        sel_list = sel if isinstance(sel, list) else [sel]
+        sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
+        if sel_clean:
+            items.append((col, ", ".join(str(x) for x in sel_clean[:4]) + ("" if len(sel_clean) <= 4 else f" +{len(sel_clean) - 4}")))
+
+    sel_det = [x for x in (st.session_state.get("rf_sym_detract", ["All"]) or []) if str(x).strip() and str(x).lower() != "all"]
+    sel_del = [x for x in (st.session_state.get("rf_sym_delight", ["All"]) or []) if str(x).strip() and str(x).lower() != "all"]
+    if sel_det:
+        items.append(("Detractors", ", ".join(sel_det[:3]) + ("" if len(sel_det) <= 3 else f" +{len(sel_det) - 3}")))
+    if sel_del:
+        items.append(("Delighters", ", ".join(sel_del[:3]) + ("" if len(sel_del) <= 3 else f" +{len(sel_del) - 3}")))
+
+    kw = _safe_text(st.session_state.get("rf_kw"))
+    if kw:
+        items.append(("Keyword", kw))
+    return items
+
+
+def _filter_description_from_items(items: Sequence[Tuple[str, str]]) -> str:
+    return "; ".join(f"{k}={v}" for k, v in items) if items else "No active filters"
+
+
+def _apply_live_review_filters(df_base: pd.DataFrame) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    if df_base is None or df_base.empty:
+        return {"filtered_df": df_base.copy() if isinstance(df_base, pd.DataFrame) else pd.DataFrame(), "active_items": [], "filter_seconds": 0.0, "description": "No active filters"}
+    d0 = df_base
+    mask = pd.Series(True, index=d0.index)
+    today = date.today()
+    tf = st.session_state.get("rf_tf", "All Time")
+    start_date = end_date = None
+    if tf == "Custom Range":
+        rng = st.session_state.get("rf_tf_range", (today - timedelta(days=30), today))
+        if isinstance(rng, (tuple, list)) and len(rng) == 2:
+            start_date, end_date = rng
+    elif tf == "Last Week":
+        start_date, end_date = today - timedelta(days=7), today
+    elif tf == "Last Month":
+        start_date, end_date = today - timedelta(days=30), today
+    elif tf == "Last Year":
+        start_date, end_date = today - timedelta(days=365), today
+
+    date_col = "submission_date" if "submission_date" in d0.columns else ("submission_time" if "submission_time" in d0.columns else None)
+    if start_date and end_date and date_col:
+        dt = pd.to_datetime(d0[date_col], errors="coerce")
+        end_inclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+        mask &= (dt >= pd.Timestamp(start_date)) & (dt <= end_inclusive)
+
+    sr_raw = st.session_state.get("rf_sr", ["All"])
+    sr_list = sr_raw if isinstance(sr_raw, list) else [sr_raw]
+    sr_sel = [x for x in sr_list if str(x).strip() and str(x).lower() != "all"]
+    if sr_sel and "rating" in d0.columns:
+        sr_nums = [int(x) for x in sr_sel if str(x).isdigit()]
+        if sr_nums:
+            mask &= pd.to_numeric(d0["rating"], errors="coerce").isin(sr_nums)
+
+    core_specs = _core_filter_specs_for_df(d0)
+    for spec in core_specs:
+        sel = st.session_state.get(f"rf_{spec['key']}", ["ALL"])
+        sel_list = sel if isinstance(sel, list) else [sel]
+        sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
+        if sel_clean:
+            mask &= _series_matches_any(_filter_series_for_spec(d0, spec), [str(x) for x in sel_clean])
+
+    extra_cols = [c for c in (st.session_state.get("rf_extra_filter_cols", []) or []) if c in d0.columns]
+    for col in extra_cols:
+        kind = _infer_extra_filter_kind(d0, col)
+        s = d0[col]
+        if kind == "numeric":
+            rk = f"rf_{col}_range"
+            if rk in st.session_state and isinstance(st.session_state.get(rk), (tuple, list)) and len(st.session_state.get(rk)) == 2:
+                lo, hi = st.session_state[rk]
+                mask &= pd.to_numeric(s, errors="coerce").between(float(lo), float(hi), inclusive="both")
+        elif kind == "date":
+            dk = f"rf_{col}_date_range"
+            if dk in st.session_state and isinstance(st.session_state.get(dk), (tuple, list)) and len(st.session_state.get(dk)) == 2:
+                lo, hi = st.session_state[dk]
+                if lo and hi:
+                    dt = pd.to_datetime(s, errors="coerce")
+                    hi_end = pd.Timestamp(hi) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+                    mask &= (dt >= pd.Timestamp(lo)) & (dt <= hi_end)
+        else:
+            ck = f"rf_{col}_contains"
+            cv = _safe_text(st.session_state.get(ck)).strip()
+            if cv:
+                mask &= s.astype("string").fillna("").str.contains(cv, case=False, na=False, regex=False)
+            else:
+                sel = st.session_state.get(f"rf_{col}", ["ALL"])
+                sel_list = sel if isinstance(sel, list) else [sel]
+                sel_clean = [x for x in sel_list if str(x).strip() and str(x).upper() != "ALL"]
+                if sel_clean:
+                    ss = s.astype("string").fillna("")
+                    sample = ss.head(200).astype(str)
+                    if bool(sample.str.contains(r"\s\|\s", regex=True).any()):
+                        toks = [str(x).strip() for x in sel_clean if str(x).strip()]
+                        pattern = r"(^|\s*\|\s*)(" + "|".join(re.escape(t) for t in toks) + r")(\s*\|\s*|$)"
+                        mask &= ss.str.contains(pattern, case=False, regex=True, na=False)
+                    else:
+                        mask &= ss.isin([str(x) for x in sel_clean])
+
+    _, _, det_cols, del_cols = _symptom_filter_options(d0)
+    sel_det = [x for x in (st.session_state.get("rf_sym_detract", ["All"]) or []) if str(x).strip() and str(x).lower() != "all"]
+    sel_del = [x for x in (st.session_state.get("rf_sym_delight", ["All"]) or []) if str(x).strip() and str(x).lower() != "all"]
+    if sel_det and det_cols:
+        mask &= d0[det_cols].isin(sel_det).any(axis=1)
+    if sel_del and del_cols:
+        mask &= d0[del_cols].isin(sel_del).any(axis=1)
+
+    kw = _safe_text(st.session_state.get("rf_kw")).strip()
+    search_col = "title_and_text" if "title_and_text" in d0.columns else ("review_text" if "review_text" in d0.columns else None)
+    if kw and search_col:
+        mask &= d0[search_col].astype("string").fillna("").str.contains(kw, case=False, na=False, regex=False)
+
+    filtered = d0.loc[mask].copy()
+    active_items = _collect_active_filter_items(d0, core_specs=core_specs, extra_cols=extra_cols, tf=tf, start_date=start_date, end_date=end_date)
+    return {"filtered_df": filtered, "active_items": active_items, "filter_seconds": time.perf_counter() - t0, "description": _filter_description_from_items(active_items)}
+
+
+def _render_active_filter_summary(filter_state: Dict[str, Any], overall_df: pd.DataFrame):
+    active_items = filter_state.get("active_items", [])
+    pills = []
+    for k, v in active_items[:12]:
+        pills.append(f"<div class='pill'><span class='muted'>{_esc(k)}:</span> {_esc(v)}</div>")
+    st.markdown(
+        f"""
+<div class="soft-panel">
+  <div><b>Active filters</b> • Showing <b>{len(filter_state.get('filtered_df', [])):,}</b> of <b>{len(overall_df):,}</b> reviews
+  <span class="small-muted"> (filter time: {float(filter_state.get('filter_seconds', 0.0)):.3f}s)</span>
+  </div>
+  <div class="pill-row">{''.join(pills) if pills else '<span class="small-muted">None (All data)</span>'}</div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
+def _render_workspace_nav() -> str:
+    current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
+    with st.container(border=True):
+        st.markdown("<div class='nav-tabs-label'>Workspace</div>", unsafe_allow_html=True)
+        st.markdown("<div class='workspace-nav-sub'>Start with the Dashboard for the executive summary, then move into Explorer, AI, Prompting, or Symptomizer as needed.</div>", unsafe_allow_html=True)
+        dash_kwargs = {"use_container_width": True, "key": "workspace_nav_dashboard"}
+        if current == TAB_DASHBOARD:
+            dash_kwargs["type"] = "primary"
+        if st.button(TAB_DASHBOARD, **dash_kwargs):
+            current = TAB_DASHBOARD
+            st.session_state["workspace_active_tab"] = TAB_DASHBOARD
+        st.markdown("<div style='height:.45rem'></div>", unsafe_allow_html=True)
+        rows = [
+            [TAB_REVIEW_EXPLORER, TAB_AI_ANALYST],
+            [TAB_REVIEW_PROMPT, TAB_SYMPTOMIZER],
+        ]
+        for ridx, row in enumerate(rows):
+            cols = st.columns(len(row))
+            for cidx, (col, label) in enumerate(zip(cols, row)):
+                kwargs = {"use_container_width": True, "key": f"workspace_nav_{ridx}_{cidx}_{_slugify(label, fallback='tab')}"}
+                if current == label:
+                    kwargs["type"] = "primary"
+                if col.button(label, **kwargs):
+                    current = label
+                    st.session_state["workspace_active_tab"] = label
+    return current
 
-def _describe_filters(*, selected_ratings, selected_products, review_source_mode,
-                      selected_locales, recommendation_mode, date_range, text_query,
-                      syndicated_mode="All", media_mode="All"):
-    parts = []
-    if selected_ratings and set(selected_ratings) != {1, 2, 3, 4, 5}:
-        parts.append("ratings=" + ",".join(str(r) for r in selected_ratings))
-    if selected_products:
-        parts.append("sku=" + ", ".join(selected_products[:4]) + ("…" if len(selected_products) > 4 else ""))
-    if review_source_mode != "All reviews":
-        parts.append(f"source={review_source_mode.lower()}")
-    if selected_locales:
-        parts.append("locales=" + ", ".join(selected_locales))
-    if recommendation_mode != "All":
-        parts.append(f"recommend={recommendation_mode.lower()}")
-    if syndicated_mode not in ("All", "All syndicated"):
-        parts.append(f"syndicated={syndicated_mode.lower()}")
-    if media_mode not in ("All", "All media"):
-        parts.append(f"media={media_mode.lower()}")
-    if date_range and date_range[0] and date_range[1]:
-        parts.append(f"dates={date_range[0]} to {date_range[1]}")
-    if text_query.strip():
-        parts.append(f'text="{text_query.strip()}"')
-    return "; ".join(parts) if parts else "No active filters"
 
 
 def _product_name(summary, df):
@@ -1763,12 +3451,12 @@ GENERAL_INSTRUCTIONS = textwrap.dedent("""
     ROLE: Synthesise consumer review data into sharp, actionable insights.
     Prioritise evidence from the supplied dataset over generic assumptions.
     ANSWER FORMAT
-    • Use clear markdown headings (##, ###).
+    • Use compact markdown. Prefer short bold section labels instead of large headings.
     • Lead with the most important insight — do not bury the lede.
     • Cite review IDs inline: (review_ids: 12345, 67890).
     • For every quantitative claim state the count or percentage from the data.
     • Mark inferences: [INFERRED].
-    • Keep responses ≤ 400 words unless the user explicitly asks for depth.
+    • Follow the caller-specified response-length target. If no target is given, prefer a detailed answer over a terse one.
     • End every response with a "**Next Steps**" section: 2–3 concrete actions.
     GUARDRAILS
     • Do not invent review IDs, quotes, counts, or trends not in the evidence.
@@ -1864,32 +3552,33 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
     return full_json
 
 
-def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, report_length="Medium"):
+def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False):
     client = _get_client()
     if client is None:
         raise ReviewDownloaderError("No OpenAI API key configured.")
-    _length_tokens = {"Short": 600, "Medium": 1400, "Long": 2800}
-    _length_note = {
-        "Short": "IMPORTANT: Keep your entire response under 150 words. Be direct — one key insight, one action.",
-        "Medium": "Keep your response to 300–400 words.",
-        "Long": "Provide a thorough 600–800 word response with detailed evidence, examples, and a full Next Steps section.",
-    }
+    target_words = _coerce_ai_target_words(target_words)
+    floor_words = max(220, int(round(target_words * 0.8)))
+    ceiling_words = min(2600, int(round(target_words * 1.15)))
+    max_tok = _ai_target_token_budget(target_words)
     base_instructions = _persona_instructions(persona_name)
-    length_suffix = f"\n\n{_length_note.get(report_length, '')}"
-    instructions = base_instructions + length_suffix
-    max_tok = _length_tokens.get(report_length, 1400)
-    ai_ctx = _build_ai_context(
-        overall_df=overall_df,
-        filtered_df=filtered_df,
-        summary=summary,
-        filter_description=filter_description,
-        question=question,
+    length_note = (
+        "RESPONSE LENGTH OVERRIDE: ignore any shorter length caps that may appear earlier in these instructions. "
+        f"Aim for about {target_words:,} words, with a practical range of roughly {floor_words:,} to {ceiling_words:,} words. "
+        "Use detailed evidence, concrete examples, and a full Next Steps section. Do not compress the answer into a short summary unless the user explicitly asks for that."
     )
+    reference_note = (
+        "REFERENCE MODE: include inline evidence references using the exact format (review_ids: 12345, 67890) for material claims."
+        if include_references else
+        "REFERENCE MODE: do NOT include inline citations, do NOT emit (review_ids: ...), and do NOT add reference callouts in the final answer."
+    )
+    instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note
+    ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question)
     msgs = [{"role": m["role"], "content": m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role": "user", "content": f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})
-    result = _chat_complete(
+    result = _chat_complete_with_fallback_models(
         client,
         model=_shared_model(),
+        structured=False,
         messages=[{"role": "system", "content": instructions}, *msgs],
         temperature=0.0,
         max_tokens=max_tok,
@@ -1897,13 +3586,15 @@ def _call_analyst(*, question, overall_df, filtered_df, summary, filter_descript
     )
     if not result:
         raise ReviewDownloaderError("OpenAI returned empty answer.")
+    if not include_references:
+        result = _strip_review_citations(result)
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  REVIEW PROMPT TAGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 def _default_prompt_df():
-    return pd.DataFrame([REVIEW_PROMPT_STARTER_ROWS[0]])
+    return pd.DataFrame(REVIEW_PROMPT_STARTER_ROWS)
 
 
 def _normalize_prompt_defs(prompt_df, existing_columns):
@@ -1937,13 +3628,7 @@ def _normalize_prompt_defs(prompt_df, existing_columns):
             col = f"{base}_{suffix}"
             suffix += 1
         seen.add(col)
-        normalized.append(dict(
-            column_name=col,
-            display_name=col.replace("_", " ").title(),
-            prompt=rp,
-            labels=deduped,
-            labels_csv=", ".join(deduped),
-        ))
+        normalized.append(dict(column_name=col, display_name=col.replace("_", " ").title(), prompt=rp, labels=deduped, labels_csv=", ".join(deduped)))
     return normalized
 
 
@@ -1973,13 +3658,13 @@ def _build_tagging_schema(prompt_defs):
 
 def _classify_chunk(*, client, chunk_df, prompt_defs):
     pc = max(len(prompt_defs), 1)
-    max_out = int(max(1800, min(12000, 450 + len(chunk_df) * (18 + 12 * pc))))
+    max_out = int(max(1600, min(9000, 450 + len(chunk_df) * (18 + 10 * pc))))
     reviews_payload = [
         dict(
             review_id=_safe_text(row.get("review_id")),
             rating=_safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else None,
             title=_trunc(row.get("title", ""), 200),
-            review_text=_trunc(row.get("review_text", ""), 1000),
+            review_text=_trunc(row.get("review_text", ""), 900),
             incentivized_review=_safe_bool(row.get("incentivized_review"), False),
         )
         for _, row in chunk_df.iterrows()
@@ -1991,9 +3676,10 @@ def _classify_chunk(*, client, chunk_df, prompt_defs):
     structured_rf = {"type": "json_schema", "json_schema": {"name": "review_prompt_tagging", "schema": _build_tagging_schema(prompt_defs), "strict": True}}
     result_text = ""
     try:
-        result_text = _chat_complete(
+        result_text = _chat_complete_with_fallback_models(
             client,
             model=_shared_model(),
+            structured=True,
             messages=msgs,
             temperature=0.0,
             response_format=structured_rf,
@@ -2006,18 +3692,16 @@ def _classify_chunk(*, client, chunk_df, prompt_defs):
             "You are a deterministic review-tagging engine. Return ONLY a JSON object with key 'results' containing an array. "
             "Each element must have: review_id (string), " + col_hints + ". Include every review_id from the input. Use 'Not Mentioned' if not applicable."
         )
-        try:
-            result_text = _chat_complete(
-                client,
-                model=_shared_model(),
-                messages=[{"role": "system", "content": fallback_instructions}, {"role": "user", "content": user_content}],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                max_tokens=max_out,
-                reasoning_effort=_shared_reasoning(),
-            )
-        except Exception as exc2:
-            raise ReviewDownloaderError(f"Review Prompt API call failed. Primary error: {exc}. Fallback error: {exc2}")
+        result_text = _chat_complete_with_fallback_models(
+            client,
+            model=_shared_model(),
+            structured=True,
+            messages=[{"role": "system", "content": fallback_instructions}, {"role": "user", "content": user_content}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=max_out,
+            reasoning_effort=_shared_reasoning(),
+        )
     if not result_text:
         raise ReviewDownloaderError("OpenAI returned an empty response. Check your API key and model selection.")
     data = _safe_json_load(result_text)
@@ -2054,6 +3738,7 @@ def _run_review_prompt_tagging(*, client, source_df, prompt_defs, chunk_size):
             errors.append(f"Batch {i}: {exc}")
             status.warning(f"Batch {i} failed — {exc}")
         prog.progress(i / len(chunks))
+        gc.collect()
     if not outputs:
         err_detail = "; ".join(errors[:3]) if errors else "unknown error"
         raise ReviewDownloaderError(f"All batches failed. First error: {err_detail}")
@@ -2091,14 +3776,7 @@ def _summarize_prompt_results(prompt_results_df, prompt_defs, source_df=None):
         col = p["column_name"]
         for label in p["labels"]:
             sub = merged[merged[col] == label]
-            rows.append(dict(
-                column_name=col,
-                display_name=p["display_name"],
-                label=str(label),
-                review_count=len(sub),
-                share=_safe_pct(len(sub), total),
-                avg_rating=_safe_mean(sub["rating"]) if "rating" in sub.columns else None,
-            ))
+            rows.append(dict(column_name=col, display_name=p["display_name"], label=str(label), review_count=len(sub), share=_safe_pct(len(sub), total), avg_rating=_safe_mean(sub["rating"]) if "rating" in sub.columns else None))
     return pd.DataFrame(rows)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2120,17 +3798,7 @@ def _build_master_excel(summary, reviews_df, *, prompt_defs=None, prompt_summary
     except Exception:
         rd = pd.DataFrame()
         md = pd.DataFrame()
-    summary_df = pd.DataFrame([dict(
-        product_name=_product_name(summary, reviews_df),
-        product_id=summary.product_id,
-        product_url=summary.product_url,
-        reviews_downloaded=summary.reviews_downloaded,
-        avg_rating=metrics.get("avg_rating"),
-        avg_rating_non_incentivized=metrics.get("avg_rating_non_incentivized"),
-        pct_low_star=metrics.get("pct_low_star"),
-        pct_incentivized=metrics.get("pct_incentivized"),
-        generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-    )])
+    summary_df = pd.DataFrame([dict(product_name=_product_name(summary, reviews_df), product_id=summary.product_id, product_url=summary.product_url, reviews_downloaded=summary.reviews_downloaded, avg_rating=metrics.get("avg_rating"), avg_rating_non_incentivized=metrics.get("avg_rating_non_incentivized"), pct_low_star=metrics.get("pct_low_star"), pct_incentivized=metrics.get("pct_incentivized"), generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))])
     priority_cols = ["review_id", "product_id", "rating", "incentivized_review", "is_recommended", "submission_time", "content_locale", "title", "review_text"]
     pc = [p["column_name"] for p in (prompt_defs or []) if p["column_name"] in reviews_df.columns]
     ordered = [c for c in priority_cols + pc if c in reviews_df.columns]
@@ -2140,10 +3808,7 @@ def _build_master_excel(summary, reviews_df, *, prompt_defs=None, prompt_summary
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         sheets = {"Summary": summary_df, "Reviews": exp_reviews, "RatingDistribution": rd, "ReviewVolume": md}
         if prompt_defs:
-            sheets["ReviewPromptDefinitions"] = pd.DataFrame([
-                dict(column_name=p["column_name"], display_name=p["display_name"], prompt=p["prompt"], labels=", ".join(p["labels"]), scope=prompt_scope)
-                for p in prompt_defs
-            ])
+            sheets["ReviewPromptDefinitions"] = pd.DataFrame([dict(column_name=p["column_name"], display_name=p["display_name"], prompt=p["prompt"], labels=", ".join(p["labels"]), scope=prompt_scope) for p in prompt_defs])
         if prompt_summary_df is not None and not prompt_summary_df.empty:
             sheets["ReviewPromptSummary"] = prompt_summary_df
         for sname, df_ in sheets.items():
@@ -2316,7 +3981,6 @@ def _prioritize_for_symptomization(df):
     w["_prio"] += text.str.lower().str.count(kw_del, flags=re.IGNORECASE).clip(upper=2) * 0.5
     return w.sort_values("_prio", ascending=False).drop(columns=["_prio"])
 
-
 def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detractors,
                              product_profile="", max_ev_chars=120, aliases=None):
     out_by_idx = {}
@@ -2360,10 +4024,11 @@ sessions    → {SESSIONS_ENUM}
   "sessions":"<enum value>"
 }}]}}"""
     payload = dict(items=[dict(id=str(it["idx"]), review=it["review"], needs_delighters=it.get("needs_del", True), needs_detractors=it.get("needs_det", True)) for it in items])
-    max_out = min(8000, max(2000, 250 * len(items) + 400))
-    result_text = _chat_complete(
+    max_out = min(7000, max(1800, 230 * len(items) + 400))
+    result_text = _chat_complete_with_fallback_models(
         client,
         model=_shared_model(),
+        structured=True,
         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(payload)}],
         temperature=0.0,
         response_format={"type": "json_object"},
@@ -2437,13 +4102,14 @@ def _ai_build_symptom_list(*, client, product_description, sample_reviews):
         Aim for 15-30 labels per side based on actual review patterns.
     """).strip()
     payload = dict(product_description=product_description or "SharkNinja consumer appliance", sample_reviews=sample_reviews[:30])
-    result_text = _chat_complete(
+    result_text = _chat_complete_with_fallback_models(
         client,
         model=_shared_model(),
+        structured=True,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(payload)}],
         temperature=0.0,
         response_format={"type": "json_object"},
-        max_tokens=4000,
+        max_tokens=3200,
         reasoning_effort=_shared_reasoning(),
     )
     data = _safe_json_load(result_text)
@@ -2556,12 +4222,17 @@ def _init_state():
         review_explorer_page=1,
         review_explorer_per_page=20,
         review_explorer_sort="Newest",
+        review_filter_signature=None,
         shared_model=DEFAULT_MODEL,
         shared_reasoning=DEFAULT_REASONING,
+        ai_response_preset="Large (1200 words)",
+        ai_response_words=1200,
+        ai_include_references=False,
         workspace_source_mode=SOURCE_MODE_URL,
         workspace_product_url=DEFAULT_PRODUCT_URL,
         workspace_file_uploader_nonce=0,
         workspace_active_tab=TAB_DASHBOARD,
+        workspace_tab_request=None,
         ai_scroll_to_top=False,
         sym_delighters=[],
         sym_detractors=[],
@@ -2592,6 +4263,7 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["prompt_run_notice"] = None
     st.session_state["review_explorer_page"] = 1
     st.session_state["workspace_active_tab"] = TAB_DASHBOARD
+    st.session_state["workspace_tab_request"] = None
     st.session_state["ai_scroll_to_top"] = False
     st.session_state["sym_processed_rows"] = []
     st.session_state["sym_new_candidates"] = {}
@@ -2605,7 +4277,7 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["sym_export_bytes"] = None
     st.session_state["_prompt_bundle_ready"] = False
     st.session_state.pop("sym_ai_build_result", None)
-
+    _reset_review_filters()
     if reset_source:
         st.session_state["workspace_source_mode"] = SOURCE_MODE_URL
         st.session_state["workspace_product_url"] = DEFAULT_PRODUCT_URL
@@ -2616,101 +4288,139 @@ _init_state()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
-def _render_sidebar(df):
+def _render_sidebar(df: Optional[pd.DataFrame]):
     api_key = _get_api_key()
-    selected_ratings = [1, 2, 3, 4, 5]
-    selected_products = []
-    review_source_mode = "All reviews"
-    selected_locales = []
-    recommendation_mode = "All"
-    date_range = None
-    text_query = ""
-    syndicated_mode = "All"
-    media_mode = "All"
+    filter_state = {"filtered_df": df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(), "active_items": [], "filter_seconds": 0.0, "description": "No active filters"}
     with st.sidebar:
-        st.markdown("### 🤖 AI Model")
-        cur_model = st.session_state.get("shared_model", DEFAULT_MODEL)
-        if cur_model not in MODEL_OPTIONS:
-            cur_model = DEFAULT_MODEL
-            st.session_state["shared_model"] = cur_model
-        st.selectbox(
-            "Model",
-            options=MODEL_OPTIONS,
-            index=MODEL_OPTIONS.index(cur_model),
-            key="shared_model",
-            help="Used by AI Analyst, Review Prompt, and Symptomizer.",
-        )
-
-        effort_options = _reasoning_options_for_model(st.session_state.get("shared_model", DEFAULT_MODEL))
-        cur_reasoning = _safe_text(st.session_state.get("shared_reasoning", DEFAULT_REASONING)).lower() or DEFAULT_REASONING
-        if cur_reasoning not in effort_options:
-            cur_reasoning = "none" if "none" in effort_options else effort_options[0]
-            st.session_state["shared_reasoning"] = cur_reasoning
-        st.selectbox(
-            "Reasoning effort",
-            options=effort_options,
-            index=effort_options.index(cur_reasoning),
-            key="shared_reasoning",
-            help="Applied to GPT-5 family models. 'none' is the default for GPT-5.4 family models; older GPT-5 models use their nearest supported fastest setting.",
-        )
-        if api_key:
-            st.markdown("<div class='chip green' style='margin-top:4px'>✓ API key loaded</div>", unsafe_allow_html=True)
-        else:
-            st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
-        st.divider()
         st.markdown("### 🔍 Review Filters")
-        st.caption("Applies to all workspace tabs.")
+        st.caption("Applies live to every workspace tab.")
+        if st.button("🧹 Clear all filters", use_container_width=True, key="rf_clear_btn"):
+            _reset_review_filters()
+            st.rerun()
         if df is None:
             st.info("Build a workspace to unlock filters.")
         else:
-            options = _build_filter_options(df)
-            rating_opts = ["All ratings", "1 star", "2 stars", "3 stars", "4 stars", "5 stars", "1-2 stars", "4-5 stars", "Custom"]
-            rating_mode = st.selectbox("Ratings", options=rating_opts, index=0, key="sidebar_rating_mode")
-            custom_ratings = None
-            if rating_mode == "Custom":
-                custom_ratings = st.multiselect("Custom ratings", options=options["ratings"], default=options["ratings"], key="sidebar_custom_ratings")
-            mapping = {
-                "All ratings": [1, 2, 3, 4, 5],
-                "1 star": [1],
-                "2 stars": [2],
-                "3 stars": [3],
-                "4 stars": [4],
-                "5 stars": [5],
-                "1-2 stars": [1, 2],
-                "4-5 stars": [4, 5],
-            }
-            selected_ratings = mapping.get(rating_mode, custom_ratings or [1, 2, 3, 4, 5])
-            review_source_mode = st.selectbox("Review source", ["All reviews", "Organic only", "Incentivized only"], index=0, key="sidebar_review_source")
-            if options["product_groups"] and len(options["product_groups"]) > 1:
-                selected_products = st.multiselect("SKU / Product ID", options=options["product_groups"], default=[], key="sidebar_product_groups")
-            if options["locales"]:
-                selected_locales = st.multiselect("Market / locale", options=options["locales"], default=[], key="sidebar_locales")
-            recommendation_mode = st.selectbox("Recommendation status", ["All", "Recommended only", "Not recommended only"], index=0, key="sidebar_recommendation")
-            syndicated_mode = st.selectbox("Syndication", ["All", "Syndicated only", "Non-syndicated only"], index=0, key="sidebar_syndicated")
-            media_mode = st.selectbox("Photos", ["All", "With photos only", "No photos only"], index=0, key="sidebar_media")
-            if options["min_date"] and options["max_date"]:
-                picked = st.date_input("Date range", value=(options["min_date"], options["max_date"]), min_value=options["min_date"], max_value=options["max_date"], key="sidebar_date_range")
-                if isinstance(picked, tuple) and len(picked) == 2:
-                    date_range = (picked[0], picked[1])
-            text_query = st.text_input("Text contains", value="", key="sidebar_text_query", placeholder="noise, basket, capacity…")
-        st.divider()
-        st.markdown("### ⚡ Symptomizer")
-        st.slider("Batch size", 1, 12, key="sym_batch_size")
-        st.slider("Max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
-    src_map = {"All reviews": "All reviews", "Organic only": "Non-incentivized only", "Incentivized only": "Incentivized only"}
-    return dict(
-        selected_ratings=selected_ratings,
-        selected_products=selected_products,
-        review_source_mode=review_source_mode,
-        incentivized_mode=src_map.get(review_source_mode, "All reviews"),
-        selected_locales=selected_locales,
-        recommendation_mode=recommendation_mode,
-        syndicated_mode=syndicated_mode,
-        media_mode=media_mode,
-        date_range=date_range,
-        text_query=text_query,
-        api_key=api_key,
-    )
+            core_specs = _core_filter_specs_for_df(df)
+            det_opts, del_opts, _, _ = _symptom_filter_options(df)
+            st.markdown(
+                f"<div class='sidebar-scope-card'><div class='sidebar-scope-title'>Loaded workspace</div><div class='sidebar-scope-value'>{len(df):,} reviews · {len(core_specs):,} core filters{' · symptoms ready' if (det_opts or del_opts) else ''}</div></div>",
+                unsafe_allow_html=True,
+            )
+            with st.expander("🗓️ Timeframe", expanded=False):
+                tf_opts = ["All Time", "Last Week", "Last Month", "Last Year", "Custom Range"]
+                if st.session_state.get("rf_tf") not in tf_opts:
+                    st.session_state["rf_tf"] = "All Time"
+                st.selectbox("Select timeframe", options=tf_opts, key="rf_tf")
+                if st.session_state.get("rf_tf") == "Custom Range":
+                    today = date.today()
+                    rng = st.session_state.get("rf_tf_range", (today - timedelta(days=30), today))
+                    if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+                        rng = (today - timedelta(days=30), today)
+                    st.session_state["rf_tf_range"] = tuple(rng)
+                    st.date_input("Start / end", value=st.session_state["rf_tf_range"], key="rf_tf_range")
+            with st.expander("⭐ Star rating", expanded=False):
+                sr_opts = ["All", 5, 4, 3, 2, 1]
+                cur = st.session_state.get("rf_sr", ["All"])
+                if not isinstance(cur, list):
+                    cur = [cur]
+                cur = [v for v in cur if v in sr_opts]
+                if not cur:
+                    cur = ["All"]
+                if "All" in cur and len(cur) > 1:
+                    cur = [v for v in cur if v != "All"]
+                st.session_state["rf_sr"] = cur
+                st.multiselect("Select stars", options=sr_opts, default=st.session_state["rf_sr"], key="rf_sr")
+            with st.expander("🧭 Core review filters", expanded=True):
+                st.caption("Use these first for an ELT-ready slice of the data.")
+                for spec in core_specs:
+                    key = f"rf_{spec['key']}"
+                    _sanitize_multiselect(key, spec["options"], ["ALL"])
+                    st.multiselect(spec["label"], options=spec["options"], default=st.session_state[key], key=key)
+            if det_opts or del_opts:
+                with st.expander("🩺 Symptom filters", expanded=False):
+                    st.caption("Only shown when symptom tags are present in the workspace.")
+                    if det_opts:
+                        det_all = ["All"] + det_opts
+                        _sanitize_multiselect_sym("rf_sym_detract", det_all, ["All"])
+                        st.multiselect("Detractors", options=det_all, default=st.session_state["rf_sym_detract"], key="rf_sym_detract")
+                    if del_opts:
+                        del_all = ["All"] + del_opts
+                        _sanitize_multiselect_sym("rf_sym_delight", del_all, ["All"])
+                        st.multiselect("Delighters", options=del_all, default=st.session_state["rf_sym_delight"], key="rf_sym_delight")
+            with st.expander("🔎 Keyword", expanded=False):
+                st.text_input("Search in title + review text", value=st.session_state.get("rf_kw", ""), key="rf_kw")
+            extra_candidates = _extra_filter_candidates(df)
+            current_extra = [c for c in (st.session_state.get("rf_extra_filter_cols", []) or []) if c in extra_candidates]
+            st.session_state["rf_extra_filter_cols"] = current_extra
+            with st.expander("➕ Add Filters (power user)", expanded=False):
+                st.caption("Choose additional columns to surface as filters.")
+                st.multiselect("Available columns", options=extra_candidates, default=current_extra, key="rf_extra_filter_cols")
+            extra_cols = st.session_state.get("rf_extra_filter_cols", []) or []
+            if extra_cols:
+                with st.expander("🧩 Extra filters", expanded=True):
+                    for col in extra_cols:
+                        if col not in df.columns:
+                            continue
+                        kind = _infer_extra_filter_kind(df, col)
+                        s = df[col]
+                        if kind == "numeric":
+                            num = pd.to_numeric(s, errors="coerce").dropna()
+                            if num.empty:
+                                continue
+                            lo, hi = float(num.min()), float(num.max())
+                            if lo == hi:
+                                st.caption(f"{col}: {lo:g} (constant)")
+                                continue
+                            key = f"rf_{col}_range"
+                            default = st.session_state.get(key, (lo, hi))
+                            if not (isinstance(default, (tuple, list)) and len(default) == 2):
+                                default = (lo, hi)
+                            st.session_state[key] = (float(default[0]), float(default[1]))
+                            st.slider(col, min_value=lo, max_value=hi, value=st.session_state[key], key=key)
+                        elif kind == "date":
+                            dt = pd.to_datetime(s, errors="coerce").dropna()
+                            if dt.empty:
+                                continue
+                            lo, hi = dt.min().date(), dt.max().date()
+                            key = f"rf_{col}_date_range"
+                            default = st.session_state.get(key, (lo, hi))
+                            if not (isinstance(default, (tuple, list)) and len(default) == 2):
+                                default = (lo, hi)
+                            st.session_state[key] = tuple(default)
+                            st.date_input(col, value=st.session_state[key], min_value=lo, max_value=hi, key=key)
+                        else:
+                            try:
+                                nunique = int(s.astype("string").replace({"": pd.NA}).nunique(dropna=True))
+                            except Exception:
+                                nunique = 0
+                            if nunique > 600:
+                                st.text_input(f"{col} contains", value=str(st.session_state.get(f"rf_{col}_contains") or ""), key=f"rf_{col}_contains", help="High-cardinality column — using a contains filter for speed.")
+                            else:
+                                opts = _col_options(df, col, max_vals=None)
+                                _sanitize_multiselect(f"rf_{col}", opts, ["ALL"])
+                                st.multiselect(col, options=opts, default=st.session_state[f"rf_{col}"], key=f"rf_{col}")
+            filter_state = _apply_live_review_filters(df)
+        with st.expander("🤖 AI Model & Symptomizer", expanded=False):
+            st.caption("Use higher reasoning for ELT-ready analysis and more nuanced summaries.")
+            cur_model = st.session_state.get("shared_model", DEFAULT_MODEL)
+            if cur_model not in MODEL_OPTIONS:
+                cur_model = DEFAULT_MODEL
+                st.session_state["shared_model"] = cur_model
+            st.selectbox("Model", options=MODEL_OPTIONS, index=MODEL_OPTIONS.index(cur_model), key="shared_model", help="Used by AI Analyst, Review Prompt, and Symptomizer.")
+            effort_options = _reasoning_options_for_model(st.session_state.get("shared_model", DEFAULT_MODEL))
+            cur_reasoning = _safe_text(st.session_state.get("shared_reasoning", DEFAULT_REASONING)).lower() or DEFAULT_REASONING
+            if cur_reasoning not in effort_options:
+                cur_reasoning = "none" if "none" in effort_options else effort_options[0]
+                st.session_state["shared_reasoning"] = cur_reasoning
+            st.selectbox("Reasoning effort", options=effort_options, index=effort_options.index(cur_reasoning), key="shared_reasoning", help="Applied to GPT-5 family models. Raising this usually improves quality on nuanced and long-form analysis, but may be a bit slower.")
+            if api_key:
+                st.markdown("<div class='helper-chip-row'><span class='helper-chip'>API key loaded</span><span class='helper-chip'>Higher reasoning = higher quality</span></div>", unsafe_allow_html=True)
+            else:
+                st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
+            st.markdown("<div style='height:.25rem'></div>", unsafe_allow_html=True)
+            st.slider("Symptomizer batch size", 1, 12, key="sym_batch_size")
+            st.slider("Symptomizer max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
+    return {"api_key": api_key, "review_filters": filter_state}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  RENDER HELPERS
@@ -2729,7 +4439,14 @@ def _render_workspace_header(summary, overall_df, prompt_artifacts, *, source_ty
     product_name = _product_name(summary, overall_df)
     organic = int((~overall_df["incentivized_review"].fillna(False)).sum()) if not overall_df.empty else 0
     n = len(overall_df)
-    src_chip = f"Uploaded · {source_label}" if source_type == "uploaded" else f"Bazaarvoice · {summary.product_id}"
+    if source_type == "uploaded":
+        src_chip = f"Uploaded · {source_label}"
+    elif source_type == "powerreviews":
+        src_chip = f"{(source_label or 'PowerReviews')} · {summary.product_id}"
+    elif source_type == "bazaarvoice":
+        src_chip = f"{(source_label or 'Bazaarvoice')} · {summary.product_id}"
+    else:
+        src_chip = f"{(source_label or str(source_type).title())} · {summary.product_id}"
     st.markdown(f"""<div class="hero-card">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
         <div>
@@ -2753,12 +4470,15 @@ def _render_workspace_header(summary, overall_df, prompt_artifacts, *, source_ty
 
 def _render_top_metrics(overall_df, filtered_df):
     m = _get_metrics(filtered_df)
+    recommend_value = _fmt_pct(m.get("recommend_rate")) if m.get("recommend_rate") is not None else "n/a"
+    recommend_sub = "Share of reviews with recommendation data" if m.get("recommend_rate") is not None else "No recommendation field available"
+    organic_share = max(0.0, 1.0 - float(m.get("pct_incentivized") or 0.0))
     cards = [
         ("Reviews in view", f"{m['review_count']:,}", f"of {len(overall_df):,} loaded", False),
-        ("Avg rating", _fmt_num(m["avg_rating"]), "Filtered view", False),
-        ("Avg rating · organic", _fmt_num(m["avg_rating_non_incentivized"]), f"{m['non_incentivized_count']:,} organic", False),
-        ("% 1-2 star", _fmt_pct(m["pct_low_star"]), f"{m['low_star_count']:,} low-star", True),
-        ("% incentivized", _fmt_pct(m["pct_incentivized"]), "Current view", False),
+        ("Avg rating", _fmt_num(m["avg_rating"]), f"Organic avg {_fmt_num(m['avg_rating_non_incentivized'])}", False),
+        ("Recommend rate", recommend_value, recommend_sub, False),
+        ("% 1-2 star", _fmt_pct(m["pct_low_star"]), f"{m['low_star_count']:,} low-star reviews", True),
+        ("% organic", _fmt_pct(organic_share), f"{m['non_incentivized_count']:,} organic reviews", False),
     ]
     cols = st.columns(len(cards))
     for col, (label, value, sub, acc) in zip(cols, cards):
@@ -2766,17 +4486,156 @@ def _render_top_metrics(overall_df, filtered_df):
             _render_metric_card(label, value, sub, accent=acc)
 
 
-def _render_status_bar(filter_description, filtered_df, overall_df):
-    is_filtered = filter_description != "No active filters"
-    dot_style = "background:#f59e0b" if is_filtered else "background:#059669"
-    filter_label = filter_description if is_filtered else "Showing all reviews"
-    st.markdown(f"""<div class="ws-status-bar">
-      <span style="display:flex;align-items:center;gap:6px;font-weight:600;font-size:13px;color:#0f172a;">
-        <span class="ws-status-dot" style="{dot_style}"></span>
-        {len(filtered_df):,} of {len(overall_df):,} reviews in view
-      </span>
-      <span class="ws-filter-pill">{_esc(filter_label)}</span>
-    </div>""", unsafe_allow_html=True)
+_REVIEW_REF_PATTERN = re.compile(r"\(review_ids?\s*:\s*([^)]+)\)", flags=re.IGNORECASE)
+
+
+def _reference_preview_rows(review_ids: Sequence[str], df: pd.DataFrame, max_items: int = 4) -> List[Dict[str, str]]:
+    if df is None or df.empty:
+        return []
+
+    def _clean_rid(value: Any) -> str:
+        rid = str(value or "").strip()
+        rid = re.sub(r'^[`\'"\s]+', '', rid)
+        rid = re.sub(r'[`\'"\s.,;:()\[\]{}]+$', '', rid)
+        return rid.strip()
+
+    lookup = df.copy()
+    lookup["review_id"] = lookup["review_id"].astype(str)
+    lookup["__rid_norm"] = lookup["review_id"].astype(str).str.strip().str.lower()
+    lookup["__rid_simple"] = lookup["__rid_norm"].str.replace(r"[^a-z0-9]+", "", regex=True)
+    out = []
+    used = set()
+    for rid in review_ids:
+        cleaned = _clean_rid(rid)
+        if not cleaned:
+            continue
+        rid_norm = cleaned.lower()
+        if rid_norm in used:
+            continue
+        used.add(rid_norm)
+        hit = lookup[lookup["__rid_norm"] == rid_norm]
+        if hit.empty:
+            rid_simple = re.sub(r"[^a-z0-9]+", "", rid_norm)
+            if rid_simple:
+                hit = lookup[lookup["__rid_simple"] == rid_simple]
+        if hit.empty:
+            hit = lookup[lookup["review_id"].astype(str).str.contains(re.escape(cleaned), case=False, na=False)].head(1)
+        if hit.empty:
+            continue
+        row = hit.iloc[0]
+        title = _safe_text(row.get("title"), "Untitled review") or "Untitled review"
+        snippet = _trunc(_safe_text(row.get("review_text")) or _safe_text(row.get("title_and_text")), 220)
+        meta = []
+        if pd.notna(row.get("rating")):
+            meta.append(f"★{_safe_int(row.get('rating'), 0)}")
+        if _safe_text(row.get("submission_date")):
+            meta.append(_safe_text(row.get("submission_date")))
+        if _safe_text(row.get("content_locale")):
+            meta.append(_safe_text(row.get("content_locale")))
+        out.append({"meta": " · ".join(meta), "title": title, "snippet": snippet})
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _reference_tile_html_from_ids(review_ids: Sequence[str], df: pd.DataFrame, *, label: str = "Reference") -> str:
+    ids = [str(x).strip() for x in review_ids if str(x).strip()]
+    previews = _reference_preview_rows(ids, df)
+    if not previews:
+        raw_ids = ", ".join(ids[:4]) + ("…" if len(ids) > 4 else "")
+        tip = f"<div class='ref-empty'>Referenced review preview not available in the loaded dataset. {_esc(raw_ids) if raw_ids else ''}</div>"
+    else:
+        bits = []
+        for item in previews:
+            bits.append(
+                "<div class='ref-item'>"
+                + (f"<div class='ref-meta'>{_esc(item['meta'])}</div>" if item.get("meta") else "")
+                + f"<div class='ref-title'>{_esc(item['title'])}</div>"
+                + f"<div class='ref-snippet'>{_esc(item['snippet'])}</div>"
+                + "</div>"
+            )
+        extra = max(0, len(ids) - len(previews))
+        if extra:
+            bits.append(f"<div class='ref-item'><div class='ref-empty'>+{extra} more referenced review(s)</div></div>")
+        tip = "".join(bits)
+    return f"<span class='ref-wrap' tabindex='0' role='button' aria-label='{_esc(label)} review reference'><span class='ref-tile'>{_esc(label)}</span><span class='ref-tip'><span class='ref-tip-inner'>{tip}</span></span></span>"
+
+
+def _normalize_ai_answer_display(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    lines = []
+    for line in raw.splitlines():
+        if re.match(r"^\s{0,3}#{1,6}\s+", line):
+            section = re.sub(r"^\s{0,3}#{1,6}\s+", "", line).strip()
+            section = section.rstrip(":")
+            lines.append(f"**{section}**" if section else "")
+        else:
+            lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _reference_tile_html_for_row(row) -> str:
+    rid = _safe_text(row.get("review_id"))
+    title = _safe_text(row.get("title"), "Untitled review") or "Untitled review"
+    snippet = _trunc(_safe_text(row.get("review_text")) or _safe_text(row.get("title_and_text")), 220)
+    meta = []
+    if pd.notna(row.get("rating")):
+        meta.append(f"★{_safe_int(row.get('rating'), 0)}")
+    if _safe_text(row.get("submission_date")):
+        meta.append(_safe_text(row.get("submission_date")))
+    if _safe_text(row.get("content_locale")):
+        meta.append(_safe_text(row.get("content_locale")))
+    if rid:
+        meta.append("Loaded review")
+    tip = (
+        "<div class='ref-item'>"
+        + (f"<div class='ref-meta'>{_esc(' · '.join(meta))}</div>" if meta else "")
+        + f"<div class='ref-title'>{_esc(title)}</div>"
+        + f"<div class='ref-snippet'>{_esc(snippet)}</div>"
+        + "</div>"
+    )
+    return f"<span class='ref-wrap'><span class='ref-tile'>Reference</span><span class='ref-tip'><span class='ref-tip-inner'>{tip}</span></span></span>"
+
+
+def _replace_review_citations_with_reference_tiles(text: str, df: pd.DataFrame) -> str:
+    normalized = _normalize_ai_answer_display(text)
+    safe = html.escape(normalized, quote=False)
+    def repl(match):
+        raw = match.group(1)
+        ids = [p.strip() for p in re.split(r"[,;\n|]+", raw) if p.strip()]
+        if len(ids) <= 1:
+            token_ids = [
+                tok for tok in re.findall(r"[A-Za-z0-9_-]{3,}", raw)
+                if tok.lower() not in {"review", "reviews", "reviewid", "reviewids", "review_id", "review_ids", "id", "ids"}
+            ]
+            if token_ids:
+                ids = token_ids
+        return _reference_tile_html_from_ids(ids, df, label="Reference")
+    return _REVIEW_REF_PATTERN.sub(repl, safe)
+
+
+def _render_markdown_with_reference_tiles(text: str, df: pd.DataFrame):
+    processed = _replace_review_citations_with_reference_tiles(text, df)
+    st.markdown(processed, unsafe_allow_html=True)
+
+
+def _strip_review_citations(text: str) -> str:
+    raw = _normalize_ai_answer_display(text)
+    cleaned = _REVIEW_REF_PATTERN.sub("", raw)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _render_ai_response(text: str, df: pd.DataFrame, *, include_references: bool):
+    if include_references:
+        _render_markdown_with_reference_tiles(text, df)
+    else:
+        st.markdown(_strip_review_citations(text))
 
 
 def _sort_reviews(df, sort_mode):
@@ -2844,6 +4703,20 @@ def _build_evidence_lookup(processed_rows):
     return lookup
 
 
+def _symptom_tags_html(det_tags, del_tags):
+    if not det_tags and not del_tags:
+        return ""
+    sym_html = "<div style='margin-top:9px;padding-top:9px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;'>"
+    if det_tags:
+        det_chips = "".join(f"<span class='chip red' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in det_tags)
+        sym_html += f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--danger);font-weight:700;white-space:nowrap;padding-top:3px;'>Issues</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{det_chips}</div></div>"
+    if del_tags:
+        del_chips = "".join(f"<span class='chip green' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in del_tags)
+        sym_html += f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--success);font-weight:700;white-space:nowrap;padding-top:3px;'>Strengths</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{del_chips}</div></div>"
+    sym_html += "</div>"
+    return sym_html
+
+
 def _render_review_card(row, evidence_items=None):
     rating_val = _safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else 0
     stars = "★" * max(0, min(rating_val, 5)) + "☆" * max(0, 5 - rating_val)
@@ -2851,10 +4724,10 @@ def _render_review_card(row, evidence_items=None):
     review_text = _safe_text(row.get("review_text"), "—") or "—"
     meta_bits = [b for b in [_safe_text(row.get("submission_date")), _safe_text(row.get("content_locale")), _safe_text(row.get("retailer")), _safe_text(row.get("product_or_sku"))] if b]
     is_organic = not _safe_bool(row.get("incentivized_review"), False)
-    status_chips = f"<span class='chip {'green' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
+    status_chips = f"<span class='chip {'gray' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
     rec = row.get("is_recommended")
     if not _is_missing(rec):
-        status_chips += f"<span class='chip {'green' if _safe_bool(rec, False) else 'red'}'>{'Recommended' if _safe_bool(rec, False) else 'Not recommended'}</span>"
+        status_chips += f"<span class='chip {'gray' if _safe_bool(rec, False) else 'red'}'>{'Recommended' if _safe_bool(rec, False) else 'Not recommended'}</span>"
     det_tags = [str(row.get(f"AI Symptom Detractor {j}", "")) for j in range(1, 11) if _is_filled(row.get(f"AI Symptom Detractor {j}"))]
     del_tags = [str(row.get(f"AI Symptom Delighter {j}", "")) for j in range(1, 11) if _is_filled(row.get(f"AI Symptom Delighter {j}"))]
     with st.container(border=True):
@@ -2871,26 +4744,80 @@ def _render_review_card(row, evidence_items=None):
             st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
         else:
             st.markdown(f"<div class='review-body'>{html.escape(review_text)}</div>", unsafe_allow_html=True)
-        if det_tags or del_tags:
-            sym_html = "<div style='margin-top:9px;padding-top:9px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;'>"
-            if det_tags:
-                det_chips = "".join(f"<span class='chip red' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in det_tags)
-                sym_html += f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--danger);font-weight:700;white-space:nowrap;padding-top:3px;'>Issues</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{det_chips}</div></div>"
-            if del_tags:
-                del_chips = "".join(f"<span class='chip green' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in del_tags)
-                sym_html += f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--success);font-weight:700;white-space:nowrap;padding-top:3px;'>Strengths</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{del_chips}</div></div>"
-            sym_html += "</div>"
-            st.markdown(sym_html, unsafe_allow_html=True)
-        footer = [b for b in [f"ID {_safe_text(row.get('review_id'))}", _safe_text(row.get("user_location"))] if b]
-        if footer:
-            st.markdown(f"<div style='font-size:11.5px;color:var(--slate-400);margin-top:6px;'>{' · '.join(_esc(b) for b in footer)}</div>", unsafe_allow_html=True)
+        tag_html = _symptom_tags_html(det_tags, del_tags)
+        if tag_html:
+            st.markdown(tag_html, unsafe_allow_html=True)
+        footer_bits = []
+        rid = _safe_text(row.get("review_id"))
+        if rid:
+            footer_bits.append(f"<span style='font-size:11.5px;color:var(--slate-400);'>ID {_esc(rid)}</span>")
+        loc = _safe_text(row.get("user_location"))
+        if loc:
+            footer_bits.append(f"<span style='font-size:11.5px;color:var(--slate-400);'>{_esc(loc)}</span>")
+        if footer_bits:
+            st.markdown(f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;'>{' · '.join(footer_bits)}</div>", unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
+def _top_theme_summary(df_in, cols):
+    try:
+        tbl = analyze_symptoms_fast(df_in, cols)
+    except Exception:
+        tbl = pd.DataFrame()
+    if tbl is None or tbl.empty:
+        return None, 0
+    row = tbl.iloc[0]
+    return _safe_text(row.get("Item")) or None, _safe_int(row.get("Mentions"), 0)
+
+
+def _render_dashboard_snapshot(chart_df, overall_df=None):
+    scope_df = chart_df if chart_df is not None else pd.DataFrame()
+    if scope_df.empty:
+        return
+    m = _get_metrics(scope_df)
+    od = overall_df if overall_df is not None else scope_df
+    det_cols, del_cols = _get_symptom_col_lists(od)
+    top_det, det_mentions = _top_theme_summary(scope_df, det_cols)
+    top_del, del_mentions = _top_theme_summary(scope_df, del_cols)
+    recommend_txt = _fmt_pct(m.get("recommend_rate")) if m.get("recommend_rate") is not None else "n/a"
+    recommend_sub = "Reviews with recommendation signal" if m.get("recommend_rate") is not None else "No recommendation field available"
+    organic_share = max(0.0, 1.0 - float(m.get("pct_incentivized") or 0.0))
+    st.markdown(
+        f"""
+<div class="soft-panel">
+  <div style="font-weight:800;color:var(--navy);margin-bottom:8px;">Executive snapshot</div>
+  <div class="summary-grid">
+    <div class="summary-item">
+      <div class="label">Current scope</div>
+      <div class="value">{len(scope_df):,} reviews</div>
+      <div class="sub">{int((~scope_df['incentivized_review'].fillna(False)).sum()):,} organic in the current view.</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Satisfaction</div>
+      <div class="value">{_fmt_num(m.get('avg_rating'))} ★</div>
+      <div class="sub">Recommend rate {recommend_txt}. {recommend_sub}.</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Biggest risk</div>
+      <div class="value">{_esc(top_det or 'Run Symptomizer')}</div>
+      <div class="sub">{(str(det_mentions) + ' mentions in view') if top_det else 'Top risk themes will appear here once symptoms are tagged.'}</div>
+    </div>
+    <div class="summary-item">
+      <div class="label">Quality of sample</div>
+      <div class="value">{_fmt_pct(organic_share)} organic</div>
+      <div class="sub">Low-star share {_fmt_pct(m.get('pct_low_star'))}. {(_esc(top_del) + ' leads positives.') if top_del else 'Top positive themes will appear here once symptoms are tagged.'}</div>
+    </div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_dashboard(filtered_df, overall_df=None):
     od = overall_df if overall_df is not None else filtered_df
     st.markdown("<div class='section-title'>Dashboard</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Rating mix, volume trend, and cohort analytics for the current filter set.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Start with the overall time trend and symptom tables. Additional charts are tucked into a cleaner secondary section below.</div>", unsafe_allow_html=True)
     sym_state = _detect_symptom_state(od)
     if sym_state == "none":
         st.markdown("""<div class="sym-state-banner" style="padding:1.5rem 1.8rem;text-align:left;display:flex;align-items:center;gap:16px;margin-bottom:.5rem;">
@@ -2901,7 +4828,7 @@ def _render_dashboard(filtered_df, overall_df=None):
           </div>
         </div>""", unsafe_allow_html=True)
         if st.button("💊 Go to Symptomizer →", type="primary", key="dash_go_sym", use_container_width=False):
-            st.session_state["workspace_active_tab"] = TAB_SYMPTOMIZER
+            st.session_state["workspace_tab_request"] = TAB_SYMPTOMIZER
             st.rerun()
         st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
@@ -2913,101 +4840,95 @@ def _render_dashboard(filtered_df, overall_df=None):
         st.info("No reviews match the current scope.")
         return
 
-    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:.3rem'></div>", unsafe_allow_html=True)
+    _render_dashboard_snapshot(chart_df, od)
     _render_reviews_over_time_chart(chart_df)
-
-    rating_df = _rating_dist(chart_df)
-    rating_df["rating_label"] = rating_df["rating"].map(lambda v: f"{int(v)}★")
-    rating_df["count_pct_label"] = rating_df.apply(lambda r: f"{int(r['review_count']):,} · {_fmt_pct(r['share'])}", axis=1)
-
-    st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        with st.container(border=True):
-            fig = px.bar(rating_df, x="rating_label", y="review_count", text="count_pct_label", title="Rating distribution", category_orders={"rating_label": ["1★", "2★", "3★", "4★", "5★"]}, color="rating", color_discrete_map={"1": "#ef4444", "2": "#f97316", "3": "#eab308", "4": "#84cc16", "5": "#22c55e"}, hover_data={"share": ":.1%", "review_count": True})
-            fig.update_traces(textposition="outside", cliponaxis=False, showlegend=False)
-            fig.update_layout(margin=dict(l=24, r=24, t=52, b=20), xaxis_title="", yaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
-            st.plotly_chart(fig, use_container_width=True)
-    with c2:
-        with st.container(border=True):
-            cohort_df = _cohort_by_incentivized(chart_df)
-            if cohort_df.empty:
-                st.info("No cohort data.")
-            else:
-                fig_c = px.bar(cohort_df, x="star", y="pct", color="cohort", barmode="group", title="Rating split: Organic vs Incentivized", labels={"star": "Star", "pct": "% of cohort", "cohort": "Cohort"}, color_discrete_map={"Organic": "#6366f1", "Incentivized": "#f59e0b"})
-                fig_c.update_layout(xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5], ticktext=["1★", "2★", "3★", "4★", "5★"]), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=20), legend=dict(orientation="h", y=1.08, x=0))
-                fig_c.update_yaxes(ticksuffix="%")
-                st.plotly_chart(fig_c, use_container_width=True)
 
     st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
     _render_symptom_dashboard(chart_df, od)
 
-    st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
-    with st.container(border=True):
-        vel_df = _rolling_velocity(chart_df)
-        if vel_df.empty:
-            st.info("No dated reviews for volume chart.")
-        else:
-            fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig2.add_trace(go.Bar(x=vel_df["month_start"], y=vel_df["review_count"], name="Volume", marker_color="#6366f1", opacity=.45), secondary_y=False)
-            fig2.add_trace(go.Scatter(x=vel_df["month_start"], y=vel_df["rolling_avg"], name="3-mo avg", mode="lines", line=dict(color="#6366f1", width=2, dash="dot")), secondary_y=False)
-            fig2.add_trace(go.Scatter(x=vel_df["month_start"], y=vel_df["avg_rating"], name="Avg ★", mode="lines+markers", line=dict(color="#0f172a", width=2), marker=dict(size=5)), secondary_y=True)
-            fig2.update_layout(title="Review volume + 3-month rolling average", margin=dict(l=24, r=24, t=52, b=20), hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", legend=dict(orientation="h", y=1.04, x=0))
-            fig2.update_xaxes(title_text="", showgrid=False)
-            fig2.update_yaxes(title_text="Reviews", secondary_y=False, showgrid=True, gridcolor="rgba(148,163,184,0.15)")
-            fig2.update_yaxes(title_text="Avg ★", range=[1, 5], secondary_y=True, showgrid=False)
-            st.plotly_chart(fig2, use_container_width=True)
+    with st.expander("📊 Additional dashboard views", expanded=False):
+        dash_tabs = st.tabs(["Rating mix", "Cohorts", "Sentiment", "Markets", "Review depth"])
 
-    st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title' style='font-size:15px;'>📊 Sentiment & Market</div>", unsafe_allow_html=True)
-    sa1, sa2 = st.columns(2)
-    with sa1:
-        with st.container(border=True):
+        with dash_tabs[0]:
+            rating_df = _rating_dist(chart_df)
+            rating_df["rating_label"] = rating_df["rating"].map(lambda v: f"{int(v)}★")
+            rating_df["count_pct_label"] = rating_df.apply(lambda r: f"{int(r['review_count']):,} · {_fmt_pct(r['share'])}", axis=1)
+            with st.container(border=True):
+                fig = px.bar(
+                    rating_df,
+                    x="rating_label",
+                    y="review_count",
+                    text="count_pct_label",
+                    title="Rating distribution",
+                    category_orders={"rating_label": ["1★", "2★", "3★", "4★", "5★"]},
+                    color="rating",
+                    color_discrete_map={"1": "#ef4444", "2": "#f97316", "3": "#eab308", "4": "#84cc16", "5": "#22c55e"},
+                    hover_data={"share": ":.1%", "review_count": True},
+                )
+                fig.update_traces(textposition="outside", cliponaxis=False, showlegend=False)
+                fig.update_layout(margin=dict(l=20, r=18, t=30, b=20), xaxis_title="", yaxis_title="Reviews", height=330, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
+                fig = _sw_style_fig(fig)
+                _show_plotly(fig)
+
+        with dash_tabs[1]:
+            cohort_df = _cohort_by_incentivized(chart_df)
+            with st.container(border=True):
+                if cohort_df.empty:
+                    st.info("No cohort data.")
+                else:
+                    fig_c = px.bar(cohort_df, x="star", y="pct", color="cohort", barmode="group", title="Rating split: Organic vs Incentivized", labels={"star": "Star", "pct": "% of cohort", "cohort": "Cohort"}, color_discrete_map={"Organic": "#6366f1", "Incentivized": "#f59e0b"})
+                    fig_c.update_layout(xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5], ticktext=["1★", "2★", "3★", "4★", "5★"]), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=30, b=30), height=330)
+                    fig_c.update_yaxes(ticksuffix="%")
+                    fig_c = _sw_style_fig(fig_c)
+                    _show_plotly(fig_c)
+
+        with dash_tabs[2]:
             sb_df = _star_band_trend(chart_df)
-            if sb_df.empty:
-                st.info("Insufficient date data for sentiment trend.")
-            else:
-                fig_sb = go.Figure()
-                fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_low"], name="% 1-2★", mode="lines+markers", line=dict(color="#ef4444", width=2), marker=dict(size=4), fill="tozeroy", fillcolor="rgba(239,68,68,0.08)"))
-                fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_high"], name="% 4-5★", mode="lines+markers", line=dict(color="#22c55e", width=2), marker=dict(size=4)))
-                fig_sb.update_layout(title="Sentiment drift: 1-2★ vs 4-5★ over time", hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=20), legend=dict(orientation="h", y=1.08, x=0))
-                fig_sb.update_yaxes(ticksuffix="%", title="% of monthly reviews")
-                st.plotly_chart(fig_sb, use_container_width=True)
-    with sa2:
-        with st.container(border=True):
-            locale_df = _locale_breakdown(chart_df, top_n=10)
-            if locale_df.empty:
-                st.info("No locale data.")
-            else:
-                fig_loc = go.Figure()
-                fig_loc.add_trace(go.Bar(x=locale_df["count"], y=locale_df["content_locale"], orientation="h", name="Reviews", marker_color="#6366f1", opacity=0.75, hovertemplate="%{y}<br>%{x:,} reviews<extra></extra>"))
-                fig_loc.add_trace(go.Scatter(x=locale_df["avg_rating"] * locale_df["count"].max() / 5, y=locale_df["content_locale"], mode="markers", name="Avg ★ (scaled)", marker=dict(color=locale_df["avg_rating"], colorscale="RdYlGn", cmin=1, cmax=5, size=9, showscale=True, colorbar=dict(title="Avg ★", len=0.6, x=1.02)), hovertemplate="%{y}<br>Avg ★: %{text}<extra></extra>", text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
-                fig_loc.update_layout(title="Top markets by review volume", height=max(260, 26 * len(locale_df) + 80), margin=dict(l=80, r=60, t=52, b=20), barmode="overlay", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", xaxis_title="Reviews", yaxis_title="", legend=dict(orientation="h", y=1.08, x=0))
-                st.plotly_chart(fig_loc, use_container_width=True)
+            with st.container(border=True):
+                if sb_df.empty:
+                    st.info("Insufficient date data for sentiment trend.")
+                else:
+                    fig_sb = go.Figure()
+                    fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_low"], name="% 1-2★", mode="lines+markers", line=dict(color="#ef4444", width=2), marker=dict(size=4), fill="tozeroy", fillcolor="rgba(239,68,68,0.08)"))
+                    fig_sb.add_trace(go.Scatter(x=sb_df["month_start"], y=sb_df["pct_high"], name="% 4-5★", mode="lines+markers", line=dict(color="#22c55e", width=2), marker=dict(size=4)))
+                    fig_sb.update_layout(title="Sentiment drift: 1-2★ vs 4-5★ over time", hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=30, b=30), height=330)
+                    fig_sb.update_yaxes(ticksuffix="%", title="% of monthly reviews")
+                    fig_sb = _sw_style_fig(fig_sb)
+                    _show_plotly(fig_sb)
 
-    st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
-    rd1, rd2 = st.columns([1.3, 1])
-    with rd1:
-        with st.container(border=True):
-            len_df = _review_length_cohort(chart_df)
-            if len_df.empty:
-                st.info("Insufficient data for review-length analysis.")
-            else:
-                fig_len = go.Figure()
-                fig_len.add_trace(go.Bar(x=len_df["Length Quartile"], y=len_df["avg_rating"], text=[f"{v:.2f}★" for v in len_df["avg_rating"]], textposition="outside", marker_color=["#ef4444" if v < 3.5 else "#eab308" if v < 4.2 else "#22c55e" for v in len_df["avg_rating"]], hovertemplate="%{x}<br>Avg ★: %{y:.2f}<br>n=%{customdata}<extra></extra>", customdata=len_df["count"]))
-                fig_len.update_layout(title="Review depth vs satisfaction", yaxis_range=[1, 5.2], yaxis_title="Avg ★", xaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=24, r=24, t=52, b=20))
-                st.plotly_chart(fig_len, use_container_width=True)
-    with rd2:
-        with st.container(border=True):
-            locs = _top_locations(chart_df, top_n=10)
-            if locs.empty:
-                st.info("No reviewer location data.")
-            else:
-                st.markdown("<div style='font-weight:700;font-size:13.5px;color:var(--navy);margin-bottom:8px;'>Top reviewer locations</div>", unsafe_allow_html=True)
-                locs_display = locs.copy()
-                locs_display["avg_rating"] = locs_display["avg_rating"].map(lambda v: f"{v:.2f}★" if pd.notna(v) else "—")
-                locs_display = locs_display.rename(columns={"user_location": "Location", "count": "Reviews", "avg_rating": "Avg ★"})
-                st.dataframe(locs_display[["Location", "Reviews", "Avg ★"]], use_container_width=True, hide_index=True, height=280)
+        with dash_tabs[3]:
+            with st.container(border=True):
+                locale_df = _locale_breakdown(chart_df, top_n=10)
+                if locale_df.empty:
+                    st.info("No locale data.")
+                else:
+                    fig_loc = go.Figure()
+                    fig_loc.add_trace(go.Bar(x=locale_df["count"], y=locale_df["content_locale"], orientation="h", name="Reviews", marker_color="#6366f1", opacity=0.82, hovertemplate="%{y}<br>%{x:,} reviews<extra></extra>"))
+                    fig_loc.add_trace(go.Scatter(x=locale_df["avg_rating"] * locale_df["count"].max() / 5, y=locale_df["content_locale"], mode="markers", name="Avg ★ (scaled)", marker=dict(color=locale_df["avg_rating"], colorscale="RdYlGn", cmin=1, cmax=5, size=9, showscale=True, colorbar=dict(title="Avg ★", len=0.42, x=1.01)), hovertemplate="%{y}<br>Avg ★: %{text}<extra></extra>", text=[f"{v:.2f}" for v in locale_df["avg_rating"]]))
+                    fig_loc.update_layout(title="Top markets by review volume", height=max(320, 26 * len(locale_df) + 100), margin=dict(l=70, r=40, t=30, b=30), barmode="overlay", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", xaxis_title="Reviews", yaxis_title="")
+                    fig_loc = _sw_style_fig(fig_loc)
+                    _show_plotly(fig_loc)
+                st.markdown("<div style='height:.35rem'></div>", unsafe_allow_html=True)
+                locs = _top_locations(chart_df, top_n=10)
+                if not locs.empty:
+                    st.markdown("**Top reviewer locations**")
+                    locs_display = locs.copy()
+                    locs_display["avg_rating"] = locs_display["avg_rating"].map(lambda v: f"{v:.2f}★" if pd.notna(v) else "—")
+                    locs_display = locs_display.rename(columns={"user_location": "Location", "count": "Reviews", "avg_rating": "Avg ★"})
+                    st.dataframe(locs_display[["Location", "Reviews", "Avg ★"]], use_container_width=True, hide_index=True, height=280)
+
+        with dash_tabs[4]:
+            with st.container(border=True):
+                len_df = _review_length_cohort(chart_df)
+                if len_df.empty:
+                    st.info("Insufficient data for review-length analysis.")
+                else:
+                    fig_len = go.Figure()
+                    fig_len.add_trace(go.Bar(x=len_df["Length Quartile"], y=len_df["avg_rating"], text=[f"{v:.2f}★" for v in len_df["avg_rating"]], textposition="outside", marker_color=["#ef4444" if v < 3.5 else "#eab308" if v < 4.2 else "#22c55e" for v in len_df["avg_rating"]], hovertemplate="%{x}<br>Avg ★: %{y:.2f}<br>n=%{customdata}<extra></extra>", customdata=len_df["count"]))
+                    fig_len.update_layout(title="Review depth vs satisfaction", yaxis_range=[1, 5.2], yaxis_title="Avg ★", xaxis_title="", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_family="Inter", margin=dict(l=20, r=18, t=30, b=24), height=330)
+                    fig_len = _sw_style_fig(fig_len)
+                    _show_plotly(fig_len)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: REVIEW EXPLORER
@@ -3059,45 +4980,40 @@ def _render_review_explorer(*, summary, overall_df, filtered_df, prompt_artifact
         st.rerun()
     else:
         st.session_state["review_explorer_page"] = current_page
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: AI ANALYST
 # ═══════════════════════════════════════════════════════════════════════════════
 def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_description):
-    st.markdown("<div class='section-title'>AI — Product & Consumer Insights</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Ask anything. Grounded in the currently filtered review text and evidence.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>AI Analyst</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Use this for executive summaries, root-cause synthesis, and evidence-backed action plans grounded in the current filtered review set.</div>", unsafe_allow_html=True)
     if filtered_df.empty:
         st.info("Adjust filters — no reviews in scope.")
         return
-
     scope_sig = json.dumps(dict(pid=summary.product_id, fd=filter_description, n=len(filtered_df), st=(st.session_state.get("analysis_dataset") or {}).get("source_type", "bv")), sort_keys=True)
     if st.session_state.get("chat_scope_signature") != scope_sig:
         if st.session_state.get("chat_messages"):
             st.session_state["chat_messages"] = []
             st.session_state["chat_scope_notice"] = "Chat cleared — scope changed."
         st.session_state["chat_scope_signature"] = scope_sig
-
     notice = st.session_state.pop("chat_scope_notice", None)
     if notice:
         st.info(notice)
-
-    if st.session_state.pop("ai_scroll_to_top", False):
-        st.markdown("<script>window.scrollTo({top:0,behavior:'smooth'});window.parent.scrollTo({top:0,behavior:'smooth'});</script>", unsafe_allow_html=True)
-
+    st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
     with st.container(border=True):
         sc = st.columns([1, 1, 1, 2])
         sc[0].metric("In scope", f"{len(filtered_df):,}")
         sc[1].metric("Organic", f"{int((~filtered_df['incentivized_review'].fillna(False)).sum()):,}")
         sc[2].metric("Model", _shared_model())
         sc[3].caption(f"Scope: {filter_description}")
-
+        st.markdown("<div class='section-note'>Best first click for ELT: <strong>Executive summary</strong>. Then raise <strong>Reasoning effort</strong> if you want a higher-confidence long-form answer.</div>", unsafe_allow_html=True)
     api_key = settings.get("api_key")
     if not api_key:
         st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
         st.code('OPENAI_API_KEY = "sk-..."', language="toml")
         return
-
+    include_references = bool(st.session_state.get("ai_include_references", False))
     archive_msgs, live_msgs = _split_chat_messages(st.session_state.get("chat_messages") or [], keep_last=AI_VISIBLE_CHAT_MESSAGES)
-
     with st.container(border=True):
         st.markdown("**Current exchange**")
         if not live_msgs:
@@ -3105,70 +5021,90 @@ def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_descrip
         else:
             for msg in live_msgs:
                 with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"])
-
+                    if msg["role"] == "assistant":
+                        _render_ai_response(msg["content"], overall_df, include_references=include_references)
+                    else:
+                        st.markdown(msg["content"])
     if archive_msgs:
         msg_label = "message" if len(archive_msgs) == 1 else "messages"
         with st.expander(f"🗂️ Chat archive ({len(archive_msgs)} earlier {msg_label})", expanded=False):
             for msg in archive_msgs:
                 with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"])
-
+                    if msg["role"] == "assistant":
+                        _render_ai_response(msg["content"], overall_df, include_references=include_references)
+                    else:
+                        st.markdown(msg["content"])
     quick_actions = {
-        "Executive summary": dict(prompt="Create a concise executive summary. Lead with biggest strengths, biggest risks, key consumer insight, and top 3 actions.", help="Leadership readout.", persona=None),
+        "Executive summary": dict(prompt="Create an executive summary. Lead with biggest strengths, biggest risks, key consumer insight, and top 3 actions.", help="Leadership readout.", persona=None),
         "Product Development": dict(prompt=PERSONAS["Product Development"]["prompt"], help=PERSONAS["Product Development"]["blurb"], persona="Product Development"),
         "Quality Engineer": dict(prompt=PERSONAS["Quality Engineer"]["prompt"], help=PERSONAS["Quality Engineer"]["blurb"], persona="Quality Engineer"),
         "Consumer Insights": dict(prompt=PERSONAS["Consumer Insights"]["prompt"], help=PERSONAS["Consumer Insights"]["blurb"], persona="Consumer Insights"),
     }
     quick_trigger = None
     with st.container(border=True):
-        st.markdown("**Quick reports**")
-        acols = st.columns(4)
-        for col, (label, config) in zip(acols, quick_actions.items()):
-            if col.button(label, use_container_width=True, help=config["help"], key=f"ai_q_{_slugify(label)}"):
-                quick_trigger = (config["persona"], label, config["prompt"])
-        lc1, lc2 = st.columns([2, 2])
-        lc1.radio("Report length", ["Short", "Medium", "Long"], horizontal=True, index=1, key="ai_report_length", help="Short ≈150 words · Medium ≈350 words · Long ≈700 words")
-        lc2.caption("Each report is grounded in the filtered review text and cites review IDs for material claims.")
-
+        st.markdown("**Quick reports & answer settings**")
+        st.caption("Use the presets below to get a polished first draft quickly, then refine with your own follow-up question.")
+        action_rows = [list(quick_actions.items())[:2], list(quick_actions.items())[2:]]
+        for ridx, row in enumerate(action_rows):
+            acols = st.columns(len(row))
+            for cidx, (col, (label, config)) in enumerate(zip(acols, row)):
+                if col.button(label, use_container_width=True, help=config["help"], key=f"ai_q_{ridx}_{cidx}_{_slugify(label)}"):
+                    quick_trigger = (config["persona"], label, config["prompt"])
+        size_cols = st.columns([1.18, 1.0, 1.05, 1.45])
+        preset_options = ["Large (1200 words)", "Deep dive (1600 words)", "Custom"]
+        cur_preset = st.session_state.get("ai_response_preset", "Large (1200 words)")
+        if cur_preset not in preset_options:
+            cur_preset = "Large (1200 words)"
+            st.session_state["ai_response_preset"] = cur_preset
+        size_cols[0].selectbox("Response size", preset_options, index=preset_options.index(cur_preset), key="ai_response_preset", help="Large is the default because shorter outputs were not detailed enough.")
+        if st.session_state.get("ai_response_preset") == "Deep dive (1600 words)":
+            st.session_state["ai_response_words"] = 1600
+        elif st.session_state.get("ai_response_preset") == "Large (1200 words)":
+            st.session_state["ai_response_words"] = 1200
+        size_cols[1].number_input("Target words", min_value=250, max_value=2400, step=100, value=_current_ai_target_words(), key="ai_response_words", help="You can type your own target word count. Around 1200 words is the default large report.", disabled=st.session_state.get("ai_response_preset") != "Custom")
+        size_cols[2].toggle("Include references · Beta", value=bool(st.session_state.get("ai_include_references", False)), key="ai_include_references", help="Beta feature. When on, the assistant includes hoverable Reference previews in the AI Analyst output. Off by default for a cleaner reading view.")
+        size_cols[3].caption(f"Target: {_current_ai_target_words():,} words · approx. {int(round(_current_ai_target_words() * 6.2)):,} characters. References are {'on' if st.session_state.get('ai_include_references') else 'off'}.")
+        if st.session_state.get("ai_include_references"):
+            st.caption("**Beta:** hoverable review references are enabled for AI Analyst answers.")
+        reasoning_now = _shared_reasoning()
+        tone = "warning" if reasoning_now in {"none", "minimal", "low"} else "info"
+        getattr(st, tone)("Accuracy tip: raise **Reasoning effort** in the sidebar AI settings for higher-confidence synthesis, especially on long reports, root-cause questions, and mixed sentiment datasets.")
     helper_cols = st.columns([2, 1, 1])
     helper_cols[0].caption(f"Scope: {filter_description}")
     if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat"):
         st.session_state["chat_messages"] = []
-        st.session_state["ai_scroll_to_top"] = False
+        st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
         st.rerun()
-
     user_message = st.chat_input("Ask about drivers, risks, opportunities, or voice-of-customer themes…", key="ai_chat_input")
     prompt_to_send = visible_user_message = persona_name = None
     if quick_trigger:
         persona_name, visible_user_message, prompt_to_send = quick_trigger
     elif user_message:
         prompt_to_send = visible_user_message = user_message
-
     if prompt_to_send and visible_user_message:
         prior = list(st.session_state["chat_messages"])
         st.session_state["chat_messages"].append({"role": "user", "content": visible_user_message})
         overlay = _show_thinking("Reviewing the filtered review text…")
         try:
-            answer = _call_analyst(question=prompt_to_send, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, chat_history=prior, persona_name=persona_name, report_length=st.session_state.get("ai_report_length", "Medium"))
+            answer = _call_analyst(question=prompt_to_send, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, chat_history=prior, persona_name=persona_name, target_words=_current_ai_target_words(), include_references=bool(st.session_state.get('ai_include_references', False)))
             if persona_name:
-                answer = f"## {persona_name} report\n\n{answer}"
+                answer = f"**{persona_name} report**\n\n{answer}"
         except Exception as exc:
             answer = f"OpenAI request failed: {exc}"
         finally:
             overlay.empty()
         st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
-        st.session_state["ai_scroll_to_top"] = True
+        st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
         st.rerun()
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: REVIEW PROMPT
 # ═══════════════════════════════════════════════════════════════════════════════
 def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, filter_description):
     st.markdown("<div class='section-title'>Review Prompt</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Create row-level AI tags that become new review columns.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Create row-level AI tags that become new review columns. Start with the default starter pack, then tailor the prompts to the questions ELT, Product, Quality, or Insights need answered repeatedly.</div>", unsafe_allow_html=True)
     with st.container(border=True):
         st.markdown("**Prompt library**")
+        st.markdown("<div class='helper-chip-row'><span class='helper-chip'>Loudness</span><span class='helper-chip'>Reliability</span><span class='helper-chip'>Usage count</span><span class='helper-chip'>Safety</span><span class='helper-chip'>Ownership period</span></div>", unsafe_allow_html=True)
         sc = st.columns([1.2, 1.2, 1])
         if sc[0].button("Add starter pack", use_container_width=True, key="prompt_add"):
             new_rows = pd.DataFrame(REVIEW_PROMPT_STARTER_ROWS)
@@ -3301,7 +5237,7 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
             else:
                 fig = px.pie(ps, names="label", values="review_count", hole=0.44, color_discrete_sequence=["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#3b82f6", "#8b5cf6"])
                 fig.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)", font_family="Inter")
-                st.plotly_chart(fig, use_container_width=True)
+                _show_plotly(fig)
     with tc_col:
         with st.container(border=True):
             st.markdown(f"**Column** `{pc_col}`")
@@ -3314,12 +5250,13 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
     prevcols = [c for c in ["review_id", "rating", "incentivized_review", "submission_time", "content_locale", "title", "review_text", pc_col] if c in _view.columns]
     st.markdown("**Tagged review preview**")
     st.dataframe(_view[prevcols].head(50), use_container_width=True, hide_index=True, height=300)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: SYMPTOMIZER
 # ═══════════════════════════════════════════════════════════════════════════════
 def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filter_description):
     st.markdown("<div class='section-title'>Symptomizer</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Row-level AI tagging of delighters and detractors. Tags write back into the shared dataframe and appear in Review Explorer.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Row-level AI tagging of delighters and detractors. Use this when you want a more structured theme layer for the Dashboard, Review Explorer, and downstream exports.</div>", unsafe_allow_html=True)
     client = _get_client()
     api_key = settings.get("api_key")
     sym_source = st.session_state.get("sym_symptoms_source", "none")
@@ -3515,6 +5452,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             eta_box.markdown(f"**Speed:** {rate * 60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem)}")
             avg_labels = total_labels_written / max(done, 1)
             stats_box.markdown(f"<span style='font-size:12px;color:var(--slate-500);'>Labels written: **{total_labels_written}** · Avg per review: **{avg_labels:.1f}**" + (f" · ⚠️ {failed_count} failed" if failed_count > 0 else "") + "</span>", unsafe_allow_html=True)
+            gc.collect()
         dataset = dict(st.session_state["analysis_dataset"])
         dataset["reviews_df"] = updated_df
         st.session_state.update(analysis_dataset=dataset, sym_processed_rows=processed_local, master_export_bundle=None)
@@ -3554,6 +5492,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     st.session_state["sym_delighters"] = list(dict.fromkeys(delighters + to_add))
                     st.success(f"Added {len(to_add)}.")
                     st.rerun()
+    updated_reviews = (st.session_state.get("analysis_dataset") or {}).get("reviews_df", overall_df)
     with st.expander(f"📋 Review log — last {min(len(processed), 20)} processed", expanded=True):
         for rec in processed[-20:]:
             idx = rec.get("idx", "?")
@@ -3565,15 +5504,15 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                         if e and e.strip():
                             all_ev_items.append((e.strip(), lab))
                 try:
-                    vb = str(overall_df.loc[int(idx), "review_text"])[:800]
-                    if all_ev_items:
-                        st.markdown(_highlight_evidence(vb, all_ev_items), unsafe_allow_html=True)
-                        st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
-                    else:
-                        st.markdown(f"<div class='review-body'>{html.escape(vb)}</div>", unsafe_allow_html=True)
+                    row = updated_reviews.loc[int(idx)]
+                    _render_review_card(row, evidence_items=all_ev_items or None)
                 except Exception:
-                    pass
-                st.markdown("<div class='chip-wrap' style='margin-bottom:6px;'>" + f"<span class='chip yellow'>Safety: {_esc(rec.get('safety', ''))}</span>" + f"<span class='chip indigo'>Reliability: {_esc(rec.get('reliability', ''))}</span>" + f"<span class='chip gray'>Sessions: {_esc(rec.get('sessions', ''))}</span>" + "</div>", unsafe_allow_html=True)
+                    try:
+                        vb = str(overall_df.loc[int(idx), "review_text"])[:800]
+                        st.markdown(f"<div class='review-body'>{html.escape(vb)}</div>", unsafe_allow_html=True)
+                    except Exception:
+                        pass
+                st.markdown("<div class='chip-wrap' style='margin-top:8px;margin-bottom:4px;'>" + f"<span class='chip yellow'>Safety: {_esc(rec.get('safety', ''))}</span>" + f"<span class='chip indigo'>Reliability: {_esc(rec.get('reliability', ''))}</span>" + f"<span class='chip gray'>Sessions: {_esc(rec.get('sessions', ''))}</span>" + "</div>", unsafe_allow_html=True)
     ec1, ec2 = st.columns([1.5, 3])
     if ec1.button("🧾 Prepare export", use_container_width=True, key="sym_prep_export"):
         upd = st.session_state["analysis_dataset"]["reviews_df"]
@@ -3593,7 +5532,7 @@ def main():
       <div style="width:36px;height:36px;background:#0f172a;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;">🦈</div>
       <div>
         <div style="font-size:20px;font-weight:800;letter-spacing:-.03em;color:#0f172a;">SharkNinja Review Analyst</div>
-        <div style="font-size:12px;color:#64748b;margin-top:1px;">Voice-of-customer · AI analyst · Symptomizer</div>
+        <div style="font-size:12px;color:#64748b;margin-top:1px;">Voice-of-customer workspace for executive review, deep-dive exploration, prompting, and symptom tagging</div>
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -3608,45 +5547,50 @@ def main():
     if st.session_state.get("workspace_source_mode") not in {SOURCE_MODE_URL, SOURCE_MODE_FILE}:
         st.session_state["workspace_source_mode"] = SOURCE_MODE_URL
 
-    source_mode = st.radio("Workspace source", [SOURCE_MODE_URL, SOURCE_MODE_FILE], horizontal=True, key="workspace_source_mode")
-    if source_mode == SOURCE_MODE_URL:
-        st.text_input("Product URL", key="workspace_product_url")
-        if st.button("Build review workspace", type="primary", key="ws_build_url"):
-            try:
-                nd = _load_product_reviews(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
-                st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD)
-                st.rerun()
-            except requests.HTTPError as exc:
-                st.error(f"HTTP error: {exc}")
-            except ReviewDownloaderError as exc:
-                st.error(str(exc))
-            except Exception as exc:
-                st.exception(exc)
-    else:
-        uploader_key = f"workspace_files_{int(st.session_state.get('workspace_file_uploader_nonce', 0))}"
-        uploaded_files = st.file_uploader("Upload review export files", type=["csv", "xlsx", "xls"], accept_multiple_files=True, help="Supports Axion-style exports and similar CSV/XLSX review files.", key=uploader_key)
-        st.caption("Mapped columns: Event Id · Base SKU · Review Text · Rating · Opened date · Seeded Flag · Retailer")
-        if st.button("Build review workspace from file", type="primary", key="ws_build_file"):
-            try:
-                nd = _load_uploaded_files(uploaded_files or [])
-                st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD)
-                if uploaded_files and len(uploaded_files) == 1:
-                    fname = getattr(uploaded_files[0], "name", "")
-                    if fname.lower().endswith(".xlsx"):
-                        st.session_state["_uploaded_raw_bytes"] = uploaded_files[0].getvalue()
-                st.rerun()
-            except ReviewDownloaderError as exc:
-                st.error(str(exc))
-            except Exception as exc:
-                st.exception(exc)
+    with st.expander("🧰 Build or switch workspace", expanded=(dataset is None)):
+        st.markdown("<div class='builder-card'><div class='builder-kicker'>Get started</div><div class='builder-title'>Build a review workspace</div><div class='builder-sub'>Paste a supported product page or review API URL, or upload a review export file. Start with the Dashboard for an executive summary, then move into the other tabs for deeper work.</div><div class='helper-chip-row'><span class='helper-chip'>Shark/Ninja US</span><span class='helper-chip'>Shark/Ninja UK/EU</span><span class='helper-chip'>Costco</span><span class='helper-chip'>Sephora</span><span class='helper-chip'>Ulta</span><span class='helper-chip'>Hoka</span><span class='helper-chip'>Bazaarvoice API</span><span class='helper-chip'>PowerReviews API</span></div></div>", unsafe_allow_html=True)
+        source_mode = st.radio("Workspace source", [SOURCE_MODE_URL, SOURCE_MODE_FILE], horizontal=True, key="workspace_source_mode")
+        if source_mode == SOURCE_MODE_URL:
+            st.text_input("Product or review URL", key="workspace_product_url", placeholder="Paste a product page or direct review endpoint")
+            st.caption("Fastest path: paste a retailer product page or a direct Bazaarvoice / PowerReviews review endpoint.")
+            if st.button("Build review workspace", type="primary", key="ws_build_url", use_container_width=True):
+                try:
+                    nd = _load_product_reviews(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
+                    _reset_review_filters()
+                    st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None)
+                    st.rerun()
+                except requests.HTTPError as exc:
+                    st.error(f"HTTP error: {exc}")
+                except ReviewDownloaderError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.exception(exc)
+        else:
+            uploader_key = f"workspace_files_{int(st.session_state.get('workspace_file_uploader_nonce', 0))}"
+            uploaded_files = st.file_uploader("Upload review export files", type=["csv", "xlsx", "xls"], accept_multiple_files=True, help="Supports Axion-style exports and similar CSV/XLSX review files.", key=uploader_key)
+            st.caption("Mapped columns include Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, and Retailer when available.")
+            if st.button("Build review workspace from file", type="primary", key="ws_build_file", use_container_width=True):
+                try:
+                    nd = _load_uploaded_files(uploaded_files or [])
+                    _reset_review_filters()
+                    st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None)
+                    if uploaded_files and len(uploaded_files) == 1:
+                        fname = getattr(uploaded_files[0], "name", "")
+                        if fname.lower().endswith(".xlsx"):
+                            st.session_state["_uploaded_raw_bytes"] = uploaded_files[0].getvalue()
+                    st.rerun()
+                except ReviewDownloaderError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.exception(exc)
 
     dataset = st.session_state.get("analysis_dataset")
     settings = _render_sidebar(dataset["reviews_df"] if dataset else None)
     if not dataset:
-        st.markdown("""<div style="margin-top:2rem;padding:2rem;background:var(--surface,#fff);border:1px solid #dde1e8;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.08);">
+        st.markdown("""<div style="margin-top:1.1rem;padding:2rem;background:var(--surface,#fff);border:1px solid #dde1e8;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.08);">
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:.4rem;">No workspace loaded</div>
-          <div style="font-size:13px;color:#64748b;">Enter a SharkNinja product URL or upload a review export above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer.</div>
+          <div style="font-size:13px;color:#64748b;max-width:720px;margin:0 auto;line-height:1.55;">Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. For ELT review, start with a product page URL and go straight to the Dashboard once the workspace is ready.</div>
         </div>""", unsafe_allow_html=True)
         return
 
@@ -3654,14 +5598,24 @@ def main():
     overall_df = dataset["reviews_df"]
     source_type = dataset.get("source_type", "bazaarvoice")
     source_label = dataset.get("source_label", "")
-    src_map = {"All reviews": "All reviews", "Organic only": "Non-incentivized only", "Incentivized only": "Incentivized only"}
-    filtered_df = _apply_filters(overall_df, selected_ratings=settings["selected_ratings"], incentivized_mode=src_map.get(settings["review_source_mode"], "All reviews"), selected_products=settings["selected_products"], selected_locales=settings["selected_locales"], recommendation_mode=settings["recommendation_mode"], syndicated_mode=settings["syndicated_mode"], media_mode=settings["media_mode"], date_range=settings["date_range"], text_query=settings["text_query"])
-    filter_description = _describe_filters(selected_ratings=settings["selected_ratings"], selected_products=settings["selected_products"], review_source_mode=settings["review_source_mode"], selected_locales=settings["selected_locales"], recommendation_mode=settings["recommendation_mode"], syndicated_mode=settings["syndicated_mode"], media_mode=settings["media_mode"], date_range=settings["date_range"], text_query=settings["text_query"])
+    filter_state = settings["review_filters"]
+    filtered_df = filter_state["filtered_df"]
+    filter_description = filter_state["description"]
+    new_filter_sig = json.dumps(filter_state["active_items"], default=str)
+    if st.session_state.get("review_filter_signature") != new_filter_sig:
+        st.session_state["review_filter_signature"] = new_filter_sig
+        st.session_state["review_explorer_page"] = 1
+
     _render_workspace_header(summary, overall_df, st.session_state.get("prompt_run_artifacts"), source_type=source_type, source_label=source_label)
     _render_top_metrics(overall_df, filtered_df)
-    _render_status_bar(filter_description, filtered_df, overall_df)
-    st.markdown("<div class='nav-tabs-wrap'><div class='nav-tabs-label'>Workspace</div></div>", unsafe_allow_html=True)
-    active_tab = st.radio("Workspace tab", WORKSPACE_TABS, horizontal=True, key="workspace_active_tab", label_visibility="collapsed")
+    _render_active_filter_summary(filter_state, overall_df)
+
+    pending_tab = st.session_state.pop("workspace_tab_request", None)
+    if pending_tab in WORKSPACE_TABS:
+        st.session_state["workspace_active_tab"] = pending_tab
+    elif st.session_state.get("workspace_active_tab") not in WORKSPACE_TABS:
+        st.session_state["workspace_active_tab"] = TAB_DASHBOARD
+    active_tab = _render_workspace_nav()
     common = dict(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
     if active_tab == TAB_DASHBOARD:
         _render_dashboard(filtered_df, overall_df)
